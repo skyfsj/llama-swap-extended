@@ -131,6 +131,56 @@ performance:
   # - minimum duration 5s
   every: 15s
 
+# power: GPU/node power monitoring, energy statistics and electricity cost.
+# - GPU-level power comes from nvidia-smi (or the platform equivalent); the
+#   activity page attributes energy to models via each model's GPU config
+#   (launch.gpus / container.gpus).
+# - Node-level power uses a local ipmitool when available (DCMI preferred,
+#   sensor readings as fallback); otherwise costs use GPU power only.
+# - Energy is persisted to the store; costs are computed with the price in
+#   effect when each sample was written.
+power:
+  # disabled: boolean
+  # - default: false
+  disabled: false
+
+  # electricityPricePerKwh: base electricity price per kWh
+  # - default: 0 (no cost accounting until configured)
+  # - when no tariffs are configured every sample uses this price
+  electricityPricePerKwh: 0
+
+  # currency: label shown with cost figures
+  # - default: CNY
+  currency: CNY
+
+  # tariffs: optional time-of-use price windows (HH:MM local time)
+  # - windows must not overlap; end earlier than start wraps past midnight
+  # - uncovered times fall back to electricityPricePerKwh
+  # tariffs:
+  #   - name: peak
+  #     pricePerKwh: 1.0
+  #     start: "08:00"
+  #     end: "22:00"
+  #   - name: valley
+  #     pricePerKwh: 0.3
+  #     start: "22:00"
+  #     end: "06:00"
+
+  # retentionDays: how many days of samples/occupancy to keep
+  # - default: 90
+  retentionDays: 90
+
+  # flushInterval: how often sampled power is aggregated into the store
+  # - default: 60s
+  # - minimum duration 15s
+  flushInterval: 60s
+
+  # ipmi: node-level power collector
+  # - command overrides the ipmitool binary path (empty = use PATH)
+  ipmi:
+    disabled: false
+    command: ""
+
 # startPort: sets the starting port number for the automatic ${PORT} macro.
 # - optional, default: 5800
 # - the ${PORT} macro can be used in model.cmd and model.proxy settings
@@ -1250,3 +1300,84 @@ peers:
         provider:
           data_collection: "deny"
           zdr: true
+
+# providers: upstream LLM providers served through the gateway forwarding path
+# - optional, default: no providers
+# - requests for provider models are forwarded to the provider's API
+# - provider models are addressable as <provider ID>/<local model ID>, and as
+#   the bare local model ID when no local model/peer claims it
+# - multiple API keys per provider are scheduled by priority tier with
+#   weighted round-robin; failing keys cool down and recover automatically
+# - each provider (and each key) can use its own outbound proxy
+providers:
+  deepseek:
+    # type: upstream protocol
+    # - optional, default: openai
+    # - openai: Authorization: Bearer (DeepSeek, Qwen, Moonshot, OpenRouter, ...)
+    # - anthropic: x-api-key + anthropic-version headers
+    type: openai
+    # endpoint: base URL of the upstream API
+    # - required
+    endpoint: https://api.deepseek.com
+    # proxy: provider-level outbound proxy
+    # - optional, default: "" (use environment proxies)
+    # - http/https/socks5/socks5h URLs; socks5 upgrades to socks5h (remote DNS)
+    # - the literal "direct" bypasses all proxies, including environment ones
+    # proxy: socks5://127.0.0.1:1080
+    # priority / weight: defaults inherited by keys without their own
+    # - optional, default: 0 / 0
+    # priority: 10
+    # weight: 1
+    # sticky: session affinity - same session sticks to the same key
+    # - optional, default: true
+    sticky: true
+    # bareNamePolicy: arbitration for the bare model name when a local model
+    #   shares it
+    # - optional, default: local-first
+    bareNamePolicy: local-first
+    # maxRetries: failed requests may switch keys this many times
+    # - optional, default: 2
+    maxRetries: 2
+    # apiKeys: upstream credentials
+    # - required, at least one
+    # - each entry is a plain string or an object with: value / valueEnv,
+    #   weight, priority, maxConcurrent, proxy, disabled
+    apiKeys:
+      - ${env.DEEPSEEK_API_KEY}
+      - valueEnv: DEEPSEEK_BACKUP_KEY
+        weight: 2
+        priority: 1
+        maxConcurrent: 4
+    # models: models served by this provider
+    # - required, at least one
+    # - a string maps the model to itself; an object maps local -> upstream
+    models:
+      - deepseek-chat
+      - deepseek-r1: deepseek-reasoner
+    # timeouts: connection timeouts for this provider
+    # - optional, defaults shown below
+    timeouts:
+      connect: 30
+      keepalive: 30
+      responseHeader: 600
+      tlsHandshake: 10
+      idleConn: 90
+
+  claude:
+    type: anthropic
+    endpoint: https://api.anthropic.com
+    apiKeys:
+      - ${env.ANTHROPIC_API_KEY}
+    models:
+      - claude-sonnet
+
+# gateway: gateway-wide settings for provider forwarding
+# - optional, defaults shown below
+gateway:
+  # stickyTTL: idle expiry for session-affinity entries; hits slide it forward
+  stickyTTL: 1h
+  # cooldown: cooldown durations per upstream error class
+  cooldown:
+    auth: 10m        # 401/403
+    rateLimit: 60s   # 429 without Retry-After
+    transient: 30s   # 5xx / network errors

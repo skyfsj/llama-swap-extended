@@ -281,6 +281,91 @@
             "default": {},
             "description": "Configuration for CPU, RAM and GPU monitoring statistics."
         },
+        "power": {
+            "type": "object",
+            "properties": {
+                "disabled": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Disable power monitoring and energy statistics."
+                },
+                "electricityPricePerKwh": {
+                    "type": "number",
+                    "minimum": 0,
+                    "default": 0,
+                    "description": "Base electricity price per kWh in the configured currency. With no tariffs every sample is priced with it; otherwise it prices the time no tariff window covers."
+                },
+                "currency": {
+                    "type": "string",
+                    "default": "CNY",
+                    "description": "Currency label shown with cost figures, e.g. CNY or USD."
+                },
+                "tariffs": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "Time-of-use window label, e.g. peak or valley."
+                            },
+                            "pricePerKwh": {
+                                "type": "number",
+                                "minimum": 0,
+                                "description": "Price per kWh while this window is active."
+                            },
+                            "start": {
+                                "type": "string",
+                                "pattern": "^([01]\\d|2[0-3]):[0-5]\\d$",
+                                "description": "Window start in HH:MM local time."
+                            },
+                            "end": {
+                                "type": "string",
+                                "pattern": "^([01]\\d|2[0-3]):[0-5]\\d$",
+                                "description": "Window end in HH:MM local time. Earlier than start wraps across midnight. Windows must not overlap."
+                            }
+                        },
+                        "required": ["pricePerKwh", "start", "end"],
+                        "additionalProperties": false
+                    },
+                    "default": [],
+                    "description": "Optional time-of-use electricity price windows. Times not covered by any window use electricityPricePerKwh."
+                },
+                "retentionDays": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 90,
+                    "description": "How many days of power samples and occupancy intervals to keep."
+                },
+                "flushInterval": {
+                    "type": "string",
+                    "pattern": "^[-+]?(\\d+(\\.\\d+)?(ns|us|ms|s|m|h))+$",
+                    "default": "60s",
+                    "description": "How often sampled power is aggregated and written to the store. Minimum duration is 15s."
+                },
+                "ipmi": {
+                    "type": "object",
+                    "properties": {
+                        "disabled": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Disable the node-level IPMI power collector."
+                        },
+                        "command": {
+                            "type": "string",
+                            "default": "",
+                            "description": "Path to the ipmitool binary. Empty uses the ipmitool found on PATH."
+                        }
+                    },
+                    "additionalProperties": false,
+                    "default": {},
+                    "description": "Node-level power via local ipmitool (DCMI preferred, sensor readings as fallback). When unavailable the panel falls back to GPU power only."
+                }
+            },
+            "additionalProperties": false,
+            "default": {},
+            "description": "GPU and node power monitoring, energy statistics and electricity cost accounting."
+        },
         "startPort": {
             "type": "integer",
             "default": 5800,
@@ -1093,6 +1178,256 @@
             },
             "default": {},
             "description": "A dictionary of remote peers and models they provide. Peers can be another llama-swap or any server that provides the /v1/ generative API endpoints supported by llama-swap."
+        },
+        "providers": {
+            "type": "object",
+            "additionalProperties": {
+                "type": "object",
+                "required": [
+                    "endpoint",
+                    "apiKeys",
+                    "models"
+                ],
+                "properties": {
+                    "type": {
+                        "type": "string",
+                        "enum": [
+                            "openai",
+                            "anthropic"
+                        ],
+                        "default": "openai",
+                        "description": "Upstream API protocol. openai injects Authorization: Bearer; anthropic injects x-api-key and anthropic-version headers."
+                    },
+                    "endpoint": {
+                        "type": "string",
+                        "format": "uri",
+                        "description": "Base URL of the upstream API, e.g. https://api.deepseek.com. Request paths are appended to it."
+                    },
+                    "proxy": {
+                        "type": "string",
+                        "description": "Provider-level outbound proxy (http/https/socks5/socks5h URL, or the literal 'direct' to bypass environment proxies). Key-level proxy overrides this; empty inherits environment proxies."
+                    },
+                    "priority": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "Default priority inherited by keys without their own. Higher priority tiers are used first."
+                    },
+                    "weight": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "Default weighted-round-robin weight inherited by keys without their own. Zero weights share equally."
+                    },
+                    "sticky": {
+                        "type": "boolean",
+                        "default": true,
+                        "description": "Enable session affinity: requests with the same session identifier stick to the same key."
+                    },
+                    "bareNamePolicy": {
+                        "type": "string",
+                        "enum": [
+                            "local-first",
+                            "provider-first"
+                        ],
+                        "default": "local-first",
+                        "description": "Arbitration for the bare model name when a local configured model shares it. local-first keeps local precedence; provider-first lets this provider win."
+                    },
+                    "maxRetries": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 2,
+                        "description": "How many times a failed request may switch to another key (or provider sharing the same bare model name) before returning the upstream error. Retries also descend priority tiers."
+                    },
+                    "disabled": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Manually disable this provider. Disabled providers do not serve requests and are excluded from /v1/models."
+                    },
+                    "apiKeys": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "oneOf": [
+                                {
+                                    "type": "string",
+                                    "minLength": 1
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "value": {
+                                            "type": "string",
+                                            "description": "The API key value. Omitted from config JSON output."
+                                        },
+                                        "valueEnv": {
+                                            "type": "string",
+                                            "description": "Environment variable holding the API key value. Used when value is empty."
+                                        },
+                                        "weight": {
+                                            "type": "integer",
+                                            "minimum": 0,
+                                            "default": 0,
+                                            "description": "Weighted-round-robin weight. Defaults to the provider weight."
+                                        },
+                                        "priority": {
+                                            "type": "integer",
+                                            "minimum": 0,
+                                            "default": 0,
+                                            "description": "Priority tier. Defaults to the provider priority."
+                                        },
+                                        "maxConcurrent": {
+                                            "type": "integer",
+                                            "minimum": 0,
+                                            "default": 0,
+                                            "description": "Per-key concurrent request cap. 0 means unlimited."
+                                        },
+                                        "proxy": {
+                                            "type": "string",
+                                            "description": "Key-level proxy override (http/https/socks5/socks5h URL or 'direct')."
+                                        },
+                                        "disabled": {
+                                            "type": "boolean",
+                                            "default": false,
+                                            "description": "Manually disable this key."
+                                        }
+                                    },
+                                    "additionalProperties": false
+                                }
+                            ]
+                        },
+                        "description": "Upstream API keys. Keys are scheduled by priority tier with weighted round-robin inside each tier."
+                    },
+                    "models": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "oneOf": [
+                                {
+                                    "type": "string",
+                                    "minLength": 1
+                                },
+                                {
+                                    "type": "object",
+                                    "maxProperties": 1,
+                                    "minProperties": 1,
+                                    "additionalProperties": {
+                                        "type": "string",
+                                        "minLength": 1
+                                    },
+                                    "description": "Shorthand mapping: the key is the local model ID, the value is the upstream model name."
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "local": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                            "description": "Model ID exposed by the gateway."
+                                        },
+                                        "remote": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                            "description": "Upstream model name sent to the provider. Defaults to local."
+                                        }
+                                    },
+                                    "required": [
+                                        "local"
+                                    ],
+                                    "additionalProperties": false
+                                }
+                            ]
+                        },
+                        "description": "Models served by this provider. A string maps the model to itself; an object maps a local gateway model ID to an upstream model name."
+                    },
+                    "timeouts": {
+                        "type": "object",
+                        "properties": {
+                            "connect": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "default": 30,
+                                "description": "TCP connection timeout in seconds."
+                            },
+                            "keepalive": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "default": 30,
+                                "description": "TCP keepalive interval in seconds."
+                            },
+                            "responseHeader": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "default": 600,
+                                "description": "Time to wait for response headers in seconds."
+                            },
+                            "tlsHandshake": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "default": 10,
+                                "description": "TLS handshake timeout in seconds."
+                            },
+                            "idleConn": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "default": 90,
+                                "description": "Idle connection timeout in seconds."
+                            }
+                        },
+                        "additionalProperties": false,
+                        "description": "Timeout settings for connections to this provider."
+                    }
+                },
+                "additionalProperties": false
+            },
+            "default": {},
+            "description": "A dictionary of upstream LLM providers. The gateway forwards matching requests to the provider's API, scheduling between multiple API keys per provider (priority tiers, weighted round-robin, cooldowns) with optional per-provider or per-key outbound proxies."
+        },
+        "gateway": {
+            "type": "object",
+            "properties": {
+                "stickyTTL": {
+                    "type": [
+                        "string",
+                        "integer"
+                    ],
+                    "default": "1h",
+                    "description": "Idle expiry for provider session-affinity entries. A hit slides the expiry forward (Go duration, e.g. 30m, 1h)."
+                },
+                "cooldown": {
+                    "type": "object",
+                    "properties": {
+                        "auth": {
+                            "type": [
+                                "string",
+                                "integer"
+                            ],
+                            "default": "10m",
+                            "description": "Cooldown applied to a key after a 401/403 response (Go duration)."
+                        },
+                        "rateLimit": {
+                            "type": [
+                                "string",
+                                "integer"
+                            ],
+                            "default": "60s",
+                            "description": "Cooldown applied to a key after a 429 without a usable Retry-After header (Go duration)."
+                        },
+                        "transient": {
+                            "type": [
+                                "string",
+                                "integer"
+                            ],
+                            "default": "30s",
+                            "description": "Cooldown applied to a key after 5xx or network errors (Go duration)."
+                        }
+                    },
+                    "additionalProperties": false,
+                    "description": "Cooldown durations per upstream error class."
+                }
+            },
+            "additionalProperties": false,
+            "description": "Gateway-wide settings for upstream provider forwarding."
         },
         "upstream": {
             "type": "object",
