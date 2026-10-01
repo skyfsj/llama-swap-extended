@@ -301,7 +301,7 @@ DOCKER_BUILDKIT=1 docker buildx build --load "${BUILD_ARGS[@]}" "${SCRIPT_DIR}"
 
 echo ""
 echo "=========================================="
-echo "Verifying build artifacts..."
+echo "Verifying build artifacts (variant=${VARIANT}, backend=${BACKEND})..."
 echo "=========================================="
 echo ""
 
