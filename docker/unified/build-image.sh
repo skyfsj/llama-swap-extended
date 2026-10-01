@@ -341,10 +341,12 @@ if [[ ${#MISSING_BINARIES[@]} -gt 0 ]]; then
     exit 1
 fi
 
-if [[ "${VARIANT}" != "vllm" ]] && ! docker run --rm --entrypoint test "${DOCKER_IMAGE_TAG}" \
-        -x /opt/llama-swap/runtimes/llamacpp/bin/llama-server; then
+if [[ "${VARIANT}" != "vllm" ]]; then
+  if ! docker run --rm --entrypoint test "${DOCKER_IMAGE_TAG}" \
+          -x /opt/llama-swap/runtimes/llamacpp/bin/llama-server; then
     echo "ERROR: bundled llama.cpp managed-runtime asset is missing or not executable."
     exit 1
+  fi
 fi
 
 # Report the variant's actual expected set, not a hardcoded list.
@@ -355,12 +357,15 @@ echo "All expected binaries verified: $(IFS=', '; echo "${EXPECTED_BINARIES[*]}"
 # to discover. Without it every load of a package without an embedded spec fails
 # with "model spec not found for family ...". The compiled catalog is raw JSON in
 # .rodata, so grepping the binary for a known spec confirms it is there.
-# Variants without audio.cpp skip this (and the llama.cpp runtime test below).
-if [[ "${VARIANT}" != "vllm" ]] && ! docker run --rm --entrypoint grep "${DOCKER_IMAGE_TAG}" \
+# Variants without audio.cpp (llamacpp, vllm) skip this. Nested ifs: writing
+# 'cond && ! cmd' as an if-condition runs the body when cond is false.
+if [[ "${VARIANT}" == "full" || "${VARIANT}" == "1cat-vllm" ]]; then
+  if ! docker run --rm --entrypoint grep "${DOCKER_IMAGE_TAG}" \
         -aq '"family": "pocket_tts"' /usr/local/bin/audiocpp_server; then
     echo "ERROR: audiocpp_server was not built with AUDIOCPP_DEPLOYMENT_BUILD=ON;"
     echo "       its compiled model spec catalog is missing."
     exit 1
+  fi
 fi
 
 # Run the binary so a missing runtime library is caught here rather than on a
