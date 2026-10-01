@@ -305,8 +305,21 @@ echo "Verifying build artifacts..."
 echo "=========================================="
 echo ""
 
-EXPECTED_BINARIES=(llama-server llama-cli llama-bench whisper-server whisper-cli sd-server sd-cli audiocpp_server audiocpp_cli llama-swap vllm-wrapper)
-if [[ "$BACKEND" == "cuda" ]]; then
+# Expected binaries follow the variant: full ships everything, llamacpp
+# only the llama.cpp servers, vllm only the wrapper. llama-swap and
+# vllm-wrapper are present in every variant.
+case "${VARIANT}" in
+    llamacpp)
+        EXPECTED_BINARIES=(llama-server llama-cli llama-tts llama-bench llama-swap vllm-wrapper)
+        ;;
+    vllm)
+        EXPECTED_BINARIES=(llama-swap vllm-wrapper)
+        ;;
+    *)
+        EXPECTED_BINARIES=(llama-server llama-cli llama-bench whisper-server whisper-cli sd-server sd-cli audiocpp_server audiocpp_cli llama-swap vllm-wrapper)
+        ;;
+esac
+if [[ "$BACKEND" == "cuda" && "${VARIANT}" != "vllm" ]]; then
     EXPECTED_BINARIES+=(ik-llama-server)
 fi
 
@@ -328,7 +341,7 @@ if [[ ${#MISSING_BINARIES[@]} -gt 0 ]]; then
     exit 1
 fi
 
-if ! docker run --rm --entrypoint test "${DOCKER_IMAGE_TAG}" \
+if [[ "${VARIANT}" != "vllm" ]] && ! docker run --rm --entrypoint test "${DOCKER_IMAGE_TAG}" \
         -x /opt/llama-swap/runtimes/llamacpp/bin/llama-server; then
     echo "ERROR: bundled llama.cpp managed-runtime asset is missing or not executable."
     exit 1
