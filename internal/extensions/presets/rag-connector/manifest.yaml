@@ -1,0 +1,12 @@
+id: rag-connector
+name: RAG Connector
+enabled: true
+description: Query a user-configured RAG / vector-search HTTP API (POST {baseUrl}{queryPath} with a JSON body {query, top_k, collection}). The preset allows the common hosted services; for anything else add the host under Permissions. The target must be a public endpoint - loopback, private and reserved addresses are blocked by the runtime.
+priority: 100
+match:
+  endpoints: [chat.completions, responses, anthropic.messages]
+permissions:
+  networkHosts: ["*.pinecone.io", "*.weaviate.io", "*.qdrant.io", "*.cloudflare.com", "api.openai.com"]
+timeout: 20s
+maxCpuMillis: 2000
+maxMemoryMiB: 256

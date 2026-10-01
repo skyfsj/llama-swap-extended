@@ -1,0 +1,11 @@
+id: openviking-memory
+name: OpenViking Memory
+enabled: true
+description: Remember and recall memories in an OpenViking context database over its HTTP API (POST /api/v1/sessions + /api/v1/search). Tenancy is isolated per API key; without a key the server's shared domain is used. OpenViking is self-hosted, so add the server's public host under Permissions before use (loopback and private IPs are blocked by the runtime).
+priority: 100
+match:
+  endpoints: [chat.completions, responses, anthropic.messages]
+permissions: {}
+timeout: 20s
+maxCpuMillis: 3000
+maxMemoryMiB: 256

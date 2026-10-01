@@ -1,0 +1,12 @@
+id: web-search-doubao
+name: Doubao Web Search
+enabled: true
+description: Search the live web with the Volcengine (Doubao) Networked Search API (联网搜索). Requires an API key from the Volcengine networked-search console.
+priority: 100
+match:
+  endpoints: [chat.completions, responses, anthropic.messages]
+permissions:
+  networkHosts: [open.feedcoopapi.com]
+timeout: 15s
+maxCpuMillis: 2000
+maxMemoryMiB: 256

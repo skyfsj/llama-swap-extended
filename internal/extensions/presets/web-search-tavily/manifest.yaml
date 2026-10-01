@@ -1,0 +1,12 @@
+id: web-search-tavily
+name: Tavily Web Search
+enabled: true
+description: Search the web with the Tavily Search API (POST /search). Requires a Tavily API key.
+priority: 100
+match:
+  endpoints: [chat.completions, responses, anthropic.messages]
+permissions:
+  networkHosts: [api.tavily.com]
+timeout: 20s
+maxCpuMillis: 2000
+maxMemoryMiB: 256

@@ -1,0 +1,8 @@
+id: openai-web-search
+name: OpenAI Built-in Web Search
+enabled: true
+description: Injects OpenAI's server-side web_search tool into outgoing requests so the model can search the web itself. No API key needed. Only enable for OpenAI models that support the built-in web_search tool (e.g. gpt-4o / gpt-5 search-capable models).
+priority: 100
+match:
+  endpoints: [chat.completions, responses]
+permissions: {}

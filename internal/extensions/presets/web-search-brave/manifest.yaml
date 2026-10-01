@@ -1,0 +1,12 @@
+id: web-search-brave
+name: Brave Web Search
+enabled: true
+description: Search the web with the Brave Search API (api.search.brave.com). Requires a Brave Search API subscription token.
+priority: 100
+match:
+  endpoints: [chat.completions, responses, anthropic.messages]
+permissions:
+  networkHosts: [api.search.brave.com]
+timeout: 15s
+maxCpuMillis: 2000
+maxMemoryMiB: 256

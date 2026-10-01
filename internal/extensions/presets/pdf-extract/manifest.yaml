@@ -1,0 +1,11 @@
+id: pdf-extract
+name: PDF Text Extraction
+enabled: true
+description: Extract text from a PDF with a self-contained JavaScript extractor (Tj/TJ text operators). Only uncompressed PDFs are supported - FlateDecode streams are skipped and reported. Pass the PDF as a url (add its host to networkHosts first) or as content (base64-encoded PDF or raw PDF text). No default network host is allowed.
+priority: 100
+match:
+  endpoints: [chat.completions, responses, anthropic.messages]
+permissions: {}
+timeout: 20s
+maxCpuMillis: 3000
+maxMemoryMiB: 256
