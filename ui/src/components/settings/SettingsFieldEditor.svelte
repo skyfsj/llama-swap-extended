@@ -7,6 +7,7 @@
   import SettingsMapEditor from "./SettingsMapEditor.svelte";
   import ModelMultiSelect from "../ModelMultiSelect.svelte";
   import type { SettingsField, SettingsOption } from "../../lib/settingsApi";
+  import { fieldEditorVariant } from "../../lib/settingsFieldVariant";
   import { translate } from "../../lib/i18n";
 
   interface Props {
@@ -36,7 +37,10 @@
   // A provider-backed list gets its choices from the server, so it renders as a
   // multi-select instead of free-text rows where a typo is silently dropped by
   // the loader.
-  let providerList = $derived(field.component === "list" && !!field.provider);
+  // The variant decides the editor shape; provider-backed lists must resolve
+  // before the plain select or a list field submits a scalar ("cannot
+  // unmarshal !!str into []string").
+  let variant = $derived(fieldEditorVariant(field));
 
   // Sensitive values reach the editor as "[REDACTED]" placeholders. While the
   // field is untouched, show a fixed-length mask so a value is visible without
@@ -44,7 +48,6 @@
   // secret when the sentinel is submitted unchanged and writes new values.
   const REDACTED_MASK = "••••••••••••";
   let sensitiveTouched = $state(false);
-  let isStructuredValue = $derived(value !== null && typeof value === "object");
   let sensitiveDisplay = $derived(
     !sensitiveTouched && typeof value === "string" && value.includes("[REDACTED]")
       ? REDACTED_MASK
@@ -81,7 +84,7 @@
     {#if field.required}<span class="text-destructive ml-1">*</span>{/if}
   </Label.Root>
 
-  {#if field.sensitive && !isStructuredValue}
+  {#if variant === "sensitive-input"}
     <Input
       id={`settings-${field.path}`}
       type="password"
@@ -89,17 +92,27 @@
       oninput={(event) => updateSensitive(event.currentTarget.value)}
       aria-invalid={error ? "true" : "false"}
     />
-  {:else if field.sensitive}
+  {:else if variant === "sensitive-status"}
     <div class="settings-sensitive-value text-muted-foreground flex items-center border px-3 text-sm" role="status">
       {value ? $translate("settingsCenter.field.configured") : $translate("settingsCenter.field.notConfigured")}
     </div>
-  {:else if field.component === "switch"}
+  {:else if variant === "switch"}
     {@const switchOn = value === true || (value === undefined && field.default === true)}
     <div class="settings-field__switch">
       <Switch.Root id={`settings-${field.path}`} checked={switchOn} onCheckedChange={onChange} />
       <span class="settings-field__switch-status">{switchOn ? $translate("settingsCenter.field.enabled") : $translate("settingsCenter.field.disabled")}</span>
     </div>
-  {:else if field.provider || field.enum?.length}
+  {:else if variant === "provider-list"}
+    <ModelMultiSelect
+      value={listValue}
+      options={options.map((option) => option.value)}
+      ariaLabel={field.label}
+      allLabel={$translate("settingsCenter.list.all")}
+      selectedLabel={$translate("settingsCenter.list.selected", { count: listValue.length })}
+      emptyLabel={$translate("settingsCenter.list.empty")}
+      onValueChange={onChange}
+    />
+  {:else if variant === "select"}
     {@const selectValue = String(value ?? (typeof field.default === "string" && field.default ? field.default : undefined) ?? field.enum?.[0] ?? "")}
     <Select.Root type="single" value={selectValue} onValueChange={(next) => next && onChange(next)}>
       <Select.Trigger id={`settings-${field.path}`} class="w-full">
@@ -111,21 +124,11 @@
         {/each}
       </Select.Content>
     </Select.Root>
-  {:else if providerList}
-    <ModelMultiSelect
-      value={listValue}
-      options={options.map((option) => option.value)}
-      ariaLabel={field.label}
-      allLabel={$translate("settingsCenter.list.all")}
-      selectedLabel={$translate("settingsCenter.list.selected", { count: listValue.length })}
-      emptyLabel={$translate("settingsCenter.list.empty")}
-      onValueChange={onChange}
-    />
-  {:else if field.component === "list"}
+  {:else if variant === "list"}
     <SettingsListEditor value={value} onChange={onChange} />
-  {:else if field.component === "map"}
+  {:else if variant === "map"}
     <SettingsMapEditor value={value} onChange={(next) => onChange(next)} numeric={field.path.includes("priority")} />
-  {:else if field.component === "textarea" || field.component === "json"}
+  {:else if variant === "textarea"}
     <textarea
       id={`settings-${field.path}`}
       class={field.component === "json"
