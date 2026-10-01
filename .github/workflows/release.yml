@@ -47,7 +47,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  # Upstream-only: updates mostlygeek/homebrew-llama-swap, which this fork
+  # is not part of. Kept for reference; the TAP_REPO_PAT secret does not
+  # exist here so the step would fail after every successful release.
   trigger-tap-update:
+    if: false
     runs-on: ubuntu-latest
     needs: goreleaser
     steps:
