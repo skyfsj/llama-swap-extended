@@ -118,10 +118,11 @@ func (p *ProcessCommand) warmupVLLM(ctx context.Context, upstream http.Handler) 
 	var lastErr error
 	for i, name := range unique {
 		var err error
-		err, name = p.warmupVLLMModel(ctx, upstream, name)
+		var sent string
+		sent, err = p.warmupVLLMModel(ctx, upstream, name)
 		if err == nil {
 			if i > 0 && p.proxyLogger != nil {
-				p.proxyLogger.Infof("<%s> vLLM warmup accepted upstream model name %q", p.id, name)
+				p.proxyLogger.Infof("<%s> vLLM warmup accepted upstream model name %q", p.id, sent)
 			}
 			return nil
 		}
@@ -137,7 +138,7 @@ func (p *ProcessCommand) warmupVLLM(ctx context.Context, upstream http.Handler) 
 // model and returns the name that was actually sent. A model-not-found style
 // response maps to errUpstreamModelUnknown so the caller can fall back to
 // another accepted name; any other failure is returned unchanged.
-func (p *ProcessCommand) warmupVLLMModel(ctx context.Context, upstream http.Handler, model string) (error, string) {
+func (p *ProcessCommand) warmupVLLMModel(ctx context.Context, upstream http.Handler, model string) (string, error) {
 	payload, err := json.Marshal(vllmWarmupRequest{
 		Model: model,
 		Messages: []vllmWarmupMessage{{
@@ -149,14 +150,14 @@ func (p *ProcessCommand) warmupVLLMModel(ctx context.Context, upstream http.Hand
 		Stream:      false,
 	})
 	if err != nil {
-		return fmt.Errorf("encode vLLM warmup request: %w", err), model
+		return model, fmt.Errorf("encode vLLM warmup request: %w", err)
 	}
 
 	warmupCtx, cancel := context.WithTimeout(ctx, vllmWarmupTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(warmupCtx, http.MethodPost, vllmWarmupPath, bytes.NewReader(payload))
 	if err != nil {
-		return fmt.Errorf("create vLLM warmup request: %w", err), model
+		return model, fmt.Errorf("create vLLM warmup request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
@@ -168,7 +169,7 @@ func (p *ProcessCommand) warmupVLLMModel(ctx context.Context, upstream http.Hand
 	defer response.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(response.Body, 8<<10))
 	if err != nil {
-		return fmt.Errorf("read vLLM warmup response: %w", err), model
+		return model, fmt.Errorf("read vLLM warmup response: %w", err)
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		detail := strings.TrimSpace(string(body))
@@ -176,11 +177,11 @@ func (p *ProcessCommand) warmupVLLMModel(ctx context.Context, upstream http.Hand
 			detail = "<empty body>"
 		}
 		if looksLikeUnknownModel(response.StatusCode, body) {
-			return fmt.Errorf("vLLM warmup with model %q: %w (%s)", model, errUpstreamModelUnknown, detail), model
+			return model, fmt.Errorf("vLLM warmup with model %q: %w (%s)", model, errUpstreamModelUnknown, detail)
 		}
-		return fmt.Errorf("vLLM warmup with model %q returned HTTP %d: %s", model, response.StatusCode, detail), model
+		return model, fmt.Errorf("vLLM warmup with model %q returned HTTP %d: %s", model, response.StatusCode, detail)
 	}
-	return nil, model
+	return model, nil
 }
 
 // looksLikeUnknownModel recognizes the vLLM and llama.cpp "model does not

@@ -11,9 +11,6 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
-// The UI locale set an extension may match its scripts against.
-var extensionLocales = map[string]bool{"en": true, "zh-CN": true, "zh-TW": true}
-
 // maxExtensionModelSnapshot bounds the embedded model list: it travels inside
 // every worker request.
 const maxExtensionModelSnapshot = 200

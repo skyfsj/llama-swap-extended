@@ -35,3 +35,6 @@ internal/server/ui_dist/*
 .zcodeignore
 .zcode/
 work/
+
+# test-run artifacts (request-error snapshots, extension debug logs)
+/internal/server/logs/

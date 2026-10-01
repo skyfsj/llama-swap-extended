@@ -693,7 +693,7 @@ func boundToolHandler(vm *goja.Runtime, object *goja.Object, input json.RawMessa
 			continue
 		}
 		marker := entryObject.Get(toolHandlerMarker)
-		if marker == nil || goja.IsUndefined(marker) || marker.ToBoolean() != true {
+		if marker == nil || goja.IsUndefined(marker) || !marker.ToBoolean() {
 			return nil
 		}
 		handler, ok := goja.AssertFunction(entryObject.Get("handler"))
