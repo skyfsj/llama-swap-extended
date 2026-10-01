@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -45,27 +46,30 @@ func CreateMetricsMiddleware(mm *metricsMonitor, cfg config.Config) chain.Middle
 			// routes and extracts the model from the URL for /upstream routes.
 			data, err := swaputil.FetchContext(r, cfg)
 			if err != nil {
-				swaputil.SendError(w, r, swaputil.ErrNoModelInContext)
+				swaputil.SendError(w, r, err)
 				return
 			}
 
-			// Buffer the request body/headers for capture before dispatch
-			// consumes them.
-			cf := captureFieldsFor(checkPath)
+			// Buffer the request body and headers for durable audit before
+			// dispatch consumes them.
 			var reqBody []byte
 			var reqHeaders map[string]string
-			if mm.enableCaptures {
-				if cf&captureReqBody != 0 && r.Body != nil {
-					if buffered, err := io.ReadAll(r.Body); err == nil {
+			if mm.audit.Enabled {
+				if r.Body != nil {
+					if buffered, err := io.ReadAll(io.LimitReader(r.Body, swaputil.MaxRequestBodySize+1)); err == nil && len(buffered) <= swaputil.MaxRequestBodySize {
 						reqBody = buffered
 						r.Body.Close()
 						r.Body = io.NopCloser(bytes.NewReader(reqBody))
+					} else if err != nil {
+						swaputil.SendResponse(w, r, http.StatusBadRequest, "could not read request body for metrics")
+						return
+					} else {
+						swaputil.SendError(w, r, fmt.Errorf("%w: request body exceeds %d bytes", swaputil.ErrRequestBodyTooLarge, swaputil.MaxRequestBodySize))
+						return
 					}
 				}
-				if cf&captureReqHeaders != 0 {
-					reqHeaders = headerMap(r.Header)
-					redactHeaders(reqHeaders)
-				}
+				reqHeaders = headerMap(r.Header)
+				redactHeaders(reqHeaders)
 			}
 
 			// Restrict Accept-Encoding to encodings we can decompress so the
@@ -79,7 +83,7 @@ func CreateMetricsMiddleware(mm *metricsMonitor, cfg config.Config) chain.Middle
 			// A request abandoned before any response was written must not be
 			// filed as a successful (empty-body) metric. See #1029.
 			swaputil.MarkClientClosed(recorder, r)
-			mm.record(data.ModelID, r, recorder, cf, reqBody, reqHeaders)
+			mm.record(data.ModelID, r, recorder, reqBody, reqHeaders)
 		})
 	}
 }

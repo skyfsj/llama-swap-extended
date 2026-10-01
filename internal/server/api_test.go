@@ -5,10 +5,12 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
 
+	"github.com/mostlygeek/llama-swap/internal/auth"
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/process"
@@ -54,6 +56,44 @@ func TestServer_HandleListModels(t *testing.T) {
 	}
 	if ids["hidden"] {
 		t.Error("unlisted model should not appear")
+	}
+}
+
+// TestServer_HandleListModels_Disabled covers maintenance mode: the model keeps
+// its configuration but is not servable, so it must not be advertised in the
+// client-facing listing. The management surface (the modelStatus event) still
+// exposes it so the operator can find and re-enable it.
+func TestServer_HandleListModels_Disabled(t *testing.T) {
+	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	s.cfg = config.Config{
+		Models: map[string]config.ModelConfig{
+			"visible":  {Name: "Visible"},
+			"disabled": {Name: "Disabled", Disabled: true},
+		},
+	}
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	s.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+
+	var resp struct {
+		Data []modelRecord `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	ids := map[string]bool{}
+	for _, m := range resp.Data {
+		ids[m.ID] = true
+	}
+	if !ids["visible"] {
+		t.Errorf("visible model missing from listing: %v", ids)
+	}
+	if ids["disabled"] {
+		t.Error("a disabled (maintenance-mode) model must not appear in the listing")
 	}
 }
 
@@ -125,14 +165,105 @@ func TestServer_HandleListModels_Aliases(t *testing.T) {
 	}
 }
 
+func TestServer_HandleListModels_ModelScopedIdentityHidesOtherModels(t *testing.T) {
+	local := newStubRouter(nil, "")
+	local.running = map[string]process.ProcessState{"allowed": process.StateReady, "denied": process.StateReady}
+	s := newTestServer(local, newStubRouter(nil, ""))
+	s.cfg = config.Config{
+		IncludeAliasesInList: true,
+		Models: map[string]config.ModelConfig{
+			"allowed": {Aliases: []string{"friendly"}, Metadata: map[string]any{"secret": "visible-only-to-owner"}},
+			"denied":  {Aliases: []string{"hidden-alias"}, Metadata: map[string]any{"secret": "must-not-leak"}},
+		},
+		Selectors: map[string]config.SelectorConfig{
+			"allowed-selector": {Targets: []string{"allowed"}},
+			"mixed-selector":   {Targets: []string{"allowed", "denied"}},
+			"denied-selector":  {Targets: []string{"denied"}},
+		},
+		Peers: config.PeerDictionaryConfig{
+			"peer": {Models: []string{"allowed", "denied"}},
+		},
+	}
+	identity := auth.Identity{ID: "scoped", Scopes: map[string]struct{}{auth.ScopeInference: {}}, Models: []string{"allowed", "allowed-selector", "mixed-selector", "peer/allowed"}}
+	base := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req := base.WithContext(withIdentity(base.Context(), identity))
+	w := httptest.NewRecorder()
+	s.handleListModels(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	var payload struct {
+		Data []modelRecord `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	ids := make(map[string]bool, len(payload.Data))
+	body := w.Body.String()
+	for _, model := range payload.Data {
+		ids[model.ID] = true
+	}
+	for _, id := range []string{"allowed", "friendly", "allowed-selector", "mixed-selector", "peer/allowed"} {
+		if !ids[id] {
+			t.Errorf("missing allowed model %q in %v", id, ids)
+		}
+	}
+	for _, id := range []string{"denied", "hidden-alias", "denied-selector", "peer/denied"} {
+		if ids[id] {
+			t.Errorf("model-scoped listing leaked %q: %v", id, ids)
+		}
+	}
+	if strings.Contains(body, "must-not-leak") {
+		t.Fatalf("model-scoped listing leaked denied model metadata: %s", body)
+	}
+	var mixed modelRecord
+	for _, record := range payload.Data {
+		if record.ID == "mixed-selector" {
+			mixed = record
+			break
+		}
+	}
+	metadata, ok := mixed.Meta["llamaswap"].(map[string]any)
+	if !ok {
+		t.Fatalf("mixed selector metadata missing: %#v", mixed.Meta)
+	}
+	if got, want := metadata["targets"], []any{"allowed"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("mixed selector targets = %#v, want %#v", got, want)
+	}
+}
+
+func TestServer_HandleRunning_ModelScopedIdentityHidesOtherModels(t *testing.T) {
+	local := newStubRouter(nil, "")
+	local.running = map[string]process.ProcessState{"allowed": process.StateReady, "denied": process.StateReady}
+	s := newTestServer(local, newStubRouter(nil, ""))
+	s.cfg = config.Config{Models: map[string]config.ModelConfig{"allowed": {}, "denied": {}}}
+	identity := auth.Identity{ID: "scoped", Models: []string{"allowed"}}
+	base := httptest.NewRequest(http.MethodGet, "/running", nil)
+	req := base.WithContext(withIdentity(base.Context(), identity))
+	w := httptest.NewRecorder()
+	s.handleRunning(w, req)
+	if w.Code != http.StatusOK || strings.Contains(w.Body.String(), "denied") {
+		t.Fatalf("running listing leaked denied model: status=%d body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "allowed") {
+		t.Fatalf("running listing omitted allowed model: %s", w.Body.String())
+	}
+}
+
 func TestServer_HandleListModels_Status(t *testing.T) {
 	local := newStubRouter(nil, "")
-	local.running = map[string]process.ProcessState{"loaded-model": process.StateReady}
+	local.running = map[string]process.ProcessState{
+		"loaded-model":   process.StateReady,
+		"starting-model": process.StateStarting,
+		"stopping-model": process.StateStopping,
+	}
 	s := newTestServer(local, newStubRouter(nil, ""))
 	s.cfg = config.Config{
 		IncludeAliasesInList: true,
 		Models: map[string]config.ModelConfig{
 			"loaded-model":   {Aliases: []string{"loaded-alias"}},
+			"starting-model": {},
+			"stopping-model": {},
 			"unloaded-model": {},
 		},
 		Peers: config.PeerDictionaryConfig{
@@ -160,6 +291,15 @@ func TestServer_HandleListModels_Status(t *testing.T) {
 	}
 	if statuses["loaded-alias"] != "loaded" {
 		t.Errorf("loaded-alias status = %q, want loaded", statuses["loaded-alias"])
+	}
+	// A process that is merely starting or stopping is not serving traffic;
+	// reporting it as loaded would show a ready model whose endpoint still
+	// refuses connections.
+	if statuses["starting-model"] != "starting" {
+		t.Errorf("starting-model status = %q, want starting", statuses["starting-model"])
+	}
+	if statuses["stopping-model"] != "stopping" {
+		t.Errorf("stopping-model status = %q, want stopping", statuses["stopping-model"])
 	}
 	if statuses["unloaded-model"] != "unloaded" {
 		t.Errorf("unloaded-model status = %q, want unloaded", statuses["unloaded-model"])
@@ -471,7 +611,7 @@ func upstreamMetricsServer(t *testing.T, response string) *Server {
 		proxylog:    proxylog,
 		upstreamlog: logmon.NewWriter(io.Discard),
 		inflight:    newInflightTracker(),
-		metrics:     newTestMetricsMonitor(t, proxylog, 10, 0),
+		metrics:     newTestMetricsMonitor(t, proxylog, 10),
 		local:       newStubRouter([]string{"m1"}, response),
 		peer:        newStubRouter(nil, ""),
 	}
@@ -725,7 +865,7 @@ func upstreamInflightServer(t *testing.T, local *stubRouter, mc config.ModelConf
 		proxylog:    proxylog,
 		upstreamlog: logmon.NewWriter(io.Discard),
 		inflight:    newInflightTracker(),
-		metrics:     newTestMetricsMonitor(t, proxylog, 10, 0),
+		metrics:     newTestMetricsMonitor(t, proxylog, 10),
 		local:       local,
 		peer:        newStubRouter(nil, ""),
 	}
@@ -878,6 +1018,18 @@ func TestServer_HandleListModels_Capabilities(t *testing.T) {
 		}))
 		if m.Capabilities == nil || m.Capabilities["reranker"] != true {
 			t.Error("expected reranker: true")
+		}
+		if m.Architecture != nil {
+			t.Error("should not have architecture")
+		}
+	})
+
+	t.Run("translation", func(t *testing.T) {
+		m := getModel(t, newServer(config.ModelConfig{
+			Capabilities: config.ModelCapConfig{Translation: true},
+		}))
+		if m.Capabilities == nil || m.Capabilities["translation"] != true {
+			t.Error("expected translation: true")
 		}
 		if m.Architecture != nil {
 			t.Error("should not have architecture")

@@ -64,7 +64,7 @@ func renderCapabilities(caps config.ModelCapConfig) (arch map[string]any, capsMa
 	}
 
 	// Build capabilities map only if there's something to put in it.
-	if hasIn || hasOut || caps.Tools || caps.Reranker {
+	if hasIn || hasOut || caps.Tools || caps.Reranker || caps.Translation {
 		capsMap = make(map[string]any)
 	}
 
@@ -95,6 +95,10 @@ func renderCapabilities(caps config.ModelCapConfig) (arch map[string]any, capsMa
 
 	if caps.Reranker {
 		capsMap["reranker"] = true
+	}
+
+	if caps.Translation {
+		capsMap["translation"] = true
 	}
 
 	if caps.Context > 0 {
@@ -134,16 +138,30 @@ func filterCappedMetadata(md map[string]any) map[string]any {
 // handleListModels serves the OpenAI-compatible model listing: local models
 // (with optional aliases) plus peer models.
 func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
+	cfg := s.currentConfig()
 	created := time.Now().Unix()
-	data := make([]modelRecord, 0, len(s.cfg.Models)+len(s.cfg.Selectors))
+	data := make([]modelRecord, 0, len(cfg.Models)+len(cfg.Selectors))
 	running := s.local.RunningModels()
 	modelIDs := make(map[string]struct{})
+	identity := identityFromContext(r.Context())
 
 	modelStatus := func(id string) string {
-		if _, ok := running[id]; ok {
-			return "loaded"
+		if s.modelSleeping(id) {
+			return "sleeping"
 		}
-		return "unloaded"
+		// A process that is merely starting (or stopping) is not serving
+		// traffic yet: reporting it as "loaded" makes the UI show a ready
+		// model while its endpoint still refuses connections.
+		switch running[id] {
+		case process.StateReady:
+			return "loaded"
+		case process.StateStarting:
+			return "starting"
+		case process.StateStopping:
+			return "stopping"
+		default:
+			return "unloaded"
+		}
 	}
 
 	newRecord := func(
@@ -185,7 +203,20 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 		return rec
 	}
 
-	for id, mc := range s.cfg.Models {
+	for id, mc := range cfg.Models {
+		// Model-scoped keys must not learn the existence, aliases, metadata, or
+		// lifecycle state of a model outside their allowlist. Check the
+		// canonical id once; aliases are emitted only for a visible canonical
+		// model and therefore inherit the same authorization decision.
+		if !modelAllowedForIdentity(cfg, identity, id) {
+			continue
+		}
+		// Maintenance mode: the model keeps its configuration but is not
+		// servable, so it must not enter the listing or the allowlist a key or
+		// alias would otherwise resolve to.
+		if mc.Disabled {
+			continue
+		}
 		modelIDs[id] = struct{}{}
 		for _, alias := range mc.Aliases {
 			modelIDs[alias] = struct{}{}
@@ -201,7 +232,7 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 		}
 		data = append(data, newRecord(id, mc.Name, mc.Description, mc.Metadata, mc.Capabilities, status, internalMetadata))
 
-		if s.cfg.IncludeAliasesInList {
+		if cfg.IncludeAliasesInList {
 			for _, alias := range mc.Aliases {
 				if alias := strings.TrimSpace(alias); alias != "" {
 					data = append(data, newRecord(
@@ -218,11 +249,14 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	for peerID, peer := range s.cfg.Peers {
+	for peerID, peer := range cfg.Peers {
 		for _, modelID := range peer.Models {
 			fqn := config.PeerModelFQN(peerID, modelID)
+			if !modelAllowedForIdentity(cfg, identity, fqn) {
+				continue
+			}
 			modelIDs[fqn] = struct{}{}
-			if resolvedPeer, resolvedModel, found := s.cfg.ResolvePeerModel(modelID); found &&
+			if resolvedPeer, resolvedModel, found := cfg.ResolvePeerModel(modelID); found &&
 				resolvedPeer == peerID && resolvedModel == modelID {
 				modelIDs[modelID] = struct{}{}
 			}
@@ -238,14 +272,26 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	for selectorID, selector := range s.cfg.Selectors {
+	for selectorID, selector := range cfg.Selectors {
+		if !modelAllowedForIdentity(cfg, identity, selectorID) {
+			continue
+		}
 		modelIDs[selectorID] = struct{}{}
 		if selector.Unlisted {
 			continue
 		}
 		status := "unloaded"
-		for _, target := range selector.Targets {
-			modelID, local := s.cfg.RealModelName(target)
+		visibleTargets := selector.Targets
+		if identity := identityFromContext(r.Context()); !identity.Legacy && len(identity.Models) > 0 {
+			visibleTargets = make([]string, 0, len(selector.Targets))
+			for _, target := range selector.Targets {
+				if modelAllowedForIdentity(cfg, identity, target) {
+					visibleTargets = append(visibleTargets, target)
+				}
+			}
+		}
+		for _, target := range visibleTargets {
+			modelID, local := cfg.RealModelName(target)
 			if local {
 				state := running[modelID]
 				if state == process.StateReady || state == process.StateStarting {
@@ -259,7 +305,7 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 		internalMetadata := map[string]any{
 			"type":     "selector",
 			"strategy": selector.Strategy,
-			"targets":  selector.Targets,
+			"targets":  visibleTargets,
 		}
 		if selector.Strategy == config.SelectorStrategySpillover {
 			internalMetadata["spillover"] = selector.Settings.Spillover
@@ -275,8 +321,11 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 		))
 	}
 
-	if profile, ok := s.cfg.Profiles[s.ActiveProfile()]; ok {
+	if profile, ok := cfg.Profiles[s.ActiveProfile()]; ok {
 		for pin, target := range profile.Pins {
+			if !modelAllowedForIdentity(cfg, identity, pin) {
+				continue
+			}
 			if target == "" {
 				continue
 			}
@@ -323,6 +372,10 @@ type runningModel struct {
 // handleUnload stops every running local process. Peer models are remote and
 // unaffected.
 func (s *Server) handleUnload(w http.ResponseWriter, r *http.Request) {
+	if identity := identityFromContext(r.Context()); !identity.Legacy && len(identity.Models) > 0 {
+		swaputil.SendResponse(w, r, http.StatusForbidden, "forbidden: unloading all models requires an unrestricted key")
+		return
+	}
 	s.local.Unload(0)
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("OK"))
@@ -331,10 +384,15 @@ func (s *Server) handleUnload(w http.ResponseWriter, r *http.Request) {
 // handleRunning lists local processes that are not stopped, joining each model
 // ID against its config for the cmd/proxy/ttl/name/description metadata.
 func (s *Server) handleRunning(w http.ResponseWriter, r *http.Request) {
+	cfg := s.currentConfig()
 	states := s.local.RunningModels()
 	list := make([]runningModel, 0, len(states))
+	identity := identityFromContext(r.Context())
 	for id, state := range states {
-		mc := s.cfg.Models[id]
+		if !modelAllowedForIdentity(cfg, identity, id) {
+			continue
+		}
+		mc := cfg.Models[id]
 		list = append(list, runningModel{
 			Model:       id,
 			State:       string(state),
@@ -373,32 +431,55 @@ func (d *discardResponseWriter) WriteHeader(status int) { d.status = status }
 // Hooks.OnStartup.Preload so they are warm before the first real request.
 // Preload names are already resolved to real model IDs by config loading.
 func (s *Server) startPreload() {
-	models := s.cfg.Hooks.OnStartup.Preload
+	models := s.currentConfig().Hooks.OnStartup.Preload
 	if len(models) == 0 {
 		return
 	}
 	go func() {
 		for _, modelID := range models {
-			if !s.local.Handles(modelID) {
-				s.proxylog.Warnf("preload: model %s is not a local model, skipping", modelID)
-				continue
-			}
-			s.proxylog.Infof("preloading model: %s", modelID)
+			// Keep each preload admission scoped to one model. The reservation is
+			// released before the next preload starts, while the planner continues
+			// accounting for a process that remains loaded after ServeHTTP returns.
+			func() {
+				if !s.local.Handles(modelID) {
+					s.proxylog.Warnf("preload: model %s is not a local model, skipping", modelID)
+					return
+				}
+				// Maintenance mode: the preload request would otherwise start a
+				// process the operator has taken out of service. The load path
+				// itself is gated by the request-context middleware; this covers
+				// the startup hook that never passes through it.
+				if model, exists := s.currentConfig().Models[modelID]; exists && model.Disabled {
+					s.proxylog.Infof("preload: model %s is disabled (maintenance mode), skipping", modelID)
+					event.Emit(swaputil.ModelPreloadedEvent{ModelName: modelID, Success: false})
+					return
+				}
+				s.proxylog.Infof("preloading model: %s", modelID)
 
-			req, err := http.NewRequestWithContext(s.shutdownCtx, http.MethodGet, "/", nil)
-			if err != nil {
-				continue
-			}
-			req = req.WithContext(swaputil.SetContext(req.Context(), swaputil.ReqContextData{Model: modelID, ModelID: modelID, Metadata: make(map[string]string)}))
+				if err := s.prepareResourceLoadContext(s.shutdownCtx, modelID); err != nil {
+					s.proxylog.Errorf("failed to admit preload model %s: %v", modelID, err)
+					event.Emit(swaputil.ModelPreloadedEvent{ModelName: modelID, Success: false})
+					return
+				}
+				defer s.releaseResourceReservation(modelID)
 
-			dw := &discardResponseWriter{status: http.StatusOK}
-			s.local.ServeHTTP(dw, req)
+				req, err := http.NewRequestWithContext(s.shutdownCtx, http.MethodGet, "/", nil)
+				if err != nil {
+					s.proxylog.Errorf("failed to create preload request for model %s: %v", modelID, err)
+					event.Emit(swaputil.ModelPreloadedEvent{ModelName: modelID, Success: false})
+					return
+				}
+				req = req.WithContext(swaputil.SetContext(req.Context(), swaputil.ReqContextData{Model: modelID, ModelID: modelID, Metadata: make(map[string]string)}))
 
-			success := dw.status < http.StatusBadRequest
-			if !success {
-				s.proxylog.Errorf("failed to preload model %s: status %d", modelID, dw.status)
-			}
-			event.Emit(swaputil.ModelPreloadedEvent{ModelName: modelID, Success: success})
+				dw := &discardResponseWriter{status: http.StatusOK}
+				s.local.ServeHTTP(dw, req)
+
+				success := dw.status < http.StatusBadRequest
+				if !success {
+					s.proxylog.Errorf("failed to preload model %s: status %d", modelID, dw.status)
+				}
+				event.Emit(swaputil.ModelPreloadedEvent{ModelName: modelID, Success: success})
+			}()
 		}
 	}()
 }
@@ -412,6 +493,10 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.perf.MetricsHandler().ServeHTTP(w, r)
+	// The perf monitor owns host/GPU gauges. Append the independent control
+	// plane families after it so existing scrapers keep their output while
+	// runtime/cache telemetry is exposed from the same endpoint.
+	s.writeControlMetrics(w)
 }
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -442,7 +527,12 @@ func handleComfyUIRedirect(w http.ResponseWriter, r *http.Request) {
 // handleComfyUI proxies requests under /comfyui/ to the fixed local
 // ComfyUI model. Its compatibility settings are applied while loading config.
 func (s *Server) handleComfyUI(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.cfg.Models[config.ComfyUIModelID]; !ok || !s.local.Handles(config.ComfyUIModelID) {
+	cfg := s.currentConfig()
+	if identity := identityFromContext(r.Context()); !modelAllowedForIdentity(cfg, identity, config.ComfyUIModelID) {
+		swaputil.SendResponse(w, r, http.StatusForbidden, "forbidden: API key is not permitted for model "+config.ComfyUIModelID)
+		return
+	}
+	if _, ok := cfg.Models[config.ComfyUIModelID]; !ok || !s.local.Handles(config.ComfyUIModelID) {
 		swaputil.SendResponse(w, r, http.StatusNotFound, "local model "+config.ComfyUIModelID+" not found")
 		return
 	}
@@ -479,11 +569,16 @@ func (s *Server) handleComfyUI(w http.ResponseWriter, r *http.Request) {
 // handleUpstream proxies ANY request under /upstream/<model>/<path> directly to
 // the model's process, bypassing model dispatch by body/query inspection.
 func (s *Server) handleUpstream(w http.ResponseWriter, r *http.Request) {
+	cfg := s.currentConfig()
 	upstreamPath := r.PathValue("upstreamPath")
 
-	searchName, modelID, remainingPath, found := swaputil.FindModelInPath(s.cfg, "/"+upstreamPath)
+	searchName, modelID, remainingPath, found := swaputil.FindModelInPath(cfg, "/"+upstreamPath)
 	if !found {
 		swaputil.SendResponse(w, r, http.StatusNotFound, "model not found")
+		return
+	}
+	if identity := identityFromContext(r.Context()); !modelAllowedForIdentity(cfg, identity, modelID) {
+		swaputil.SendResponse(w, r, http.StatusForbidden, "forbidden: API key is not permitted for model "+modelID)
 		return
 	}
 
@@ -509,12 +604,16 @@ func (s *Server) handleUpstream(w http.ResponseWriter, r *http.Request) {
 	r.URL.RawPath = escapedRemaining
 	// Pin the resolved model so the router skips body/query extraction.
 	*r = *r.WithContext(swaputil.SetContext(r.Context(), swaputil.ReqContextData{Model: searchName, ModelID: modelID, Metadata: make(map[string]string)}))
+	// This route bypasses the request-context middleware, so publish the
+	// resolved model for the outermost request logger here instead: a failed
+	// /upstream/ request is archived the same way any other is.
+	swaputil.PublishRequestModel(r.Context(), modelID)
 
 	// If the path matches an upstream.ignorePaths entry and the model is
 	// not already loaded, refuse the request without triggering a swap. The
 	// server was not able to process the response because the model was not
 	// already loaded.
-	for _, re := range s.cfg.Upstream.IgnorePaths {
+	for _, re := range cfg.Upstream.IgnorePaths {
 		if !re.MatchString(remainingPath) {
 			continue
 		}

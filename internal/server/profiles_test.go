@@ -9,6 +9,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/mostlygeek/llama-swap/internal/auth"
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
@@ -91,6 +92,33 @@ func TestServer_ProfileAPI(t *testing.T) {
 	assert.Empty(t, s.ActiveProfile())
 }
 
+func TestServer_ProfileAPI_ModelScopedIdentityHidesUnallowedPins(t *testing.T) {
+	s := profileTestServer(t, profileTestConfig(t), newStubRouter([]string{"real", "hidden"}, "ok"))
+	base := httptest.NewRequest(http.MethodGet, "/api/profiles", nil)
+	identity := auth.Identity{ID: "scoped", Models: []string{"real"}}
+	req := base.WithContext(withIdentity(base.Context(), identity))
+	w := httptest.NewRecorder()
+	s.handleAPIProfiles(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	var listed struct {
+		Profiles []apiProfile `json:"profiles"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &listed))
+	require.Len(t, listed.Profiles, 1)
+	assert.Equal(t, map[string]string{"real": "hidden"}, listed.Profiles[0].Pins)
+}
+
+func TestServer_ProfileActivationRejectsModelScopedIdentity(t *testing.T) {
+	s := profileTestServer(t, profileTestConfig(t), newStubRouter([]string{"real", "hidden"}, "ok"))
+	base := httptest.NewRequest(http.MethodPut, "/api/profiles/active", strings.NewReader(`{"name":"coding"}`))
+	identity := auth.Identity{ID: "scoped", Models: []string{"real"}}
+	req := base.WithContext(withIdentity(base.Context(), identity))
+	w := httptest.NewRecorder()
+	s.handleAPIActiveProfile(w, req)
+	assert.Equal(t, http.StatusForbidden, w.Code)
+	assert.Empty(t, s.ActiveProfile())
+}
+
 func TestServer_ProfileMiddleware_JSONAndFilters(t *testing.T) {
 	cfg := profileTestConfig(t)
 	local := newStubRouter([]string{"real", "hidden"}, "")
@@ -115,7 +143,12 @@ func TestServer_ProfileMiddleware_JSONAndFilters(t *testing.T) {
 	assert.Equal(t, "variant", received.Model)
 	assert.Equal(t, "real", received.ModelID)
 	assert.Empty(t, received.Metadata)
-	assert.Equal(t, "variant", gjson.GetBytes(body, "model").String())
+	// The profile pins the body to "variant", and the filter stage then rewrites
+	// it to the name the engine serves. "variant" is an alias of "real" (the
+	// setParamsByID key is auto-registered as one), and the engine only knows
+	// "real" — forwarding the alias is what produced "The model X does not
+	// exist" from vLLM.
+	assert.Equal(t, "real", gjson.GetBytes(body, "model").String())
 	assert.True(t, gjson.GetBytes(body, "thinking").Bool())
 
 	req = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"disabled"}`))

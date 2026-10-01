@@ -82,6 +82,9 @@ func TestServer_ServeUI_IndexAndRoot(t *testing.T) {
 		if w.Code != http.StatusOK || w.Body.String() != "<html>app</html>" {
 			t.Errorf("%s: status=%d body=%q", path, w.Code, w.Body.String())
 		}
+		if got := w.Header().Get("Cache-Control"); got != "no-cache" {
+			t.Errorf("%s Cache-Control=%q, want no-cache", path, got)
+		}
 	}
 }
 

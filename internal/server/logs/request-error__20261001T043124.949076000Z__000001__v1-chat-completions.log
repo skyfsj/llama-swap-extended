@@ -1,0 +1,12 @@
+event: request-error
+time: 2026-10-01T04:31:24.949072Z
+client: 192.0.2.1
+request: POST /v1/chat/completions HTTP/1.1
+status: 503
+body_bytes: 17
+user_agent: 
+duration: 177.709µs
+model: a
+
+response:
+data: partial\n\n

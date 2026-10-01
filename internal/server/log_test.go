@@ -10,9 +10,11 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/mostlygeek/llama-swap/internal/auth"
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 )
@@ -82,6 +84,21 @@ func TestServer_HandleLogs_HTMLRedirect(t *testing.T) {
 	}
 	if got := w.Header().Get("Location"); got != "/ui/" {
 		t.Errorf("Location = %q, want /ui/", got)
+	}
+}
+
+func TestServer_HandleLogs_ModelScopedIdentityCannotReadCombinedHistory(t *testing.T) {
+	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	s.muxlog.Write([]byte("secret from another model"))
+	identity := auth.Identity{ID: "scoped", Scopes: map[string]struct{}{auth.ScopeLogs: {}}, Models: []string{"allowed"}}
+	req := httptest.NewRequest(http.MethodGet, "/logs", nil).WithContext(withIdentity(context.Background(), identity))
+	w := httptest.NewRecorder()
+	s.handleLogs(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status=%d body=%q, want 403", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "secret from another model") {
+		t.Fatalf("combined log leaked to model-scoped identity: %q", w.Body.String())
 	}
 }
 
@@ -368,4 +385,238 @@ func TestServer_RequestLogMiddleware_WebSocketUpgrade(t *testing.T) {
 	if string(echo) != "ping" {
 		t.Errorf("echo = %q, want %q", echo, "ping")
 	}
+}
+
+// newLogStreamTestServer builds a server whose local router resolves model
+// "m1" to a swappable per-model monitor, backed by a live HTTP server so the
+// streaming handler can be read incrementally.
+func newLogStreamTestServer(t *testing.T) (*Server, *stubRouter, *httptest.Server) {
+	t.Helper()
+	local := newStubRouter([]string{"m1"}, "")
+	s := newTestServer(local, newStubRouter(nil, ""))
+	s.cfg = config.Config{Models: map[string]config.ModelConfig{"m1": {Cmd: "true"}}}
+	srv := httptest.NewServer(s)
+	t.Cleanup(srv.Close)
+	return s, local, srv
+}
+
+func TestServer_LogStreamEndsWhenModelMonitorReplaced(t *testing.T) {
+	_, local, srv := newLogStreamTestServer(t)
+
+	monitorA := logmon.NewWriter(io.Discard)
+	monitorA.Write([]byte("old process history\n"))
+	local.setModelLogger("m1", monitorA)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/logs/stream/m1", nil)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+
+	reader := bufio.NewReader(resp.Body)
+	line, err := reader.ReadString('\n')
+	if err != nil || line != "old process history\n" {
+		t.Fatalf("history line = %q, err = %v", line, err)
+	}
+
+	// Simulate a process replacement: the model's monitor is swapped for a
+	// fresh one, as happens on restarts and config reloads.
+	monitorB := logmon.NewWriter(io.Discard)
+	monitorB.Write([]byte("new process history\n"))
+	local.setModelLogger("m1", monitorB)
+
+	// The stream must end so the client reconnects to the new monitor. Before
+	// the re-resolution existed the stream tailed the orphaned monitor forever.
+	rest, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("stream did not end after monitor replacement: %v", err)
+	}
+	if len(rest) != 0 {
+		t.Fatalf("stream emitted unexpected trailing data: %q", rest)
+	}
+}
+
+func TestServer_LogStreamSurvivesWhenMonitorUnchanged(t *testing.T) {
+	_, local, srv := newLogStreamTestServer(t)
+
+	monitor := logmon.NewWriter(io.Discard)
+	local.setModelLogger("m1", monitor)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/logs/stream/m1", nil)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Well past the recheck interval: the re-resolution must keep finding the
+	// same monitor and leave the stream connected.
+	monitor.Write([]byte("still live\n"))
+	buf := make([]byte, len("still live\n"))
+	if _, err := io.ReadFull(resp.Body, buf); err != nil {
+		t.Fatalf("live write not delivered after recheck interval: %v", err)
+	}
+	if string(buf) != "still live\n" {
+		t.Fatalf("read %q", buf)
+	}
+}
+
+func TestServer_LogStreamWritesDropMarker(t *testing.T) {
+	_, local, srv := newLogStreamTestServer(t)
+
+	monitor := logmon.NewWriter(io.Discard)
+	local.setModelLogger("m1", monitor)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/logs/stream/m1", nil)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var mu sync.Mutex
+	var got []byte
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		buf := make([]byte, 64*1024)
+		for {
+			n, err := resp.Body.Read(buf)
+			if n > 0 {
+				mu.Lock()
+				got = append(got, buf[:n]...)
+				mu.Unlock()
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	waitFor := func(sub string, timeout time.Duration) {
+		t.Helper()
+		deadline := time.Now().Add(timeout)
+		for {
+			mu.Lock()
+			found := strings.Contains(string(got), sub)
+			mu.Unlock()
+			if found {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("%q did not appear in the stream within %v (got %d bytes)", sub, timeout, len(got))
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	// Liveness before the flood: the handler delivers normal writes.
+	monitor.Write([]byte("hello\n"))
+	waitFor("hello\n", 2*time.Second)
+
+	// Flood far past both buffers (the monitor's 1024 broadcast slots and this
+	// handler's forwarding buffer) while the reader drains the response, so
+	// handler-level drops occur and must be reported in-stream. The message
+	// count, not the byte count, is what fills the channels, so keep each write
+	// small and send many of them.
+	payload := strings.Repeat("x", 1024) + "\n"
+	for i := 0; i < 6000; i++ {
+		monitor.Write([]byte(payload))
+	}
+	waitFor("bytes dropped", 3*time.Second)
+
+	cancel()
+	<-done
+}
+
+// TestServer_LogStreamQueuesBurstWithoutDropping is the counterpart to
+// TestServer_LogStreamWritesDropMarker. A cold-start transcript arrives as a
+// burst of small writes while the panel is busy re-rendering; the forwarding
+// buffer must be wide enough to queue that burst instead of dropping it and
+// printing "— N bytes dropped —" to the operator.
+func TestServer_LogStreamQueuesBurstWithoutDropping(t *testing.T) {
+	_, local, srv := newLogStreamTestServer(t)
+
+	monitor := logmon.NewWriter(io.Discard)
+	local.setModelLogger("m1", monitor)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/logs/stream/m1", nil)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var mu sync.Mutex
+	var got []byte
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		buf := make([]byte, 64*1024)
+		for {
+			n, err := resp.Body.Read(buf)
+			if n > 0 {
+				mu.Lock()
+				got = append(got, buf[:n]...)
+				mu.Unlock()
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	// A burst comfortably inside the forwarding buffer, written before the
+	// reader starts draining, must not trip the drop path.
+	const burst = logStreamSendBuffer - 8
+	for i := 0; i < burst; i++ {
+		monitor.Write([]byte("cold start line\n"))
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		mu.Lock()
+		body := string(got)
+		mu.Unlock()
+		if strings.Count(body, "cold start line\n") >= burst {
+			if strings.Contains(body, "bytes dropped") {
+				t.Fatalf("burst was dropped with a marker: %q", body[len(body)-200:])
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			mu.Lock()
+			count := strings.Count(string(got), "cold start line\n")
+			mu.Unlock()
+			t.Fatalf("only %d/%d burst lines delivered", count, burst)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	cancel()
+	<-done
 }

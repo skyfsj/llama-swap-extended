@@ -1,13 +1,16 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/mostlygeek/llama-swap/internal/auth"
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/process"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
@@ -215,7 +218,12 @@ func TestServer_SelectorMiddleware_RewritesBeforeFiltersAndRecordsActivity(t *te
 
 	assert.Equal(t, "variant", received.Model)
 	assert.Equal(t, "a", received.ModelID)
-	assert.Equal(t, "variant", gjson.GetBytes(body, "model").String())
+	// The selector pins the body to "variant", and the filter stage then
+	// rewrites it to the name the engine serves. "variant" is an alias of "a"
+	// (the setParamsByID key is auto-registered as one), and the engine only
+	// knows "a" — forwarding the alias is what produced "The model X does not
+	// exist" from the engine.
+	assert.Equal(t, "a", gjson.GetBytes(body, "model").String())
 	assert.True(t, gjson.GetBytes(body, "thinking").Bool())
 
 	entries := metricsEntries(t, s.metrics)
@@ -343,6 +351,157 @@ func TestServer_SelectorMiddleware_AllSpilloverTargetsStopping(t *testing.T) {
 	assert.Contains(t, w.Body.String(), "no available spillover targets")
 }
 
+func TestServer_SelectorMiddleware_FailoverRewritesEachAttempt(t *testing.T) {
+	cfg := config.Config{
+		Models: map[string]config.ModelConfig{
+			"a": {Proxy: "http://a"},
+			"b": {Proxy: "http://b"},
+		},
+		Selectors: map[string]config.SelectorConfig{
+			"public": {Strategy: config.SelectorStrategyFailover, Targets: []string{"a", "b"}},
+		},
+	}
+	local := newStubRouter([]string{"a", "b"}, "")
+	var attempts []struct{ model, body string }
+	local.serveHTTP = func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		data, _ := swaputil.ReadContext(r.Context())
+		attempts = append(attempts, struct{ model, body string }{data.ModelID, string(body)})
+		if len(attempts) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}
+	s := selectorTestServer(t, cfg, local)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, chatRequest("public"))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	if len(attempts) != 2 || attempts[0].model != "a" || attempts[1].model != "b" {
+		t.Fatalf("attempts=%+v", attempts)
+	}
+	if !strings.Contains(attempts[0].body, `"model":"a"`) || !strings.Contains(attempts[1].body, `"model":"b"`) {
+		t.Fatalf("models were not rewritten per attempt: %+v", attempts)
+	}
+}
+
+func TestServer_SelectorMiddleware_FailoverRejectsOversizedRequestBeforeAttempt(t *testing.T) {
+	cfg := config.Config{
+		Models: map[string]config.ModelConfig{
+			"a": {Proxy: "http://a"},
+			"b": {Proxy: "http://b"},
+		},
+		Selectors: map[string]config.SelectorConfig{
+			"public": {Strategy: config.SelectorStrategyFailover, Targets: []string{"a", "b"}},
+		},
+	}
+	local := newStubRouter([]string{"a", "b"}, "")
+	attempts := 0
+	local.serveHTTP = func(w http.ResponseWriter, _ *http.Request) {
+		attempts++
+		w.WriteHeader(http.StatusOK)
+	}
+	s := selectorTestServer(t, cfg, local)
+	body := append([]byte(`{"model":"public","padding":"`), bytes.Repeat([]byte{'x'}, backendTransformBodyLimit)...)
+	body = append(body, '"', '}')
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized failover status=%d body=%s", w.Code, w.Body.String())
+	}
+	if attempts != 0 {
+		t.Fatalf("oversized failover reached %d backend attempts", attempts)
+	}
+}
+
+func TestServer_SelectorMiddleware_FailoverDoesNotRetryPartialSSE(t *testing.T) {
+	cfg := config.Config{
+		Models: map[string]config.ModelConfig{
+			"a": {Proxy: "http://a"},
+			"b": {Proxy: "http://b"},
+		},
+		Selectors: map[string]config.SelectorConfig{
+			"public": {Strategy: config.SelectorStrategyFailover, Targets: []string{"a", "b"}},
+		},
+	}
+	local := newStubRouter([]string{"a", "b"}, "")
+	attempts := 0
+	local.serveHTTP = func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("data: partial\\n\\n"))
+	}
+	s := selectorTestServer(t, cfg, local)
+
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, chatRequest("public"))
+
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+	assert.Equal(t, 1, attempts)
+	assert.Equal(t, "data: partial\\n\\n", w.Body.String())
+}
+
+func TestServer_SelectorMiddleware_FailoverWebsocketIsSingleAttempt(t *testing.T) {
+	cfg := config.Config{
+		Models: map[string]config.ModelConfig{
+			"a": {Proxy: "http://a"},
+			"b": {Proxy: "http://b"},
+		},
+		Selectors: map[string]config.SelectorConfig{
+			"public": {Strategy: config.SelectorStrategyFailover, Targets: []string{"a", "b"}},
+		},
+	}
+	local := newStubRouter([]string{"a", "b"}, "")
+	attempts := 0
+	var selected string
+	local.serveHTTP = func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		data, _ := swaputil.ReadContext(r.Context())
+		selected = data.ModelID
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}
+	s := selectorTestServer(t, cfg, local)
+
+	req := httptest.NewRequest(http.MethodGet, "/props?model=public", nil)
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+
+	assert.Equal(t, 1, attempts)
+	assert.Equal(t, "a", selected)
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+}
+
+func TestServer_SelectorFailoverRetryStatusMatrix(t *testing.T) {
+	for _, test := range []struct {
+		status    int
+		retryable bool
+	}{
+		{http.StatusRequestTimeout, true},
+		{http.StatusTooManyRequests, true},
+		{http.StatusBadGateway, true},
+		{http.StatusServiceUnavailable, true},
+		{http.StatusGatewayTimeout, true},
+		{http.StatusBadRequest, false},
+		{http.StatusUnauthorized, false},
+		{http.StatusForbidden, false},
+		{http.StatusNotFound, false},
+		{http.StatusInternalServerError, false},
+	} {
+		t.Run(strconv.Itoa(test.status), func(t *testing.T) {
+			if got := retryableFailoverStatus(test.status); got != test.retryable {
+				t.Fatalf("retryableFailoverStatus(%d)=%v, want %v", test.status, got, test.retryable)
+			}
+		})
+	}
+}
+
 func TestServer_SelectorMiddleware_UpstreamUnsupported(t *testing.T) {
 	cfg := selectorTestConfig(t)
 	local := newStubRouter([]string{"a", "b", "c"}, "")
@@ -403,6 +562,28 @@ func TestServer_Selector_ModelListings(t *testing.T) {
 	assert.Equal(t, float64(1), balancedMetadata["spillover"])
 
 	assert.NotContains(t, byID, "hidden-selector")
+}
+
+func TestServer_SelectorModelScopedIdentityCannotIndirectToDeniedTarget(t *testing.T) {
+	cfg := config.Config{
+		Models: map[string]config.ModelConfig{"allowed": {}, "denied": {}},
+		Selectors: map[string]config.SelectorConfig{
+			"mixed": {Strategy: config.SelectorStrategyPin, Targets: []string{"allowed", "denied"}},
+		},
+	}
+	s := selectorTestServer(t, cfg, newStubRouter(nil, ""))
+	next := CreateSelectorMiddleware(s)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	base := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"mixed","messages":[]}`))
+	base.Header.Set("Content-Type", "application/json")
+	identity := auth.Identity{ID: "scoped", Models: []string{"mixed", "allowed"}}
+	req := base.WithContext(withIdentity(base.Context(), identity))
+	w := httptest.NewRecorder()
+	next.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("mixed selector status=%d body=%s", w.Code, w.Body.String())
+	}
 }
 
 func TestServer_Selector_ModelListingPinUsesFirstTarget(t *testing.T) {

@@ -72,6 +72,12 @@ func serveUI(fsys http.FileSystem, w http.ResponseWriter, r *http.Request) {
 	if name == "" {
 		name = "index.html"
 	}
+	// The entry document names every lazy-loaded chunk. Never let a browser
+	// keep an older copy across a binary upgrade, otherwise its next route
+	// navigation can request a chunk that no longer exists in the new embed.
+	if name == "index.html" {
+		w.Header().Set("Cache-Control", "no-cache")
+	}
 
 	if err := serveCompressedFile(fsys, w, r, name); err != nil {
 		if strings.Contains(path.Base(name), ".") {

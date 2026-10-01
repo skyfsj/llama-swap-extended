@@ -5,14 +5,18 @@ import (
 	"bytes"
 	"compress/flate"
 	"compress/gzip"
-	"io"
+	"context"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
+	"github.com/mostlygeek/llama-swap/internal/auth"
 	"github.com/mostlygeek/llama-swap/internal/config"
-	"github.com/mostlygeek/llama-swap/internal/logmon"
+	"github.com/mostlygeek/llama-swap/internal/store"
+	"github.com/mostlygeek/llama-swap/internal/swaputil"
+	"time"
 )
 
 func TestServer_DecompressBody(t *testing.T) {
@@ -48,6 +52,21 @@ func TestServer_DecompressBody(t *testing.T) {
 				t.Errorf("got %q, want %q", got, plain)
 			}
 		})
+	}
+}
+
+func TestServer_DecompressBodyRejectsExpansionBeyondRequestLimit(t *testing.T) {
+	plain := bytes.Repeat([]byte{'x'}, swaputil.MaxRequestBodySize+1)
+	var compressed bytes.Buffer
+	writer := gzip.NewWriter(&compressed)
+	if _, err := writer.Write(plain); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decompressBody(compressed.Bytes(), "gzip"); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("oversized decompressed body error = %v", err)
 	}
 }
 
@@ -248,35 +267,73 @@ func TestServer_HandleAPIUnloadModel(t *testing.T) {
 	})
 }
 
-func TestServer_HandleAPICapture(t *testing.T) {
+func TestServer_HandleAPIUnloadModelEnforcesModelRestriction(t *testing.T) {
+	local := newStubRouter([]string{"allowed", "denied"}, "")
+	s := newTestServer(local, newStubRouter(nil, ""))
+	s.cfg = config.Config{Models: map[string]config.ModelConfig{
+		"allowed": {},
+		"denied":  {},
+	}}
+	if err := s.store.UpsertAPIKey(context.Background(), store.APIKeyRecord{
+		ID: "scoped-unload", KeyHash: store.KeyFingerprint("unload-secret"),
+		Scopes: []string{auth.ScopeModelUnload}, Models: []string{"allowed"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/models/unload/denied", nil)
+	req.Header.Set("Authorization", "Bearer unload-secret")
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status=%d body=%q, want 403", w.Code, w.Body.String())
+	}
+	if local.unloadCalls.Load() != 0 {
+		t.Fatalf("unloadCalls=%d, want 0 for denied model", local.unloadCalls.Load())
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/models/unload/allowed", nil)
+	req.Header.Set("Authorization", "Bearer unload-secret")
+	w = httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("allowed status=%d body=%q, want 200", w.Code, w.Body.String())
+	}
+	if len(local.unloadModels) != 1 || local.unloadModels[0] != "allowed" {
+		t.Fatalf("unloadModels=%v, want [allowed]", local.unloadModels)
+	}
+}
+
+func TestServer_CaptureEndpointRemoved(t *testing.T) {
 	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
-	s.metrics = newTestMetricsMonitor(t, logmon.NewWriter(io.Discard), 100, 5)
-	s.metrics.addCapture(ReqRespCapture{ID: 42, ReqPath: "/v1/chat/completions"})
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/captures/42", nil))
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", w.Code)
+	}
+}
 
-	t.Run("found", func(t *testing.T) {
-		w := httptest.NewRecorder()
-		s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/captures/42", nil))
-		if w.Code != http.StatusOK {
-			t.Fatalf("status = %d", w.Code)
-		}
-		if !bytes.Contains(w.Body.Bytes(), []byte("/v1/chat/completions")) {
-			t.Errorf("body = %q", w.Body.String())
-		}
-	})
+// The request-error incident throttle: one save per (method, path, status)
+// signature inside the window, then suppressed saves, then a fresh window
+// after the cap reset boundary. This keeps a 4xx flood from turning every
+// request into a synchronous fsync cascade.
+func TestServer_RequestErrorThrottle(t *testing.T) {
+	s := &Server{}
+	signature := "GET /models 404"
+	now := time.Now()
 
-	t.Run("not found", func(t *testing.T) {
-		w := httptest.NewRecorder()
-		s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/captures/999", nil))
-		if w.Code != http.StatusNotFound {
-			t.Errorf("status = %d, want 404", w.Code)
-		}
-	})
-
-	t.Run("invalid id", func(t *testing.T) {
-		w := httptest.NewRecorder()
-		s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/captures/abc", nil))
-		if w.Code != http.StatusBadRequest {
-			t.Errorf("status = %d, want 400", w.Code)
-		}
-	})
+	if s.requestErrorThrottled(signature, now) {
+		t.Fatal("first occurrence must not be throttled")
+	}
+	if !s.requestErrorThrottled(signature, now.Add(time.Second)) {
+		t.Fatal("second occurrence within the window must be throttled")
+	}
+	// A different signature is throttled independently.
+	if s.requestErrorThrottled("GET /other 404", now.Add(time.Second)) {
+		t.Fatal("a different signature must not inherit the throttle")
+	}
+	// After the window the same signature is saved again.
+	if s.requestErrorThrottled(signature, now.Add(2*incidentSaveWindow)) {
+		t.Fatal("occurrence after the window must not be throttled")
+	}
 }

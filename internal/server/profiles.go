@@ -13,7 +13,8 @@ import (
 func CreateProfileMiddleware(s *Server) chain.Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			profile, ok := s.cfg.Profiles[s.ActiveProfile()]
+			cfg := s.currentConfig()
+			profile, ok := cfg.Profiles[s.ActiveProfile()]
 			if ok {
 				var model, replacement string
 				var pinned bool
@@ -28,7 +29,7 @@ func CreateProfileMiddleware(s *Server) chain.Middleware {
 				if pinned {
 					updated, err := swaputil.ReplaceRequestModel(r, model, replacement)
 					if err != nil {
-						swaputil.SendResponse(w, r, http.StatusBadRequest, err.Error())
+						sendModelRewriteError(w, r, err)
 						return
 					}
 					r = updated

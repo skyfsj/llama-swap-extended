@@ -6,6 +6,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/mostlygeek/llama-swap/internal/config"
@@ -77,6 +78,177 @@ func TestServer_ResolveFilters_QualifiedPeer(t *testing.T) {
 	}
 }
 
+// TestServer_ResolveFilters_AliasRewrite is the regression test for the alias
+// routing bug: an alias resolved to a model correctly, but the request body was
+// forwarded with the alias intact, so the engine — which serves only its
+// canonical name — answered "The model X does not exist". resolveFilters must
+// now report the name the engine actually serves so the body can be rewritten.
+func TestServer_ResolveFilters_AliasRewrite(t *testing.T) {
+	cfg := config.Config{
+		Models: map[string]config.ModelConfig{
+			"Qwen/Qwen3.8-27B-FP8": {
+				Aliases: []string{"qwen38", "Qwen/Qwen3.8-27B"},
+			},
+		},
+	}
+
+	cases := []struct {
+		name     string
+		request  string
+		upstream string
+	}{
+		// An alias must be rewritten to the name the engine serves.
+		{"alias rewrites to the canonical id", "qwen38", "Qwen/Qwen3.8-27B-FP8"},
+		{"slash alias rewrites to the canonical id", "Qwen/Qwen3.8-27B", "Qwen/Qwen3.8-27B-FP8"},
+		// The canonical name already names what the engine serves, so no
+		// rewrite is needed and the body must not be touched.
+		{"canonical name needs no rewrite", "Qwen/Qwen3.8-27B-FP8", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream, _, ok := resolveFilters(cfg, tc.request)
+			if !ok {
+				t.Fatalf("resolveFilters(%q) did not resolve", tc.request)
+			}
+			if upstream != tc.upstream {
+				t.Errorf("upstream name = %q, want %q", upstream, tc.upstream)
+			}
+		})
+	}
+}
+
+// TestServer_ResolveFilters_UseModelNameWins pins the precedence: when the
+// operator configured useModelName the engine serves that name, so it wins
+// over the canonical id the alias rewrite would otherwise produce.
+func TestServer_ResolveFilters_UseModelNameWins(t *testing.T) {
+	cfg := config.Config{
+		Models: map[string]config.ModelConfig{
+			"Qwen/Qwen3.8-27B-FP8": {
+				Aliases:      []string{"qwen38"},
+				UseModelName: "served-upstream-name",
+			},
+		},
+	}
+	upstream, _, ok := resolveFilters(cfg, "qwen38")
+	if !ok {
+		t.Fatal("resolveFilters did not resolve the alias")
+	}
+	if upstream != "served-upstream-name" {
+		t.Errorf("upstream name = %q, want served-upstream-name", upstream)
+	}
+}
+
+// TestServer_AliasRequestRewritesModelBody is the end-to-end version: a JSON
+// request that names an alias must reach the next handler with the body's model
+// field set to the name the engine serves. Without it the upstream rejects the
+// request with a model-not-found error even though routing succeeded.
+func TestServer_AliasRequestRewritesModelBody(t *testing.T) {
+	cfg := config.Config{
+		Models: map[string]config.ModelConfig{
+			"Qwen/Qwen3.8-27B-FP8": {
+				Aliases: []string{"qwen38"},
+			},
+		},
+	}
+
+	var forwarded []byte
+	final := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		forwarded, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+	})
+	mw := CreateFilterMiddleware(cfg)
+
+	for _, requested := range []string{"qwen38", "Qwen/Qwen3.8-27B-FP8"} {
+		forwarded = nil
+		body := `{"model":"` + requested + `","messages":[]}`
+		r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		r.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mw(final).ServeHTTP(w, r)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d for %q", w.Code, requested)
+		}
+		if got := gjson.GetBytes(forwarded, "model").String(); got != "Qwen/Qwen3.8-27B-FP8" {
+			t.Errorf("forwarded model = %q for request %q, want Qwen/Qwen3.8-27B-FP8", got, requested)
+		}
+	}
+}
+
+// TestServer_UpstreamAliasRequest covers the /upstream passthrough, where the
+// model is named in the URL path instead of the body. Both spellings must
+// reach the engine with the body's model field rewritten to the name the engine
+// serves, and a request with no model field at all must still be forwarded
+// rather than rejected (the path already identified the model).
+func TestServer_UpstreamAliasRequest(t *testing.T) {
+	cfg := config.Config{
+		Models: map[string]config.ModelConfig{
+			"Qwen/Qwen3.8-27B-FP8": {Aliases: []string{"qwen38"}},
+		},
+	}
+
+	run := func(path, body string) (int, []byte) {
+		var forwarded []byte
+		final := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			forwarded, _ = io.ReadAll(r.Body)
+			w.WriteHeader(http.StatusOK)
+		})
+		r := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+		r.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		CreateFilterMiddleware(cfg)(final).ServeHTTP(w, r)
+		return w.Code, forwarded
+	}
+
+	t.Run("alias in the path and body", func(t *testing.T) {
+		code, body := run("/upstream/qwen38/v1/chat/completions", `{"model":"qwen38"}`)
+		if code != http.StatusOK {
+			t.Fatalf("status = %d", code)
+		}
+		if got := gjson.GetBytes(body, "model").String(); got != "Qwen/Qwen3.8-27B-FP8" {
+			t.Errorf("forwarded model = %q, want Qwen/Qwen3.8-27B-FP8", got)
+		}
+	})
+
+	t.Run("canonical name in the path", func(t *testing.T) {
+		code, body := run("/upstream/Qwen%2FQwen3.8-27B-FP8/v1/chat/completions", `{"model":"Qwen/Qwen3.8-27B-FP8"}`)
+		if code != http.StatusOK {
+			t.Fatalf("status = %d", code)
+		}
+		if got := gjson.GetBytes(body, "model").String(); got != "Qwen/Qwen3.8-27B-FP8" {
+			t.Errorf("forwarded model = %q, want it unchanged", got)
+		}
+	})
+
+	t.Run("no model field in the body is forwarded", func(t *testing.T) {
+		code, body := run("/upstream/qwen38/v1/chat/completions", `{"messages":[]}`)
+		if code != http.StatusOK {
+			t.Fatalf("status = %d, want the passthrough to accept it", code)
+		}
+		if gjson.GetBytes(body, "model").Exists() {
+			t.Errorf("forwarded body = %q, want no model field invented", body)
+		}
+	})
+}
+
+// TestServer_PeerRequestKeepsModelName proves the rewrite stays local to
+// models: a peer decides its own naming, so the request must be forwarded
+// exactly as the client sent it.
+func TestServer_PeerRequestKeepsModelName(t *testing.T) {
+	cfg := config.Config{
+		Peers: config.PeerDictionaryConfig{
+			"remote": {Models: []string{"org/model"}},
+		},
+	}
+	upstream, _, ok := resolveFilters(cfg, "remote/org/model")
+	if !ok {
+		t.Fatal("peer did not resolve")
+	}
+	if upstream != "" {
+		t.Errorf("upstream name = %q, want empty so the peer's own name is kept", upstream)
+	}
+}
+
 func TestServer_FormFilterMiddleware(t *testing.T) {
 	cfg := config.Config{Models: map[string]config.ModelConfig{
 		"whisper": {UseModelName: "whisper-large-v3"},
@@ -129,5 +301,36 @@ func TestServer_FormFilterMiddleware(t *testing.T) {
 	}
 	if gotContext.Model != "whisper" || gotContext.ModelID != "whisper" {
 		t.Errorf("request context = %+v, want original whisper model", gotContext)
+	}
+}
+
+// TestServer_FormFilterMiddleware_Alias covers the same rewrite for a form
+// field: an alias the engine does not serve must reach it as the canonical
+// name, exactly as the JSON path does.
+func TestServer_FormFilterMiddleware_Alias(t *testing.T) {
+	cfg := config.Config{Models: map[string]config.ModelConfig{
+		"Qwen/Qwen3.8-27B-FP8": {Aliases: []string{"qwen38"}},
+	}}
+
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	mw.WriteField("model", "qwen38")
+	mw.Close()
+
+	r := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", &buf)
+	r.Header.Set("Content-Type", mw.FormDataContentType())
+
+	var gotModel string
+	final := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseMultipartForm(swaputil.MaxMultiPartSize); err != nil {
+			t.Errorf("ParseMultipartForm: %v", err)
+			return
+		}
+		gotModel = r.MultipartForm.Value["model"][0]
+	})
+	CreateFormFilterMiddleware(cfg)(final).ServeHTTP(httptest.NewRecorder(), r)
+
+	if gotModel != "Qwen/Qwen3.8-27B-FP8" {
+		t.Errorf("model rewritten to %q, want Qwen/Qwen3.8-27B-FP8", gotModel)
 	}
 }
