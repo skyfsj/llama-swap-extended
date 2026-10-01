@@ -126,6 +126,11 @@ export function normalizeProvider(value: unknown): ProviderConfigUI | null {
           if (typeof item === "string" && item.trim() !== "") return { local: item, remote: item };
           if (!item || typeof item !== "object") return null;
           const entry = item as Record<string, unknown>;
+          // Shorthand mapping {localName: upstreamName} from the YAML form.
+          const keys = Object.keys(entry);
+          if (keys.length === 1 && keys[0] !== "local" && typeof entry[keys[0]] === "string" && entry[keys[0]] !== "") {
+            return { local: keys[0], remote: entry[keys[0]] as string };
+          }
           if (typeof entry.local !== "string" || entry.local.trim() === "") return null;
           const remote = typeof entry.remote === "string" && entry.remote.trim() !== "" ? entry.remote : entry.local;
           return { local: entry.local, remote };

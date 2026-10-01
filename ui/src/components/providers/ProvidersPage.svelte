@@ -449,7 +449,11 @@
                 <Input
                   type="password"
                   placeholder={$translate("providers.fields.keyValueOrEnv")}
-                  value={key.value ?? key.valueEnv !== undefined ? `env:${key.valueEnv}` : ""}
+                  value={key.value !== undefined && key.value !== ""
+                    ? key.value
+                    : key.valueEnv
+                      ? `env:${key.valueEnv}`
+                      : ""}
                   onchange={(e) => {
                     const raw = e.currentTarget.value;
                     const next = [...draft.apiKeys];
