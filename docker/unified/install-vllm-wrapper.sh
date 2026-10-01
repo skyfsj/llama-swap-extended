@@ -15,9 +15,10 @@ SRC=/src/llama-swap
 
 mkdir -p /install/bin
 
-# If a full commit hash is given, find the release tag that points to it. This
-# mirrors install-llama-swap.sh so both binaries come from the same revision.
-if echo "${VERSION}" | grep -qE '^[0-9a-f]{40}$'; then
+# If a commit hash (full or abbreviated) is given, find the release tag that
+# points to it. This mirrors install-llama-swap.sh so both binaries come from
+# the same revision.
+if echo "${VERSION}" | grep -qE '^[0-9a-f]{7,40}$'; then
     echo "=== Resolving commit ${VERSION:0:7} to release tag ==="
     TAG=$(git ls-remote --tags "https://github.com/${REPO}.git" 2>/dev/null \
         | grep "^${VERSION}" | sed 's|.*refs/tags/||' | grep -v '\^{}' | head -1)

@@ -87,11 +87,11 @@ jobs:
       - name: Resolve llama-swap version for the build
         id: version
         run: |
-          if [[ -n "${{ inputs.ref }}" ]]; then
-            echo "ls_version=${{ inputs.ref }}" >> $GITHUB_OUTPUT
-          else
-            echo "ls_version=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
-          fi
+          # Pass the full commit SHA: the installers map a hash to the
+          # release tag that points at it, which is robust against tag
+          # force-pushes and branch names that look like versions.
+          REF="${{ inputs.ref || github.ref }}"
+          echo "ls_version=$(git rev-parse "${REF}")" >> "$GITHUB_OUTPUT"
 
       - name: Build and push ${{ matrix.image.variant }}-${{ matrix.image.backend }}
         env:

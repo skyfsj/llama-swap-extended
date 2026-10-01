@@ -11,8 +11,10 @@ REPO="${LS_BINARY_REPO:-skyfsj/llama-swap-extended}"
 
 mkdir -p /install/bin
 
-# If a full commit hash is given, find the release tag that points to it
-if echo "${VERSION}" | grep -qE '^[0-9a-f]{40}$'; then
+# If a commit hash (full or abbreviated) is given, find the release tag
+# that points to it. git ls-remote hashes are full 40-char, so an
+# abbreviated prefix matches by grep.
+if echo "${VERSION}" | grep -qE '^[0-9a-f]{7,40}$'; then
     echo "=== Resolving commit ${VERSION:0:7} to release tag ==="
     TAG=$(git ls-remote --tags "https://github.com/${REPO}.git" 2>/dev/null \
         | grep "^${VERSION}" | sed 's|.*refs/tags/||' | grep -v '\^{}' | head -1)
