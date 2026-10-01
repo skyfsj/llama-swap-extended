@@ -281,6 +281,8 @@ func schemaFor(f *Field) map[string]any {
 		out["type"] = "boolean"
 	case KInt:
 		out["type"] = "integer"
+	case KFloat:
+		out["type"] = "number"
 	case KDuration:
 		out["type"] = []string{"string", "integer"}
 	case KStringList:

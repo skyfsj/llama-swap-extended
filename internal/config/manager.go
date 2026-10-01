@@ -873,6 +873,12 @@ func redactNode(node *yaml.Node, parent string) {
 		node.Content = nil
 		return
 	}
+	// providers.<id>.apiKeys entries carry upstream credential material:
+	// redact scalar entries and the value field of object entries.
+	if strings.EqualFold(parent, "providers") {
+		redactProviderNode(node, parent)
+		return
+	}
 	if node.Kind == yaml.MappingNode {
 		for i := 0; i+1 < len(node.Content); i += 2 {
 			key, value := node.Content[i], node.Content[i+1]
@@ -888,6 +894,60 @@ func redactNode(node *yaml.Node, parent string) {
 	} else if node.Kind == yaml.SequenceNode {
 		for _, child := range node.Content {
 			redactNode(child, parent)
+		}
+	}
+}
+
+// redactProviderNode walks a providers subtree: when it reaches an apiKeys
+// collection it redacts credential material the same way the top-level
+// apiKeys section is handled.
+func redactProviderNode(node *yaml.Node, parent string) {
+	if node == nil {
+		return
+	}
+	switch node.Kind {
+	case yaml.DocumentNode:
+		for _, child := range node.Content {
+			redactProviderNode(child, parent)
+		}
+	case yaml.MappingNode:
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			key, value := node.Content[i], node.Content[i+1]
+			if strings.EqualFold(key.Value, "apiKeys") {
+				redactAPIKeyCollection(value)
+				continue
+			}
+			redactProviderNode(value, key.Value)
+		}
+	case yaml.SequenceNode:
+		for _, child := range node.Content {
+			redactProviderNode(child, parent)
+		}
+	}
+}
+
+// redactAPIKeyCollection redacts a list of API key entries (scalar or object
+// form) in place.
+func redactAPIKeyCollection(node *yaml.Node) {
+	if node == nil {
+		return
+	}
+	if node.Kind != yaml.SequenceNode {
+		return
+	}
+	for _, entry := range node.Content {
+		switch entry.Kind {
+		case yaml.ScalarNode:
+			entry.Kind, entry.Tag, entry.Value = yaml.ScalarNode, "!!str", "[REDACTED]"
+			entry.Content = nil
+		case yaml.MappingNode:
+			for i := 0; i+1 < len(entry.Content); i += 2 {
+				key, value := entry.Content[i], entry.Content[i+1]
+				if strings.EqualFold(key.Value, "value") {
+					value.Kind, value.Tag, value.Value = yaml.ScalarNode, "!!str", "[REDACTED]"
+					value.Content = nil
+				}
+			}
 		}
 	}
 }

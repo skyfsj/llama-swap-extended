@@ -1,6 +1,6 @@
 <script lang="ts">
   import { link } from "svelte-spa-router";
-  import { FerrisWheel, Boxes, Activity, ScrollText, Gauge, Cpu, Sun, Moon, Monitor, ChevronRight, Settings, Server, KeyRound, FolderOpen, CircleAlert, Puzzle, BarChart3 } from "@lucide/svelte";
+  import { FerrisWheel, Boxes, Activity, ScrollText, Gauge, Cpu, Sun, Moon, Monitor, ChevronRight, Settings, Server, KeyRound, FolderOpen, CircleAlert, Puzzle, BarChart3, Network } from "@lucide/svelte";
   import * as Sidebar from "$lib/components/ui/sidebar/index.js";
   import * as Collapsible from "$lib/components/ui/collapsible/index.js";
   import { Button } from "$lib/components/ui/button/index.js";
@@ -200,6 +200,14 @@
             <Sidebar.MenuButton isActive={isActive("/model-files", $currentRoute)} tooltipContent={$translate("navigation.modelFiles")}>
               {#snippet child({ props })}
                 <a href="/model-files" use:link {...props}><FolderOpen /><span>{$translate("navigation.modelFiles")}</span></a>
+              {/snippet}
+            </Sidebar.MenuButton>
+          </Sidebar.MenuItem>
+
+          <Sidebar.MenuItem>
+            <Sidebar.MenuButton isActive={isActive("/providers", $currentRoute)} tooltipContent={$translate("navigation.providers")}>
+              {#snippet child({ props })}
+                <a href="/providers" use:link {...props}><Network /><span>{$translate("navigation.providers")}</span></a>
               {/snippet}
             </Sidebar.MenuButton>
           </Sidebar.MenuItem>

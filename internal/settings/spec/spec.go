@@ -17,6 +17,8 @@ const (
 	KBool
 	// KInt is an integer scalar.
 	KInt
+	// KFloat is a floating-point scalar.
+	KFloat
 	// KDuration is a time.Duration written in YAML as "5s", "24h" or
 	// nanoseconds.
 	KDuration

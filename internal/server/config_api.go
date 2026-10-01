@@ -510,6 +510,12 @@ func isSensitiveConfigKey(key, parent string) bool {
 	if strings.EqualFold(parent, "apikeys") && (key == "key" || key == "value" || key == "secret") {
 		return true
 	}
+	// Provider credential entries: providers.<id>.apiKeys[].value is the
+	// upstream API key material.
+	if strings.EqualFold(parent, "apikeys") && (key == "value" || key == "valueenv") {
+		// valueEnv is a variable name, not a secret; only raw values redact.
+		return key == "value"
+	}
 	return sensitiveConfigName(key)
 }
 

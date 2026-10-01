@@ -19,7 +19,8 @@
       "observe": "Observability",
       "access": "Access"
     },
-    "usageRecords": "Usage records"
+    "usageRecords": "Usage records",
+    "providers": "Providers"
   },
   "profile": {
     "label": "Profile",
@@ -2916,5 +2917,68 @@
   },
   "toast": {
     "region": "Notifications"
+  },
+  "providers": {
+    "title": "Upstream Providers",
+    "subtitle": "Forward requests to external LLM providers with multi-key scheduling and per-provider proxies.",
+    "empty": "No providers configured. Add one to start forwarding.",
+    "actions": {
+      "add": "Add provider",
+      "addKey": "Add key",
+      "addModel": "Add model",
+      "pull": "Pull from upstream",
+      "test": "Test"
+    },
+    "fields": {
+      "name": "Name",
+      "type": "Type",
+      "endpoint": "Endpoint",
+      "proxy": "Proxy",
+      "priority": "Priority",
+      "weight": "Weight",
+      "sticky": "Session affinity",
+      "disabled": "Disable",
+      "bareNamePolicy": "Bare name arbitration",
+      "localFirst": "Local model first",
+      "providerFirst": "Provider first",
+      "maxRetries": "Max retries",
+      "apiKeys": "API Keys",
+      "keyValueOrEnv": "Key value or env:name",
+      "maxConcurrent": "Max concurrent",
+      "models": "Models",
+      "modelLocal": "Local model ID",
+      "modelRemote": "Upstream model name"
+    },
+    "status": {
+      "disabled": "disabled",
+      "coolingShort": "cooling",
+      "models": "Models"
+    },
+    "editor": {
+      "createTitle": "New provider",
+      "editTitle": "Edit provider · {id}",
+      "noModels": "No models yet. Pull from upstream or add manually."
+    },
+    "errors": {
+      "nameRequired": "Provider name is required.",
+      "endpointRequired": "Endpoint is required.",
+      "keysRequired": "At least one API key is required.",
+      "modelsRequired": "At least one model is required."
+    },
+    "toast": {
+      "saved": "Provider {id} saved.",
+      "deleted": "Provider {id} removed.",
+      "noModels": "Upstream returned no models.",
+      "pulled": "Pulled {count} models from upstream.",
+      "testOk": "Connectivity OK ({count} models visible)."
+    },
+    "delete": {
+      "title": "Remove provider",
+      "message": "Remove provider {id} from the configuration? The gateway stops forwarding its models."
+    },
+    "deleteKey": {
+      "title": "Remove API key",
+      "message": "Remove this API key from the provider?"
+    }
   }
 }

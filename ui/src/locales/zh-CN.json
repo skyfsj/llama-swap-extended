@@ -19,7 +19,8 @@
       "observe": "观测",
       "access": "访问"
     },
-    "usageRecords": "使用记录"
+    "usageRecords": "使用记录",
+    "providers": "供应商"
   },
   "profile": {
     "label": "配置档",
@@ -2916,5 +2917,68 @@
   },
   "toast": {
     "region": "通知"
+  },
+  "providers": {
+    "title": "上游供应商",
+    "subtitle": "将请求转发到外部 LLM 供应商，支持多 Key 调度与每供应商独立代理。",
+    "empty": "尚未配置供应商。添加一个以开始转发。",
+    "actions": {
+      "add": "添加供应商",
+      "addKey": "添加密钥",
+      "addModel": "添加模型",
+      "pull": "从上游拉取",
+      "test": "测试"
+    },
+    "fields": {
+      "name": "名称",
+      "type": "类型",
+      "endpoint": "服务地址",
+      "proxy": "代理",
+      "priority": "优先级",
+      "weight": "权重",
+      "sticky": "会话粘滞",
+      "disabled": "停用",
+      "bareNamePolicy": "裸名仲裁",
+      "localFirst": "本地模型优先",
+      "providerFirst": "供应商优先",
+      "maxRetries": "最大重试",
+      "apiKeys": "API 密钥",
+      "keyValueOrEnv": "密钥值或 env:变量名",
+      "maxConcurrent": "并发上限",
+      "models": "模型",
+      "modelLocal": "本地模型 ID",
+      "modelRemote": "上游模型名"
+    },
+    "status": {
+      "disabled": "已停用",
+      "coolingShort": "冷却中",
+      "models": "模型"
+    },
+    "editor": {
+      "createTitle": "新建供应商",
+      "editTitle": "编辑供应商 · {id}",
+      "noModels": "暂无模型。从上游拉取或手动添加。"
+    },
+    "errors": {
+      "nameRequired": "必须填写供应商名称。",
+      "endpointRequired": "必须填写服务地址。",
+      "keysRequired": "至少需要一个 API 密钥。",
+      "modelsRequired": "至少需要一个模型。"
+    },
+    "toast": {
+      "saved": "供应商 {id} 已保存。",
+      "deleted": "供应商 {id} 已移除。",
+      "noModels": "上游未返回任何模型。",
+      "pulled": "已从上游拉取 {count} 个模型。",
+      "testOk": "连通正常（可见 {count} 个模型）。"
+    },
+    "delete": {
+      "title": "移除供应商",
+      "message": "从配置中移除供应商 {id}？网关将停止转发其模型。"
+    },
+    "deleteKey": {
+      "title": "移除 API 密钥",
+      "message": "从该供应商移除此 API 密钥？"
+    }
   }
 }

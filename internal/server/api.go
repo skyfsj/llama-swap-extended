@@ -272,6 +272,37 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Provider models follow the peer pattern: FQNs are always listed; the
+	// bare name enters the listing when the gateway alone claims it (the
+	// dispatch arbitration with local models is the same rule).
+	if gw := s.currentGateway(); gw != nil {
+		for _, route := range gw.AllRoutes() {
+			fqn := config.ProviderModelFQN(route.ProviderID, route.ModelID)
+			if !modelAllowedForIdentity(cfg, identity, fqn) {
+				continue
+			}
+			modelIDs[fqn] = struct{}{}
+			if _, baseOK := cfg.ResolveBaseModel(route.ModelID); baseOK && gw.RouteFor(route.ModelID, false) == route {
+				modelIDs[route.ModelID] = struct{}{}
+			}
+			status := "loaded"
+			if route.BestCredential() == nil {
+				// Every credential is cooling down or saturated; the model
+				// stays listed but reports unavailable.
+				status = "unavailable"
+			}
+			data = append(data, newRecord(
+				fqn,
+				route.ProviderID+": "+route.ModelID,
+				"",
+				nil,
+				config.ModelCapConfig{},
+				status,
+				map[string]any{"type": "provider", "providerID": route.ProviderID},
+			))
+		}
+	}
+
 	for selectorID, selector := range cfg.Selectors {
 		if !modelAllowedForIdentity(cfg, identity, selectorID) {
 			continue

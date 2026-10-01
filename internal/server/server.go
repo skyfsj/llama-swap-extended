@@ -1,9 +1,11 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"reflect"
 	"strings"
@@ -33,6 +35,9 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/settings"
 	"github.com/mostlygeek/llama-swap/internal/store"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
+	"github.com/tidwall/gjson"
+
+	"github.com/mostlygeek/llama-swap/internal/gateway"
 )
 
 // Server owns the HTTP mux, cross-cutting middleware, and the local/peer model
@@ -98,6 +103,12 @@ type Server struct {
 
 	local router.LocalRouter
 	peer  router.Router
+
+	// gateway forwards requests to configured upstream LLM providers.
+	// It is nil when no providers are configured; dispatch and /v1/models
+	// merge skip it in that case.
+	gatewayMu sync.RWMutex
+	gateway   *gateway.Gateway
 
 	mux       *http.ServeMux
 	handler   http.Handler
@@ -385,6 +396,22 @@ func (s *Server) applyConfigCandidate(active, desired config.Config, changes con
 			return err
 		}
 	}
+	// The provider gateway is a pure in-memory rebuild: construction either
+	// succeeds atomically or the previous gateway keeps serving. Cooldown
+	// state is intentionally reset on reload — the credential set itself
+	// changed.
+	if !reflect.DeepEqual(active.Providers, effective.Providers) || !reflect.DeepEqual(active.Gateway, effective.Gateway) {
+		if len(effective.Providers) > 0 {
+			next, gwErr := gateway.New(effective, s.proxylog)
+			if gwErr != nil {
+				rollbackRuntimeDefinitions()
+				return fmt.Errorf("rebuilding provider gateway: %w", gwErr)
+			}
+			s.setGateway(next)
+		} else {
+			s.setGateway(nil)
+		}
+	}
 	if err := s.reconfigureModelFileServices(active.ModelFiles, effective.ModelFiles); err != nil {
 		if peer, ok := s.peer.(interface{ Reconfigure(config.Config) error }); ok {
 			if rollbackErr := peer.Reconfigure(active); rollbackErr != nil && s.proxylog != nil {
@@ -632,6 +659,14 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 		return nil, fmt.Errorf("creating peer router: %w", err)
 	}
 
+	var gw *gateway.Gateway
+	if len(cfg.Providers) > 0 {
+		gw, err = gateway.New(cfg, proxylog)
+		if err != nil {
+			return nil, fmt.Errorf("creating provider gateway: %w", err)
+		}
+	}
+
 	if st == nil {
 		return nil, fmt.Errorf("store is required")
 	}
@@ -659,6 +694,7 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 		hardware:        hardware,
 		local:           local,
 		peer:            peer,
+		gateway:         gw,
 		shutdownCtx:     shutdownCtx,
 		shutdownFn:      shutdownFn,
 		backendProgress: make(map[string]swaputil.BackendProgressEvent),
@@ -977,6 +1013,18 @@ func (s *Server) localPeerHandlerWithConfig(w http.ResponseWriter, r *http.Reque
 	// loaded, while failed/canceled cold starts do not leak reserved capacity.
 	defer s.releaseResourceReservation(data.ModelID)
 
+	// Provider gateway arbitration: FQNs (provider/model) route exactly; a
+	// bare name yields to local models unless the winning route is
+	// provider-first.
+	if gw := s.currentGateway(); gw != nil && gw.Handles(data.ModelID) {
+		localClaims := s.local.Handles(data.ModelID)
+		if route := gw.RouteFor(data.ModelID, localClaims); route != nil {
+			s.proxylog.Debugf("dispatch: using provider gateway for model: %s (provider %s)", data.ModelID, route.ProviderID)
+			s.serveGateway(w, r, gw, route, data, cfg)
+			return
+		}
+	}
+
 	switch {
 	case s.local.Handles(data.ModelID):
 		s.proxylog.Debugf("dispatch: using local process for model: %s", data.ModelID)
@@ -987,6 +1035,124 @@ func (s *Server) localPeerHandlerWithConfig(w http.ResponseWriter, r *http.Reque
 	default:
 		swaputil.SendError(w, r, router.ErrNoRouterFound)
 	}
+}
+
+// serveGateway rewrites the model name to the upstream name and forwards the
+// request through the gateway, keeping the audit attribution on the original
+// (gateway-facing) model ID.
+func (s *Server) serveGateway(w http.ResponseWriter, r *http.Request, gw *gateway.Gateway, route *gateway.Route, data swaputil.ReqContextData, cfg config.Config) {
+	if data.Model != route.ModelID {
+		rewritten, err := swaputil.ReplaceRequestModel(r, data.Model, route.ModelID)
+		if err != nil {
+			swaputil.SendResponse(w, r, http.StatusBadRequest, err.Error())
+			return
+		}
+		r = rewritten
+	}
+	// Rewrite to the upstream model name just before forwarding; the request
+	// context keeps the original model for metrics/audit.
+	if route.RemoteName != route.ModelID {
+		rewritten, err := swaputil.ReplaceRequestModel(r, route.ModelID, route.RemoteName)
+		if err != nil {
+			swaputil.SendResponse(w, r, http.StatusBadRequest, err.Error())
+			return
+		}
+		r = rewritten
+	}
+
+	// Session affinity hash: explicit configured headers first, falling back
+	// to client identity + a body fingerprint.
+	sessionHash := gatewaySessionHash(r, cfg)
+
+	gw.ServeHTTP(w, r, route, sessionHash)
+}
+
+// currentGateway returns the active provider gateway (nil when none is
+// configured).
+func (s *Server) currentGateway() *gateway.Gateway {
+	if s == nil {
+		return nil
+	}
+	s.gatewayMu.RLock()
+	defer s.gatewayMu.RUnlock()
+	return s.gateway
+}
+
+// setGateway swaps the active gateway, shutting down the previous one.
+func (s *Server) setGateway(gw *gateway.Gateway) {
+	s.gatewayMu.Lock()
+	previous := s.gateway
+	s.gateway = gw
+	s.gatewayMu.Unlock()
+	if previous != nil {
+		previous.Shutdown()
+	}
+}
+
+// gatewaySessionHash derives the sticky session key for provider routing.
+func gatewaySessionHash(r *http.Request, cfg config.Config) string {
+	headerValue := ""
+	for _, header := range cfg.UI.Activity.SessionID {
+		if v := strings.TrimSpace(r.Header.Get(header)); v != "" {
+			headerValue = v
+			break
+		}
+	}
+
+	// Content signals: Anthropic metadata.user_id, OpenAI prompt_cache_key.
+	bodyFingerprint := ""
+	if r.Body != nil && r.Method != http.MethodGet {
+		fingerprint, err := gatewayBodyFingerprint(r)
+		if err == nil {
+			bodyFingerprint = fingerprint
+		}
+	}
+
+	clientIP := clientIP(r)
+	keyID := ""
+	if identity := identityFromContext(r.Context()); identity.ID != "" {
+		keyID = identity.ID
+	}
+	return gateway.SessionHash(headerValue, clientIP, keyID, bodyFingerprint)
+}
+
+// gatewayBodyFingerprint extracts session-bearing fields from the request
+// body without permanently consuming it.
+func gatewayBodyFingerprint(r *http.Request) (string, error) {
+	if r.Body == nil || r.Body == http.NoBody {
+		return "", nil
+	}
+	// Read a bounded prefix and restore it; body consumers downstream
+	// (model rewrite, dispatch) re-read from the restored reader.
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		return "", err
+	}
+	r.Body.Close()
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	if r.GetBody != nil {
+		// Keep the replayable contract intact when one exists.
+		if replay, rbErr := r.GetBody(); rbErr == nil {
+			r.Body = replay
+		} else {
+			r.Body = io.NopCloser(bytes.NewReader(body))
+		}
+	}
+	if len(body) == 0 {
+		return "", nil
+	}
+	// metadata.user_id (Anthropic/Claude Code) and prompt_cache_key (OpenAI).
+	if v := gjson.GetBytes(body, "metadata.user_id").String(); v != "" {
+		return v, nil
+	}
+	if v := gjson.GetBytes(body, "prompt_cache_key").String(); v != "" {
+		return v, nil
+	}
+	// Fall back to the first message content.
+	if v := gjson.GetBytes(body, "messages.0.content").String(); v != "" {
+		return v, nil
+	}
+	return "", nil
 }
 
 // stripVersionPrefix rewrites versionless /v/... requests to their /... form
@@ -1229,6 +1395,9 @@ func (s *Server) routes() {
 	mux.Handle("POST /api/launch/preview", runtimeReadAPI.ThenFunc(s.handleAPILaunchPreview))
 	mux.Handle("GET /api/gpus", runtimeReadAPI.ThenFunc(s.handleAPIGPUs))
 	mux.Handle("GET /api/config", configAPI.ThenFunc(s.handleAPIConfig))
+	mux.Handle("GET /api/providers/status", configAPI.ThenFunc(s.handleAPIProvidersStatus))
+	mux.Handle("POST /api/providers/keys/{keyID}/clear-cooldown", configAPI.ThenFunc(s.handleAPIProvidersClearCooldown))
+	mux.Handle("POST /api/providers/probe", configAPI.ThenFunc(s.handleAPIProvidersProbe))
 	mux.Handle("GET /api/extensions", configAPI.ThenFunc(s.handleAPIExtensions))
 	mux.Handle("POST /api/extensions", configAPI.ThenFunc(s.handleAPIExtensions))
 	mux.Handle("GET /api/extensions/{id}", configAPI.ThenFunc(s.handleAPIExtension))
@@ -1696,6 +1865,9 @@ func (s *Server) Shutdown(timeout time.Duration) error {
 		if lmErr := s.lmcacheMod.stopServer(); lmErr != nil && s.proxylog != nil {
 			s.proxylog.Warnf("lmcache server shutdown: %v", lmErr)
 		}
+	}
+	if gw := s.currentGateway(); gw != nil {
+		gw.Shutdown()
 	}
 
 	var wg sync.WaitGroup

@@ -422,6 +422,10 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		return Config{}, err
 	}
 
+	if err := ValidateProviderNamespace(config); err != nil {
+		return Config{}, err
+	}
+
 	if err := validateSelectors(config); err != nil {
 		return Config{}, err
 	}

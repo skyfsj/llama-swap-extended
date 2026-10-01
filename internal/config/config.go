@@ -228,6 +228,11 @@ type Config struct {
 	// support remote peers, see issue #433, #296
 	Peers PeerDictionaryConfig `yaml:"peers"`
 
+	// Providers are upstream LLM providers served through the gateway
+	// forwarding path. See internal/config/provider.go.
+	Providers ProviderDictionaryConfig `yaml:"providers"`
+	Gateway   GatewayConfig            `yaml:"gateway"`
+
 	// upstream controls behaviour of the /upstream passthrough endpoint
 	Upstream UpstreamConfig `yaml:"upstream"`
 
@@ -374,10 +379,14 @@ func (c *Config) FindConfig(modelName string) (ModelConfig, string, bool) {
 }
 
 // ResolveBaseModel resolves a name without applying profiles. Local model IDs
-// and aliases take precedence over peer model IDs, matching server dispatch.
+// and aliases take precedence over provider and peer model IDs, matching
+// server dispatch.
 func (c *Config) ResolveBaseModel(search string) (string, bool) {
 	if realName, found := c.RealModelName(search); found {
 		return realName, true
+	}
+	if _, _, pool, found := c.ResolveProviderModel(search); found && len(pool) == 0 {
+		return search, true
 	}
 	if _, _, found := c.ResolvePeerModel(search); found {
 		return search, true

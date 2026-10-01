@@ -19,7 +19,8 @@
       "observe": "觀測",
       "access": "存取"
     },
-    "usageRecords": "使用記錄"
+    "usageRecords": "使用記錄",
+    "providers": "供應商"
   },
   "profile": {
     "label": "設定檔",
@@ -2916,5 +2917,68 @@
   },
   "toast": {
     "region": "通知"
+  },
+  "providers": {
+    "title": "上游供應商",
+    "subtitle": "將請求轉發到外部 LLM 供應商，支援多金鑰調度與每供應商獨立代理。",
+    "empty": "尚未設定供應商。新增一個以開始轉發。",
+    "actions": {
+      "add": "新增供應商",
+      "addKey": "新增金鑰",
+      "addModel": "新增模型",
+      "pull": "從上游拉取",
+      "test": "測試"
+    },
+    "fields": {
+      "name": "名稱",
+      "type": "類型",
+      "endpoint": "服務位址",
+      "proxy": "代理",
+      "priority": "優先級",
+      "weight": "權重",
+      "sticky": "會話黏滯",
+      "disabled": "停用",
+      "bareNamePolicy": "裸名仲裁",
+      "localFirst": "本地模型優先",
+      "providerFirst": "供應商優先",
+      "maxRetries": "最大重試",
+      "apiKeys": "API 金鑰",
+      "keyValueOrEnv": "金鑰值或 env:變數名",
+      "maxConcurrent": "並發上限",
+      "models": "模型",
+      "modelLocal": "本地模型 ID",
+      "modelRemote": "上游模型名"
+    },
+    "status": {
+      "disabled": "已停用",
+      "coolingShort": "冷卻中",
+      "models": "模型"
+    },
+    "editor": {
+      "createTitle": "新增供應商",
+      "editTitle": "編輯供應商 · {id}",
+      "noModels": "尚無模型。從上游拉取或手動新增。"
+    },
+    "errors": {
+      "nameRequired": "必須填寫供應商名稱。",
+      "endpointRequired": "必須填寫服務位址。",
+      "keysRequired": "至少需要一個 API 金鑰。",
+      "modelsRequired": "至少需要一個模型。"
+    },
+    "toast": {
+      "saved": "供應商 {id} 已儲存。",
+      "deleted": "供應商 {id} 已移除。",
+      "noModels": "上游未回傳任何模型。",
+      "pulled": "已從上游拉取 {count} 個模型。",
+      "testOk": "連通正常（可見 {count} 個模型）。"
+    },
+    "delete": {
+      "title": "移除供應商",
+      "message": "從設定中移除供應商 {id}？閘道將停止轉發其模型。"
+    },
+    "deleteKey": {
+      "title": "移除 API 金鑰",
+      "message": "從該供應商移除此 API 金鑰？"
+    }
   }
 }
