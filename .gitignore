@@ -2,6 +2,10 @@
 .env
 build/
 dist/
+# the bundled extension SDK is go:embed'd and committed (see
+# internal/extensions/sdk/build.go) — do not let dist/ ignore it
+!internal/extensions/sdk/dist/
+!internal/extensions/sdk/dist/extension.js
 .vscode
 .DS_Store
 .dev/
