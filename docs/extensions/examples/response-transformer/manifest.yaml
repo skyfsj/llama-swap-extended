@@ -1,0 +1,6 @@
+id: response-transformer
+name: Response Transformer
+enabled: false
+priority: 30
+match:
+  endpoints: [chat.completions]

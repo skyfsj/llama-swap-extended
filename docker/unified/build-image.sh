@@ -5,6 +5,7 @@
 # Usage:
 #   ./build-image.sh --cuda                              # Build CUDA image
 #   ./build-image.sh --vulkan                            # Build Vulkan image
+#   ./build-image.sh --rocm                              # Build ROCm/HIP image
 #   ./build-image.sh --cuda --no-cache                   # Build without cache
 #   LLAMA_REF=b1234 ./build-image.sh --vulkan            # Pin llama.cpp to a commit hash
 #   LLAMA_REF=v1.2.3 ./build-image.sh --cuda             # Pin llama.cpp to a tag
@@ -29,20 +30,26 @@ for arg in "$@"; do
         --vulkan)
             BACKEND="vulkan"
             ;;
+        --rocm|--hip)
+            BACKEND="rocm"
+            ;;
         --no-cache)
             NO_CACHE=true
             ;;
         --help|-h)
-            echo "Usage: ./build-image.sh --cuda|--vulkan [--no-cache]"
+            echo "Usage: ./build-image.sh --cuda|--vulkan|--rocm [--no-cache]"
             echo ""
             echo "Options:"
             echo "  --cuda      Build CUDA image (NVIDIA GPUs)"
             echo "  --vulkan    Build Vulkan image (AMD GPUs and compatible hardware)"
+            echo "  --rocm      Build ROCm/HIP image (AMD GPUs)"
             echo "  --no-cache  Force rebuild without using Docker cache"
             echo "  --help, -h  Show this help message"
             echo ""
             echo "Environment variables:"
-            echo "  DOCKER_IMAGE_TAG     Set custom image tag (default: llama-swap:unified-cuda or llama-swap:unified-vulkan)"
+            echo "  DOCKER_IMAGE_TAG     Set custom image tag (default: llama-swap:unified-<backend>)"
+            echo "  ROCM_IMAGE           ROCm builder/runtime image (default: rocm/dev-ubuntu-24.04:7.2.4)"
+            echo "  GPU_TARGETS          Optional semicolon-separated AMD GPU targets (e.g. gfx1100;gfx1103)"
             echo "  LLAMA_REF            Pin llama.cpp to a commit, tag, or branch"
             echo "  WHISPER_REF          Pin whisper.cpp to a commit, tag, or branch"
             echo "  SD_REF               Pin stable-diffusion.cpp to a commit, tag, or branch"
@@ -56,9 +63,9 @@ for arg in "$@"; do
 done
 
 if [[ -z "$BACKEND" ]]; then
-    echo "Error: No backend specified. Please use --cuda or --vulkan."
+    echo "Error: No backend specified. Please use --cuda, --vulkan, or --rocm."
     echo ""
-    echo "Usage: ./build-image.sh --cuda|--vulkan [--no-cache]"
+    echo "Usage: ./build-image.sh --cuda|--vulkan|--rocm [--no-cache]"
     exit 1
 fi
 
@@ -188,7 +195,7 @@ if [[ "$BACKEND" == "cuda" ]]; then
     fi
 else
     IK_LLAMA_HASH="n/a"
-    echo "ik_llama.cpp: skipped (vulkan build)"
+    echo "ik_llama.cpp: skipped (${BACKEND} build)"
 fi
 
 # Resolve llama-swap ref
@@ -224,6 +231,12 @@ BUILD_ARGS=(
     -t "${DOCKER_IMAGE_TAG}"
     -f "${SCRIPT_DIR}/Dockerfile"
 )
+if [[ -n "${ROCM_IMAGE:-}" ]]; then
+    BUILD_ARGS+=(--build-arg "ROCM_IMAGE=${ROCM_IMAGE}")
+fi
+if [[ -n "${GPU_TARGETS:-}" ]]; then
+    BUILD_ARGS+=(--build-arg "GPU_TARGETS=${GPU_TARGETS}")
+fi
 
 if [[ "$NO_CACHE" == true ]]; then
     BUILD_ARGS+=(--no-cache)
@@ -265,6 +278,12 @@ if [[ ${#MISSING_BINARIES[@]} -gt 0 ]]; then
     echo ""
     echo "Try running with --no-cache flag:"
     echo "  ./build-image.sh --${BACKEND} --no-cache"
+    exit 1
+fi
+
+if ! docker run --rm --entrypoint test "${DOCKER_IMAGE_TAG}" \
+        -x /opt/llama-swap/runtimes/llamacpp/bin/llama-server; then
+    echo "ERROR: bundled llama.cpp managed-runtime asset is missing or not executable."
     exit 1
 fi
 
@@ -316,7 +335,7 @@ USER root
 RUN groupadd --system --gid 10001 llama-swap && \\
     useradd --system --uid 10001 --gid 10001 \\
       --home /app --shell /sbin/nologin llama-swap && \\
-    chown -R 10001:10001 /etc/llama-swap /models
+    chown -R 10001:10001 /etc/llama-swap /var/lib/llama-swap /models
 USER 10001
 EOF
 
@@ -347,6 +366,9 @@ if [[ "$BACKEND" == "vulkan" ]]; then
     echo ""
     echo "Note: For AMD GPUs, you may also need:"
     echo "  docker run -it --rm --device /dev/dri:/dev/dri --group-add video ${DOCKER_IMAGE_TAG}"
+elif [[ "$BACKEND" == "rocm" ]]; then
+    echo "Run with:"
+    echo "  docker run -it --rm --device /dev/kfd:/dev/kfd --device /dev/dri:/dev/dri --group-add video ${DOCKER_IMAGE_TAG}"
 else
     echo "Run with:"
     echo "  docker run -it --rm --gpus all ${DOCKER_IMAGE_TAG}"

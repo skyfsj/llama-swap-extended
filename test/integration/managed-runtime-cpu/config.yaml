@@ -1,0 +1,83 @@
+# Linux CPU integration fixture. The verification script mounts the checkout
+# at /workspace and a disposable writable runtime root at /work/data.
+healthCheckTimeout: 20
+logToStdout: both
+
+store:
+  path: /work/data/llama-swap.db
+
+# This is an isolated integration-test credential only. Legacy scalar keys
+# retain the documented full control-plane compatibility behavior.
+apiKeys:
+  - managed-runtime-test-key
+
+runtimeManager:
+  root: /work/data/runtimes
+  operationTimeout: 15m
+  sourceAllowlist:
+    - /work/llama.cpp
+    - /work/llama.cpp.git
+    - /work/vllm-dist
+    - /work/fake-vllm.git
+    - /workspace/test/integration/managed-runtime-cpu/fake-vllm
+
+runtimes:
+  simulator:
+    kind: llamacpp
+    source:
+      type: bundled
+      path: /work/simulator
+    update:
+      policy: manual
+      version: simulator-v1
+  llama-cpu:
+    kind: llamacpp
+    source:
+      type: local
+      path: /work/llama.cpp
+    update:
+      policy: manual
+      version: cpu-it-v1
+  vllm-cpu:
+    kind: vllm
+    source:
+      type: local
+      path: /workspace/test/integration/managed-runtime-cpu/fake-vllm
+    update:
+      policy: manual
+      version: 0.0.1
+  vllm-wheel:
+    kind: vllm
+    source:
+      type: local
+      path: /workspace/test/integration/managed-runtime-cpu/fake-vllm
+    update:
+      policy: manual
+      version: 0.0.1
+  vllm-git:
+    kind: vllm
+    source:
+      type: local
+      path: /workspace/test/integration/managed-runtime-cpu/fake-vllm
+    update:
+      policy: manual
+      version: 0.0.1
+  vllm-pypi:
+    kind: vllm
+    source:
+      type: local
+      path: /workspace/test/integration/managed-runtime-cpu/fake-vllm
+    update:
+      policy: manual
+      version: 0.0.1
+
+models:
+  simulated:
+    proxy: http://127.0.0.1:19090
+    checkEndpoint: /health
+    backend:
+      type: llamacpp
+      runtime: simulator
+      protocol: responsesToChat
+      apis: [chat, responses]
+      args: [llama-server, --port, "19090"]

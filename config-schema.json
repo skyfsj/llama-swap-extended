@@ -361,7 +361,8 @@
                         "enum": [
                             "warm",
                             "pin",
-                            "spillover"
+                            "spillover",
+                            "failover"
                         ],
                         "description": "How a target is selected for each request."
                     },
@@ -419,9 +420,6 @@
             "description": "A dictionary of model configurations. Each key is a model's ID. Model settings have defaults if not defined. The model's ID is available as ${MODEL_ID}.",
             "additionalProperties": {
                 "type": "object",
-                "required": [
-                    "cmd"
-                ],
                 "properties": {
                     "macros": {
                         "$ref": "#/definitions/macros"
@@ -611,12 +609,352 @@
                                 "minimum": 0,
                                 "default": 0,
                                 "description": "Maximum token context length supported by the model."
+                            },
+                            "translation": {
+                                "type": "boolean",
+                                "default": false,
+                                "description": "Marks the model as a translation model (for example Hy-MT2). Clients use it to group the model under translation tooling."
                             }
                         },
                         "additionalProperties": false,
                         "description": "Defines what the model accepts for input, output and other metadata. Used in v1/models to inform clients what the model can do. An empty capabilities block (all zero values) is treated as not configured."
+                    },
+                    "backend": {
+                        "type": "object",
+                        "description": "Structured backend definition. Remove cmd when using this shape; the legacy cmd path remains fully compatible and takes precedence when both are present.",
+                        "additionalProperties": false,
+                        "properties": {
+                            "type": {
+                                "type": "string",
+                                "enum": [
+                                    "llamacpp",
+                                    "vllm",
+                                    "generic"
+                                ],
+                                "description": "Backend flavour. Omitted means generic."
+                            },
+                            "runtime": {
+                                "type": "string",
+                                "description": "Name of a managed runtime that provides this backend, instead of a system binary."
+                            },
+                            "runtimeVersion": {
+                                "type": "string",
+                                "description": "Pin the model to one installed version of backend.runtime. Requires runtime."
+                            },
+                            "protocol": {
+                                "type": "string",
+                                "enum": [
+                                    "native",
+                                    "responsesToChat"
+                                ],
+                                "description": "Upstream protocol adaptation applied by llama-swap."
+                            },
+                            "apis": {
+                                "type": "array",
+                                "uniqueItems": true,
+                                "items": {
+                                    "type": "string",
+                                    "enum": [
+                                        "chat",
+                                        "completions",
+                                        "embeddings",
+                                        "responses",
+                                        "transcriptions",
+                                        "translations",
+                                        "speech",
+                                        "images",
+                                        "realtime",
+                                        "anthropic",
+                                        "embed",
+                                        "rerank",
+                                        "classify",
+                                        "score",
+                                        "pooling",
+                                        "generative_scoring",
+                                        "all",
+                                        "*"
+                                    ]
+                                },
+                                "description": "API families this backend serves. Limits which proxy routes are bound to it."
+                            },
+                            "discover": {
+                                "type": "boolean",
+                                "description": "Discover the process port from the runtime instead of expecting llama-swap to set one."
+                            },
+                            "args": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                },
+                                "description": "Structured argv. Used when cmd is absent; ${PORT} and macros are expanded."
+                            },
+                            "lifecycle": {
+                                "type": "object",
+                                "properties": {
+                                    "mode": {
+                                        "type": "string",
+                                        "enum": [
+                                            "process",
+                                            "sleep"
+                                        ],
+                                        "description": "process keeps a resident process; sleep lets llama-swap park it."
+                                    },
+                                    "sleepLevel": {
+                                        "type": "integer",
+                                        "minimum": 0,
+                                        "maximum": 2,
+                                        "description": "How deeply to park a sleeping backend."
+                                    }
+                                }
+                            },
+                            "resources": {
+                                "type": "object",
+                                "properties": {
+                                    "vramMiB": {
+                                        "type": "integer",
+                                        "minimum": 0
+                                    },
+                                    "ramMiB": {
+                                        "type": "integer",
+                                        "minimum": 0
+                                    },
+                                    "gpuAffinity": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "string"
+                                        },
+                                        "description": "GPU card ids this model may occupy."
+                                    },
+                                    "priority": {
+                                        "type": "integer",
+                                        "minimum": 0,
+                                        "description": "Scheduling priority for this model's runtime. Higher wins when the budget is contended."
+                                    },
+                                    "evictionPriority": {
+                                        "type": "integer",
+                                        "description": "Order in which runtimes are evicted when the budget is exceeded. Lower is evicted first."
+                                    }
+                                }
+                            },
+                            "container": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "description": "Run the backend inside a container managed by llama-swap.",
+                                "properties": {
+                                    "engine": {
+                                        "type": "string",
+                                        "enum": [
+                                            "docker",
+                                            "podman"
+                                        ]
+                                    },
+                                    "name": {
+                                        "type": "string"
+                                    },
+                                    "image": {
+                                        "type": "string"
+                                    },
+                                    "platform": {
+                                        "type": "string"
+                                    },
+                                    "pullPolicy": {
+                                        "type": "string",
+                                        "enum": [
+                                            "always",
+                                            "if-missing",
+                                            "never"
+                                        ]
+                                    },
+                                    "entrypoint": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "string"
+                                        }
+                                    },
+                                    "command": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "string"
+                                        }
+                                    },
+                                    "env": {
+                                        "type": "object",
+                                        "additionalProperties": {
+                                            "type": "string"
+                                        }
+                                    },
+                                    "mounts": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "object",
+                                            "additionalProperties": false,
+                                            "properties": {
+                                                "source": {
+                                                    "type": "string"
+                                                },
+                                                "target": {
+                                                    "type": "string"
+                                                },
+                                                "readOnly": {
+                                                    "type": "boolean",
+                                                    "description": "Bind the mount read-only."
+                                                }
+                                            }
+                                        },
+                                        "description": "Host paths exposed inside the container."
+                                    },
+                                    "ports": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "object",
+                                            "additionalProperties": false,
+                                            "properties": {
+                                                "host": {
+                                                    "type": "integer",
+                                                    "minimum": 1,
+                                                    "maximum": 65535
+                                                },
+                                                "container": {
+                                                    "type": "integer",
+                                                    "minimum": 1,
+                                                    "maximum": 65535
+                                                }
+                                            }
+                                        },
+                                        "description": "Host to container port mappings."
+                                    },
+                                    "gpus": {
+                                        "type": "string"
+                                    },
+                                    "shmSize": {
+                                        "type": "string"
+                                    },
+                                    "stopTimeout": {
+                                        "type": [
+                                            "integer",
+                                            "string"
+                                        ],
+                                        "description": "Grace period before SIGKILL, in seconds or as a duration such as 10s."
+                                    }
+                                }
+                            },
+                            "launch": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "description": "Structured launch settings. When model is set the launch block owns the model target instead of backend.args.",
+                                "properties": {
+                                    "model": {
+                                        "type": "string",
+                                        "description": "Model path or name to serve."
+                                    },
+                                    "servedModelName": {
+                                        "type": "string",
+                                        "description": "Name the upstream engine serves this model as."
+                                    },
+                                    "contextPerRequest": {
+                                        "type": "integer",
+                                        "minimum": 0,
+                                        "description": "Per-request context limit, overriding the engine default."
+                                    },
+                                    "maxConcurrency": {
+                                        "type": "integer",
+                                        "minimum": 0,
+                                        "description": "Maximum concurrent requests inside the engine."
+                                    },
+                                    "gpus": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "string"
+                                        },
+                                        "description": "GPU cards the engine may use."
+                                    },
+                                    "gpuMemoryUtilization": {
+                                        "type": "number",
+                                        "exclusiveMinimum": 0,
+                                        "maximum": 1
+                                    },
+                                    "tensorParallelSize": {
+                                        "type": "integer",
+                                        "minimum": 1,
+                                        "description": "Number of GPUs a single engine is sharded across."
+                                    }
+                                }
+                            },
+                            "pricing": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "description": "Attach this model to a pricing catalog entry so the usage records page can estimate its cost.",
+                                "properties": {
+                                    "provider": {
+                                        "type": "string"
+                                    },
+                                    "model": {
+                                        "type": "string",
+                                        "description": "Model name in the pricing catalog."
+                                    }
+                                }
+                            },
+                            "lmcache": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "description": "Attach a vLLM backend to LMCache. Only supported for vllm backends with a managed runtime.",
+                                "properties": {
+                                    "enabled": {
+                                        "type": "boolean"
+                                    },
+                                    "mode": {
+                                        "type": "string",
+                                        "enum": [
+                                            "mp",
+                                            "inProcess"
+                                        ],
+                                        "description": "mp runs a standalone LMCache server; inProcess keeps the built-in connector."
+                                    },
+                                    "role": {
+                                        "type": "string",
+                                        "enum": [
+                                            "kv_both",
+                                            "kv_producer",
+                                            "kv_consumer"
+                                        ]
+                                    },
+                                    "host": {
+                                        "type": "string",
+                                        "description": "ZMQ server host for the mp mode."
+                                    },
+                                    "port": {
+                                        "type": "integer",
+                                        "minimum": 1,
+                                        "maximum": 65535,
+                                        "description": "ZMQ server port for the mp mode."
+                                    },
+                                    "chunkSize": {
+                                        "type": "integer",
+                                        "minimum": 0,
+                                        "description": "KV chunk size for the inProcess mode. 0 keeps the library default."
+                                    }
+                                }
+                            }
+                        },
+                        "dependentRequired": {
+                            "runtimeVersion": [
+                                "runtime"
+                            ]
+                        }
                     }
-                }
+                },
+                "anyOf": [
+                    {
+                        "required": [
+                            "cmd"
+                        ]
+                    },
+                    {
+                        "required": [
+                            "backend"
+                        ]
+                    }
+                ]
             }
         },
         "groups": {
@@ -842,6 +1180,436 @@
                 }
             },
             "additionalProperties": false
+        },
+        "extensions": {
+            "type": "object",
+            "description": "Programmable request, response and tool extensions. Disabled by default.",
+            "properties": {
+                "enabled": {
+                    "type": "boolean",
+                    "default": false
+                },
+                "directory": {
+                    "type": "string"
+                },
+                "maxToolRounds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 16,
+                    "default": 4
+                }
+            },
+            "additionalProperties": false
+        },
+        "resourceBudget": {
+            "type": "object",
+            "description": "Budget of host resources llama-swap may give to managed runtimes and containers.",
+            "properties": {
+                "vramMiB": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "default": 0,
+                    "description": "Total VRAM managed runtimes may occupy, in MiB. 0 means no limit."
+                },
+                "ramMiB": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "default": 0,
+                    "description": "Total system memory managed runtimes may occupy, in MiB. 0 means no limit."
+                },
+                "autoEvict": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Stop the least recently used runtime when the budget is exceeded instead of failing the start."
+                },
+                "queueLoads": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Queue model loads when the runtime is busy instead of rejecting the load."
+                }
+            }
+        },
+        "rollbackOnModelStartFailure": {
+            "type": "boolean",
+            "default": true,
+            "description": "What happens when a model fails to start with a newly applied configuration. true (the default) restores the last configuration that started so the model keeps serving. false keeps the new configuration and takes the model out of service: it refuses to be started by incoming requests until a later start succeeds and serves a request."
+        },
+        "runtimes": {
+            "type": "object",
+            "description": "Managed runtime definitions. One key per runtime; a model's backend.runtime points at one of them.",
+            "additionalProperties": {
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "description": "What this runtime provides. Omitted means llamacpp.",
+                        "enum": [
+                            "llamacpp",
+                            "vllm"
+                        ]
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": [
+                            "native",
+                            "container"
+                        ],
+                        "description": "native installs into a versioned directory; container runs it in a container."
+                    },
+                    "source": {
+                        "type": "object",
+                        "description": "Where the runtime comes from. Exactly one source type is meaningful per definition.",
+                        "properties": {
+                            "type": {
+                                "type": "string",
+                                "enum": [
+                                    "bundled",
+                                    "release",
+                                    "channel",
+                                    "pypi",
+                                    "wheel",
+                                    "git",
+                                    "tag",
+                                    "commit",
+                                    "local",
+                                    "image"
+                                ]
+                            },
+                            "repository": {
+                                "type": "string",
+                                "description": "Source repository, as owner/name for a GitHub source."
+                            },
+                            "asset": {
+                                "type": "string",
+                                "description": "GitHub Release asset name template for a native release channel. {tag} and {version} expand."
+                            },
+                            "trackRef": {
+                                "type": "string",
+                                "description": "Ref whose tag list is followed when tracking releases."
+                            },
+                            "ref": {
+                                "type": "string",
+                                "description": "Branch, tag or commit ref for a git source."
+                            },
+                            "url": {
+                                "type": "string",
+                                "format": "uri",
+                                "description": "Direct download URL for a wheel or archive."
+                            },
+                            "path": {
+                                "type": "string",
+                                "description": "Absolute path to a local source tree or install root."
+                            },
+                            "image": {
+                                "type": "string",
+                                "description": "Container image reference for a container-mode runtime."
+                            },
+                            "platform": {
+                                "type": "string",
+                                "description": "Container platform override, for example linux/arm64."
+                            },
+                            "pullPolicy": {
+                                "type": "string",
+                                "enum": [
+                                    "always",
+                                    "if-missing",
+                                    "never"
+                                ]
+                            },
+                            "checksum": {
+                                "type": "string",
+                                "description": "Expected SHA-256 of the downloaded artifact. Verified before installation."
+                            }
+                        }
+                    },
+                    "build": {
+                        "type": "object",
+                        "description": "How to build the runtime when the source is not a prebuilt artifact.",
+                        "properties": {
+                            "driver": {
+                                "type": "string",
+                                "enum": [
+                                    "cmake",
+                                    "make",
+                                    "uv",
+                                    "custom"
+                                ]
+                            },
+                            "workDir": {
+                                "type": "string"
+                            },
+                            "backend": {
+                                "type": "string",
+                                "description": "Backend flavour passed to the build."
+                            },
+                            "compiler": {
+                                "type": "string",
+                                "description": "C/C++ compiler for cmake and make drivers."
+                            },
+                            "cudaArchitectures": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                },
+                                "description": "CUDA architectures to build for, for example 70;7.5."
+                            },
+                            "cmake": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                },
+                                "description": "Extra cmake arguments."
+                            },
+                            "python": {
+                                "type": "string",
+                                "description": "Interpreter selector for the uv driver."
+                            },
+                            "extras": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                },
+                                "description": "Package extras to install."
+                            },
+                            "indexURL": {
+                                "type": "string",
+                                "format": "uri",
+                                "description": "Package index for the uv driver."
+                            },
+                            "env": {
+                                "type": "object",
+                                "additionalProperties": {
+                                    "type": "string"
+                                }
+                            },
+                            "args": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                }
+                            },
+                            "installArgs": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                }
+                            },
+                            "steps": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "workDir": {
+                                            "type": "string"
+                                        },
+                                        "command": {
+                                            "type": "string"
+                                        },
+                                        "args": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "string"
+                                            }
+                                        },
+                                        "env": {
+                                            "type": "object",
+                                            "additionalProperties": {
+                                                "type": "string"
+                                            }
+                                        }
+                                    }
+                                },
+                                "description": "Explicit build steps for the custom driver. No shell is involved."
+                            },
+                            "artifacts": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "from": {
+                                            "type": "string",
+                                            "description": "Path inside the staged build directory."
+                                        },
+                                        "to": {
+                                            "type": "string",
+                                            "description": "Destination inside the immutable version."
+                                        }
+                                    }
+                                },
+                                "description": "Build outputs copied into the installed version."
+                            }
+                        }
+                    },
+                    "container": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "description": "Container settings for a container-mode runtime.",
+                        "properties": {
+                            "engine": {
+                                "type": "string",
+                                "enum": [
+                                    "docker",
+                                    "podman"
+                                ]
+                            },
+                            "name": {
+                                "type": "string"
+                            },
+                            "image": {
+                                "type": "string"
+                            },
+                            "platform": {
+                                "type": "string"
+                            },
+                            "pullPolicy": {
+                                "type": "string",
+                                "enum": [
+                                    "always",
+                                    "if-missing",
+                                    "never"
+                                ]
+                            },
+                            "entrypoint": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                }
+                            },
+                            "command": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                }
+                            },
+                            "env": {
+                                "type": "object",
+                                "additionalProperties": {
+                                    "type": "string"
+                                }
+                            },
+                            "mounts": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "properties": {
+                                        "source": {
+                                            "type": "string"
+                                        },
+                                        "target": {
+                                            "type": "string"
+                                        },
+                                        "readOnly": {
+                                            "type": "boolean"
+                                        }
+                                    }
+                                }
+                            },
+                            "ports": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "properties": {
+                                        "host": {
+                                            "type": "integer",
+                                            "minimum": 1,
+                                            "maximum": 65535
+                                        },
+                                        "container": {
+                                            "type": "integer",
+                                            "minimum": 1,
+                                            "maximum": 65535
+                                        }
+                                    }
+                                }
+                            },
+                            "gpus": {
+                                "type": "string"
+                            },
+                            "shmSize": {
+                                "type": "string"
+                            },
+                            "stopTimeout": {
+                                "type": [
+                                    "integer",
+                                    "string"
+                                ],
+                                "description": "Grace period before SIGKILL, in seconds or as a duration such as 10s."
+                            }
+                        }
+                    },
+                    "update": {
+                        "type": "object",
+                        "description": "Update policy for a tracked runtime.",
+                        "properties": {
+                            "policy": {
+                                "type": "string",
+                                "enum": [
+                                    "disabled",
+                                    "manual",
+                                    "automatic",
+                                    "pinned"
+                                ]
+                            },
+                            "channel": {
+                                "type": "string",
+                                "enum": [
+                                    "stable",
+                                    "prerelease"
+                                ]
+                            },
+                            "version": {
+                                "type": "string",
+                                "description": "Exact version to pin. Requires policy: pinned."
+                            },
+                            "commit": {
+                                "type": "string"
+                            },
+                            "checkEvery": {
+                                "type": [
+                                    "integer",
+                                    "string"
+                                ],
+                                "description": "How often to look for a new version, as seconds or a duration such as 6h."
+                            },
+                            "minIdle": {
+                                "type": [
+                                    "integer",
+                                    "string"
+                                ],
+                                "description": "How long the runtime must be idle before an update is applied."
+                            },
+                            "activateOnlyWhenIdle": {
+                                "type": "boolean"
+                            },
+                            "keepVersions": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "description": "How many versions to retain."
+                            }
+                        }
+                    },
+                    "verify": {
+                        "type": "object",
+                        "description": "Checks run against a freshly installed runtime before it is activated.",
+                        "properties": {
+                            "sha256": {
+                                "type": "string",
+                                "description": "Expected digest of the installed runtime."
+                            },
+                            "healthPath": {
+                                "type": "string",
+                                "description": "Path probed during a readiness check."
+                            },
+                            "smokeCommand": {
+                                "type": "string",
+                                "description": "Command that must exit 0 to accept the version."
+                            }
+                        }
+                    }
+                }
+            }
         }
     },
     "allOf": [

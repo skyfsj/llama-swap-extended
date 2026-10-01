@@ -12,6 +12,31 @@ These scripts create a custom llama-swap container that contains:
 binary in the image. It expects a vLLM server started with `--enable-sleep-mode`
 that is reachable from the container; vLLM itself is not included in the image.
 
+Runtime Manager is always active. The shipped config registers `llamacpp` from
+the image-owned `/opt/llama-swap/runtimes/llamacpp` asset. The first start seeds it
+into the `/var/lib/llama-swap` volume; later image upgrades leave the active
+runtime untouched.
+
+### Persistent runtime and control-plane state
+
+The image declares `/var/lib/llama-swap` as a volume. Its shipped config stores
+managed runtime versions under `/var/lib/llama-swap/runtimes`; runtime
+journals, API-key hashes, audit records and response affinity are kept there and
+are not replaced by an image upgrade. Mount a named or host volume in production:
+
+```bash
+docker volume create llama-swap-state
+docker run --rm --runtime nvidia -p 9292:8080 \
+  -v llama-swap-state:/var/lib/llama-swap \
+  -v /path/to/models:/models \
+  -v /path/to/config.yaml:/etc/llama-swap/config/config.yaml \
+  llama-swap:unified-cuda
+```
+
+For a rootless image, build with `RUN_UID=10001` (or use the build script's
+rootless tag) and ensure the mounted volume is writable by UID/GID 10001. The
+container does not require `docker.sock`, privileged mode or host PID access.
+
 ## audio.cpp
 
 `audiocpp_server` needs its own JSON config listing the models it serves. The
@@ -27,9 +52,9 @@ Replace the example entries with your models, then point the `audio` entry in
 matching an audio.cpp model spec, and a `path` to the package inside the
 container.
 
-The `backend` field must match the image: `cuda` or `vulkan`. `audiocpp_server`
-defaults to `cuda` regardless of how it was compiled, so a vulkan image with an
-unset backend fails to load models.
+The `backend` field must match the image: `cuda`, `vulkan`, or `rocm` (HIP).
+`audiocpp_server` defaults to `cuda` regardless of how it was compiled, so a
+non-CUDA image with an unset backend fails to load models.
 
 audio.cpp is compiled as a **deployment build**
 (`AUDIOCPP_DEPLOYMENT_BUILD=ON`), which compiles the `model_specs/*.json`
@@ -62,3 +87,15 @@ The Vulkan image builds audio.cpp with `ENGINE_ENABLE_VULKAN=ON`. audio.cpp is
 tuned for CUDA, and the server prints a notice on startup that a non-CUDA
 backend may have lower performance and model coverage.
 
+The ROCm image uses the AMD-published `rocm/dev-ubuntu-24.04` development
+image and builds llama.cpp/whisper.cpp with `GGML_HIP=ON`, stable-diffusion.cpp
+with `SD_HIPBLAS=ON`, and audio.cpp with `ENGINE_ENABLE_HIP=ON`. Set
+`GPU_TARGETS` when the image must contain code for a specific AMD architecture;
+otherwise the ROCm toolchain's default target is used:
+
+```bash
+GPU_TARGETS='gfx1100;gfx1103' ./build-image.sh --rocm
+docker run -it --rm \
+  --device /dev/kfd:/dev/kfd --device /dev/dri:/dev/dri --group-add video \
+  llama-swap:unified-rocm
+```

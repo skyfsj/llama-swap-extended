@@ -1,9 +1,18 @@
 #!/bin/bash
 # Install audio.cpp - clone, build, and install binaries
-# Usage: BACKEND=cuda|vulkan ./install-audio.sh <commit_hash>
+# Usage: BACKEND=cuda|vulkan|rocm ./install-audio.sh <commit_hash>
 set -e
 
 COMMIT_HASH="${1:-main}"
+
+# Refuse a moving ref by default: building from master/main produces images
+# that cannot be reproduced later. Pass an explicit commit hash/tag (or use
+# build-image.sh, which resolves refs) or set ALLOW_MOVING_REF=1 to opt in.
+if [[ "main" == "${COMMIT_HASH}" && "${ALLOW_MOVING_REF:-0}" != "1" ]]; then
+    echo "ERROR: audio ref defaults to a moving branch ('main'). Pin an explicit commit or tag:" >&2
+    echo "       install-audio.sh <commit_hash>   (or ALLOW_MOVING_REF=1 to accept a non-reproducible build)" >&2
+    exit 1
+fi
 BACKEND="${BACKEND:-cuda}"
 CUDA_ROOT="${CUDA_ROOT:-/usr/local/cuda}"
 
@@ -69,6 +78,18 @@ elif [ "$BACKEND" = "vulkan" ]; then
         -DENGINE_ENABLE_CUDA=OFF
         -DENGINE_ENABLE_VULKAN=ON
     )
+elif [ "$BACKEND" = "rocm" ]; then
+    CMAKE_FLAGS+=(
+        -DENGINE_ENABLE_CUDA=OFF
+        -DENGINE_ENABLE_HIP=ON
+        -DENGINE_ENABLE_VULKAN=OFF
+    )
+    if [ -n "${GPU_TARGETS:-}" ]; then
+        CMAKE_FLAGS+=("-DGPU_TARGETS=${GPU_TARGETS}" "-DAMDGPU_TARGETS=${GPU_TARGETS}")
+    fi
+else
+    echo "FATAL: unsupported backend ${BACKEND}; use cuda, vulkan, or rocm" >&2
+    exit 1
 fi
 
 TARGETS=(audiocpp_cli audiocpp_server)
@@ -109,6 +130,18 @@ verify_linkage() {
                 echo "$needed" >&2
                 exit 1
             fi
+            ;;
+        rocm)
+            if ! grep -qE 'libamdhip64\.so|librocblas\.so|libhipblas\.so' <<<"$needed"; then
+                echo "FATAL: $bin is not linked against a ROCm/HIP runtime." >&2
+                echo "       NEEDED entries:" >&2
+                echo "$needed" >&2
+                exit 1
+            fi
+            ;;
+        *)
+            echo "FATAL: unsupported backend ${BACKEND}" >&2
+            exit 1
             ;;
     esac
 

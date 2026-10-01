@@ -2,22 +2,61 @@ healthCheckTimeout: 300
 logRequests: true
 metricsMaxInMemory: 1000
 
+# Incident snapshots for inference crashes and failed HTTP requests.
+# logStorage:
+#   path: /var/lib/llama-swap/logs
+#   maxFiles: 5
+
+runtimeManager:
+  root: /var/lib/llama-swap/runtimes
+
+runtimes:
+  llamacpp:
+    kind: llamacpp
+    mode: native
+    source:
+      type: bundled
+      path: /app
+    update:
+      policy: manual
+      version: bundled
+
+# LMCache is an optional KV-cache accelerator for vLLM. It is NOT installed
+# by default; enable it from the Runtime Manager page once an active vLLM
+# runtime exists, or configure it here (see the root config.example.yaml for
+# the full lmcache server options).
+# lmcache:
+#   enabled: false
+#   server:
+#     enabled: false
+
 models:
   "qwen2.5":
     proxy: "http://127.0.0.1:9999"
-    cmd: >
-      /app/llama-server
-      -hf bartowski/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M
-      --port 9999
+    backend:
+      type: llamacpp
+      runtime: llamacpp
+      args:
+        - llama-server
+        - -hf
+        - bartowski/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M
+        - --port
+        - "9999"
 
   "smollm2":
     proxy: "http://127.0.0.1:9999"
-    cmd: >
-      /app/llama-server
-      -hf bartowski/SmolLM2-135M-Instruct-GGUF:Q4_K_M
-      --port 9999
+    backend:
+      type: llamacpp
+      runtime: llamacpp
+      args:
+        - llama-server
+        - -hf
+        - bartowski/SmolLM2-135M-Instruct-GGUF:Q4_K_M
+        - --port
+        - "9999"
 
   z-image:
+    proxy: "http://127.0.0.1:9999"
     checkEndpoint: /
     cmd: |
       /app/sd-server

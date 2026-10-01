@@ -1,9 +1,18 @@
 #!/bin/bash
 # Install stable-diffusion.cpp - clone, build, and install binaries and library
-# Usage: BACKEND=cuda|vulkan ./install-sd.sh <commit_hash>
+# Usage: BACKEND=cuda|vulkan|rocm ./install-sd.sh <commit_hash>
 set -e
 
 COMMIT_HASH="${1:-master}"
+
+# Refuse a moving ref by default: building from master/main produces images
+# that cannot be reproduced later. Pass an explicit commit hash/tag (or use
+# build-image.sh, which resolves refs) or set ALLOW_MOVING_REF=1 to opt in.
+if [[ "master" == "${COMMIT_HASH}" && "${ALLOW_MOVING_REF:-0}" != "1" ]]; then
+    echo "ERROR: sd ref defaults to a moving branch ('master'). Pin an explicit commit or tag:" >&2
+    echo "       install-sd.sh <commit_hash>   (or ALLOW_MOVING_REF=1 to accept a non-reproducible build)" >&2
+    exit 1
+fi
 BACKEND="${BACKEND:-cuda}"
 
 mkdir -p /install/bin /install/lib
@@ -45,6 +54,19 @@ elif [ "$BACKEND" = "vulkan" ]; then
         -DGGML_VULKAN=ON
         -DSD_VULKAN=ON
     )
+elif [ "$BACKEND" = "rocm" ]; then
+    CMAKE_FLAGS+=(
+        -DGGML_CUDA=OFF
+        -DGGML_VULKAN=OFF
+        -DGGML_HIP=ON
+        -DSD_HIPBLAS=ON
+    )
+    if [ -n "${GPU_TARGETS:-}" ]; then
+        CMAKE_FLAGS+=("-DGPU_TARGETS=${GPU_TARGETS}" "-DAMDGPU_TARGETS=${GPU_TARGETS}")
+    fi
+else
+    echo "FATAL: unsupported backend ${BACKEND}; use cuda, vulkan, or rocm" >&2
+    exit 1
 fi
 
 TARGETS=(stable-diffusion sd-cli sd-server)

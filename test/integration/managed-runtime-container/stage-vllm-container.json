@@ -1,0 +1,11 @@
+{
+  "kind": "vllm",
+  "mode": "container",
+  "version": "container-it-v1",
+  "sourceType": "image",
+  "image": "docker.io/library/alpine:3.20",
+  "pullPolicy": "never",
+  "container": {
+    "engine": "docker"
+  }
+}

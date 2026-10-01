@@ -3,9 +3,17 @@
 ![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/mostlygeek/llama-swap/go-ci.yml)
 ![GitHub Repo stars](https://img.shields.io/github/stars/mostlygeek/llama-swap)
 
-# llama-swap
+# llama-swap-extended
 
 Run multiple generative AI models on your machine and hot-swap between them on demand. llama-swap works with any OpenAI and Anthropic API compatible server and is used by thousands of people to power their local AI workflows.
+
+> **About this fork:** `llama-swap-extended` is a feature-rich fork of
+> [mostlygeek/llama-swap](https://github.com/mostlygeek/llama-swap). On top of
+> upstream it adds an extension system (JavaScript hooks and tools with a
+> bundled SDK), a runtime center for building and managing inference backends,
+> multi-user access keys, usage analytics, per-request speed telemetry and an
+> overhauled management UI. Upstream's MIT license remains in effect — see
+> `LICENSE.md`.
 
 Built in Go for performance and simplicity, llama-swap has zero dependencies and is incredibly easy to set up. Get started in minutes - just one binary and one configuration file.
 
@@ -14,9 +22,13 @@ Built in Go for performance and simplicity, llama-swap has zero dependencies and
 - ✅ Easy to deploy and configure: one binary, one configuration file. no external dependencies
 - ✅ On-demand model switching for many local AI servers (llama.cpp + forks, vllm, stable-diffusion.cpp, audio.cpp, ComfyUI, etc.)
   - future proof, upgrade your inference servers at any time.
+- ✅ [Managed llama.cpp and vLLM runtimes](docs/configuration.md#managed-vllm-and-llamacpp-backends) from configurable Git/release/PyPI sources or Docker/Podman images, with immutable versions, automatic updates, pinning, rollback, and retention.
+- ✅ [Optional LMCache KV-cache accelerator for vLLM](docs/configuration.md#lmcache-optional-kv-cache-accelerator): a supervised standalone server in its own version-managed virtualenv (isolated from vLLM venvs), seven-state lifecycle with health checks, fail-closed model startup, L2/L3 (system-memory/disk) tiers, per-model dependency tracking that refuses cache-dropping operations while models run, and versioned stage/activate/rollback updates.
+- ✅ [Programmable Extensions](docs/extensions/README.md) for OpenAI-compatible request and response hooks, function tools, and controlled JavaScript execution.
 - ✅ OpenAI API supported endpoints:
   - `v1/completions`
   - `v1/chat/completions`
+  - `v1/chat/completions/batch` (vLLM batched Chat Completions; `model` may be omitted when one local model is configured)
   - `v1/responses`
   - `v1/embeddings`
   - `v1/models` - list available models
@@ -105,7 +117,7 @@ llama-swap can be installed in multiple ways
 
 Two types of container images are built nightly for llama-swap:
 
-1. A unified container with llama-server, ik-llama-server, stable-diffusion.cpp, whisper.cpp and llama-swap built from source. This is only available for cuda and vulkan but has more capabilities. This one is recommended for use.
+1. A unified container with llama-server, ik-llama-server, stable-diffusion.cpp, whisper.cpp and llama-swap built from source. CUDA, Vulkan, and ROCm/HIP variants are available and have more capabilities. This one is recommended for use.
 2. A legacy image that is based on llama.cpp's images and llama-swap copied into the container. Use this one if you prefer to stay close to llama.cpp's container images.
 
 #### Unified container (Recommended)
@@ -118,6 +130,16 @@ $ docker run -it --rm --runtime nvidia -p 9292:8080 \
  -v /path/to/models:/models \
  -v /path/to/custom/config.yaml:/etc/llama-swap/config/config.yaml \
  ghcr.io/mostlygeek/llama-swap:unified-cuda
+```
+
+For AMD ROCm/HIP hosts, build or pull the matching unified variant and expose
+the KFD/DRI devices:
+
+```shell
+$ docker pull ghcr.io/mostlygeek/llama-swap:unified-rocm
+$ docker run -it --rm --device /dev/kfd:/dev/kfd --device /dev/dri:/dev/dri \
+  --group-add video -p 9292:8080 -v /path/to/models:/models \
+  ghcr.io/mostlygeek/llama-swap:unified-rocm
 ```
 
 #### Legacy container
@@ -218,6 +240,7 @@ Almost all configuration settings are optional and can be added one step at a ti
 
 - Advanced features
   - `matrix` to run concurrent models with a custom swap logic DSL
+  - `gpus` to run concurrent models based on which GPU card each model occupies
   - `hooks` to run things on startup
   - `macros` reusable snippets
 - Model customization

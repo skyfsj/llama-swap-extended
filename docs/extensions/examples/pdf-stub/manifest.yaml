@@ -1,0 +1,4 @@
+id: pdf-stub
+name: PDF Tool Stub
+enabled: false
+priority: 40

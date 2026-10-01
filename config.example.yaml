@@ -44,6 +44,14 @@ logTimeFormat: ""
 #   - "none": no logs are ever written to stdout
 logToStdout: "proxy"
 
+# logStorage: durable snapshots for inference crashes and failed requests
+# - optional, default maxFiles: 5 per incident kind
+# - snapshots contain process-output tails or request metadata, never request bodies
+# - path is optional; when empty, use ./logs (or the directory beside store.path)
+# logStorage:
+#   path: ./logs
+#   maxFiles: 5
+
 # store: persistent storage for activity metrics state
 # - optional, default: in-memory sqlite database capped by metricsMaxInMemory
 # - path is a sqlite database file path
@@ -58,10 +66,49 @@ logToStdout: "proxy"
 # - when persistent sqlite storage is defined in store.path this has no effect
 metricsMaxInMemory: 1000
 
-# captureBuffer: how many MBs to allocate for storing request/response captures
-# - optional, default: 10
-# - set to 0 to disable
-captureBuffer: 15
+# modelFiles: model-file catalog exposed in the control UI
+# - optional, default: scans automatically discovered Hugging Face and ModelScope caches
+# - source type "directory" scans model-looking files recursively
+# - source type "file" exposes one model file
+# - source type "hf_cache" scans Hugging Face Hub snapshots; omit path to use
+#   HF_HUB_CACHE, HF_HOME, XDG_CACHE_HOME, or the platform cache directory
+# - source type "modelscope_cache" scans ModelScope snapshots; omit path to use
+#   MODELSCOPE_CACHE, XDG_CACHE_HOME, or the platform cache directory
+# - paths must be absolute; missing sources are shown as unavailable
+modelFiles:
+  maxFiles: 2000
+  maxDepth: 8
+  downloads:
+    enabled: true
+    workers: 1
+    fileWorkers: 4
+    # Large single files are split into resumable HTTP Range chunks.
+    chunkWorkers: 4
+    chunkSizeMiB: 16
+    chunkThresholdMiB: 64
+    maxRetries: 5
+    # After request retries are exhausted, retry transient task failures.
+    maxTaskRetries: 3
+    retryBackoff: 2s
+    hfBaseURL: https://huggingface.co
+    hfTokenEnv: HF_TOKEN
+    # Optional: configure this from the Model files page. The value is
+    # redacted by the control API; prefer an environment-backed secret in
+    # production.
+    # hfToken: hf_example_token
+    modelScopeBaseURL: https://modelscope.cn
+    modelScopeTokenEnv: MODELSCOPE_API_TOKEN
+    # Optional: configure this from the Model files page.
+    # modelScopeToken: ms_example_token
+  sources:
+    local-models:
+      type: directory
+      path: /path/to/models
+      recursive: true
+    huggingface:
+      type: hf_cache
+    modelscope:
+      type: modelscope_cache
 
 # ui.activity.session_id: ordered request headers used to identify sessions in
 # the Activity page's in-flight request table.
@@ -105,7 +152,8 @@ sendLoadingState: true
 includeAliasesInList: false
 
 # globalTTL: the default TTL in seconds before unloading a model
-# - optional, default: 0 (never automatically unload)
+# - optional, default: 0 — omitting it or setting 0 both mean "never
+#   automatically unload"
 # - must be >= 0
 globalTTL: 0
 
@@ -115,6 +163,15 @@ globalTTL: 0
 # - can be overridden per model with model.unloadTimeout
 # - large values extend how long an unload can take when a process does not exit cleanly
 unloadTimeout: 10
+
+# rollbackOnModelStartFailure: what happens when a model fails to start with a
+#   newly applied configuration
+# - optional, default: true
+# - true: restore the last configuration that started, so the model keeps serving
+# - false: keep the new configuration but take the model out of service. It
+#   refuses to be started by incoming requests and exits that state on its own
+#   once a later start succeeds and serves a request. See "Maintenance mode".
+rollbackOnModelStartFailure: true
 
 # macros: a dictionary of string substitutions
 # - optional, default: empty dictionary
@@ -160,6 +217,364 @@ apiKeys:
   # use environment variable macros to keep secrets out of the config
   - "${env.API_KEY_1}"
   - "${env.API_KEY_2}"
+
+# apiKeys also accepts structured startup keys. Secrets are hashed into the
+# SQLite store and are never returned by the control API after startup. The
+# scalar form above retains full legacy-admin permissions; structured entries
+# should declare only the scopes they need.
+# apiKeys:
+#   - key: "${env.INFERENCE_KEY}"
+#     name: "automation"
+#     scopes: [inference, logs]
+#     models: ["gpt-oss-120b"]
+
+# anthropic.cacheFix: conservative Claude Code prompt-cache repair. `auto`
+# requires both a Claude Code signal and Anthropic-shaped request fields.
+# anthropic:
+#   cacheFix:
+#     mode: auto
+#     telemetry: true
+#     transforms:
+#       fingerprintStrip: true
+#       sortStabilization: true
+#       freshSessionSort: true
+#       identityNormalization: true
+#       cacheControlNormalize: true
+#       ttlManagement: true
+#       thinkingSanitize: safe
+
+# audit: raw request/response conversations (including media when enabled).
+# Authentication headers and llama-swap secrets are always redacted.
+# audit:
+#   enabled: true
+#   retention: 720h
+#   maxBytes: 5GiB
+#   storeMedia: true
+#   redactHeaders: true
+
+# pricing: models.dev is used only for non-billing cost estimates.
+# pricing:
+#   modelsDev:
+#     enabled: true
+#     refreshEvery: 24h
+#     url: https://models.dev/api.json
+
+# ============================================================================
+# Runtime Manager
+# ============================================================================
+# The runtime manager is always active and stores every runtime as immutable,
+# per-version directories under its root, plus persistent current/previous
+# pointers (so an image upgrade never touches installed versions).
+#
+#   <root>/<name>/versions/<version>/   one immutable install (venv or tree)
+#   <root>/<name>/current  ->  versions/<v>      serving pointer
+#   <root>/<name>/previous ->  versions/<v>      rollback target
+#
+# Lifecycle of one version:  Stage (download/build + verify) -> Activate
+# (swap current/previous, health-checked) -> Rollback (swap back). The Runtimes
+# page in the UI drives all of these; a config change only declares what
+# versions a runtime may move between.
+#
+# Hot reload: runtimes changes apply to the running manager without a restart;
+# removing a definition stops its automatic checks but keeps installed
+# versions on disk. Only runtimeManager.root / store.path / logToStdout
+# changes restart the daemon.
+#
+# runtimeManager:
+#   root: /var/lib/llama-swap/runtimes
+#   # Which hosts may be fetched or cloned. Empty or omitted = allow all
+#   # HTTPS sources (still HTTPS-only). Pin the exact hosts you trust in
+#   # production. Git sources additionally need the API/codeload hosts.
+#   sourceAllowlist:
+#     - https://pypi.org
+#     - https://files.pythonhosted.org
+#     - https://github.com
+#     - https://api.github.com
+#     - https://codeload.github.com
+#     - https://release-assets.githubusercontent.com
+#   # Registries allowed for container-mode runtimes.
+#   containerRegistries: [docker.io, ghcr.io]
+#   # Allow download/build work while models are serving (default false: the
+#   # manager waits for idle before staging).
+#   # buildWhileBusy: false
+#   # Upper bound for one stage/activate operation. 0 (default) = unbounded;
+#   # source builds can legitimately run for hours, so raise it well above
+#   # the longest build you expect (e.g. 4h) rather than leaving a tight cap.
+#   # operationTimeout: 4h
+#
+# ============================================================================
+# Runtimes
+# ============================================================================
+# Each runtime: kind (vllm | llamacpp), optional mode (native | container),
+# source (where the version comes from), build (how it is materialized),
+# update (version-check policy), verify (optional post-stage checks).
+#
+# source.type values and what they pair with:
+#   pypi      (vllm)      install vllm==<version> from the PyPI index
+#   wheel     (vllm)      install one .whl from source.url (checksum optional)
+#   release   (vllm)      a GitHub release asset: source.repository +
+#                         source.asset template ({tag} / {version} placeholders)
+#   git       (both)      clone source.repository, checkout source.ref (exact
+#                         tag/branch/commit) or track source.trackRef (the
+#                         update loop resolves it to a commit via ls-remote)
+#   tag       (both)      like git, ref must be a tag
+#   commit    (both)      like git, ref must be a full commit hash
+#   release   (llamacpp)  prebuilt archive from a direct source.url
+#   channel   (llamacpp)  like release; source.url is a rolling channel asset
+#   local     (both)      source.path (or file:// source.url) on this host
+#   bundled   (llamacpp)  the llama-server shipped inside the llama-swap image
+#   image     (both)      container mode: source.image (+ pullPolicy)
+#
+# build.driver values:
+#   uv      (vllm)        uv venv + uv pip install <package spec> (default)
+#   make    (llamacpp)    run make in the source tree (args pass through)
+#   cmake   (llamacpp)    configure + build with cmake (default for llamacpp)
+#   none    (llamacpp)    no build: prebuilt release/channel archives; the
+#                         entrypoint + its shared libraries are materialized
+#                         straight from the extracted source layout
+#   custom  (both)        run build.steps (shell-free: one command + args per
+#                         step, no shell interpretation)
+#
+# Build steps may reference provider stage macros (expanded at stage time):
+#   ${RUNTIME_DIR}  this version's immutable directory
+#   ${SOURCE_DIR}   where the source was fetched/extracted (empty for plain
+#                   package installs)
+#   ${BUILD_DIR}    scratch build directory for this version
+#   ${UV} ${PYTHON} (vllm) the uv binary and the version venv's python
+# The default working directory is ${SOURCE_DIR} when the source materializes
+# a tree (git/local/extracted archives), otherwise the version directory;
+# workDir overrides it (relative to the version directory).
+#
+# update policy (per runtime; defaults shown):
+#   policy: automatic|manual|pinned|disabled   (default automatic)
+#     automatic  check -> stage -> activate when the idle gates are met
+#     manual     only explicit Stage/Activate from the UI or API
+#     pinned     operator lock: the loop never even checks
+#     disabled   no automatic activity, explicit operations still allowed
+#   channel: stable|prerelease                (default stable; prerelease also
+#                                              consumes prerelease tags)
+#   version:  exact version to keep/target (wins over channel discovery)
+#     Changing version to a version that is already installed switches the
+#     runtime to it without re-building (stage is a no-op, then activate).
+#     Changing it to a new version stages (download/build + verify) first.
+#   commit:   (git) exact commit to target
+#   checkEvery: 24h                           (default; min 1m)
+#   minIdle: 30m                                default; runtime must be idle
+#                                              this long before activate
+#   activateOnlyWhenIdle: true                default
+#   keepVersions: 2                             retention target; current,
+#                                              previous and pinned are protected
+#   rollbackOnFailure: true                    default; failed activate swaps
+#                                              the pointer back to previous
+#
+# The automatic loop runs one check per runtime per pass (pass every minute,
+# checks throttled by checkEvery) and stages/activates only when the runtime
+# is idle and the idle-duration gate is met; with models serving and
+# buildWhileBusy false it defers and reports waiting_for_idle.
+#
+# runtimes:
+#   # ── vLLM from PyPI: the common case ────────────────────────────────
+#   # Stages a uv venv per version; activation health = filesystem checks
+#   # plus optional verify.smokeCommand (a GPU is only needed if you add a
+#   # smoke test that exercises one).
+#   vllm-cuda:
+#     kind: vllm
+#     source: {type: pypi}
+#     build: {python: "3.11"}
+#     update: {version: "0.10.0", policy: automatic, channel: stable, minIdle: 30m, keepVersions: 2, rollbackOnFailure: true}
+#     verify:
+#       healthPath: /health/ready
+#       smokeCommand: python -c 'print("runtime ok")'
+#
+#   # ── vLLM from one official release wheel (direct URL + checksum) ──
+#   # Downloads the artifact, verifies sha256, then uv pip installs it;
+#   # dependencies still resolve from PyPI.
+#   vllm-wheel:
+#     kind: vllm
+#     source:
+#       type: wheel
+#       url: https://files.pythonhosted.org/packages/.../vllm-0.10.0-cp39-abi3-manylinux_2_28_aarch64.whl
+#       checksum: "sha256:<64 hex digits>"
+#     update: {version: "0.10.0", policy: manual}
+#     build: {python: "3.11"}
+#
+#   # ── llama.cpp compiled from git (CPU example) ──────────────────────
+#   # git clone --no-checkout + checkout <ref>, then the build driver runs
+#   # and the resulting llama-server is materialized to bin/llama-server.
+#   # Recent llama.cpp removed the top-level Makefile (it only prints
+#   # "Build system changed"), so use the cmake driver:
+#   llama-git-cmake:
+#     kind: llamacpp
+#     source:
+#       type: git
+#       repository: https://github.com/ggml-org/llama.cpp.git
+#       ref: b5999
+#     update: {version: b5999, policy: automatic}
+#     build:
+#       driver: cmake            # runs cmake -S source -B build
+#                                # -DGGML_NATIVE=OFF
+#                                # -DCMAKE_BUILD_RPATH_USE_ORIGIN=ON (binaries
+#                                # keep $ORIGIN-relative RUNPATH after the
+#                                # staging dir is renamed into versions/<v>/),
+#                                # then cmake --build build
+#                                # --target llama-server (parallel)
+#       args: ["-DCMAKE_BUILD_TYPE=Release"]   # appended to configure
+#       backend: cpu             # adds -DGGML_CPU=ON; e.g. cuda -> -DGGML_CUDA=ON
+#       compiler: clang          # adds -DCMAKE_C_COMPILER=clang
+#       env: {CMAKE_BUILD_PARALLEL_LEVEL: "8"}
+#   # Refs old enough to still ship a working Makefile can use:
+#   #   build: {driver: make, args: [-j4], env: {GGML_CUDA: "1"}}
+#
+#   # ── llama.cpp prebuilt release binary (no compilation) ────────────
+#   # Downloads the archive (sha256 verified) and extracts it, keeping the
+#   # shared-library symlink chains. The archive's top level is a versioned
+#   # directory (llama-bXXXX/), and the prebuilt llama-server carries RUNPATH
+#   # $ORIGIN, so driver: none is enough: the manager materializes
+#   # source/<version>/llama-server plus every .so next to it under bin/.
+#   llama-release:
+#     kind: llamacpp
+#     source:
+#       type: release
+#       url: https://github.com/ggml-org/llama.cpp/releases/download/b5999/llama-b5999-bin-ubuntu-arm64.tar.gz
+#       checksum: "sha256:<64 hex digits>"
+#     update: {version: b5999, policy: automatic}
+#     build: {driver: none}
+#
+#   # ── vLLM fork built from git with custom uv steps ─────────────────
+#   # trackRef: the update loop resolves the branch to a commit each check
+#   # (git ls-remote only, no clone) and stages it as version git-<sha>.
+#   vllm-1cat:
+#     kind: vllm
+#     source:
+#       type: git
+#       repository: https://github.com/1CatAI/1Cat-vLLM.git
+#       trackRef: refs/heads/main
+#     update: {policy: automatic, checkEvery: 24h, minIdle: 30m, keepVersions: 2, rollbackOnFailure: true}
+#     build:
+#       driver: custom
+#       python: "3.12"
+#       env:
+#         CUDA_HOME: /usr/local/cuda-12.8
+#         TORCH_CUDA_ARCH_LIST: "7.0;8.0"
+#         FLASH_ATTN_V100_CUDA_ARCH_LIST: "7.0"
+#         MAX_JOBS: "12"
+#         NVCC_THREADS: "1"
+#       steps:
+#         - {workDir: "${SOURCE_DIR}", command: "${UV}", args: [pip, install, --python, "${PYTHON}", -r, requirements/build/cuda.txt]}
+#         - {workDir: "${SOURCE_DIR}", command: "${UV}", args: [pip, install, --python, "${PYTHON}", -r, requirements/cuda.txt]}
+#         - {workDir: "${SOURCE_DIR}", command: "${UV}", args: [pip, install, --python, "${PYTHON}", -r, requirements/common.txt]}
+#         - {workDir: "${SOURCE_DIR}", command: "${UV}", args: [pip, install, --python, "${PYTHON}", -r, requirements/build/cuda.txt]}
+#         - {workDir: "${SOURCE_DIR}", command: "${UV}", args: [pip, install, --python, "${PYTHON}", --no-build-isolation, --editable, .]}
+#   # NOTE for CPU source builds (requirements/build/cpu.txt): the repo pins
+#   # torch==<ver>+cpu, which is only published on PyTorch's own CPU index, so
+#   # also set in build.env:
+#   #     UV_EXTRA_INDEX_URL: "https://download.pytorch.org/whl/cpu/"
+#   #     UV_INDEX_STRATEGY: "unsafe-best-match"   # the CPU index also hosts
+#   #     some plain packages (e.g. setuptools); without best-match uv
+#   #     refuses to look at your primary index for those
+#
+#   # ── vLLM in a container: the manager only tracks image state ──────
+#   vllm-container:
+#     kind: vllm
+#     mode: container
+#     source: {type: image, image: ghcr.io/example/vllm:stable, pullPolicy: always}
+#     update: {policy: automatic, checkEvery: 24h, minIdle: 30m, keepVersions: 2}
+#     container:
+#       engine: docker
+#       gpus: all
+#       shmSize: 16g
+#       command: [serve, /models/Qwen3, --port, "8000"]
+
+# LMCache is an optional KV-cache accelerator for vLLM models. It is NOT
+# installed by default: the control panel shows an empty module card until
+# enabled.
+# The module has two independent parts:
+#   - A standalone lmcache server that runs in its own dedicated virtualenv,
+#     independent of any vLLM runtime. Enabling the module (from the Runtime
+#     Manager page or here) installs it; llama-swap supervises the server as
+#     a child process and restarts it on parameter changes.
+#   - A connector that the vLLM process imports. When a model enables
+#     LMCache (backend.lmcache below), the connector is installed into that
+#     model's vLLM runtime virtualenv automatically at model start, pinned
+#     to the server's current version. Re-staging a vLLM runtime rebuilds
+#     its virtualenv and removes the connector.
+# lmcache:
+#   # pip requirement name; exact version pin and extras allowed.
+#   package: lmcache
+#   # Legacy compatibility alias for update.version. Prefer update.version;
+#   # if both are present they must match exactly (configuration validation
+#   # rejects conflicts and never rewrites this YAML).
+#   # version: 0.5.4
+#   # interpreter for the server virtualenv; defaults to the documented
+#   # LMCache baseline.
+#   # pythonVersion: "3.11"
+#   # optional HTTPS package index mirror. Still subject to
+#   # runtimeManager.sourceAllowlist when that list is set.
+#   # indexURL: https://pypi.org
+#   # Enable the module: install and supervise the dedicated server runtime.
+#   enabled: true
+#   # start the standalone server at daemon boot; default true. false defers
+#   # the first start to a model's pre-start gate.
+#   # autoStart: true
+#   # stop the server when the last referencing model stops; default false
+#   # keeps the KV cache warm across model turnover.
+#   # autoStop: false
+#   server:
+#     enabled: true
+#     # ZMQ endpoint vLLM engines attach to.
+#     host: localhost
+#     port: 5555
+#     # Management frontend. Defaults away from llama-swap's own 8080.
+#     httpHost: 127.0.0.1
+#     httpPort: 8900
+#     # Pinned-DRAM pool ("L2", system memory) size — the server's ONLY memory
+#     # tier, rendered as LMCache's --l1-size-gb. Overrides the legacy l1SizeGB
+#     # when enabled. KB/MB/GB are powers of 1000, KiB/MiB/GiB are powers of
+#     # 1024; a bare number is bytes. Restart-required.
+#     # l2:
+#     #   enabled: true
+#     #   maxBytes: 30GB
+#     # Legacy pinned-DRAM size in GB; superseded by l2.maxBytes. Still
+#     # accepted, but new configurations should set l2.maxBytes only.
+#     # l1SizeGB: 20
+#     # Disk tier ("L3"): absolute directory, auto-created. The path must be
+#     # writable with enough free space, or the server start fails closed.
+#     # maxBytes only sets the minimum free space (default 1 GiB); the LMCache
+#     # fs adapter itself has no size cap. Restart-required.
+#     # l3:
+#     #   enabled: true
+#     #   path: /var/lib/lmcache
+#     #   maxBytes: 100GB
+#     # LRU | IsolatedLRU | noop
+#     evictionPolicy: LRU
+#     # tokens per cache chunk. 0 (or unset) means auto: the --chunk-size flag
+#     # is omitted and the server applies its own library default.
+#     # chunkSize: 0
+#   # Update policy for the dedicated LMCache server runtime. The standard
+#   # version field is update.version; it is authoritative over the legacy
+#   # top-level version alias and a version embedded in package. Absent or
+#   # empty update.policy means manual-only lifecycle operations. Only an
+#   # explicit automatic policy enables background checks/downloads/activation.
+#   # A pinned policy stops background work; the UI/API can still perform an
+#   # explicit upgrade or rollback. LMCache always rolls back a failed server
+#   # health check, so rollbackOnFailure: false is rejected.
+#   # update:
+#   #   policy: manual # disabled | manual | automatic | pinned
+#   #   channel: stable # stable | prerelease
+#   #   # version: 0.5.5 # exact version target (standard field)
+#   #   checkEvery: 12h
+#   #   minIdle: 10m
+#   #   activateOnlyWhenIdle: true
+#   #   keepVersions: 2
+#   #   rollbackOnFailure: true
+
+# resourceBudget is opt-in. It limits locally managed model footprints and
+# only evicts models with no in-flight requests when autoEvict is enabled.
+# resourceBudget:
+#   vramMiB: 24576
+#   ramMiB: 32768
+#   autoEvict: true
+#   queueLoads: true
 
 # upstream: controls behaviour of the /upstream passthrough endpoint
 # - optional, default: empty dictionary
@@ -231,6 +646,15 @@ selectors:
       # - optional, default: 1
       spillover: 4
 
+  # failover retries only connection/load failures and 408/429/502/503/504
+  # responses. It buffers an attempt before sending it to the client, so a
+  # partial SSE response is never replayed to another backend.
+  "resilient":
+    strategy: failover
+    targets:
+      - "gpt-oss-120b"
+      - "qwen-unlisted"
+
 # models: a dictionary of model configurations
 # - required
 # - each key is the model's ID, used in API requests
@@ -259,6 +683,44 @@ models:
       --model path/to/gpt-oss-120B.gguf
       --ctx-size ${default_ctx}
       --temperature ${temp}
+
+    # A managed backend can use structured argv instead of a shell command.
+    # Remove `cmd` when using this shape; the legacy cmd path remains fully
+    # compatible and takes precedence when both are present.
+    # backend:
+    #   type: vllm
+    #   runtime: vllm-cuda
+    #   # Pin this model to one installed version of its managed runtime so a
+    #   # runtime upgrade never changes its environment under it. Omitted:
+    #   # follows the runtime's current version (legacy behavior). The pinned
+    #   # version must be installed; model start fails closed if it is not.
+    #   # runtimeVersion: 0.11.0
+    #   protocol: responsesToChat
+    #   apis: [chat, completions, responses, embeddings]
+    #   args: [vllm, serve, /models/qwen, --host, 127.0.0.1, --port, "${PORT}", --enable-sleep-mode]
+    #   # The activity table's drafted (speculative-decoding) acceptance rate is
+    #   # only populated when vLLM reports metrics.speculative_decoding, which
+    #   # requires starting vLLM with --per-request-spec-decode-metrics summary
+    #   # (spec decoding must be enabled via --speculative-config). The 1Cat-vLLM
+    #   # fork does not ship that flag yet, so the column stays "-" until it is
+    #   # backported. llama-swap parses the field as soon as it is present.
+    #   # Explicit vLLM backends receive one best-effort short chat request after
+    #   # readiness and before being exposed as ready, to warm the model/cache.
+    #   lifecycle: {mode: sleep, sleepLevel: 1}
+    #   resources: {vramMiB: 24576, ramMiB: 32768, priority: 10, evictionPriority: 5}
+    #   # Attach this vLLM model to LMCache. Requires the top-level lmcache
+    #   # module to be enabled and a native managed vLLM runtime; the
+    #   # connector is installed into the model's runtime automatically at
+    #   # model start.
+    #   # mp = standalone lmcache server (recommended); inProcess = legacy
+    #   # single-process connector.
+    #   lmcache:
+    #     enabled: true
+    #     mode: mp
+    #     role: kv_both # kv_both | kv_producer | kv_consumer
+    #     host: localhost # mp: ZMQ host of the lmcache server
+    #     port: 5555 # mp: ZMQ port of the lmcache server
+    #     chunkSize: 256 # inProcess: 0 keeps the library default
 
     # name: a display name for the model
     # - optional, default: empty string
@@ -298,6 +760,9 @@ models:
     # - a ttl of -1 will use the global TTL value as the default
     # - a ttl of 0 will mean never unload
     # - a value of 0 disables automatic unloading of the model
+    # - for a vLLM backend, ttl > 0 automatically adds --enable-sleep-mode to
+    #   the private launch command when the flag is not already configured;
+    #   ttl 0 does not add it
     ttl: 60
 
     # unloadTimeout: graceful timeout in seconds when unloading this model (manual, API, or ttl expiry)
@@ -345,12 +810,13 @@ models:
 
       # setParamsByID: a dictionary of parameters to set based the model ID
       # - optional, default: empty dictionary
-      # - combine with aliases to create variant behaviour without reloading the model
+      # - combine with aliases to create variant behaviour without reloading
+      #   the model; declare each variant name under aliases (keys support
+      #   ${MODEL_ID} macro substitution but do not create aliases themselves)
       # - parameters are set in the request body JSON
       # - run after setParams so it will override any settings
       # - protected params like "model" cannot be overridden
       # - values can be strings, numbers, booleans, arrays, or objects
-      # - model aliases will be automatically created for each key
       setParamsByID:
         "${MODEL_ID}":
           chat_template_kwargs:
@@ -366,6 +832,10 @@ models:
     # - optional, default: empty array
     # - aliases must be unique globally
     # - useful for impersonating a specific model
+    # - the upstream engine must also serve these names (set useModelName or
+    #   backend.launch.servedModelName to one of them), otherwise requests
+    #   made with an alias are forwarded unchanged and the engine rejects
+    #   them with "The model ... does not exist"
     aliases:
       - "gpt-4o-mini"
 
@@ -449,6 +919,10 @@ models:
       # - default: false
       reranker: false
 
+      # translation: the model is a translation model (e.g. Hy-MT2)
+      # - default: false
+      translation: false
+
       # context: the maximum token context length supported
       # - default: 0
       # - must be an integer > 0
@@ -485,6 +959,23 @@ models:
     # - processes have 5 seconds to shutdown until forceful termination is attempted
     cmdStop: docker stop ${MODEL_ID}
 
+  # Structured container form (no shell parsing). The image is pulled by the
+  # configured engine and the process layer stops it with the child lifecycle.
+  "structured-docker-llama":
+    proxy: "http://127.0.0.1:${PORT}"
+    backend:
+      type: llamacpp
+      container:
+        engine: docker
+        image: ghcr.io/ggml-org/llama.cpp:server
+        name: ${MODEL_ID}
+        pullPolicy: if-missing
+        gpus: all
+        mounts:
+          - {source: /mnt/nvme/models, target: /models, readOnly: true}
+        ports: [{host: 8080, container: 8080}]
+        command: [--model, /models/Qwen2.5-Coder-0.5B-Instruct-Q4_K_M.gguf]
+
 # hooks: a dictionary of event triggers and actions
 # - optional, default: empty dictionary
 # - the only supported hook is on_startup
@@ -503,23 +994,30 @@ hooks:
 
 # routing:
 # Controls how llama-swap decides which models can run at the same time and
-# which get swapped out. Choose one of two swap engines:
+# which get swapped out. Choose one of three swap engines:
 #
 # - group:  the default engine. Simpler to configure. You define groups of
 #           models that run together, and loading one group typically unloads
 #           the others.
 #
-# - matrix: the newer engine. More involved to configure, but far more
-#           flexible. It uses a small expression language to describe which
-#           model combinations are allowed to run concurrently, enabling
-#           setups that groups cannot express.
+# - matrix: the most flexible engine. More involved to configure. It uses a
+#           small expression language to describe which model combinations
+#           are allowed to run concurrently, enabling setups that groups
+#           cannot express.
+#
+# - gpus:   card-level occupancy. You declare which models may occupy each
+#           GPU card. Models sharing a card are mutually exclusive (starting
+#           one evicts the others on that card); models on disjoint cards run
+#           concurrently. A model listed on no card occupies no card and runs
+#           alongside everything. Use this when your concurrency rules are
+#           simply "who fits on which card".
 #
 # The routing section is optional.
 routing:
   router:
     # use: a string defining which engine to use
     # - optional, default: "group"
-    # - valid values: group, matrix
+    # - valid values: group, matrix, gpus
     use: group
 
     # settings: a dictionary of settings for the specific engines
@@ -655,6 +1153,20 @@ routing:
           # Vars are not required when using real model IDs.
           full: "llama-70B"
 
+      # gpus: the card-occupancy engine. Describe your hardware once, per
+      # card: for each GPU card, list the models that may occupy it.
+      # - models on the same card are mutually exclusive: starting one
+      #   evicts whatever else is running on that card
+      # - models on different cards run concurrently
+      # - a model listed on several cards occupies all of them (multi-GPU)
+      # - a model listed on no card occupies no card (e.g. CPU models) and
+      #   runs alongside anything
+      #
+      # gpus:
+      #   "0": [llama, qwen]       # the LLMs share card 0
+      #   "1": [voxtral-model]     # TTS keeps card 1 to itself
+      #   "2": [stable-diffusion]  # image gen on card 2
+
   # scheduler: how queued requests are ordered.
   # The default and only valid scheduler is "fifo"
   scheduler:
@@ -685,7 +1197,7 @@ peers:
     # proxy: a valid base URL to proxy requests to
     # - required
     # - requested path to llama-swap will be appended to the end of the proxy value
-    proxy: http://192.168.1.23
+    proxy: http://192.0.2.1
     # models: a list of models served by the peer
     # - required
     models:

@@ -1,0 +1,4 @@
+id: request-logger
+name: Request Logger
+enabled: false
+priority: 20

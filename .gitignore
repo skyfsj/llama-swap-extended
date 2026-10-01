@@ -6,5 +6,28 @@ dist/
 .DS_Store
 .dev/
 
+# local working artifacts and runtime data
+/artifacts/
+/logs/
+/models/
+/node_modules/
+PROGRESS.md
+design-qa.md
+
+# local builds of the main binary
+/llama-swap
+
+# editors and agent tooling
+.idea/
+.zcode/
+
 # UI build output; embedded via the `embed_ui` build tag (internal/server/embed.go)
 internal/server/ui_dist/*
+
+# AI/agent working artifacts (plans, hook state, build scratch) stay local
+.codex-tmp/
+.mimosa/
+.v2c/
+.zcodeignore
+.zcode/
+work/

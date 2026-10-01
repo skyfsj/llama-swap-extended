@@ -1,0 +1,6 @@
+id: system-prompt
+name: System Prompt
+enabled: false
+priority: 10
+match:
+  models: ["qwen*"]

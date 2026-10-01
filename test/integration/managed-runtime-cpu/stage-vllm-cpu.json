@@ -1,0 +1,7 @@
+{
+  "kind": "vllm",
+  "mode": "native",
+  "version": "0.0.1",
+  "sourceType": "local",
+  "source": "/workspace/test/integration/managed-runtime-cpu/fake-vllm"
+}

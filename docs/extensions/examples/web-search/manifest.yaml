@@ -1,0 +1,11 @@
+id: web-search
+name: Web Search
+enabled: false
+priority: 100
+match:
+  endpoints: [chat.completions, responses, anthropic.messages]
+permissions:
+  networkHosts: [en.wikipedia.org]
+timeout: 10s
+maxCpuMillis: 2000
+maxMemoryMiB: 256

@@ -1,0 +1,48 @@
+# Host-Docker integration fixture. The verification script supplies all paths,
+# ports and the unique child-container name through environment macros so this
+# file remains safe to reuse on developer machines and CI runners.
+healthCheckTimeout: 20
+logToStdout: both
+
+store:
+  path: "${env.RUNTIME_CONTAINER_IT_ROOT}/llama-swap.db"
+
+apiKeys:
+  - managed-runtime-container-test-key
+
+runtimeManager:
+  root: "${env.RUNTIME_CONTAINER_IT_ROOT}/runtimes"
+  operationTimeout: 3m
+  containerRegistries: [docker.io]
+
+runtimes:
+  vllm-oci:
+    kind: vllm
+    mode: container
+    source:
+      type: image
+      image: docker.io/library/alpine:3.20
+      pullPolicy: never
+    container:
+      engine: docker
+
+models:
+  managed-container:
+    proxy: "http://127.0.0.1:${env.RUNTIME_CONTAINER_IT_MODEL_PORT}"
+    checkEndpoint: /health
+    backend:
+      type: vllm
+      runtime: vllm-oci
+      protocol: native
+      apis: [chat]
+      container:
+        name: "${env.RUNTIME_CONTAINER_IT_NAME}"
+        entrypoint: ["/fixture/fake-model"]
+        command: ["--listen", "0.0.0.0:8000", "--tokens", "3", "--tps", "200"]
+        mounts:
+          - source: "${env.RUNTIME_CONTAINER_IT_FAKE_MODEL}"
+            target: /fixture/fake-model
+            readOnly: true
+        ports:
+          - host: ${env.RUNTIME_CONTAINER_IT_MODEL_PORT}
+            container: 8000

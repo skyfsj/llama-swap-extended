@@ -1,15 +1,18 @@
 # Unified multi-stage Dockerfile for AI inference tools
-# Supports CUDA and Vulkan backends via BACKEND build arg
+# Supports CUDA, Vulkan, and ROCm/HIP backends via BACKEND build arg
 #
 # Usage:
 #   docker buildx build --build-arg BACKEND=cuda -t llama-swap:unified-cuda .
 #   docker buildx build --build-arg BACKEND=vulkan -t llama-swap:unified-vulkan .
+#   docker buildx build --build-arg BACKEND=rocm -t llama-swap:unified-rocm .
 #   docker buildx build --build-arg BACKEND=cuda --build-arg CMAKE_CUDA_ARCHITECTURES="86;89" -t llama-swap:unified-cuda .
 #
 # Each project has its own install script that handles cloning, building,
 # and installing binaries. Build stages are independent for cache efficiency.
 
 ARG BACKEND=cuda
+ARG ROCM_IMAGE=rocm/dev-ubuntu-24.04:7.2.4
+ARG GPU_TARGETS=""
 
 # ── Builder bases ──────────────────────────────────────────────────────
 
@@ -53,6 +56,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libvulkan-dev glslang-tools spirv-tools vulkan-validationlayers glslc \
     pkg-config libavcodec-dev libavformat-dev libavutil-dev libswresample-dev \
     spirv-headers \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+FROM ${ROCM_IMAGE} AS builder-base-rocm
+
+ARG GPU_TARGETS=""
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV ROCM_PATH=/opt/rocm
+ENV HIP_PATH=/opt/rocm
+ENV GPU_TARGETS=${GPU_TARGETS}
+ENV CCACHE_DIR=/ccache
+ENV CCACHE_MAXSIZE=2G
+ENV PATH="/opt/rocm/bin:/opt/rocm/llvm/bin:/usr/lib/ccache:${PATH}"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake git python3 python3-pip libssl-dev \
+    curl ca-certificates ccache make wget clang lld ninja-build \
+    pkg-config libavcodec-dev libavformat-dev libavutil-dev libswresample-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
@@ -112,6 +135,9 @@ RUN --mount=type=cache,id=ccache-${BACKEND},target=/ccache \
 # pull nvidia/cuda:*-devel or compile ik_llama.cpp.
 
 FROM builder-base-vulkan AS ik-llama-vulkan
+RUN mkdir -p /install/bin
+
+FROM builder-base-rocm AS ik-llama-rocm
 RUN mkdir -p /install/bin
 
 FROM builder-base-cuda AS ik-llama-cuda
@@ -176,6 +202,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
+FROM ${ROCM_IMAGE} AS runtime-rocm
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV ROCM_PATH=/opt/rocm
+ENV HIP_PATH=/opt/rocm
+ENV LD_LIBRARY_PATH="/opt/rocm/lib:/opt/rocm/lib64"
+ENV PATH="/opt/rocm/bin:/opt/rocm/llvm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgomp1 python3 curl ca-certificates \
+    libavcodec60 libavformat60 libavutil58 libswresample4 \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 # ── Select runtime base by BACKEND ────────────────────────────────────
 
 FROM runtime-${BACKEND} AS runtime
@@ -189,7 +229,7 @@ ARG AUDIO_COMMIT_HASH=unknown
 ARG RUN_UID=0
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3-numpy python3-sentencepiece python3-pip \
+    python3-numpy python3-sentencepiece python3-pip nodejs npm \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user when RUN_UID != 0
@@ -198,8 +238,13 @@ RUN if [ "$RUN_UID" != "0" ]; then \
       useradd --system --uid $RUN_UID --gid $RUN_UID \
         --home /app --shell /sbin/nologin llama-swap; \
     fi && \
-    mkdir -p /etc/llama-swap/config && \
-    chown -R ${RUN_UID}:${RUN_UID} /etc/llama-swap
+    mkdir -p /etc/llama-swap/config /var/lib/llama-swap/runtimes && \
+    chown -R ${RUN_UID}:${RUN_UID} /etc/llama-swap /var/lib/llama-swap
+
+# Runtime versions, journals, managed keys and audit state must survive an
+# image replacement.  Keep them below one explicit volume so an upgraded image
+# cannot overwrite an operator-managed `current` runtime pointer.
+VOLUME ["/var/lib/llama-swap"]
 
 WORKDIR /app
 
@@ -226,7 +271,17 @@ COPY --from=llama-build /install/bin/llama-cli /usr/local/bin/
 COPY --from=llama-build /install/bin/llama-tts /usr/local/bin/
 COPY --from=llama-build /install/bin/llama-bench /usr/local/bin/
 
-# Copy ik-llama-server (CUDA only; empty copy for vulkan)
+# Keep a managed-runtime shaped copy of the bundled llama.cpp server. The
+# persistent Runtime Manager root is a volume, so this image-owned asset is
+# safe to seed once without replacing an operator-selected version later.
+RUN mkdir -p /opt/llama-swap/runtimes/llamacpp/bin /opt/llama-swap/runtimes/llamacpp/build && \
+    cp /usr/local/bin/llama-server /opt/llama-swap/runtimes/llamacpp/bin/llama-server && \
+    cp /usr/local/bin/llama-cli /opt/llama-swap/runtimes/llamacpp/bin/llama-cli && \
+    cp /usr/local/bin/llama-tts /opt/llama-swap/runtimes/llamacpp/bin/llama-tts && \
+    cp /usr/local/bin/llama-bench /opt/llama-swap/runtimes/llamacpp/bin/llama-bench && \
+    printf '%s\n' '{"mode":"native","sourceType":"bundled","builtin":"true"}' > /opt/llama-swap/runtimes/llamacpp/metadata.json
+
+# Copy ik-llama-server (CUDA only; empty copy for Vulkan/ROCm)
 COPY --from=ik-llama-build /install/bin/ /usr/local/bin/
 
 # Install uv
@@ -244,12 +299,12 @@ RUN ldconfig
 COPY config.example.yaml /etc/llama-swap/config/config.yaml
 
 # audiocpp_server takes its own JSON config. Ship a starter with this image's
-# backend baked in -- the binary defaults to "cuda", so a vulkan image that
+# backend baked in -- the binary defaults to "cuda", so a non-CUDA image that
 # copies an unedited example would try to load every model on a backend it was
 # not built with.
 COPY audiocpp-server.example.json /etc/llama-swap/audiocpp-server.example.json
 RUN sed -i "s/__BACKEND__/${BACKEND}/" /etc/llama-swap/audiocpp-server.example.json && \
-    chown -R ${RUN_UID}:${RUN_UID} /etc/llama-swap
+    chown -R ${RUN_UID}:${RUN_UID} /etc/llama-swap /var/lib/llama-swap
 
 # Version tracking
 RUN echo "llama.cpp: ${LLAMA_COMMIT_HASH}" > /versions.txt && \

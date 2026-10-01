@@ -1,0 +1,10 @@
+{
+  "kind": "llamacpp",
+  "mode": "native",
+  "version": "cpu-it-v1",
+  "sourceType": "local",
+  "source": "/work/llama.cpp",
+  "build": {
+    "driver": "cmake"
+  }
+}

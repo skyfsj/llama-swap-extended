@@ -10,6 +10,9 @@ ARG UID=10001
 ARG GID=10001
 ARG USER_HOME=/app
 
+RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm && \
+    rm -rf /var/lib/apt/lists/*
+
 # Add user/group
 ENV HOME=$USER_HOME
 RUN if [ $UID -ne 0 ]; then \
@@ -22,7 +25,11 @@ RUN if [ $UID -ne 0 ]; then \
 
 # Handle paths
 RUN mkdir --parents $HOME /app
-RUN chown --recursive $UID:$GID $HOME /app
+RUN mkdir --parents /var/lib/llama-swap/runtimes && \
+    chown --recursive $UID:$GID $HOME /app /var/lib/llama-swap
+
+# Keep managed runtime versions and pointers outside the image layer.
+VOLUME ["/var/lib/llama-swap"]
 
 # Switch user
 USER $UID:$GID

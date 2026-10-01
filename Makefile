@@ -24,14 +24,14 @@ clean:
 # use cached test results while developing
 test-dev:
 	go test -short ./...
-	staticcheck ./... || true
+	staticcheck ./...
 
 test:
-	go test -short -count=1 ./internal/...
+	go test -short -count=1 ./...
 
 # for CI - full test (takes longer)
 test-all:
-	go test -race -count=1 ./internal/...
+	go test -race -count=1 ./...
 
 ui/node_modules:
 	cd ui && npm install
@@ -100,5 +100,13 @@ test-ui:
 	cd ui && npm ci && npm run check && npm test
 
 # Phony targets
-.PHONY: all clean ui mac windows simple-responder simple-responder-windows test test-all test-dev test-ui wol-proxy
+.PHONY: all clean ui mac windows simple-responder simple-responder-windows test test-all test-dev test-ui wol-proxy verify-runtime-container verify-runtime-cpu
 .PHONY: linux linux-arm64 linux-amd64
+
+# Managed-runtime E2E verification suites (require a container runtime / CPU
+# toolchain; see scripts/verify-managed-runtime-*.sh for prerequisites)
+verify-runtime-container:
+	./scripts/verify-managed-runtime-container.sh
+
+verify-runtime-cpu:
+	./scripts/verify-managed-runtime-cpu.sh
