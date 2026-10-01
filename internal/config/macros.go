@@ -171,15 +171,12 @@ func resolveConfigMacros(yamlStr string) (map[string]any, configMacroConfig, err
 			return nil, configMacroConfig{}, fmt.Errorf("model %s filters.setParamsByID: %w", modelID, err)
 		}
 
-		cmd, _ := model["cmd"].(string)
-		proxy, _ := model["proxy"].(string)
-		cmdHasPort := strings.Contains(cmd, "${PORT}")
-		proxyHasPort := strings.Contains(proxy, "${PORT}")
+		cmdHasPort, proxyHasPort := modelPortMacros(model)
 		if cmdHasPort || proxyHasPort {
 			// PORT is available only to models whose command requests an
 			// automatically allocated port. Once allocated, apply it throughout
 			// that model just like a typed macro value.
-			if !cmdHasPort && proxyHasPort {
+			if !cmdHasPort && proxyHasPort && !managedNativeRuntime(raw, model) {
 				return nil, configMacroConfig{}, fmt.Errorf("model %s: proxy uses ${PORT} but cmd does not - ${PORT} is only available when used in cmd", modelID)
 			}
 
@@ -206,6 +203,68 @@ func resolveConfigMacros(yamlStr string) (map[string]any, configMacroConfig, err
 		return nil, configMacroConfig{}, err
 	}
 	return raw, declarations, nil
+}
+
+// modelPortMacros reports whether a model's process command source requests
+// an automatically allocated port. Managed backends use argv rather than the
+// legacy shell command, so their args participate in the same allocation and
+// substitution pass. The proxy may mirror ${PORT}, but it cannot introduce a
+// port allocation on its own.
+func modelPortMacros(model map[string]any) (command, proxy bool) {
+	if value, ok := model["cmd"].(string); ok {
+		command = strings.Contains(value, "${PORT}")
+	}
+	if value, ok := model["proxy"].(string); ok {
+		proxy = strings.Contains(value, "${PORT}")
+	}
+	if backend, ok := model["backend"].(map[string]any); ok {
+		if args, ok := backend["args"].([]any); ok {
+			for _, value := range args {
+				if text, ok := value.(string); ok && strings.Contains(text, "${PORT}") {
+					command = true
+					break
+				}
+			}
+		}
+	}
+	return command, proxy
+}
+
+// managedNativeRuntime reports whether the model's backend.runtime references
+// a native managed runtime. Such a model never needs ${PORT} in its command
+// or args: the launch binding injects the port into the engine argv at start,
+// so its proxy may carry ${PORT} and request an allocation on its own.
+func managedNativeRuntime(raw map[string]any, model map[string]any) bool {
+	backend, ok := model["backend"].(map[string]any)
+	if !ok {
+		return false
+	}
+	runtimeName, _ := backend["runtime"].(string)
+	if strings.TrimSpace(runtimeName) == "" {
+		return false
+	}
+	runtimes, ok := raw["runtimes"].(map[string]any)
+	if !ok {
+		return false
+	}
+	runtimeConfig, ok := runtimes[runtimeName].(map[string]any)
+	if !ok {
+		return false
+	}
+	if mode, _ := runtimeConfig["mode"].(string); strings.EqualFold(strings.TrimSpace(mode), "container") {
+		return false
+	}
+	if source, ok := runtimeConfig["source"].(map[string]any); ok {
+		if image, _ := source["image"].(string); strings.TrimSpace(image) != "" {
+			return false
+		}
+	}
+	if container, ok := runtimeConfig["container"].(map[string]any); ok {
+		if image, _ := container["image"].(string); strings.TrimSpace(image) != "" {
+			return false
+		}
+	}
+	return true
 }
 
 func stripRawCommandComments(model map[string]any) {
@@ -304,6 +363,26 @@ func validateSetParamsByIDKeys(model map[string]any, modelID string) error {
 	return nil
 }
 
+// runtimeStageMacros are provider build variables expanded by the runtime
+// providers at stage time (see internal/runtime expandRuntimeMacro). Their
+// values depend on the per-version staging directory, so the loader cannot
+// resolve them and must not report them as unknown placeholders.
+var runtimeStageMacros = map[string]struct{}{
+	"RUNTIME_DIR": {},
+	"SOURCE_DIR":  {},
+	"BUILD_DIR":   {},
+	"UV":          {},
+	"PYTHON":      {},
+}
+
+func isRuntimeStageMacro(path, macroName string) bool {
+	if !strings.HasPrefix(path, "runtimes.") {
+		return false
+	}
+	_, ok := runtimeStageMacros[macroName]
+	return ok
+}
+
 func validateConfigMacroUses(raw map[string]any) error {
 	knownFields := make(map[string]struct{})
 	configType := reflect.TypeOf(Config{})
@@ -357,9 +436,12 @@ func validateMacroUses(value any, path, modelID, fieldPath string, allowPID bool
 			if macroName == "PID" && allowPID {
 				continue
 			}
+			if isRuntimeStageMacro(path, macroName) {
+				continue
+			}
 			if modelID != "" {
 				switch fieldPath {
-				case "cmd", "cmdStop", "proxy", "checkEndpoint", "filters.stripParams", "name", "description":
+				case "cmd", "cmdStop", "proxy", "checkEndpoint", "filters.stripParams", "name", "description", "backend.args":
 					if macroName == "PORT" || macroName == "MODEL_ID" {
 						return fmt.Errorf("macro '${%s}' should have been substituted in %s.%s", macroName, modelID, fieldPath)
 					}
@@ -484,29 +566,70 @@ func substituteEnvMacrosInString(target, scanStr string) (string, error) {
 			return "", fmt.Errorf("environment variable '%s' is not set", varName)
 		}
 
-		// Sanitize the value for safe YAML substitution
-		value, err := sanitizeEnvValueForYAML(value, varName)
+		var err error
+		result, err = replaceEnvMacroEverywhere(result, fullMatch, varName, value)
 		if err != nil {
 			return "", err
 		}
-
-		result = strings.ReplaceAll(result, fullMatch, value)
 	}
 	return result, nil
 }
 
-// sanitizeEnvValueForYAML ensures an environment variable value is safe for YAML substitution.
-// It rejects values with characters that break YAML structure and escapes quotes/backslashes
-// for compatibility with double-quoted YAML strings.
-func sanitizeEnvValueForYAML(value, varName string) (string, error) {
-	// Reject values that would break YAML structure regardless of quoting context
+// replaceEnvMacroEverywhere replaces every occurrence of fullMatch in s with
+// the env value. Escaping is decided per occurrence: the same variable may be
+// referenced inside a double-quoted scalar in one place and as a plain scalar
+// in another, and the two contexts need different text.
+func replaceEnvMacroEverywhere(s, fullMatch, varName, rawValue string) (string, error) {
+	var b strings.Builder
+	for {
+		i := strings.Index(s, fullMatch)
+		if i < 0 {
+			b.WriteString(s)
+			return b.String(), nil
+		}
+		lineStart := strings.LastIndexByte(s[:i], '\n') + 1
+		quoted := countUnescapedQuotes(s[lineStart:i])%2 == 1
+		value, err := sanitizeEnvValueForYAML(rawValue, varName, quoted)
+		if err != nil {
+			return "", err
+		}
+		b.WriteString(s[:i])
+		b.WriteString(value)
+		s = s[i+len(fullMatch):]
+	}
+}
+
+// countUnescapedQuotes counts `"` characters in s that are not preceded by a
+// backslash. An odd count before a macro occurrence means the occurrence sits
+// inside a double-quoted YAML scalar (same-line heuristic, which covers every
+// single-line scalar — the overwhelmingly common case).
+func countUnescapedQuotes(s string) int {
+	count := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == '"' && (i == 0 || s[i-1] != '\\') {
+			count++
+		}
+	}
+	return count
+}
+
+// sanitizeEnvValueForYAML ensures an environment variable value is safe for
+// YAML substitution. It rejects values with characters that break YAML
+// structure. Backslashes and double quotes are escaped only when the macro
+// reference sits inside a double-quoted scalar, where `\\` and `\"` are the
+// correct escape forms; in plain or single-quoted scalars those characters
+// are literal, and escaping them would corrupt the value (a Windows path
+// would become a literal `C:\\models`). Values that cannot survive the
+// chosen style make the YAML parse fail loudly instead.
+func sanitizeEnvValueForYAML(value, varName string, inDoubleQuotes bool) (string, error) {
 	if strings.ContainsAny(value, "\n\r\x00") {
 		return "", fmt.Errorf("environment variable '%s' contains newlines or null bytes which are not allowed in YAML substitution", varName)
 	}
 
-	// Escape backslashes and double quotes for safe use in double-quoted YAML strings.
-	// In unquoted contexts, these escapes appear literally (harmless for most use cases).
-	// In double-quoted contexts, they are interpreted correctly.
+	if !inDoubleQuotes {
+		return value, nil
+	}
+
 	value = strings.ReplaceAll(value, `\`, `\\`)
 	value = strings.ReplaceAll(value, `"`, `\"`)
 

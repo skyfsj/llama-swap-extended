@@ -111,6 +111,38 @@ models:
 	assert.Contains(t, err.Error(), `duplicate groups "g1"`)
 }
 
+func TestLoadConfigSources_DuplicateGpusCard(t *testing.T) {
+	dir := t.TempDir()
+	writeYAML(t, dir, "a.yaml", `
+models:
+`+modelCfg("m1", "echo m1")+"routing:\n  router:\n    use: gpus\n    settings:\n      gpus:\n        \"0\": [m1]\n")
+	writeYAML(t, dir, "b.yaml", `
+models:
+`+modelCfg("m2", "echo m2")+"routing:\n  router:\n    settings:\n      gpus:\n        \"0\": [m2]\n")
+
+	_, err := LoadConfigSources("", dir)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `duplicate gpus "0"`)
+}
+
+func TestLoadConfigSources_GpusCardsAdditive(t *testing.T) {
+	dir := t.TempDir()
+	writeYAML(t, dir, "a.yaml", `
+models:
+`+modelCfg("m1", "echo m1")+"routing:\n  router:\n    use: gpus\n    settings:\n      gpus:\n        \"0\": [m1]\n")
+	writeYAML(t, dir, "b.yaml", `
+models:
+`+modelCfg("m2", "echo m2")+"routing:\n  router:\n    settings:\n      gpus:\n        \"1\": [m2]\n")
+
+	cfg, err := LoadConfigSources("", dir)
+	require.NoError(t, err)
+	assert.Equal(t, "gpus", cfg.Routing.Router.Use)
+	gpus := cfg.Routing.Router.Settings.Gpus
+	require.NotNil(t, gpus)
+	assert.Equal(t, []string{"m1"}, gpus.Cards["0"])
+	assert.Equal(t, []string{"m2"}, gpus.Cards["1"])
+}
+
 func TestLoadConfigSources_DuplicatePeer(t *testing.T) {
 	dir := t.TempDir()
 	peerA := "peers:\n  remote:\n    proxy: http://x:1\n    models: [m1]\n"
@@ -121,6 +153,18 @@ func TestLoadConfigSources_DuplicatePeer(t *testing.T) {
 	_, err := LoadConfigSources("", dir)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `duplicate peers "remote"`)
+}
+
+func TestLoadConfigSources_DuplicateRuntimeID(t *testing.T) {
+	dir := t.TempDir()
+	writeYAML(t, dir, "a.yaml", "runtimes:\n  vllm:\n    kind: vllm\n    source:\n      type: pypi\n")
+	writeYAML(t, dir, "b.yaml", "runtimes:\n  vllm:\n    kind: vllm\n    source:\n      type: git\n      repository: https://github.com/vllm-project/vllm.git\n      ref: v0.8.0\n")
+
+	_, err := LoadConfigSources("", dir)
+	if err == nil {
+		t.Fatal("expected duplicate runtime error")
+	}
+	assert.Contains(t, err.Error(), `duplicate runtimes "vllm"`)
 }
 
 func TestLoadConfigSources_ScalarConflict(t *testing.T) {

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -11,10 +12,12 @@ import (
 const DEFAULT_GROUP_ID = "(default)"
 const DEFAULT_UNLOAD_TIMEOUT = 10
 const (
-	LogToStdoutProxy    = "proxy"
-	LogToStdoutUpstream = "upstream"
-	LogToStdoutBoth     = "both"
-	LogToStdoutNone     = "none"
+	LogToStdoutProxy          = "proxy"
+	LogToStdoutUpstream       = "upstream"
+	LogToStdoutBoth           = "both"
+	LogToStdoutNone           = "none"
+	LogStorageDefaultMaxFiles = 5
+	LogStorageMaxFiles        = 100
 )
 
 type MacroEntry struct {
@@ -100,12 +103,40 @@ type Store struct {
 	Path string `yaml:"path"`
 }
 
+// LogStorageConfig controls durable snapshots created for inference crashes
+// and failed HTTP requests. MaxFiles applies independently to each event type.
+type LogStorageConfig struct {
+	Path     string `yaml:"path"`
+	MaxFiles int    `yaml:"maxFiles"`
+}
+
+func (c LogStorageConfig) Effective() LogStorageConfig {
+	if c.MaxFiles == 0 {
+		c.MaxFiles = LogStorageDefaultMaxFiles
+	}
+	return c
+}
+
 type UIConfig struct {
 	Activity UIActivityConfig `yaml:"activity" json:"activity"`
 }
 
 type UIActivityConfig struct {
 	SessionID []string `yaml:"session_id" json:"session_id"`
+}
+
+// StartupAPIKey is the structured form accepted in apiKeys. The secret is
+// consumed at startup and is never exposed by JSON serialization. The scalar
+// form remains available through RequiredAPIKeys for backwards compatibility.
+type StartupAPIKey struct {
+	ID        string     `yaml:"id" json:"id,omitempty"`
+	Name      string     `yaml:"name" json:"name,omitempty"`
+	Key       string     `yaml:"key" json:"-"`
+	Value     string     `yaml:"value" json:"-"`
+	Secret    string     `yaml:"secret" json:"-"`
+	Scopes    []string   `yaml:"scopes" json:"scopes,omitempty"`
+	Models    []string   `yaml:"models" json:"models,omitempty"`
+	ExpiresAt *time.Time `yaml:"expiresAt" json:"expiresAt,omitempty"`
 }
 
 // ProfileConfig describes a runtime-selectable set of model ID rewrites.
@@ -132,21 +163,32 @@ func (c *ProfileConfig) UnmarshalYAML(value *yaml.Node) error {
 }
 
 type Config struct {
-	HealthCheckTimeout int                       `yaml:"healthCheckTimeout"`
-	LogRequests        bool                      `yaml:"logRequests"`
-	LogLevel           string                    `yaml:"logLevel"`
-	LogTimeFormat      string                    `yaml:"logTimeFormat"`
-	LogToStdout        string                    `yaml:"logToStdout"`
-	MetricsMaxInMemory int                       `yaml:"metricsMaxInMemory"`
-	CaptureBuffer      int                       `yaml:"captureBuffer"`
-	Store              *Store                    `yaml:"store"`
-	UI                 UIConfig                  `yaml:"ui"`
-	Performance        PerformanceConfig         `yaml:"performance"`
-	GlobalTTL          int                       `yaml:"globalTTL"`
-	UnloadTimeout      int                       `yaml:"unloadTimeout"`
-	Models             map[string]ModelConfig    `yaml:"models"` /* key is model ID */
-	Profiles           map[string]ProfileConfig  `yaml:"profiles"`
-	Selectors          map[string]SelectorConfig `yaml:"selectors"`
+	HealthCheckTimeout int               `yaml:"healthCheckTimeout"`
+	LogRequests        bool              `yaml:"logRequests"`
+	LogLevel           string            `yaml:"logLevel"`
+	LogTimeFormat      string            `yaml:"logTimeFormat"`
+	LogToStdout        string            `yaml:"logToStdout"`
+	LogStorage         LogStorageConfig  `yaml:"logStorage"`
+	MetricsMaxInMemory int               `yaml:"metricsMaxInMemory"`
+	Store              *Store            `yaml:"store"`
+	UI                 UIConfig          `yaml:"ui"`
+	Performance        PerformanceConfig `yaml:"performance"`
+	GlobalTTL          int               `yaml:"globalTTL"`
+	UnloadTimeout      int               `yaml:"unloadTimeout"`
+
+	// RollbackOnModelStartFailure decides what happens when a model fails to
+	// start with a newly applied configuration. nil (the default) means true,
+	// which restores the last configuration that did start so the model keeps
+	// serving while the operator fixes the change. false switches to
+	// maintenance mode: the model keeps the new configuration, is marked
+	// in-maintenance, and refuses to be started by incoming requests until a
+	// later start succeeds and serves a request.
+	RollbackOnModelStartFailure *bool `yaml:"rollbackOnModelStartFailure"`
+
+	Models     map[string]ModelConfig    `yaml:"models"` /* key is model ID */
+	Profiles   map[string]ProfileConfig  `yaml:"profiles"`
+	Selectors  map[string]SelectorConfig `yaml:"selectors"`
+	Extensions ExtensionsConfig          `yaml:"extensions" json:"extensions"`
 
 	// routing is the canonical source for swap/scheduling configuration.
 	// New code must read Routing, never the backwards-compat fields below.
@@ -177,13 +219,99 @@ type Config struct {
 	IncludeAliasesInList bool `yaml:"includeAliasesInList"`
 
 	// support API keys, see issue #433, #50, #251
-	RequiredAPIKeys []string `yaml:"apiKeys"`
+	RequiredAPIKeys []string `yaml:"apiKeys" json:"-"`
+	// StartupAPIKeys contains structured apiKeys entries. It is populated by
+	// Config.UnmarshalYAML and intentionally omitted from the effective config
+	// JSON so secrets cannot be returned by the control API.
+	StartupAPIKeys []StartupAPIKey `yaml:"-" json:"-"`
 
 	// support remote peers, see issue #433, #296
 	Peers PeerDictionaryConfig `yaml:"peers"`
 
 	// upstream controls behaviour of the /upstream passthrough endpoint
 	Upstream UpstreamConfig `yaml:"upstream"`
+
+	// Extension configuration. Runtime management is always initialized; these
+	// fields configure it without changing legacy command-based model behavior.
+	ModelFiles     ModelFilesConfig         `yaml:"modelFiles"`
+	RuntimeManager RuntimeManagerConfig     `yaml:"runtimeManager"`
+	Runtimes       map[string]RuntimeConfig `yaml:"runtimes"`
+	// LMCache is the optional KV-cache accelerator module. It is not
+	// installed by default; enabling it is a control-plane operation.
+	LMCache        LMCacheModuleConfig  `yaml:"lmcache"`
+	ResourceBudget ResourceBudgetConfig `yaml:"resourceBudget" json:"resourceBudget"`
+	Anthropic      AnthropicConfig      `yaml:"anthropic"`
+	Audit          AuditConfig          `yaml:"audit"`
+	Pricing        PricingConfig        `yaml:"pricing"`
+}
+
+// UnmarshalYAML accepts both the historical scalar apiKeys list and the
+// structured startup-key form. We decode all other fields through an alias
+// after removing apiKeys from a shallow node copy so a mapping entry cannot be
+// coerced into []string by yaml.v3.
+func (c *Config) UnmarshalYAML(value *yaml.Node) error {
+	type plainConfig Config
+	root := value
+	if root.Kind == yaml.DocumentNode && len(root.Content) > 0 {
+		root = root.Content[0]
+	}
+	if root.Kind != yaml.MappingNode {
+		return fmt.Errorf("config must be a mapping")
+	}
+	withoutKeys := *root
+	withoutKeys.Content = make([]*yaml.Node, 0, len(root.Content))
+	var keysNode *yaml.Node
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		key, child := root.Content[i], root.Content[i+1]
+		if key.Value == "apiKeys" {
+			keysNode = child
+			continue
+		}
+		withoutKeys.Content = append(withoutKeys.Content, key, child)
+	}
+	// The loader initializes legacy defaults before decoding. Preserve those
+	// values here; decoding into a zero alias would accidentally erase them.
+	raw := plainConfig(*c)
+	if err := withoutKeys.Decode((*plainConfig)(&raw)); err != nil {
+		return err
+	}
+	*c = Config(raw)
+	c.RequiredAPIKeys = nil
+	c.StartupAPIKeys = nil
+	if keysNode == nil {
+		return nil
+	}
+	if keysNode.Kind != yaml.SequenceNode {
+		return fmt.Errorf("apiKeys must be a sequence of strings or objects")
+	}
+	for i, item := range keysNode.Content {
+		if item.Kind == yaml.ScalarNode {
+			var secret string
+			if err := item.Decode(&secret); err != nil {
+				return fmt.Errorf("apiKeys[%d]: %w", i, err)
+			}
+			c.RequiredAPIKeys = append(c.RequiredAPIKeys, secret)
+			continue
+		}
+		if item.Kind != yaml.MappingNode {
+			return fmt.Errorf("apiKeys[%d] must be a string or object", i)
+		}
+		var entry StartupAPIKey
+		if err := item.Decode(&entry); err != nil {
+			return fmt.Errorf("apiKeys[%d]: %w", i, err)
+		}
+		if entry.Key == "" {
+			entry.Key = entry.Value
+		}
+		if entry.Key == "" {
+			entry.Key = entry.Secret
+		}
+		if entry.Key == "" {
+			return fmt.Errorf("apiKeys[%d]: key is required", i)
+		}
+		c.StartupAPIKeys = append(c.StartupAPIKeys, entry)
+	}
+	return nil
 }
 
 // RoutingConfig is the canonical, normalized routing/scheduling configuration.
@@ -206,13 +334,14 @@ type FifoConfig struct {
 }
 
 type RouterConfig struct {
-	Use      string         `yaml:"use"` // "group" (default) | "matrix"
+	Use      string         `yaml:"use"` // "group" (default) | "matrix" | "gpus"
 	Settings RouterSettings `yaml:"settings"`
 }
 
 type RouterSettings struct {
 	Groups map[string]GroupConfig `yaml:"groups"`
 	Matrix *MatrixConfig          `yaml:"matrix"`
+	Gpus   *GpusConfig            `yaml:"gpus"`
 }
 
 func (c *Config) RealModelName(search string) (string, bool) {
@@ -220,9 +349,20 @@ func (c *Config) RealModelName(search string) (string, bool) {
 		return search, true
 	} else if name, found := c.aliases[search]; found {
 		return name, found
-	} else {
-		return "", false
 	}
+	// Config values assembled by tests, embedders, or a future hot-loader may
+	// not have gone through the normalization pass that populates the private
+	// aliases index. Keep aliases declared on each model authoritative in that
+	// case so routing and authorization do not diverge merely because the
+	// config came from a different construction path.
+	for name, model := range c.Models {
+		for _, alias := range model.Aliases {
+			if alias == search {
+				return name, true
+			}
+		}
+	}
+	return "", false
 }
 
 func (c *Config) FindConfig(modelName string) (ModelConfig, string, bool) {

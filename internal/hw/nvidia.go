@@ -1,3 +1,5 @@
+//go:build linux || windows
+
 package hw
 
 import (
@@ -65,6 +67,7 @@ func detectNvidia(ctx context.Context) ([]detectedAccelerator, error) {
 		}
 		accelerator := Accelerator{
 			Kind:         "gpu",
+			UUID:         nonEmptyStringPtr(record.uuid),
 			Vendor:       stringPtr("NVIDIA"),
 			Model:        nonEmptyStringPtr(record.name),
 			Architecture: nonEmptyStringPtr(record.architecture),
@@ -211,3 +214,5 @@ func normalizePCIIdentity(value string) string {
 	}
 	return value
 }
+
+func float64Ptr(value float64) *float64 { return &value }

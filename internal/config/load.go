@@ -7,7 +7,9 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
+	"github.com/mostlygeek/llama-swap/internal/auth"
 	"gopkg.in/yaml.v3"
 )
 
@@ -42,8 +44,8 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		LogLevel:           "info",
 		LogTimeFormat:      "",
 		LogToStdout:        LogToStdoutProxy,
+		LogStorage:         LogStorageConfig{MaxFiles: LogStorageDefaultMaxFiles},
 		MetricsMaxInMemory: 1000,
-		CaptureBuffer:      5,
 		GlobalTTL:          0,
 		UnloadTimeout:      DEFAULT_UNLOAD_TIMEOUT,
 		UI: UIConfig{Activity: UIActivityConfig{SessionID: []string{
@@ -58,6 +60,13 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 	for modelID, modelConfig := range config.Models {
 		modelConfig.Macros = macroConfig.Models[modelID].Macros
 		config.Models[modelID] = modelConfig
+	}
+	// Managed runtime definitions use the automatic stable update policy unless a
+	// field is explicitly configured. Applying this after YAML decoding keeps
+	// the legacy zero-value config untouched while making the runtime contract
+	// deterministic for callers and the control API.
+	for name, runtimeConfig := range config.Runtimes {
+		config.Runtimes[name] = runtimeConfig.Effective()
 	}
 
 	if config.HealthCheckTimeout < 15 {
@@ -85,6 +94,19 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 	}
 	if config.UnloadTimeout == 0 {
 		config.UnloadTimeout = DEFAULT_UNLOAD_TIMEOUT
+	}
+
+	// A nil RollbackOnModelStartFailure keeps the historical behaviour
+	// (restore the last configuration that started). Only an explicit false
+	// opts into maintenance mode, so existing configurations are unchanged.
+	rollback := true
+	if config.RollbackOnModelStartFailure != nil {
+		rollback = *config.RollbackOnModelStartFailure
+	}
+	config.RollbackOnModelStartFailure = &rollback
+
+	if config.LogStorage.MaxFiles < 1 || config.LogStorage.MaxFiles > LogStorageMaxFiles {
+		return Config{}, fmt.Errorf("logStorage.maxFiles must be between 1 and %d", LogStorageMaxFiles)
 	}
 
 	config.UI.Activity.SessionID = normalizeHeaderNames(config.UI.Activity.SessionID)
@@ -155,6 +177,9 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		if err := modelConfig.Capabilities.Validate(); err != nil {
 			return Config{}, fmt.Errorf("model %s: %w", modelId, err)
 		}
+		if err := modelConfig.Backend.Validate(modelId); err != nil {
+			return Config{}, err
+		}
 
 		// Auto-register setParamsByID keys as aliases (skip the model's own ID)
 		for key := range modelConfig.Filters.SetParamsByID {
@@ -178,6 +203,18 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 			return Config{}, fmt.Errorf("model %s: invalid proxy URL: %w", modelId, err)
 		}
 
+		// checkEndpoint is dereferenced during every start; a value that
+		// cannot form a request would panic the start goroutine, so reject it
+		// here. "none" disables the health check; empty means the user wrote
+		// an explicit "" (the unmarshal default is "/health").
+		if check := strings.TrimSpace(modelConfig.CheckEndpoint); check == "" {
+			return Config{}, fmt.Errorf("model %s: checkEndpoint must be a URL path or \"none\", got an empty string", modelId)
+		} else if check != "none" {
+			if _, err := url.Parse(check); err != nil {
+				return Config{}, fmt.Errorf("model %s: invalid checkEndpoint %q: %w", modelId, check, err)
+			}
+		}
+
 		if modelConfig.SendLoadingState == nil {
 			v := config.SendLoadingState
 			modelConfig.SendLoadingState = &v
@@ -191,26 +228,36 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 	// either style, never both.
 	hasTopLevel := config.Matrix != nil || len(config.Groups) > 0
 	rtr := config.Routing.Router
-	hasRouting := rtr.Use != "" || rtr.Settings.Matrix != nil || len(rtr.Settings.Groups) > 0
+	hasRouting := rtr.Use != "" || rtr.Settings.Matrix != nil || rtr.Settings.Gpus != nil || len(rtr.Settings.Groups) > 0
 
 	if hasTopLevel && hasRouting {
 		return Config{}, fmt.Errorf("config uses both the legacy top-level 'matrix'/'groups' keys and the new 'routing.router' block; please migrate the top-level keys into 'routing.router' and remove them")
 	}
 
 	if !hasTopLevel {
-		// Both groups and matrix may be defined under routing.router.settings;
-		// routing.router.use selects which one is active, so there is no conflict.
+		// groups, matrix, and gpus may all be defined under
+		// routing.router.settings; routing.router.use selects which one is
+		// active, so there is no conflict. But a settings block without a
+		// selection silently runs the group router — almost always a missed
+		// `use:` key, so reject it instead of ignoring the block.
 		rs := config.Routing.Router.Settings
+		if config.Routing.Router.Use == "" && (rs.Matrix != nil || rs.Gpus != nil) {
+			return Config{}, fmt.Errorf("routing.router.settings defines matrix/gpus but routing.router.use is not set; set routing.router.use to matrix, gpus, or group")
+		}
 		switch config.Routing.Router.Use {
 		case "matrix":
 			if rs.Matrix == nil {
 				return Config{}, fmt.Errorf("routing.router.use is 'matrix' but routing.router.settings.matrix is not set")
 			}
 			config.Matrix = rs.Matrix
+		case "gpus":
+			if rs.Gpus == nil {
+				return Config{}, fmt.Errorf("routing.router.use is 'gpus' but routing.router.settings.gpus is not set")
+			}
 		case "group", "":
 			config.Groups = rs.Groups
 		default:
-			return Config{}, fmt.Errorf("routing.router.use: unknown router %q (valid: group, matrix)", config.Routing.Router.Use)
+			return Config{}, fmt.Errorf("routing.router.use: unknown router %q (valid: group, matrix, gpus)", config.Routing.Router.Use)
 		}
 	}
 
@@ -219,11 +266,16 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		return Config{}, fmt.Errorf("config cannot use both 'groups' and 'matrix'")
 	}
 
-	if config.Matrix != nil {
+	switch {
+	case config.Matrix != nil:
 		if err := ValidateMatrix(config.Matrix, config.Models); err != nil {
 			return Config{}, fmt.Errorf("matrix: %w", err)
 		}
-	} else {
+	case rtr.Use == "gpus":
+		if err := ValidateGpus(config.Routing.Router.Settings.Gpus, config.Models); err != nil {
+			return Config{}, fmt.Errorf("gpus: %w", err)
+		}
+	default:
 		config = AddDefaultGroupToConfig(config)
 
 		// Validate group members
@@ -236,6 +288,14 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 				}
 				prevSet[member] = true
 
+				// Reject unknown members here rather than letting a typo'd
+				// name fail late (cold start) or vanish silently (hot reload,
+				// which skips models missing from conf.Models). Members may be
+				// aliases, so resolve through the same lookup the router uses.
+				if _, _, found := config.FindConfig(member); !found {
+					return Config{}, fmt.Errorf("group %s: member %s does not match any configured model or alias", groupID, member)
+				}
+
 				if existingGroup, exists := memberUsage[member]; exists {
 					return Config{}, fmt.Errorf("model member %s is used in multiple groups: %s and %s", member, existingGroup, groupID)
 				}
@@ -246,17 +306,27 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 
 	// Build the canonical Config.Routing from the effective result. Both legacy
 	// and new-style configs converge here. The Matrix pointer is shared so the
-	// compiled matrix program stays in one place.
-	if config.Matrix != nil {
+	// compiled matrix program stays in one place. Only the settings block of
+	// the active engine survives normalization.
+	switch {
+	case config.Matrix != nil:
 		config.Routing.Router.Use = "matrix"
-	} else {
+		config.Routing.Router.Settings.Gpus = nil
+	case rtr.Use == "gpus":
+		config.Routing.Router.Use = "gpus"
+	default:
 		config.Routing.Router.Use = "group"
+		config.Routing.Router.Settings.Gpus = nil
 	}
 	config.Routing.Router.Settings.Matrix = config.Matrix
 	config.Routing.Router.Settings.Groups = config.Groups
 
 	if config.Routing.Scheduler.Use == "" {
 		config.Routing.Scheduler.Use = "fifo"
+	}
+
+	if err := config.ValidateExtensionConfig(); err != nil {
+		return Config{}, err
 	}
 	if config.Routing.Scheduler.Use != "fifo" {
 		return Config{}, fmt.Errorf("routing.scheduler.use: unknown scheduler %q (valid: fifo)", config.Routing.Scheduler.Use)
@@ -267,7 +337,11 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		}
 	}
 
-	// Clean up hooks preload
+	// Normalize hooks preload. An entry naming no configured model is an
+	// operator mistake, and dropping it silently meant the model simply never
+	// warmed up with nothing recorded anywhere — the same dangling-reference
+	// case the fifo priority check above and the profile pin check below
+	// reject.
 	if len(config.Hooks.OnStartup.Preload) > 0 {
 		var toPreload []string
 		for _, modelID := range config.Hooks.OnStartup.Preload {
@@ -275,9 +349,11 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 			if modelID == "" {
 				continue
 			}
-			if real, found := config.RealModelName(modelID); found {
-				toPreload = append(toPreload, real)
+			real, found := config.RealModelName(modelID)
+			if !found {
+				return Config{}, fmt.Errorf("hooks.on_startup.preload references unknown model %q", modelID)
 			}
+			toPreload = append(toPreload, real)
 		}
 		config.Hooks.OnStartup.Preload = toPreload
 	}
@@ -287,10 +363,59 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		if apikey == "" {
 			return Config{}, fmt.Errorf("empty api key found in apiKeys")
 		}
-		if strings.Contains(apikey, " ") {
+		if unsafeAPIKeyRune(apikey) {
 			return Config{}, fmt.Errorf("apiKeys[%d]: api key cannot contain spaces", i)
 		}
 		config.RequiredAPIKeys[i] = apikey
+	}
+	startupIDs := make(map[string]struct{}, len(config.StartupAPIKeys))
+	for i := range config.StartupAPIKeys {
+		entry := &config.StartupAPIKeys[i]
+		if unsafeAPIKeyUnicodeRune(entry.Key) {
+			return Config{}, fmt.Errorf("apiKeys[%d]: key cannot contain whitespace", i)
+		}
+		entry.Key = strings.TrimSpace(entry.Key)
+		if entry.Key == "" {
+			return Config{}, fmt.Errorf("apiKeys[%d]: empty key", i)
+		}
+		if unsafeAPIKeyRune(entry.Key) {
+			return Config{}, fmt.Errorf("apiKeys[%d]: key cannot contain whitespace", i)
+		}
+		if unsafeAPIKeyUnicodeRune(entry.ID) {
+			return Config{}, fmt.Errorf("apiKeys[%d]: id must be at most 128 characters and contain no whitespace", i)
+		}
+		entry.ID = strings.TrimSpace(entry.ID)
+		if entry.ID != "" {
+			if len(entry.ID) > 128 || strings.ContainsAny(entry.ID, " \t\r\n\x00") {
+				return Config{}, fmt.Errorf("apiKeys[%d]: id must be at most 128 characters and contain no whitespace", i)
+			}
+			if _, duplicate := startupIDs[entry.ID]; duplicate {
+				return Config{}, fmt.Errorf("apiKeys[%d]: duplicate id %q", i, entry.ID)
+			}
+			startupIDs[entry.ID] = struct{}{}
+		}
+		var nameErr error
+		entry.Name, nameErr = auth.NormalizeKeyName(entry.Name)
+		if nameErr != nil {
+			return Config{}, fmt.Errorf("apiKeys[%d]: %w", i, nameErr)
+		}
+		if entry.ExpiresAt != nil && !entry.ExpiresAt.After(time.Now()) {
+			return Config{}, fmt.Errorf("apiKeys[%d]: expiresAt must be in the future", i)
+		}
+		scopes, scopeErr := auth.NormalizeScopes(entry.Scopes)
+		if scopeErr != nil {
+			return Config{}, fmt.Errorf("apiKeys[%d]: %w", i, scopeErr)
+		}
+		entry.Scopes = entry.Scopes[:0]
+		for scope := range scopes {
+			entry.Scopes = append(entry.Scopes, scope)
+		}
+		sort.Strings(entry.Scopes)
+		models, modelErr := auth.NormalizeModels(entry.Models)
+		if modelErr != nil {
+			return Config{}, fmt.Errorf("apiKeys[%d]: %w", i, modelErr)
+		}
+		entry.Models = models
 	}
 
 	if err := ValidatePeerNamespace(config); err != nil {
@@ -306,6 +431,24 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 	}
 
 	return config, nil
+}
+
+func unsafeAPIKeyRune(value string) bool {
+	for _, r := range value {
+		if unicode.IsSpace(r) || unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			return true
+		}
+	}
+	return false
+}
+
+func unsafeAPIKeyUnicodeRune(value string) bool {
+	for _, r := range value {
+		if (unicode.IsSpace(r) && r != ' ') || unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			return true
+		}
+	}
+	return false
 }
 
 func validateProfiles(config Config) error {

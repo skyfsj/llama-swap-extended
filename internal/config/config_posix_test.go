@@ -167,6 +167,7 @@ groups:
 	}
 
 	modelLoadingState := false
+	trueRollback := true
 
 	defaultTimeout := TimeoutsConfig{
 		Connect:        30,
@@ -200,6 +201,7 @@ groups:
 		LogLevel:      "info",
 		LogTimeFormat: "",
 		LogToStdout:   LogToStdoutProxy,
+		LogStorage:    LogStorageConfig{MaxFiles: LogStorageDefaultMaxFiles},
 		StartPort:     5800,
 		Macros: MacroList{
 			{"svr-path", "path/to/server"},
@@ -261,7 +263,9 @@ groups:
 		},
 		HealthCheckTimeout: 15,
 		MetricsMaxInMemory: 1000,
-		CaptureBuffer:      5,
+		// Config loading normalizes the rollback policy: an absent key becomes
+		// an explicit true so every consumer reads the historical behaviour.
+		RollbackOnModelStartFailure: &trueRollback,
 		UI: UIConfig{Activity: UIActivityConfig{SessionID: []string{
 			"X-Session-ID",
 			"X-Litellm-Session-Id",
@@ -306,4 +310,39 @@ groups:
 	realname, found := config.RealModelName("m1")
 	assert.True(t, found)
 	assert.Equal(t, "model1", realname)
+}
+
+func TestConfig_StorePathRejectsSymlinkComponents(t *testing.T) {
+	dir := t.TempDir()
+	targetDir := filepath.Join(dir, "target")
+	if err := os.Mkdir(targetDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	linkedDir := filepath.Join(dir, "linked")
+	if err := os.Symlink(targetDir, linkedDir); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadConfigFromReader(strings.NewReader(`
+store:
+  path: ` + filepath.Join(linkedDir, "store.db") + `
+`))
+	if err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("symlinked parent was accepted: %v", err)
+	}
+
+	regular := filepath.Join(dir, "regular.db")
+	if err := os.WriteFile(regular, []byte{}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	linkedFile := filepath.Join(dir, "linked.db")
+	if err := os.Symlink(regular, linkedFile); err != nil {
+		t.Fatal(err)
+	}
+	_, err = LoadConfigFromReader(strings.NewReader(`
+store:
+  path: ` + linkedFile + `
+`))
+	if err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("symlinked store file was accepted: %v", err)
+	}
 }

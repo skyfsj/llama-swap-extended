@@ -20,9 +20,11 @@ var identityMapPaths = map[string]bool{
 	"profiles":                       true,
 	"selectors":                      true,
 	"peers":                          true,
+	"runtimes":                       true,
 	"matrix":                         true,
 	"routing.router.settings.groups": true,
 	"routing.router.settings.matrix": true,
+	"routing.router.settings.gpus":   true,
 }
 
 // LoadConfigSources loads and merges configuration from -config (optional)
@@ -110,6 +112,13 @@ func listYAMLFiles(dir string) ([]string, error) {
 	}
 	var files []string
 	for _, e := range entries {
+		// Do not follow symlinked entries from a config directory. The
+		// ConfigManager writes source files atomically, so treating a link as a
+		// normal YAML source could both read outside the configured boundary and
+		// later replace the link target during an edit.
+		if e.Type()&os.ModeSymlink != 0 {
+			continue
+		}
 		if e.IsDir() {
 			continue
 		}

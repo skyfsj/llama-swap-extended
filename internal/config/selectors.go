@@ -11,6 +11,7 @@ const (
 	SelectorStrategyWarm      = "warm"
 	SelectorStrategyPin       = "pin"
 	SelectorStrategySpillover = "spillover"
+	SelectorStrategyFailover  = "failover"
 )
 
 // SelectorSettings contains strategy-specific selector settings.
@@ -59,11 +60,11 @@ func validateSelectors(config Config) error {
 		}
 
 		switch selector.Strategy {
-		case SelectorStrategyPin, SelectorStrategyWarm, SelectorStrategySpillover:
+		case SelectorStrategyPin, SelectorStrategyWarm, SelectorStrategySpillover, SelectorStrategyFailover:
 		case "":
 			return fmt.Errorf("selectors.%s.strategy is required", selectorID)
 		default:
-			return fmt.Errorf("selectors.%s.strategy: unknown strategy %q (valid: warm, pin, spillover)", selectorID, selector.Strategy)
+			return fmt.Errorf("selectors.%s.strategy: unknown strategy %q (valid: warm, pin, spillover, failover)", selectorID, selector.Strategy)
 		}
 		if len(selector.Targets) == 0 {
 			return fmt.Errorf("selectors.%s.targets must contain at least one entry", selectorID)
@@ -128,6 +129,20 @@ func validateSpilloverCoexistence(config Config, selectorID string, targets []st
 			return nil
 		}
 		return fmt.Errorf("selectors.%s.targets must all appear together in one expanded matrix set", selectorID)
+	}
+
+	if config.Routing.Router.Use == "gpus" {
+		gpus := config.Routing.Router.Settings.Gpus
+		usedCards := make(map[string]string, len(targets))
+		for _, target := range targets {
+			for _, card := range gpus.CardsOf(target) {
+				if first, taken := usedCards[card]; taken {
+					return fmt.Errorf("selectors.%s.targets %q and %q share GPU card %q and cannot run together", selectorID, first, target, card)
+				}
+				usedCards[card] = target
+			}
+		}
+		return nil
 	}
 
 	groupOf := make(map[string]string, len(config.Models))

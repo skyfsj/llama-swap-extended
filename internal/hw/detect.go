@@ -213,8 +213,6 @@ func intPtr(value int) *int { return &value }
 
 func uint64Ptr(value uint64) *uint64 { return &value }
 
-func float64Ptr(value float64) *float64 { return &value }
-
 func stringValue(value *string) string {
 	if value == nil {
 		return ""

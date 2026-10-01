@@ -10,11 +10,15 @@ import (
 )
 
 func validateStorePath(path string) error {
-	if strings.TrimSpace(path) == "" {
+	path = strings.TrimSpace(path)
+	if path == "" {
 		return fmt.Errorf("store.path must not be empty")
 	}
+	if err := rejectSymlinkComponents(path); err != nil {
+		return fmt.Errorf("store.path: %w", err)
+	}
 
-	info, err := os.Stat(path)
+	info, err := os.Lstat(path)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			return fmt.Errorf("store.path: %w", err)
@@ -30,8 +34,8 @@ func validateStorePath(path string) error {
 	}
 
 	// File exists; ensure it is a regular file and is writable.
-	if info.IsDir() {
-		return fmt.Errorf("store.path: %s is a directory, not a file", path)
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("store.path: %s is not a regular file", path)
 	}
 	f, err := os.OpenFile(path, os.O_WRONLY, 0)
 	if err != nil {

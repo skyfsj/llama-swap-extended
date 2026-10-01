@@ -10,7 +10,7 @@ type PeerDictionaryConfig map[string]PeerConfig
 type PeerConfig struct {
 	Proxy    string   `yaml:"proxy"`
 	ProxyURL *url.URL `yaml:"-"`
-	ApiKey   string   `yaml:"apiKey"`
+	ApiKey   string   `yaml:"apiKey" json:"-"`
 	Models   []string `yaml:"models"`
 	Filters  Filters  `yaml:"filters"`
 

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -42,6 +43,176 @@ groups:
 
 	// a Contains as order of the map is not guaranteed
 	assert.Contains(t, err.Error(), "model member model2 is used in multiple groups:")
+}
+
+func TestConfig_StructuredAPIKeys(t *testing.T) {
+	cfg, err := LoadConfigFromReader(strings.NewReader(`
+models:
+  model:
+    cmd: echo model
+    proxy: http://127.0.0.1:9000
+apiKeys:
+  - legacy-key
+  - key: structured-key
+    name: automation
+    scopes: [inference, logs]
+    models: [model]
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.RequiredAPIKeys) != 1 || cfg.RequiredAPIKeys[0] != "legacy-key" {
+		t.Fatalf("legacy keys = %#v", cfg.RequiredAPIKeys)
+	}
+	if len(cfg.StartupAPIKeys) != 1 || cfg.StartupAPIKeys[0].Key != "structured-key" {
+		t.Fatalf("structured keys = %#v", cfg.StartupAPIKeys)
+	}
+}
+
+func TestConfig_StructuredAPIKeysValidateScopesAndModels(t *testing.T) {
+	valid, err := LoadConfigFromReader(strings.NewReader(`
+models:
+  model:
+    cmd: echo model
+    proxy: http://127.0.0.1:9000
+apiKeys:
+  - key: structured-key
+    scopes: [logs, inference, logs]
+    models: [" model ", "model", "model*"]
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := valid.StartupAPIKeys[0].Scopes; !slices.Equal(got, []string{"inference", "logs"}) {
+		t.Fatalf("normalized scopes = %#v", got)
+	}
+	if got := valid.StartupAPIKeys[0].Models; !slices.Equal(got, []string{"model", "model*"}) {
+		t.Fatalf("normalized models = %#v", got)
+	}
+
+	for _, tc := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "unknown scope",
+			body: "apiKeys:\n  - key: secret\n    scopes: [inference, admin]\n",
+			want: "unknown api key scope",
+		},
+		{
+			name: "internal wildcard",
+			body: "apiKeys:\n  - key: secret\n    models: [model*7b]\n",
+			want: "leading/trailing",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := LoadConfigFromReader(strings.NewReader(tc.body)); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("expected %q, got %v", tc.want, err)
+			}
+		})
+	}
+}
+
+func TestConfig_StructuredAPIKeysRejectDuplicateOrUnsafeIDs(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "duplicate", body: "apiKeys:\n  - id: same\n    key: one\n  - id: same\n    key: two\n", want: "duplicate id"},
+		{name: "whitespace", body: "apiKeys:\n  - id: \"bad\\tid\"\n    key: secret\n", want: "id must"},
+		{name: "nul", body: "apiKeys:\n  - id: \"bad\\u0000id\"\n    key: secret\n", want: "id must"},
+		{name: "zero width id", body: "apiKeys:\n  - id: \"bad\\u200bid\"\n    key: secret\n", want: "id must"},
+		{name: "unicode key whitespace", body: "apiKeys:\n  - key: \"secret\\u00a0\"\n", want: "key cannot contain whitespace"},
+		{name: "long", body: "apiKeys:\n  - id: " + strings.Repeat("x", 129) + "\n    key: secret\n", want: "id must"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := LoadConfigFromReader(strings.NewReader(tc.body)); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("expected %q, got %v", tc.want, err)
+			}
+		})
+	}
+}
+
+func TestConfig_LegacyAPIKeysRejectAllWhitespace(t *testing.T) {
+	for _, key := range []string{"key\\tvalue", "key\\nvalue", "key\\rvalue"} {
+		body := "apiKeys:\n  - \"" + key + "\"\n"
+		if _, err := LoadConfigFromReader(strings.NewReader(body)); err == nil || !strings.Contains(err.Error(), "api key cannot contain spaces") {
+			t.Fatalf("whitespace key %q accepted: %v", key, err)
+		}
+	}
+}
+
+func TestConfig_ResourceBudget(t *testing.T) {
+	cfg, err := LoadConfigFromReader(strings.NewReader(`
+resourceBudget:
+  vramMiB: 4096
+  ramMiB: 8192
+  autoEvict: true
+  queueLoads: true
+models:
+  model:
+    cmd: echo model
+    proxy: http://127.0.0.1:9000
+    backend:
+      type: vllm
+      resources:
+        vramMiB: 2048
+        ramMiB: 4096
+`))
+	require.NoError(t, err)
+	assert.Equal(t, 4096, cfg.ResourceBudget.VRAMMiB)
+	assert.Equal(t, 8192, cfg.ResourceBudget.RAMMiB)
+	assert.True(t, cfg.ResourceBudget.AutoEvict)
+	assert.Equal(t, 2048, cfg.Models["model"].Backend.Resources.VRAMMiB)
+}
+
+func TestConfig_ResourceBudgetRejectsNegativeValues(t *testing.T) {
+	_, err := LoadConfigFromReader(strings.NewReader(`
+resourceBudget:
+  vramMiB: -1
+models:
+  model:
+    cmd: echo model
+    proxy: http://127.0.0.1:9000
+`))
+	if err == nil || !strings.Contains(err.Error(), "resourceBudget") {
+		t.Fatalf("expected resource budget validation error, got %v", err)
+	}
+}
+
+func TestConfig_CheckEndpointValidation(t *testing.T) {
+	tests := []struct {
+		name          string
+		checkEndpoint string
+		wantErr       bool
+	}{
+		{"default applies /health when unset", "", false},
+		{"relative path", "/health", false},
+		{"absolute url", "http://127.0.0.1:8080/health", false},
+		{"none disables checking", "none", false},
+		{"explicit empty string rejected", `""`, true},
+		{"malformed url rejected", "http://[::1", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := fmt.Sprintf(`
+models:
+  model:
+    cmd: echo model
+    proxy: http://127.0.0.1:9000
+    checkEndpoint: %s
+`, tt.checkEndpoint)
+			_, err := LoadConfigFromReader(strings.NewReader(body))
+			if tt.wantErr && err == nil {
+				t.Fatalf("expected checkEndpoint validation error, got nil")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
 }
 
 func TestConfig_ModelAliasesAreUnique(t *testing.T) {
@@ -234,6 +405,53 @@ models:
 		_, err := LoadConfigFromReader(strings.NewReader(content))
 		assert.Equal(t, "model model1: proxy uses ${PORT} but cmd does not - ${PORT} is only available when used in cmd", err.Error())
 	})
+
+	t.Run("Managed backend argv participates in automatic port allocation", func(t *testing.T) {
+		content := `
+startPort: 6100
+models:
+  model1:
+    backend:
+      type: vllm
+      args: [serve, --port, "${PORT}"]
+`
+		config, err := LoadConfigFromReader(strings.NewReader(content))
+		if !assert.NoError(t, err) {
+			t.Fatalf("Failed to load config: %v", err)
+		}
+		assert.Equal(t, []string{"serve", "--port", "6100"}, config.Models["model1"].Backend.Arguments)
+		assert.Equal(t, "http://localhost:6100", config.Models["model1"].Proxy)
+	})
+
+	t.Run("Managed native runtime proxy may request ${PORT} alone", func(t *testing.T) {
+		// The launch binding injects --port into the engine argv at start, so a
+		// managed native model never writes ${PORT} into its args. Its proxy
+		// must still be able to request the allocation on its own.
+		content := `
+startPort: 6200
+runtimes:
+  vllm-cuda:
+    kind: vllm
+models:
+  model1:
+    proxy: "http://127.0.0.1:${PORT}"
+    backend:
+      type: vllm
+      runtime: vllm-cuda
+      args: [--model, /models/qwen]
+`
+		config, err := LoadConfigFromReader(strings.NewReader(content))
+		if !assert.NoError(t, err) {
+			t.Fatalf("Failed to load config: %v", err)
+		}
+		assert.Equal(t, "http://127.0.0.1:6200", config.Models["model1"].Proxy)
+		// The hand-written args migrate into the structured launch block.
+		launch := config.Models["model1"].Backend.Launch
+		if launch == nil || launch.Model != "/models/qwen" {
+			t.Fatalf("expected a migrated launch block, got %+v", launch)
+		}
+		assert.Equal(t, []string{}, config.Models["model1"].Backend.Arguments)
+	})
 }
 
 func TestConfig_MacroReplacement(t *testing.T) {
@@ -422,6 +640,50 @@ models:
 		})
 	}
 }
+
+func TestConfig_RuntimeStageMacrosAccepted(t *testing.T) {
+	config := `
+runtimes:
+  vllm-git:
+    kind: vllm
+    source: {type: pypi}
+    build:
+      driver: custom
+      steps:
+        - {workDir: "${SOURCE_DIR}", command: "${UV}", args: ["pip", "install", "--python", "${PYTHON}", "."]}
+        - {command: "mkdir", args: ["-p", "${BUILD_DIR}/bin"]}
+  llama-release:
+    kind: llamacpp
+    source: {type: release, url: "https://github.com/example/llama.cpp/releases/download/b1/llama.tar.gz"}
+    build:
+      driver: custom
+      steps:
+        - {command: "rsync", args: ["-a", "${SOURCE_DIR}/", "${BUILD_DIR}/bin/"]}
+`
+	cfg, err := LoadConfigFromReader(strings.NewReader(config))
+	if !assert.NoError(t, err) {
+		return
+	}
+	step := cfg.Runtimes["vllm-git"].Build.Steps[0]
+	assert.Equal(t, "${SOURCE_DIR}", step.WorkDir)
+	assert.Equal(t, "${UV}", step.Command)
+	assert.Equal(t, []string{"pip", "install", "--python", "${PYTHON}", "."}, step.Args)
+	assert.Equal(t, []string{"-a", "${SOURCE_DIR}/", "${BUILD_DIR}/bin/"}, cfg.Runtimes["llama-release"].Build.Steps[0].Args)
+
+	// Unknown placeholders inside runtime definitions are still rejected.
+	_, err = LoadConfigFromReader(strings.NewReader(config + `
+  broken:
+    kind: vllm
+    source: {type: pypi}
+    build:
+      driver: custom
+      steps:
+        - {command: "echo", args: ["${NOT_A_MACRO}"]}
+`))
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "unknown macro '${NOT_A_MACRO}'")
+}
+
 func TestStripComments(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -1328,6 +1590,23 @@ models:
 		// Final result preserves the original value with backslashes
 		assert.Contains(t, config.Models["test"].Cmd, `path\to\file`)
 	})
+
+	t.Run("env value with backslash stays literal in a plain scalar", func(t *testing.T) {
+		t.Setenv("TEST_BACKSLASH_PLAIN", `C:\models`)
+
+		content := `
+models:
+  test:
+    cmd: ${env.TEST_BACKSLASH_PLAIN}\server.exe --port 8080
+    proxy: http://localhost:8080
+`
+		config, err := LoadConfigFromReader(strings.NewReader(content))
+		assert.NoError(t, err)
+		// A plain (unquoted) YAML scalar treats backslashes literally, so the
+		// substituted value must not have them doubled: escaping here turned
+		// Windows paths into literal `C:\\models`.
+		assert.Equal(t, `C:\models\server.exe --port 8080`, config.Models["test"].Cmd)
+	})
 }
 
 func TestConfig_PeerApiKey_EnvMacros(t *testing.T) {
@@ -1856,4 +2135,56 @@ routing:
 	cfg, err := LoadConfigFromReader(strings.NewReader(yaml))
 	require.NoError(t, err)
 	assert.Equal(t, 5, cfg.Routing.Scheduler.Settings.Fifo.Priority["gemma"])
+}
+
+func TestConfig_RealModelNameFallsBackToModelAliases(t *testing.T) {
+	cfg := Config{Models: map[string]ModelConfig{
+		"canonical": {Aliases: []string{"friendly"}},
+	}}
+
+	model, found := cfg.RealModelName("friendly")
+	if !found || model != "canonical" {
+		t.Fatalf("RealModelName(friendly) = %q, %v; want canonical, true", model, found)
+	}
+}
+
+// TestConfig_RollbackOnModelStartFailureDefault pins the normalization: an
+// absent key means the historical behaviour (restore the last configuration
+// that started), and only an explicit false opts into maintenance mode.
+func TestConfig_RollbackOnModelStartFailureDefault(t *testing.T) {
+	cases := []struct {
+		name   string
+		yaml   string
+		expect bool
+	}{
+		{
+			name:   "absent key rolls back",
+			yaml:   "models:\n  a:\n    cmd: echo ${PORT}\n",
+			expect: true,
+		},
+		{
+			name:   "explicit true rolls back",
+			yaml:   "rollbackOnModelStartFailure: true\nmodels:\n  a:\n    cmd: echo ${PORT}\n",
+			expect: true,
+		},
+		{
+			name:   "explicit false opts into maintenance",
+			yaml:   "rollbackOnModelStartFailure: false\nmodels:\n  a:\n    cmd: echo ${PORT}\n",
+			expect: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := LoadConfigFromReader(strings.NewReader(tc.yaml))
+			if err != nil {
+				t.Fatalf("LoadConfigFromReader: %v", err)
+			}
+			if cfg.RollbackOnModelStartFailure == nil {
+				t.Fatal("RollbackOnModelStartFailure was not normalized to a value")
+			}
+			if got := *cfg.RollbackOnModelStartFailure; got != tc.expect {
+				t.Errorf("RollbackOnModelStartFailure = %v, want %v", got, tc.expect)
+			}
+		})
+	}
 }

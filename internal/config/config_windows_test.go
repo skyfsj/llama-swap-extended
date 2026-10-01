@@ -192,6 +192,7 @@ groups:
 		LogLevel:      "info",
 		LogTimeFormat: "",
 		LogToStdout:   LogToStdoutProxy,
+		LogStorage:    LogStorageConfig{MaxFiles: LogStorageDefaultMaxFiles},
 		StartPort:     5800,
 		Macros: MacroList{
 			{"svr-path", "path/to/server"},
@@ -250,7 +251,6 @@ groups:
 		},
 		HealthCheckTimeout: 15,
 		MetricsMaxInMemory: 1000,
-		CaptureBuffer:      5,
 		UI: UIConfig{Activity: UIActivityConfig{SessionID: []string{
 			"X-Session-ID",
 			"X-Litellm-Session-Id",

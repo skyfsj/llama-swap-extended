@@ -70,6 +70,7 @@ type Accelerator struct {
 	RawKind         *string           `json:"raw_kind,omitempty"`
 	Vendor          *string           `json:"vendor"`
 	Model           *string           `json:"model"`
+	UUID            *string           `json:"uuid,omitempty"`
 	Architecture    *string           `json:"architecture"`
 	Memory          AcceleratorMemory `json:"memory"`
 	Driver          *Driver           `json:"driver"`

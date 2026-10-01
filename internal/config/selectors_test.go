@@ -197,6 +197,16 @@ selectors:
 `,
 			wantErr: "must share a group with swap: false",
 		},
+		{
+			name: "peer FQN collision",
+			config: `
+selectors:
+  remote/remote-model:
+    strategy: pin
+    targets: [remote/remote-model]
+`,
+			wantErr: `selector ID "remote/remote-model" conflicts with fully qualified peer model name`,
+		},
 	}
 
 	const base = `
@@ -329,6 +339,50 @@ selectors:
 
 		_, err := LoadConfigFromReader(strings.NewReader(yaml.String()))
 		require.NoError(t, err)
+	})
+
+	t.Run("gpus disjoint cards", func(t *testing.T) {
+		_, err := LoadConfigFromReader(strings.NewReader(`
+models:
+  a:
+    cmd: echo ${PORT}
+  b:
+    cmd: echo ${PORT}
+routing:
+  router:
+    use: gpus
+    settings:
+      gpus:
+        "0": [a]
+        "1": [b]
+selectors:
+  public:
+    strategy: spillover
+    targets: [a, b]
+`))
+		require.NoError(t, err)
+	})
+
+	t.Run("gpus shared card", func(t *testing.T) {
+		_, err := LoadConfigFromReader(strings.NewReader(`
+models:
+  a:
+    cmd: echo ${PORT}
+  b:
+    cmd: echo ${PORT}
+routing:
+  router:
+    use: gpus
+    settings:
+      gpus:
+        "0": [a, b]
+selectors:
+  public:
+    strategy: spillover
+    targets: [a, b]
+`))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "share GPU card")
 	})
 
 	t.Run("remote targets", func(t *testing.T) {
