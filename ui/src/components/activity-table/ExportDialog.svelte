@@ -2,6 +2,7 @@
   import { Button } from "$lib/components/ui/button/index.js";
   import * as Dialog from "$lib/components/ui/dialog/index.js";
   import { copyText } from "../../lib/clipboard";
+  import { translate } from "../../lib/i18n";
 
   interface Props {
     markdown: string;
@@ -57,9 +58,9 @@
     class="flex max-h-[90vh] w-[90%] flex-col gap-0 p-0 sm:max-w-[90%]"
   >
     <Dialog.Header class="border-border border-b px-4 py-3">
-      <Dialog.Title class="text-lg font-bold">Export</Dialog.Title>
+      <Dialog.Title class="text-lg font-bold">{$translate("activity.export.title")}</Dialog.Title>
       <Dialog.Description class="text-muted-foreground text-sm">
-        The current page of results as markdown table source.
+        {$translate("activity.export.description")}
       </Dialog.Description>
     </Dialog.Header>
 
@@ -67,7 +68,7 @@
       <div class="bg-background border-border max-h-[60vh] overflow-auto rounded-md border">
         <pre
           bind:this={preEl}
-          class="p-3 font-mono text-xs whitespace-pre">{markdown || "(no rows)"}</pre>
+          class="p-3 font-mono text-xs whitespace-pre">{markdown || $translate("activity.export.noRows")}</pre>
       </div>
     </div>
 
@@ -79,9 +80,9 @@
     <Dialog.Footer
       class="border-border bg-card mx-0 mb-0 border-t px-4 py-3 sm:justify-end"
     >
-      <Button variant="outline" onclick={onclose}>Close</Button>
+      <Button variant="outline" onclick={onclose}>{$translate("common.close")}</Button>
       <Button onclick={copy} disabled={!markdown}>
-        {status === "copied" ? "Copied!" : status === "failed" ? "Press Ctrl+C" : "Copy"}
+        {status === "copied" ? $translate("common.copied") : status === "failed" ? $translate("common.pressCtrlC") : $translate("common.copy")}
       </Button>
     </Dialog.Footer>
   </Dialog.Content>

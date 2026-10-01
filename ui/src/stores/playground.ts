@@ -1,14 +1,21 @@
 import { persistentStore } from "./persistent";
 
-export type PlaygroundTab = "chat" | "images" | "speech" | "audio" | "rerank" | "concurrency";
+export type PlaygroundTab = "chat" | "translation" | "images" | "concurrency";
 
-export const playgroundTabs: { id: PlaygroundTab; label: string }[] = [
-  { id: "chat", label: "Chat" },
-  { id: "images", label: "Images" },
-  { id: "speech", label: "Speech" },
-  { id: "audio", label: "Transcription" },
-  { id: "rerank", label: "Rerank" },
-  { id: "concurrency", label: "Load Test" },
+export const playgroundTabs: { id: PlaygroundTab; labelKey: string }[] = [
+  { id: "chat", labelKey: "playground.tabs.chat" },
+  { id: "translation", labelKey: "playground.tabs.translation" },
+  { id: "images", labelKey: "playground.tabs.images" },
+  { id: "concurrency", labelKey: "playground.tabs.concurrency" },
 ];
 
-export const selectedPlaygroundTab = persistentStore<PlaygroundTab>("playground-selected-tab", "chat");
+// A previously persisted tab may belong to a removed module; fall back to chat
+// so the page always renders with an active tab.
+const storedTab = persistentStore<string>("playground-selected-tab", "chat");
+const knownTabs = new Set<string>(playgroundTabs.map((t) => t.id));
+
+export const selectedPlaygroundTab = {
+  ...storedTab,
+  subscribe: (run: (value: PlaygroundTab) => void) =>
+    storedTab.subscribe((value) => run(knownTabs.has(value) ? (value as PlaygroundTab) : "chat")),
+} as typeof storedTab;

@@ -3,9 +3,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   activeProfile,
   activityRevision,
+  backendProgress,
   fetchPlaygroundModels,
   fetchProfiles,
   getHardware,
+  getActivity,
+  getActivityStats,
+  getModelLoadConflicts,
   handleAPIEventMessage,
   hasListedModels,
   inFlightRequests,
@@ -14,6 +18,7 @@ import {
   playgroundModels,
   profileModels,
   profiles,
+  runtimeLogs,
   selectorModels,
   setActiveProfile,
   uiConfig,
@@ -25,6 +30,8 @@ afterEach(() => {
   playgroundModels.set([]);
   profiles.set([]);
   activeProfile.set(null);
+  backendProgress.set({});
+  runtimeLogs.set({});
 });
 
 describe("hardware api", () => {
@@ -48,6 +55,38 @@ describe("hardware api", () => {
   it("rejects unavailable hardware", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 503 }));
     await expect(getHardware()).rejects.toThrow("Failed to fetch hardware: 503");
+  });
+});
+
+describe("activity api", () => {
+  it("limits the main activity views to currently configured models", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await getActivity({ configuredOnly: true });
+    await getActivityStats({ configuredOnly: true });
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/metrics/activity?configured_only=true");
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/metrics/stats?configured_only=true");
+  });
+});
+
+describe("model load conflict api", () => {
+  it("returns the server's numeric model conflict list", async () => {
+    const response = {
+      conflicts: [{ id: "old/model", name: "Old model", state: "ready" }],
+    };
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => response });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(getModelLoadConflicts("target/model")).resolves.toEqual(response.conflicts);
+    expect(fetchMock).toHaveBeenCalledWith("/api/models/conflicts/target%2Fmodel");
+  });
+
+  it("does not turn a failed conflict check into an implicit load", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 503 }));
+
+    await expect(getModelLoadConflicts("target")).rejects.toThrow("Failed to check model conflicts: 503");
   });
 });
 
@@ -160,6 +199,39 @@ describe("api store event handling", () => {
     expect(get(activeProfile)).toBe("coding");
   });
 
+  it("keeps the latest backend progress event by model or runtime", () => {
+    handleAPIEventMessage(JSON.stringify({
+      type: "backendProgress",
+      data: JSON.stringify({ model: "m1", phase: "downloading", progress: 0.5, message: "fetching" }),
+    }));
+    handleAPIEventMessage(JSON.stringify({
+      type: "backendProgress",
+      data: JSON.stringify({ runtime: "vllm", phase: "active", progress: 1 }),
+    }));
+    expect(get(backendProgress)).toEqual({
+      m1: { model: "m1", phase: "downloading", progress: 0.5, message: "fetching" },
+      vllm: { runtime: "vllm", phase: "active", progress: 1 },
+    });
+  });
+
+  it("keeps streamed runtime output separate from the latest phase", () => {
+    handleAPIEventMessage(JSON.stringify({
+      type: "backendProgress",
+      data: JSON.stringify({ runtime: "vllm", phase: "building", progress: 0.2, message: "compiling" }),
+    }));
+    handleAPIEventMessage(JSON.stringify({
+      type: "backendProgress",
+      data: JSON.stringify({ runtime: "vllm", operationId: "op-1", phase: "log", progress: 0, outputStream: "stderr", output: "error: first line\n" }),
+    }));
+    handleAPIEventMessage(JSON.stringify({
+      type: "backendProgress",
+      data: JSON.stringify({ runtime: "vllm", operationId: "op-1", phase: "log", progress: 0, outputStream: "stderr", output: "error: second line\n" }),
+    }));
+
+    expect(get(runtimeLogs)).toEqual({ vllm: "error: first line\nerror: second line\n" });
+    expect(get(backendProgress).vllm?.phase).toBe("building");
+  });
+
   it("loads and switches profiles", async () => {
     const mockFetch = vi.fn()
       .mockResolvedValueOnce({
@@ -196,6 +268,7 @@ describe("api store event handling", () => {
             id: "real",
             name: "Real",
             capabilities: { vision: true },
+            context_length: 128000,
             meta: { llamaswap: { type: "model", aliases: ["variant", "alternate"] } },
           },
           {
@@ -233,6 +306,7 @@ describe("api store event handling", () => {
     expect(get(playgroundModels).find((model) => model.id === "real")).toMatchObject({
       aliases: ["variant", "alternate"],
       capabilities: { vision: true },
+      context_length: 128000,
       playgroundType: "model",
     });
     expect(get(playgroundModels).find((model) => model.id === "remote/remote-model")).toMatchObject({

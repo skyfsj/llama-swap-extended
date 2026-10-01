@@ -3,12 +3,47 @@
 
 import type { ActivityLogEntry } from "./types";
 import { formatAbsoluteTime, formatDuration, formatSpeed } from "./format";
+import { localeToIntl, translateFor, type Locale } from "./i18n";
 
 /** Format a draft acceptance rate as "p% (accepted/drafted)". */
 export function formatDrafted(drafted: number, accepted: number): string {
   return drafted > 0
     ? ((accepted * 100) / drafted).toFixed(1) + "% (" + accepted + "/" + drafted + ")"
     : "-";
+}
+
+/** Format cache creation tokens while keeping missing/invalid telemetry clear. */
+export function formatCacheCreationTokens(value: number | undefined, locale?: Locale): string {
+  if (value === undefined || !Number.isFinite(value) || value <= 0) return "-";
+  return value.toLocaleString(locale ? localeToIntl(locale) : undefined);
+}
+
+/**
+ * Format the cache hit ratio only when the row actually carries cache
+ * telemetry. A zero ratio is meaningful for a cache-creation request, while
+ * an omitted ratio is indistinguishable from JSON's zero value on the client;
+ * the accompanying counters/hash let us make that distinction safely.
+ */
+export function formatCacheHitRatio(row: ActivityLogEntry): string {
+  const ratio = row.cache_hit_ratio;
+  const hasTelemetry =
+    ratio !== undefined &&
+    Number.isFinite(ratio) &&
+    (ratio > 0 ||
+      (row.tokens.cache_tokens ?? 0) > 0 ||
+      (row.cache_creation_tokens ?? 0) > 0 ||
+      !!row.prefix_hash ||
+      row.repair_applied === true);
+  if (!hasTelemetry) return "-";
+  const bounded = Math.max(0, Math.min(1, ratio as number));
+  return `${(bounded * 100).toFixed(1)}%`;
+}
+
+/** Render a short, copy-safe prefix hash as the stability marker. */
+export function formatPrefixStability(row: ActivityLogEntry): string {
+  const hash = row.prefix_hash?.trim();
+  if (!hash) return "-";
+  return hash.length > 12 ? `${hash.slice(0, 12)}…` : hash;
 }
 
 /** Totals and average speeds across a set of activity rows. */
@@ -74,7 +109,7 @@ export function summarizeActivity(rows: ActivityLogEntry[]): ActivitySummary {
       }
     }
 
-    summary.durationMs += row.duration_ms;
+    if (row.duration_ms >= 0) summary.durationMs += row.duration_ms;
     summary.cacheTokens += row.tokens.cache_tokens;
     summary.inputTokens += row.tokens.input_tokens;
     summary.outputTokens += row.tokens.output_tokens;
@@ -102,12 +137,21 @@ export function summarizeActivity(rows: ActivityLogEntry[]): ActivitySummary {
  * renderer shows. The time column is rendered as an absolute timestamp because
  * an exported "5m ago" is meaningless once pasted somewhere else.
  */
-export function activityCellText(row: ActivityLogEntry, columnId: string): string {
+export function activityCellText(
+  row: ActivityLogEntry,
+  columnId: string,
+  locale?: Locale,
+): string {
+  const numberLocale = locale ? localeToIntl(locale) : undefined;
+  const formatNumber = (value: number): string =>
+    numberLocale ? value.toLocaleString(numberLocale) : value.toLocaleString();
+  const unknown = locale ? translateFor(locale, "common.unknown") : "unknown";
+
   switch (columnId) {
     case "id":
       return String(row.id);
     case "time":
-      return formatAbsoluteTime(row.timestamp);
+      return formatAbsoluteTime(row.timestamp, locale);
     case "model":
       return row.model;
     case "req_path":
@@ -117,19 +161,30 @@ export function activityCellText(row: ActivityLogEntry, columnId: string): strin
     case "resp_content_type":
       return row.resp_content_type || "-";
     case "cached":
-      return row.tokens.cache_tokens > 0 ? row.tokens.cache_tokens.toLocaleString() : "-";
+      return row.tokens.cache_tokens > 0 ? formatNumber(row.tokens.cache_tokens) : "-";
+    case "cache_creation":
+      return formatCacheCreationTokens(row.cache_creation_tokens, locale);
+    case "cache_hit_ratio":
+      return formatCacheHitRatio(row);
+    case "repair_applied":
+      return row.repair_applied ? (locale ? translateFor(locale, "activity.table.values.applied") : "Applied") : "-";
+    case "prefix_stability":
+      return formatPrefixStability(row);
     case "prompt":
-      return row.tokens.input_tokens.toLocaleString();
+      return formatNumber(row.tokens.input_tokens);
     case "generated":
-      return row.tokens.output_tokens.toLocaleString();
+      return formatNumber(row.tokens.output_tokens);
     case "drafted":
       return formatDrafted(row.tokens.draft_tokens, row.tokens.draft_acc_tokens);
     case "prompt_speed":
-      return formatSpeed(row.tokens.prompt_per_second);
+      return formatSpeed(row.tokens.prompt_per_second, unknown);
     case "gen_speed":
-      return formatSpeed(row.tokens.tokens_per_second);
-    case "duration":
-      return formatDuration(row.duration_ms);
+      return formatSpeed(row.tokens.tokens_per_second, unknown);
+    case "duration": {
+      const first = row.first_token_ms > 0 ? formatDuration(row.first_token_ms) : "-";
+      const total = row.duration_ms >= 0 ? formatDuration(row.duration_ms) : "-";
+      return `${first} / ${total}`;
+    }
     case "meta": {
       const entries = Object.entries(row.metadata || {});
       return entries.length > 0
@@ -145,7 +200,13 @@ export function activityCellText(row: ActivityLogEntry, columnId: string): strin
  * Render the page totals as a two-column markdown table. Speeds are annotated
  * in parentheses next to the token counts they describe.
  */
-export function summaryMarkdown(summary: ActivitySummary): string {
+export function summaryMarkdown(summary: ActivitySummary, locale?: Locale): string {
+  const message = (key: string, fallback: string): string =>
+    locale ? translateFor(locale, key) : fallback;
+  const numberLocale = locale ? localeToIntl(locale) : undefined;
+  const formatNumber = (value: number): string =>
+    numberLocale ? value.toLocaleString(numberLocale) : value.toLocaleString();
+  const unknown = locale ? translateFor(locale, "common.unknown") : "unknown";
   const drafted =
     summary.draftTokens > 0
       ? `${((summary.draftAccTokens * 100) / summary.draftTokens).toFixed(1)}% ${
@@ -155,26 +216,26 @@ export function summaryMarkdown(summary: ActivitySummary): string {
 
   const range =
     summary.startedAt !== "" && summary.endedAt !== ""
-      ? `${formatAbsoluteTime(summary.startedAt)} → ${formatAbsoluteTime(summary.endedAt)}`
+      ? `${formatAbsoluteTime(summary.startedAt, locale)} → ${formatAbsoluteTime(summary.endedAt, locale)}`
       : "-";
 
   const rows: [string, string][] = [
-    ["Range", range],
-    ["Duration", formatDuration(summary.durationMs)],
-    ["Cached", summary.cacheTokens.toLocaleString()],
+    [message("activity.export.range", "Range"), range],
+    [message("activity.export.duration", "Duration"), formatDuration(summary.durationMs)],
+    [message("activity.export.cached", "Cached"), formatNumber(summary.cacheTokens)],
     [
-      "Prompt",
-      `${summary.inputTokens.toLocaleString()} (${formatSpeed(summary.promptPerSecond)})`,
+      message("activity.export.prompt", "Prompt"),
+      `${formatNumber(summary.inputTokens)} (${formatSpeed(summary.promptPerSecond, unknown)})`,
     ],
     [
-      "Generated",
-      `${summary.outputTokens.toLocaleString()} (${formatSpeed(summary.tokensPerSecond)})`,
+      message("activity.export.generated", "Generated"),
+      `${formatNumber(summary.outputTokens)} (${formatSpeed(summary.tokensPerSecond, unknown)})`,
     ],
-    ["Drafted", drafted],
+    [message("activity.export.drafted", "Drafted"), drafted],
   ];
 
   return [
-    "| Summary | |",
+    `| ${message("activity.export.summary", "Summary")} | |`,
     "| --- | --- |",
     ...rows.map(([label, value]) => `| ${label} | ${escapeCell(value)} |`),
   ].join("\n");
@@ -194,7 +255,8 @@ function escapeCell(value: string): string {
 /** Render rows as GitHub-flavored markdown table source, columns in order. */
 export function toMarkdownTable(
   rows: ActivityLogEntry[],
-  columns: MarkdownColumn[]
+  columns: MarkdownColumn[],
+  locale?: Locale,
 ): string {
   if (columns.length === 0) return "";
   const lines = [
@@ -203,7 +265,7 @@ export function toMarkdownTable(
   ];
   for (const row of rows) {
     lines.push(
-      `| ${columns.map((column) => escapeCell(activityCellText(row, column.id))).join(" | ")} |`
+      `| ${columns.map((column) => escapeCell(activityCellText(row, column.id, locale))).join(" | ")} |`
     );
   }
   return lines.join("\n");
@@ -216,13 +278,17 @@ export function toMarkdownTable(
 export function buildActivityMarkdown(
   rows: ActivityLogEntry[],
   columns: MarkdownColumn[],
-  generatedAt: Date = new Date()
+  generatedAt: Date = new Date(),
+  locale?: Locale,
 ): string {
-  const attribution =
-    "Exported from [llama-swap](https://github.com/mostlygeek/llama-swap) at " +
-    formatAbsoluteTime(generatedAt.toISOString());
+  const attribution = locale
+    ? translateFor(locale, "activity.export.attribution", {
+        timestamp: formatAbsoluteTime(generatedAt.toISOString(), locale),
+      })
+    : "Exported from [llama-swap](https://github.com/mostlygeek/llama-swap) at " +
+      formatAbsoluteTime(generatedAt.toISOString());
 
-  return [summaryMarkdown(summarizeActivity(rows)), toMarkdownTable(rows, columns), attribution]
+  return [summaryMarkdown(summarizeActivity(rows), locale), toMarkdownTable(rows, columns, locale), attribution]
     .filter((section) => section !== "")
     .join("\n\n");
 }

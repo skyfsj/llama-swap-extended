@@ -8,6 +8,7 @@
   import * as Card from "$lib/components/ui/card/index.js";
   import { Button } from "$lib/components/ui/button/index.js";
   import { RefreshCw } from "@lucide/svelte";
+  import { translate } from "../lib/i18n";
 
   const COLORS = [
     "#3b82f6",
@@ -28,19 +29,34 @@
     "#22d3ee",
   ];
 
-  const WINDOWS = [
-    { label: "5 min", ms: 5 * 60 * 1000 },
-    { label: "15 min", ms: 15 * 60 * 1000 },
-    { label: "1 hr", ms: 60 * 60 * 1000 },
+  const WINDOW_OPTIONS = [
+    { labelKey: "performance.windows.fiveMinutes", ms: 5 * 60 * 1000 },
+    { labelKey: "performance.windows.fifteenMinutes", ms: 15 * 60 * 1000 },
+    { labelKey: "performance.windows.oneHour", ms: 60 * 60 * 1000 },
   ] as const;
 
-  const INTERVALS = [
-    { label: "Off", ms: 0 },
-    { label: "5s", ms: 5000 },
-    { label: "10s", ms: 10000 },
-    { label: "30s", ms: 30000 },
-    { label: "60s", ms: 60000 },
+  // Sample retention: incremental polling appends unconditionally, so the
+  // buffers must be trimmed against the largest selectable window (with
+  // margin for slow clocks and missed refreshes) instead of growing for the
+  // lifetime of the page.
+  const MAX_WINDOW_MS = Math.max(...WINDOW_OPTIONS.map((w) => w.ms));
+  const MAX_BUFFER_SAMPLES = Math.ceil((MAX_WINDOW_MS * 1.5) / 1000);
+
+  function trimBuffer<T extends { timestamp: string }>(buffer: T[]): T[] {
+    if (buffer.length <= MAX_BUFFER_SAMPLES) return buffer;
+    return buffer.slice(buffer.length - MAX_BUFFER_SAMPLES);
+  }
+
+  const INTERVAL_OPTIONS = [
+    { labelKey: "performance.intervals.off", ms: 0 },
+    { labelKey: "performance.intervals.fiveSeconds", ms: 5000 },
+    { labelKey: "performance.intervals.tenSeconds", ms: 10000 },
+    { labelKey: "performance.intervals.thirtySeconds", ms: 30000 },
+    { labelKey: "performance.intervals.sixtySeconds", ms: 60000 },
   ] as const;
+
+  let windows = $derived(WINDOW_OPTIONS.map((option) => ({ label: $translate(option.labelKey), ms: option.ms })));
+  let intervals = $derived(INTERVAL_OPTIONS.map((option) => ({ label: $translate(option.labelKey), ms: option.ms })));
 
   let selectedWindow = persistentStore("perf-window", 0);
   let selectedInterval = persistentStore("perf-refresh-interval", 0);
@@ -53,7 +69,7 @@
   let mounted = $state(false);
 
   function cutoffTime(): number {
-    return Date.now() - WINDOWS[$selectedWindow].ms;
+    return Date.now() - WINDOW_OPTIONS[$selectedWindow].ms;
   }
 
   function formatDelta(ts: string, refTime: number): string {
@@ -90,17 +106,17 @@
       const newSys = resp.sys_stats ?? [];
       const newGpu = resp.gpu_stats ?? [];
       if (newSys.length > 0) {
-        sysData = [...sysData, ...newSys];
+        sysData = trimBuffer([...sysData, ...newSys]);
       }
       if (newGpu.length > 0) {
-        gpuData = [...gpuData, ...newGpu];
+        gpuData = trimBuffer([...gpuData, ...newGpu]);
       }
     }
   }
 
   function startPolling() {
     stopPolling();
-    const ms = INTERVALS[$selectedInterval].ms;
+    const ms = INTERVAL_OPTIONS[$selectedInterval].ms;
     if (ms <= 0) return;
     pollTimer = setInterval(() => {
       if (visible) {
@@ -167,7 +183,7 @@
     const datasets = [];
     for (let i = 0; i < coreCount; i++) {
       datasets.push({
-        label: `Core ${i}`,
+        label: $translate("performance.core", { index: i }),
         data: stats.map((s) => s.cpu_util_per_core[i]),
         borderColor: COLORS[i % COLORS.length],
       });
@@ -180,12 +196,12 @@
     if (stats.length === 0) return [];
     return [
       {
-        label: "Memory Used %",
+        label: $translate("performance.memoryUsed"),
         data: stats.map((s) => (s.mem_used_mb / s.mem_total_mb) * 100),
         borderColor: "#3b82f6",
       },
       {
-        label: "Swap Used %",
+        label: $translate("performance.swapUsed"),
         data: stats.map((s) => (s.swap_total_mb > 0 ? (s.swap_used_mb / s.swap_total_mb) * 100 : 0)),
         borderColor: "#8b5cf6",
       },
@@ -211,17 +227,17 @@
     if (stats.length === 0) return [];
     return [
       {
-        label: "1 min",
+        label: $translate("performance.oneMinute"),
         data: stats.map((s) => s.load_avg_1),
         borderColor: "#10b981",
       },
       {
-        label: "5 min",
+        label: $translate("performance.windows.fiveMinutes"),
         data: stats.map((s) => s.load_avg_5),
         borderColor: "#f59e0b",
       },
       {
-        label: "15 min",
+        label: $translate("performance.windows.fifteenMinutes"),
         data: stats.map((s) => s.load_avg_15),
         borderColor: "#ef4444",
       },
@@ -274,13 +290,13 @@
       }
 
       datasets.push({
-        label: `${iface} in`,
+        label: $translate("performance.networkIn", { iface }),
         data: recvData,
         borderColor: COLORS[colorIdx % COLORS.length],
       });
       colorIdx++;
       datasets.push({
-        label: `${iface} out`,
+        label: $translate("performance.networkOut", { iface }),
         data: sentData,
         borderColor: COLORS[colorIdx % COLORS.length],
       });
@@ -337,7 +353,7 @@
     let colorIdx = 0;
     for (const [id, entry] of byId) {
       datasets.push({
-        label: entry.name || `GPU ${id}`,
+        label: entry.name || `${$translate("performance.gpu")} ${id}`,
         data: entry.values,
         borderColor: COLORS[colorIdx % COLORS.length],
       });
@@ -356,40 +372,40 @@
 
 <div class="space-y-6">
   <div class="flex items-center justify-between">
-    <h2 class="text-xl font-semibold text-foreground">Performance (Experimental)</h2>
+    <h2 class="text-xl font-semibold text-foreground">{$translate("performance.title")}</h2>
     <div class="flex items-center gap-4">
-      <SegmentedControl items={WINDOWS} selected={$selectedWindow} onSelect={(i) => ($selectedWindow = i)} />
+      <SegmentedControl items={windows} selected={$selectedWindow} onSelect={(i) => ($selectedWindow = i)} />
       <SegmentedControl
-        items={INTERVALS}
+        items={intervals}
         selected={$selectedInterval}
         onSelect={handleIntervalChange}
-        label="Refresh:"
+        label={$translate("performance.refresh")}
       />
-      <Button variant="outline" size="icon-sm" title="Refresh" onclick={manualRefresh} disabled={refreshing}>
+      <Button variant="outline" size="icon-sm" title={$translate("common.refresh")} onclick={manualRefresh} disabled={refreshing}>
         <RefreshCw class={refreshing ? "animate-spin" : ""} />
       </Button>
     </div>
   </div>
   <p class="text-sm text-muted-foreground">
-    This is an experimental feature. Please use <a
+    {$translate("performance.experimentalBefore")} <a
       class="underline hover:text-foreground"
-      href="https://github.com/mostlygeek/llama-swap/discussions/771">discussion #771</a
-    > for instructions and to share feedback.
+      href="https://github.com/mostlygeek/llama-swap/discussions/771">{$translate("performance.discussion")}</a
+    >{$translate("performance.experimentalAfter")}
   </p>
 
   <!-- GPU Section -->
   <section class="space-y-4">
-    <h3 class="text-lg font-medium text-foreground">GPU</h3>
+    <h3 class="text-lg font-medium text-foreground">{$translate("performance.gpu")}</h3>
     {#if !hasGpuData}
       <Card.Root class="py-0">
         <Card.Content class="p-4">
-          <p class="text-muted-foreground">No GPU data available</p>
+          <p class="text-muted-foreground">{$translate("performance.noGpuData")}</p>
         </Card.Content>
       </Card.Root>
     {:else}
       <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <PerformanceChart
-          title="GPU Utilization (%)"
+          title={$translate("performance.gpuUtilization")}
           labels={gpuLabels}
           datasets={gpuUtilDatasets}
           yMin={0}
@@ -397,7 +413,7 @@
           yLabel="%"
         />
         <PerformanceChart
-          title="GPU Memory Utilization (%)"
+          title={$translate("performance.gpuMemoryUtilization")}
           labels={gpuLabels}
           datasets={gpuMemDatasets}
           yMin={0}
@@ -405,7 +421,7 @@
           yLabel="%"
         />
         <PerformanceChart
-          title="GPU Temperature (°C)"
+            title={$translate("performance.gpuTemperature")}
           labels={gpuLabels}
           datasets={gpuTempDatasets}
           yMin={0}
@@ -413,7 +429,7 @@
         />
         {#if hasVramTemp}
           <PerformanceChart
-            title="GPU VRAM Temperature (°C)"
+            title={$translate("performance.gpuVramTemperature")}
             labels={gpuLabels}
             datasets={gpuVramTempDatasets}
             yMin={0}
@@ -421,7 +437,7 @@
           />
         {/if}
         <PerformanceChart
-          title="GPU Power Draw (W)"
+          title={$translate("performance.gpuPowerDraw")}
           labels={gpuLabels}
           datasets={gpuPowerDatasets}
           yMin={0}
@@ -433,10 +449,10 @@
 
   <!-- System Section -->
   <section class="space-y-4">
-    <h3 class="text-lg font-medium text-foreground">System</h3>
+    <h3 class="text-lg font-medium text-foreground">{$translate("performance.system")}</h3>
     <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
       <PerformanceChart
-        title="CPU Utilization (%)"
+        title={$translate("performance.cpuUtilization")}
         labels={sysLabels}
         datasets={cpuDatasets}
         yMin={0}
@@ -446,7 +462,7 @@
       />
       <div>
         <PerformanceChart
-          title="Memory & Swap Usage (%)"
+          title={$translate("performance.memorySwapUsage")}
           labels={sysLabels}
           datasets={memSwapDatasets}
           yMin={0}
@@ -456,13 +472,13 @@
         {#if latestMemSwap}
           <div class="flex items-center justify-center gap-4 text-xs text-muted-foreground mt-1 px-4">
             <span
-              >Mem: <span class="text-foreground font-medium"
+                >{$translate("performance.mem")}: <span class="text-foreground font-medium"
                 >{latestMemSwap.mem_used_mb.toLocaleString()} / {latestMemSwap.mem_total_mb.toLocaleString()} MB ({latestMemSwap.mem_used_pct}%)</span
               ></span
             >
             {#if latestMemSwap.swap_used_pct !== null}
               <span
-                >Swap: <span class="text-foreground font-medium"
+                >{$translate("performance.swap")}: <span class="text-foreground font-medium"
                   >{latestMemSwap.swap_used_mb.toLocaleString()} / {latestMemSwap.swap_total_mb.toLocaleString()} MB ({latestMemSwap.swap_used_pct}%)</span
                 ></span
               >
@@ -470,10 +486,10 @@
           </div>
         {/if}
       </div>
-      <PerformanceChart title="Load Average" labels={sysLabels} datasets={loadDatasets} yMin={0} />
+      <PerformanceChart title={$translate("performance.loadAverage")} labels={sysLabels} datasets={loadDatasets} yMin={0} />
       {#if netBandwidthDatasets.length > 0}
         <PerformanceChart
-          title="Network Bandwidth (Mbit/s)"
+          title={$translate("performance.networkBandwidth")}
           labels={netBandwidthLabels}
           datasets={netBandwidthDatasets}
           yMin={0}

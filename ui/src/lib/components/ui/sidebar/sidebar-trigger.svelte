@@ -4,6 +4,7 @@
 	import { cn } from "$lib/utils.js";
 	import type { ComponentProps } from "svelte";
 	import { useSidebar } from "./context.svelte.js";
+	import { translate } from "$lib/i18n";
 
 	let {
 		ref = $bindable(null),
@@ -32,5 +33,5 @@
 	{...restProps}
 >
 	<PanelLeftIcon  />
-	<span class="sr-only">Toggle Sidebar</span>
+	<span class="sr-only">{$translate("common.toggleSidebar")}</span>
 </Button>

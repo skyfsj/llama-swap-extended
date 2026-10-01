@@ -1,5 +1,6 @@
 import { get, writable, type Writable } from "svelte/store";
 import { persistentStore } from "../stores/persistent";
+import { t } from "./i18n";
 
 export interface PlaygroundInterface {
   /** Persisted selected-model id for this interface. */
@@ -36,7 +37,7 @@ export function createPlaygroundInterface(
       await task(abort.signal);
     } catch (err) {
       if (!(err instanceof Error && err.name === "AbortError")) {
-        error.set(err instanceof Error ? err.message : "An error occurred");
+        error.set(err instanceof Error ? err.message : t("errors.anErrorOccurred"));
       }
     } finally {
       busy.set(false);

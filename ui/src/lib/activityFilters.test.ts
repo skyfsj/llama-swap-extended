@@ -12,9 +12,9 @@ function build(overrides: Partial<ActivityFilters> = {}): ActivityFilters {
   return { ...emptyActivityFilters(), ...overrides };
 }
 
-function paramsFor(filters: ActivityFilters): URLSearchParams {
+function paramsFor(filters: ActivityFilters, now?: Date): URLSearchParams {
   const query = new URLSearchParams();
-  appendActivityFilters(query, filters);
+  appendActivityFilters(query, filters, now);
   return query;
 }
 
@@ -43,12 +43,32 @@ describe("appendActivityFilters", () => {
     }
   });
 
-  it("never writes a model param", () => {
-    expect(paramsFor(build({ minID: "2" })).has("model")).toBe(false);
+  it("writes model, key, session and valid time bounds", () => {
+    const query = paramsFor(build({ model: "qwen", keyID: "key-1", sessionID: "session-1", start: "2026-08-01T00:00:00Z", end: "2026-08-02T00:00:00Z" }));
+    expect(query.get("model")).toBe("qwen");
+    expect(query.get("key_id")).toBe("key-1");
+    expect(query.get("session_id")).toBe("session-1");
+    expect(query.get("start")).toBe("2026-08-01T00:00:00.000Z");
+    expect(query.get("end")).toBe("2026-08-02T00:00:00.000Z");
   });
 
-  it("combines every filter dimension", () => {
-    expect(paramsFor(build({ minID: "2", maxID: "9" })).toString()).toBe("min_id=2&max_id=9");
+  it("drops invalid time bounds", () => {
+    const query = paramsFor(build({ start: "not-a-date", end: "" }));
+    expect(query.has("start")).toBe(false);
+    expect(query.has("end")).toBe(false);
+  });
+
+  it("uses a deterministic relative time range without guessing token data", () => {
+    const now = new Date("2026-09-05T12:00:00.000Z");
+    const query = paramsFor(build({ range: "week" }), now);
+    expect(query.get("start")).toBe("2026-08-29T12:00:00.000Z");
+    expect(query.get("end")).toBe("2026-09-05T12:00:00.000Z");
+  });
+
+  it("uses explicit bounds for a custom range", () => {
+    const query = paramsFor(build({ range: "custom", start: "2026-09-01T00:00:00Z", end: "2026-09-05T00:00:00Z" }));
+    expect(query.get("start")).toBe("2026-09-01T00:00:00.000Z");
+    expect(query.get("end")).toBe("2026-09-05T00:00:00.000Z");
   });
 });
 
@@ -60,9 +80,14 @@ describe("activeFilterCount", () => {
 
   it("counts each set field", () => {
     expect(activeFilterCount(build({ minID: "1" }))).toBe(1);
-    const filters = build({ minID: "1", maxID: "9" });
-    expect(activeFilterCount(filters)).toBe(2);
+    const filters = build({ minID: "1", maxID: "9", model: "m", keyID: "k", sessionID: "s", start: "2026-01-01", end: "2026-01-02" });
+    expect(activeFilterCount(filters)).toBe(7);
     expect(hasActiveFilters(filters)).toBe(true);
+  });
+
+  it("counts a preset or custom range as one time filter", () => {
+    expect(activeFilterCount(build({ range: "day" }))).toBe(1);
+    expect(activeFilterCount(build({ range: "custom", start: "2026-09-01", end: "2026-09-02" }))).toBe(1);
   });
 });
 
@@ -75,22 +100,25 @@ describe("normalizeActivityFilters", () => {
 
   it("keeps valid fields and drops wrongly typed ones", () => {
     expect(normalizeActivityFilters({ minID: "3", maxID: 5 })).toEqual(build({ minID: "3" }));
+    expect(normalizeActivityFilters({ range: "week" })).toEqual(build({ range: "week" }));
+    expect(normalizeActivityFilters({ range: "quarter" })).toEqual(build());
   });
 
   it("ignores unknown keys", () => {
     expect(normalizeActivityFilters({ minID: "3", userAgent: "x" })).toEqual(build({ minID: "3" }));
   });
 
-  // Filters persisted by an earlier build that had a date range and a model
-  // multi-select must not carry those fields back into the current shape.
-  it("drops start, end and models left over in stored filters", () => {
+  it("keeps supported dimensions and ignores unknown keys", () => {
     const restored = normalizeActivityFilters({
       start: "2026-08-01T00:00",
       end: "2026-08-16T00:00",
       models: ["m1", "m2"],
       minID: "2",
+      model: "m1",
+      keyID: "k1",
     });
-    expect(restored).toEqual(build({ minID: "2" }));
-    expect(paramsFor(restored).toString()).toBe("min_id=2");
+    expect(restored).toEqual(build({ minID: "2", start: "2026-08-01T00:00", end: "2026-08-16T00:00", model: "m1", keyID: "k1" }));
+    expect(paramsFor(restored).get("model")).toBe("m1");
+    expect(paramsFor(restored).get("key_id")).toBe("k1");
   });
 });

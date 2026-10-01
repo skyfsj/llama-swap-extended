@@ -421,3 +421,53 @@ describe("renderStreamingMarkdown", () => {
     expect(pendingHtml).toContain("<strong>bold</strong>");
   });
 });
+
+// Model output is untrusted: prompt injection can carry markup, so raw HTML,
+// event handlers, javascript: URLs and scripts must never reach the DOM.
+describe("markdown sanitization", () => {
+  it("strips inline HTML event handlers", () => {
+    const html = renderMarkdown(`<img src=x onerror="alert(1)">`);
+    expect(html).not.toContain("onerror");
+    expect(html).not.toContain("<img");
+  });
+
+  it("strips script tags entirely", () => {
+    const html = renderMarkdown(`<script>alert(1)</script>hello`);
+    expect(html).not.toContain("<script");
+    expect(html).not.toContain("alert(1)");
+  });
+
+  it("strips javascript: link protocols", () => {
+    const html = renderMarkdown(`[click me](javascript:alert(1))`);
+    expect(html).not.toContain("javascript:");
+  });
+
+  it("keeps normal markdown structure", () => {
+    const html = renderMarkdown("# Title\n\n```go\nfmt.Println()\n```\n\n- item");
+    expect(html).toContain("<h1");
+    expect(html).toContain("hljs");
+    expect(html).toContain("<li");
+  });
+
+  it("keeps katex math rendering", () => {
+    const html = renderMarkdown("$$a^2 + b^2 = c^2$$");
+    expect(html).toContain("katex");
+  });
+
+  it("keeps katex layout intact after sanitization", () => {
+    // Superscripts/fractions rely on KaTeX's inline styles and the MathML
+    // accessibility copy; stripping either would visually collapse math.
+    const html = renderMarkdown("$$x^2 + \\frac{a}{b} = c$$");
+    expect(html).toContain("katex");
+    expect(html).toContain("style=");
+    expect(html).toContain("vlist");
+    expect(html).toContain("MathML");
+  });
+
+  it("does not let model output inject tailwind utility classes", () => {
+    const html = renderMarkdown(`<span class="fixed inset-0 z-50 bg-black">cloak</span>`);
+    expect(html).not.toContain("inset-0");
+    expect(html).not.toContain("z-50");
+    expect(html).toContain("cloak");
+  });
+});

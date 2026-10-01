@@ -4,6 +4,7 @@ import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import remarkRehype from "remark-rehype";
 import rehypeKatex from "rehype-katex";
+import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import rehypeStringify from "rehype-stringify";
 // Scoped here (rather than in the global stylesheet) so it ships with this
 // module's chunk instead of loading on every page.
@@ -137,12 +138,24 @@ export function escapeHtml(text: string): string {
   return text.replace(/[&<>"']/g, (char) => htmlEntities[char]);
 }
 
+// Sanitizer schema: model output is untrusted (prompt injection can carry
+// markup), so raw HTML and scripts never reach the DOM. The sanitizer runs
+// BEFORE KaTeX and the syntax highlighter. remark-math's intermediate nodes
+// arrive as `code` elements carrying `language-math`/`math-display` classes,
+// which defaultSchema already permits, so no schema extension is needed —
+// and none is added: `className` stays closed on arbitrary elements so model
+// output cannot inject utility classes (UI redressing). KaTeX output itself
+// is not re-sanitized — KaTeX is designed for untrusted input and its
+// `trust` option is off — and highlight.js inserts trusted escaped markup.
+const sanitizeSchema = { ...defaultSchema };
+
 // Create the unified processor
 const processor = unified()
   .use(remarkParse)
   .use(remarkGfm)
   .use(remarkMath)
   .use(remarkRehype, { allowDangerousHtml: true })
+  .use(rehypeSanitize, sanitizeSchema)
   .use(rehypeKatex)
   .use(rehypeHighlight)
   .use(rehypeStringify, { allowDangerousHtml: true });

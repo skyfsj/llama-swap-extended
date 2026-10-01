@@ -29,8 +29,12 @@
 
   interface Dataset {
     label: string;
-    data: number[];
+    data: (number | null)[];
     borderColor: string;
+    /** Axis this series is measured on. Defaults to the primary (left) axis. */
+    axis?: "y" | "y1";
+    /** Label every point with its value instead of only on hover. */
+    pointLabels?: boolean;
   }
 
   interface Props {
@@ -40,10 +44,14 @@
     yMin?: number;
     yMax?: number;
     yLabel?: string;
+    /** Right-hand axis, for a series measured in different units. */
+    y2Label?: string;
+    y2Min?: number;
+    y2Max?: number;
     showLegend?: boolean;
   }
 
-  let { title, labels, datasets, yMin, yMax, yLabel, showLegend = true }: Props = $props();
+  let { title, labels, datasets, yMin, yMax, yLabel, y2Label, y2Min, y2Max, showLegend = true }: Props = $props();
 
   let canvas: HTMLCanvasElement;
   let chart: Chart;
@@ -59,8 +67,41 @@
     };
   }
 
+  // Point labels keep sparse category charts readable without hovering, which
+  // matters for context-length tables where each bucket is a handful of
+  // requests. They are opt-in because a dense time series would become noise.
+  const valueLabelPlugin = {
+    id: "valueLabels",
+    afterDatasetsDraw(chartInstance: Chart) {
+      const { ctx } = chartInstance;
+      ctx.save();
+      ctx.font = "10px ui-sans-serif, system-ui, sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "bottom";
+      chartInstance.data.datasets.forEach((dataset, datasetIndex) => {
+        if (!(dataset as Dataset).pointLabels) return;
+        const meta = chartInstance.getDatasetMeta(datasetIndex);
+        if (meta.hidden) return;
+        const color = dataset.borderColor;
+        ctx.fillStyle = typeof color === "string" ? color : "#6b7280";
+        meta.data.forEach((point, index) => {
+          const value = dataset.data?.[index];
+          if (value === null || value === undefined) return;
+          // Chart.js types a data point as number | [x, y] | Point; only the
+          // scalar form carries a value worth labelling.
+          const numeric = typeof value === "number" ? value : null;
+          if (numeric === null || !Number.isFinite(numeric)) return;
+          const text = Number.isInteger(numeric) ? String(numeric) : numeric.toFixed(1);
+          ctx.fillText(text, point.x, point.y - 5);
+        });
+      });
+      ctx.restore();
+    },
+  };
+
   function buildOptions(dark: boolean) {
     const colors = getChartColors(dark);
+    const usesSecondaryAxis = datasets.some((dataset) => dataset.axis === "y1");
     return {
       responsive: true,
       maintainAspectRatio: false,
@@ -111,8 +152,38 @@
             ? { display: true, text: yLabel, color: colors.tick }
             : undefined,
         },
+        ...(usesSecondaryAxis
+          ? {
+              y1: {
+                position: "right" as const,
+                min: y2Min,
+                max: y2Max,
+                // A right axis must not paint over the primary grid.
+                grid: { drawOnChartArea: false, color: colors.grid },
+                ticks: { color: colors.tick, font: { size: 10 } },
+                title: y2Label
+                  ? { display: true, text: y2Label, color: colors.tick }
+                  : undefined,
+              },
+            }
+          : {}),
       },
     };
+  }
+
+  function toChartDatasets(source: Dataset[]) {
+    return source.map((ds) => ({
+      label: ds.label,
+      data: [...ds.data],
+      borderColor: ds.borderColor,
+      backgroundColor: ds.borderColor + "20",
+      borderWidth: 1.5,
+      // Labelled points stay visible; an unlabelled series is only a curve.
+      pointRadius: ds.pointLabels ? 3 : 0,
+      tension: 0.4,
+      fill: false,
+      yAxisID: ds.axis === "y1" ? "y1" : "y",
+    }));
   }
 
   onMount(() => {
@@ -120,18 +191,10 @@
       type: "line",
       data: {
         labels: [...labels],
-        datasets: datasets.map((ds) => ({
-          label: ds.label,
-          data: [...ds.data],
-          borderColor: ds.borderColor,
-          backgroundColor: ds.borderColor + "20",
-          borderWidth: 1.5,
-          pointRadius: 0,
-          tension: 0.4,
-          fill: false,
-        })),
+        datasets: toChartDatasets(datasets),
       },
       options: buildOptions($isDarkMode),
+      plugins: [valueLabelPlugin],
     });
 
     return () => {
@@ -142,7 +205,13 @@
   $effect(() => {
     if (!chart) return;
     const _dark = $isDarkMode;
+    const _title = title;
+    const _yLabel = yLabel;
+    const _y2Label = y2Label;
     chart.options = buildOptions(_dark);
+    void _title;
+    void _yLabel;
+    void _y2Label;
     chart.update("none");
   });
 
@@ -151,16 +220,7 @@
     const _l = labels;
     const _d = datasets;
     chart.data.labels = [..._l];
-    chart.data.datasets = _d.map((ds) => ({
-      label: ds.label,
-      data: [...ds.data],
-      borderColor: ds.borderColor,
-      backgroundColor: ds.borderColor + "20",
-      borderWidth: 1.5,
-      pointRadius: 0,
-      tension: 0.4,
-      fill: false,
-    }));
+    chart.data.datasets = toChartDatasets(_d);
     chart.update("none");
   });
 </script>

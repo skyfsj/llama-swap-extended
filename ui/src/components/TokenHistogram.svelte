@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { HistogramData } from "../lib/types";
+  import { translate } from "../lib/i18n";
 
   let {
     data,
@@ -19,9 +20,13 @@
 
   let maxCount = $derived(Math.max(...data.bins));
   let barWidth = $derived(chartWidth / data.bins.length);
-  let range = $derived(data.max - data.min);
+  // A single reported speed is a valid histogram, but its min/max range is
+  // zero. Keep percentile markers finite instead of rendering SVG lines at
+  // NaN coordinates.
+  let range = $derived(data.max > data.min ? data.max - data.min : 1);
 
   function getXPosition(value: number): number {
+    if (data.max <= data.min) return padding.left + chartWidth / 2;
     return padding.left + ((value - data.min) / range) * chartWidth;
   }
 </script>
@@ -85,7 +90,7 @@
           opacity="0.6"
           class="{colorClass} hover:opacity-90 transition-opacity cursor-pointer"
         />
-        <title>{`${binStart.toFixed(1)} - ${binEnd.toFixed(1)} ${unit}\nCount: ${count}`}</title>
+        <title>{`${binStart.toFixed(1)} - ${binEnd.toFixed(1)} ${unit}\n${$translate("activity.stats.count")}: ${count}`}</title>
       </g>
     {/each}
 

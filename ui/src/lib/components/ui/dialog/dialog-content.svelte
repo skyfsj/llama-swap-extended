@@ -7,23 +7,26 @@
 	import type { ComponentProps } from "svelte";
 	import { Button } from "$lib/components/ui/button/index.js";
 	import XIcon from '@lucide/svelte/icons/x';
+	import { translate } from "$lib/i18n";
 
 	let {
 		ref = $bindable(null),
 		class: className,
+		overlayClassName,
 		portalProps,
 		children,
 		showCloseButton = true,
 		...restProps
 	}: WithoutChildrenOrChild<DialogPrimitive.ContentProps> & {
 		portalProps?: WithoutChildrenOrChild<ComponentProps<typeof DialogPortal>>;
+		overlayClassName?: string;
 		children: Snippet;
 		showCloseButton?: boolean;
 	} = $props();
 </script>
 
 <DialogPortal {...portalProps}>
-	<Dialog.Overlay />
+	<Dialog.Overlay class={overlayClassName} />
 	<DialogPrimitive.Content
 		bind:ref
 		data-slot="dialog-content"
@@ -39,7 +42,7 @@
 				{#snippet child({ props })}
 					<Button variant="ghost" class="absolute top-2 right-2" size="icon-sm" {...props}>
 						<XIcon  />
-						<span class="sr-only">Close</span>
+						<span class="sr-only">{$translate("common.close")}</span>
 					</Button>
 				{/snippet}
 			</DialogPrimitive.Close>

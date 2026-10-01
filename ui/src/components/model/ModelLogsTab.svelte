@@ -1,6 +1,7 @@
 <script lang="ts">
   import { streamModelLog } from "../../stores/modelLogs";
   import LogPanel from "../LogPanel.svelte";
+  import { translate } from "../../lib/i18n";
 
   interface Props {
     modelId: string;
@@ -22,5 +23,5 @@
 </script>
 
 <div class="h-full">
-  <LogPanel id={`model-${modelId}`} title="Model Logs" {logData} />
+  <LogPanel id={`model-${modelId}`} title={$translate("modelDetail.modelLogs")} {logData} />
 </div>

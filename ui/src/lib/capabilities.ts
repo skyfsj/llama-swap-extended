@@ -1,20 +1,21 @@
 import type { Model } from "./types";
 
-// Canonical capability key -> human label. Shared by the model Details tab
-// and the Models list so labels live in exactly one place.
-export const capabilityLabels: Record<string, string> = {
-  vision: "Vision",
-  audio_transcriptions: "Transcription",
-  audio_speech: "Speech",
-  image_generation: "Image Gen",
-  image_to_image: "Img→Img",
-  function_calling: "Function Calling",
-  reranker: "Reranker",
+// Canonical capability key -> locale message key. The JSON catalogs own all
+// human-readable labels; this map only describes the domain-to-locale link.
+export const capabilityMessageKeys: Record<string, string> = {
+  vision: "capabilities.vision",
+  audio_transcriptions: "capabilities.audioTranscriptions",
+  audio_speech: "capabilities.audioSpeech",
+  image_generation: "capabilities.imageGeneration",
+  image_to_image: "capabilities.imageToImage",
+  function_calling: "capabilities.functionCalling",
+  reranker: "capabilities.reranker",
+  context: "capabilities.context",
 };
 
 export interface CapabilityBadge {
   key: string;
-  label: string;
+  label?: string;
 }
 
 // Formats a token count as a compact context-window badge. Uses decimal units
@@ -56,9 +57,9 @@ export function listCapabilityBadges(
   const badges: CapabilityBadge[] = [];
 
   const caps = model.capabilities ?? {};
-  for (const key of Object.keys(capabilityLabels)) {
+  for (const key of Object.keys(capabilityMessageKeys).filter((key) => key !== "context")) {
     if (caps[key as keyof Model["capabilities"]]) {
-      badges.push({ key, label: capabilityLabels[key] });
+      badges.push({ key });
     }
   }
 

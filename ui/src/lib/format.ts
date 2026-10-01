@@ -1,5 +1,7 @@
 // Shared display formatters used across the UI.
 
+import { localeToIntl, translateFor, type Locale } from "./i18n";
+
 export interface FormatDurationOptions {
   /** Number of decimal places when rendering seconds. Default 2. */
   precision?: number;
@@ -17,8 +19,18 @@ export function formatDuration(ms: number, opts: FormatDurationOptions = {}): st
 }
 
 /** Format a tokens-per-second value; negative values are reported as "unknown". */
-export function formatSpeed(speed: number): string {
-  return speed < 0 ? "unknown" : speed.toFixed(2) + " t/s";
+export function formatSpeed(speed: number, unknownLabel = "unknown"): string {
+  return speed < 0 ? unknownLabel : speed.toFixed(2) + " t/s";
+}
+
+/** Format a count with locale-aware compact units such as 1.68万 or 1.05B. */
+export function formatCompactNumber(value: number, locale: Locale): string {
+  const safeValue = Number.isFinite(value) ? value : 0;
+  return new Intl.NumberFormat(localeToIntl(locale), {
+    notation: "compact",
+    compactDisplay: "short",
+    maximumFractionDigits: 2,
+  }).format(safeValue);
 }
 
 /** Format a byte count as B / KB / MB. */
@@ -29,8 +41,8 @@ export function formatFileSize(bytes: number): string {
 }
 
 /** Format a hardware capacity using binary units through TiB. */
-export function formatCapacity(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes <= 0) return "Not detected";
+export function formatCapacity(bytes: number, missingLabel = "Not detected"): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return missingLabel;
   const units = ["B", "KiB", "MiB", "GiB", "TiB"];
   let value = bytes;
   let unit = 0;
@@ -43,8 +55,19 @@ export function formatCapacity(bytes: number): string {
 }
 
 /** Format a timestamp as a local "YYYY-MM-DD HH:mm:ss" string. */
-export function formatAbsoluteTime(timestamp: string): string {
+export function formatAbsoluteTime(timestamp: string, locale?: Locale): string {
   const date = new Date(timestamp);
+  if (locale) {
+    return new Intl.DateTimeFormat(localeToIntl(locale), {
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    }).format(date);
+  }
   const datePart = [
     date.getFullYear(),
     String(date.getMonth() + 1).padStart(2, "0"),
@@ -57,15 +80,27 @@ export function formatAbsoluteTime(timestamp: string): string {
 }
 
 /** Format a timestamp as a relative time or local timestamp when older than a day. */
-export function formatRelativeTime(timestamp: string): string {
+export function formatRelativeTime(timestamp: string, locale?: Locale): string {
   const now = new Date();
   const date = new Date(timestamp);
   const diffInSeconds = Math.floor((now.getTime() - date.getTime()) / 1000);
-  if (diffInSeconds < 5) return "now";
-  if (diffInSeconds < 60) return `${diffInSeconds}s ago`;
+  if (diffInSeconds < 5) return locale ? translateFor(locale, "common.time.now") : "now";
+  if (diffInSeconds < 60) {
+    return locale
+      ? translateFor(locale, "common.time.secondsAgo", { count: diffInSeconds })
+      : `${diffInSeconds}s ago`;
+  }
   const diffInMinutes = Math.floor(diffInSeconds / 60);
-  if (diffInMinutes < 60) return `${diffInMinutes}m ago`;
+  if (diffInMinutes < 60) {
+    return locale
+      ? translateFor(locale, "common.time.minutesAgo", { count: diffInMinutes })
+      : `${diffInMinutes}m ago`;
+  }
   const diffInHours = Math.floor(diffInMinutes / 60);
-  if (diffInHours < 24) return `${diffInHours}h ago`;
-  return formatAbsoluteTime(timestamp);
+  if (diffInHours < 24) {
+    return locale
+      ? translateFor(locale, "common.time.hoursAgo", { count: diffInHours })
+      : `${diffInHours}h ago`;
+  }
+  return formatAbsoluteTime(timestamp, locale);
 }

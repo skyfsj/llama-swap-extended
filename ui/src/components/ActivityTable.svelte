@@ -1,9 +1,8 @@
 <script lang="ts">
-  import type { ActivityLogEntry, InflightRequestEntry, ReqRespCapture } from "../lib/types";
-  import { cancelInflightRequest, getCapture, uiConfig } from "../stores/api";
+  import type { ActivityLogEntry, InflightRequestEntry } from "../lib/types";
+  import { cancelInflightRequest, uiConfig } from "../stores/api";
   import { persistentStore } from "../stores/persistent";
   import { flip } from "svelte/animate";
-  import CaptureDialog from "./CaptureDialog.svelte";
   import {
     type ColumnDef,
     type SortingState,
@@ -20,6 +19,7 @@
   import * as Card from "$lib/components/ui/card/index.js";
   import * as DropdownMenu from "$lib/components/ui/dropdown-menu/index.js";
   import { Button } from "$lib/components/ui/button/index.js";
+  import { Badge } from "$lib/components/ui/badge/index.js";
   import {
     Columns3,
     ChevronDown,
@@ -39,20 +39,30 @@
   import FilterDrawer from "./activity-table/FilterDrawer.svelte";
   import { activeFilterCount, type ActivityFilters } from "../lib/activityFilters";
   import HeaderLabel from "./activity-table/HeaderLabel.svelte";
-  import ViewCaptureButton from "./activity-table/ViewCaptureButton.svelte";
+  import ActivityRowActions from "./activity-table/ActivityRowActions.svelte";
   import MetaCell from "./activity-table/MetaCell.svelte";
   import ModelLink from "./activity-table/ModelLink.svelte";
   import MiddleEllipsis from "./activity-table/MiddleEllipsis.svelte";
   import ExportDialog from "./activity-table/ExportDialog.svelte";
-  import { buildActivityMarkdown, formatDrafted } from "../lib/activityExport";
-  import { formatDuration, formatSpeed, formatRelativeTime } from "../lib/format";
+  import TimeCell from "./activity-table/TimeCell.svelte";
+  import {
+    buildActivityMarkdown,
+    formatCacheCreationTokens,
+    formatCacheHitRatio,
+    formatDrafted,
+    formatPrefixStability,
+  } from "../lib/activityExport";
+  import { formatDuration, formatSpeed } from "../lib/format";
   import { formatBytes, liveElapsedMs, requestHeader, sessionID } from "../lib/inflight";
+  import { locale, t, translate } from "../lib/i18n";
 
   interface Props {
     metrics: ActivityLogEntry[];
     inflightRequests?: InflightRequestEntry[];
     storagePrefix: string;
     showModelColumn?: boolean;
+    showInflight?: boolean;
+    showRowActions?: boolean;
     showPagination?: boolean;
     page?: number;
     limit?: number;
@@ -69,6 +79,13 @@
     cardClass?: string;
     filters?: ActivityFilters;
     onFiltersChange?: (filters: ActivityFilters) => void;
+    showModelFilter?: boolean;
+    showIDFilters?: boolean;
+    filterIdPrefix?: string;
+    onViewRow?: (row: ActivityLogEntry) => void;
+    canViewRow?: (row: ActivityLogEntry) => boolean;
+    onFilterSession?: (row: ActivityLogEntry) => void;
+    onDeleteRow?: (row: ActivityLogEntry) => void;
   }
 
   let {
@@ -76,6 +93,8 @@
     inflightRequests = [],
     storagePrefix,
     showModelColumn = true,
+    showInflight = true,
+    showRowActions = false,
     showPagination = false,
     page = 1,
     limit = 25,
@@ -88,10 +107,17 @@
     onSortChange,
     title,
     compact = false,
-    emptyMessage = "No activity recorded",
+    emptyMessage,
     cardClass = "",
     filters,
     onFiltersChange,
+    showModelFilter = true,
+    showIDFilters = true,
+    filterIdPrefix = "filter",
+    onViewRow,
+    canViewRow,
+    onFilterSession,
+    onDeleteRow,
   }: Props = $props();
 
   // The filter drawer only renders when the parent owns filter state.
@@ -104,30 +130,42 @@
     defaultVisible: boolean;
   }
 
-  function buildColumnMeta(withModel: boolean): ColMeta[] {
+  function buildColumnMeta(withModel: boolean, withActions: boolean): ColMeta[] {
     const cols: ColMeta[] = [
-      { id: "id", label: "ID", defaultVisible: true },
-      { id: "time", label: "Time", defaultVisible: true },
+      { id: "id", label: t("activity.table.columns.id"), defaultVisible: true },
+      { id: "time", label: t("activity.table.columns.time"), defaultVisible: true },
     ];
-    if (withModel) cols.push({ id: "model", label: "Model", defaultVisible: true });
+    if (withModel) cols.push({ id: "model", label: t("activity.table.columns.model"), defaultVisible: true });
     cols.push(
-      { id: "req_path", label: "Path", defaultVisible: false },
-      { id: "resp_status_code", label: "Status", defaultVisible: true },
-      { id: "resp_content_type", label: "Content-Type", defaultVisible: false },
-      { id: "cached", label: "Cached", defaultVisible: true },
-      { id: "prompt", label: "Prompt", defaultVisible: true },
-      { id: "generated", label: "Generated", defaultVisible: true },
-      { id: "drafted", label: "Drafted", defaultVisible: false },
-      { id: "prompt_speed", label: "Prefill", defaultVisible: true },
-      { id: "gen_speed", label: "Decode", defaultVisible: true },
-      { id: "duration", label: "Duration", defaultVisible: true },
-      { id: "capture", label: "Capture", defaultVisible: true },
-      { id: "meta", label: "Meta", defaultVisible: false }
+      { id: "req_path", label: t("activity.table.columns.path"), defaultVisible: false },
+      { id: "resp_status_code", label: t("activity.table.columns.status"), defaultVisible: true },
+      { id: "resp_content_type", label: t("activity.table.columns.contentType"), defaultVisible: false },
+      { id: "cached", label: t("activity.table.columns.cached"), defaultVisible: true },
+      { id: "cache_creation", label: t("activity.table.columns.cacheCreation"), defaultVisible: true },
+      { id: "cache_hit_ratio", label: t("activity.table.columns.cacheHitRatio"), defaultVisible: true },
+      { id: "repair_applied", label: t("activity.table.columns.repairApplied"), defaultVisible: true },
+      { id: "prefix_stability", label: t("activity.table.columns.prefixStability"), defaultVisible: true },
+      { id: "prompt", label: t("activity.table.columns.prompt"), defaultVisible: true },
+      { id: "generated", label: t("activity.table.columns.generated"), defaultVisible: true },
+      { id: "drafted", label: t("activity.table.columns.drafted"), defaultVisible: false },
+      { id: "prompt_speed", label: t("activity.table.columns.prefill"), defaultVisible: true },
+      { id: "gen_speed", label: t("activity.table.columns.decode"), defaultVisible: true },
+      { id: "duration", label: t("activity.table.columns.duration"), defaultVisible: true },
+      { id: "meta", label: t("activity.table.columns.meta"), defaultVisible: false }
     );
+    if (withActions) {
+      cols.push({ id: "actions", label: t("activity.table.columns.actions"), defaultVisible: true });
+    }
     return cols;
   }
 
-  let columnMeta = $derived(buildColumnMeta(showModelColumn));
+  let columnMeta = $derived.by(() => {
+    $locale;
+    return buildColumnMeta(
+      showModelColumn,
+      showRowActions && (!!onViewRow || !!onFilterSession || !!onDeleteRow),
+    );
+  });
 
   let columnLabelMap = $derived(
     Object.fromEntries(columnMeta.map((c) => [c.id, c.label])) as Record<string, string>
@@ -182,21 +220,27 @@
 
   function buildInflightColumnMeta(withModel: boolean): ColMeta[] {
     const cols: ColMeta[] = [
-      { id: "cancel", label: "Cancel", defaultVisible: true },
-      { id: "elapsed", label: "Elapsed", defaultVisible: true },
+      { id: "cancel", label: t("activity.table.inFlightColumns.cancel"), defaultVisible: true },
+      { id: "elapsed", label: t("activity.table.inFlightColumns.elapsed"), defaultVisible: true },
+      { id: "phase", label: t("activity.table.inFlightColumns.phase"), defaultVisible: true },
     ];
-    if (withModel) cols.push({ id: "model", label: "Model", defaultVisible: true });
+    if (withModel) cols.push({ id: "model", label: t("activity.table.inFlightColumns.model"), defaultVisible: true });
     cols.push(
-      { id: "request", label: "Request", defaultVisible: true },
-      { id: "identity", label: "Address", defaultVisible: true },
-      { id: "user_agent", label: "User Agent", defaultVisible: true },
-      { id: "session_id", label: "Session ID", defaultVisible: true },
-      { id: "bytes_received", label: "Bytes Received", defaultVisible: true }
+      { id: "request", label: t("activity.table.inFlightColumns.request"), defaultVisible: true },
+      { id: "identity", label: t("activity.table.inFlightColumns.address"), defaultVisible: true },
+      { id: "user_agent", label: t("activity.table.inFlightColumns.userAgent"), defaultVisible: true },
+      { id: "session_id", label: t("activity.table.inFlightColumns.sessionId"), defaultVisible: true },
+      { id: "bytes_received", label: t("activity.table.inFlightColumns.bytesReceived"), defaultVisible: true },
+      { id: "prefill_speed", label: t("activity.table.inFlightColumns.prefillSpeed"), defaultVisible: true },
+      { id: "decode_speed", label: t("activity.table.inFlightColumns.decodeSpeed"), defaultVisible: true }
     );
     return cols;
   }
 
-  let inflightColumnMeta = $derived(buildInflightColumnMeta(showModelColumn));
+  let inflightColumnMeta = $derived.by(() => {
+    $locale;
+    return buildInflightColumnMeta(showModelColumn);
+  });
   let inflightColumnLabelMap = $derived(
     Object.fromEntries(inflightColumnMeta.map((column) => [column.id, column.label])) as Record<string, string>
   );
@@ -258,11 +302,8 @@
   let inflightOpen = $state($storedInflightOpen);
   let filterOpen = $state($storedFilterOpen);
 
-  let selectedCapture = $state<ReqRespCapture | null>(null);
-  let dialogOpen = $state(false);
   let exportOpen = $state(false);
   let exportMarkdown = $state("");
-  let loadingCaptureId = $state<number | null>(null);
   let cancelingInflightIds = $state<string[]>([]);
   let inflightNowMs = $state(performance.now());
 
@@ -283,25 +324,14 @@
     return () => cancelAnimationFrame(frame);
   });
 
-  async function viewCapture(id: number) {
-    loadingCaptureId = id;
-    const capture = await getCapture(id);
-    loadingCaptureId = null;
-    selectedCapture = capture;
-    dialogOpen = true;
-  }
-
-  function closeDialog() {
-    dialogOpen = false;
-    selectedCapture = null;
-  }
-
   // Built on demand rather than in a $derived: the source only matters while
   // the dialog is open, and activity refreshes land every second.
   function openExport() {
     exportMarkdown = buildActivityMarkdown(
       table.getRowModel().rows.map((row) => row.original),
-      exportColumns
+      exportColumns,
+      new Date(),
+      $locale
     );
     exportOpen = true;
   }
@@ -331,7 +361,7 @@
     }
   }
 
-  function buildColumns(withModel: boolean): ColumnDef<ActivityLogEntry>[] {
+  function buildColumns(withModel: boolean, withActions: boolean): ColumnDef<ActivityLogEntry>[] {
     const cols: ColumnDef<ActivityLogEntry>[] = [
       {
         id: "id",
@@ -342,8 +372,8 @@
       {
         id: "time",
         accessorKey: "timestamp",
-        header: "Time",
-        cell: ({ row }) => formatRelativeTime(row.original.timestamp),
+        header: t("activity.table.columns.time"),
+        cell: ({ row }) => renderComponent(TimeCell, { timestamp: row.original.timestamp }),
       },
     ];
 
@@ -351,7 +381,7 @@
       cols.push({
         id: "model",
         accessorKey: "model",
-        header: "Model",
+        header: t("activity.table.columns.model"),
         cell: ({ row }) =>
           renderComponent(ModelLink, { model: row.original.model }),
       });
@@ -361,90 +391,134 @@
       {
         id: "req_path",
         accessorKey: "req_path",
-        header: "Path",
+        header: t("activity.table.columns.path"),
         cell: ({ row }) => row.original.req_path || "-",
       },
       {
         id: "resp_status_code",
         accessorKey: "resp_status_code",
-        header: "Status",
+        header: t("activity.table.columns.status"),
         cell: ({ row }) => String(row.original.resp_status_code || "-"),
       },
       {
         id: "resp_content_type",
         accessorKey: "resp_content_type",
-        header: "Content-Type",
+        header: t("activity.table.columns.contentType"),
         cell: ({ row }) => row.original.resp_content_type || "-",
       },
       {
         id: "cached",
         accessorFn: (row) => row.tokens.cache_tokens,
-        header: () => renderComponent(HeaderLabel, { label: "Cached", tooltip: "prompt tokens from cache" }),
+        header: () => renderComponent(HeaderLabel, { label: t("activity.table.columns.cached"), tooltip: t("activity.table.tooltips.cached") }),
         cell: ({ row }) =>
           row.original.tokens.cache_tokens > 0
             ? row.original.tokens.cache_tokens.toLocaleString()
             : "-",
       },
       {
+        id: "cache_creation",
+        accessorFn: (row) => row.cache_creation_tokens ?? 0,
+        header: () => renderComponent(HeaderLabel, { label: t("activity.table.columns.cacheCreation"), tooltip: t("activity.table.tooltips.cacheCreation") }),
+        enableSorting: false,
+        cell: ({ row }) => formatCacheCreationTokens(row.original.cache_creation_tokens, $locale),
+      },
+      {
+        id: "cache_hit_ratio",
+        accessorFn: (row) => row.cache_hit_ratio ?? -1,
+        header: () => renderComponent(HeaderLabel, { label: t("activity.table.columns.cacheHitRatio"), tooltip: t("activity.table.tooltips.cacheHitRatio") }),
+        enableSorting: false,
+        cell: ({ row }) => formatCacheHitRatio(row.original),
+      },
+      {
+        id: "repair_applied",
+        accessorFn: (row) => (row.repair_applied ? 1 : 0),
+        header: () => renderComponent(HeaderLabel, { label: t("activity.table.columns.repairApplied"), tooltip: t("activity.table.tooltips.repairApplied") }),
+        enableSorting: false,
+        cell: ({ row }) => row.original.repair_applied ? t("activity.table.values.applied") : "-",
+      },
+      {
+        id: "prefix_stability",
+        accessorFn: (row) => row.prefix_hash ?? "",
+        header: () => renderComponent(HeaderLabel, { label: t("activity.table.columns.prefixStability"), tooltip: t("activity.table.tooltips.prefixStability") }),
+        enableSorting: false,
+        cell: ({ row }) => {
+          const value = formatPrefixStability(row.original);
+          return value === "-"
+            ? value
+            : renderComponent(MiddleEllipsis, { value: row.original.prefix_hash ?? value, tailLength: 4, className: "max-w-[8rem] font-mono text-xs" });
+        },
+      },
+      {
         id: "prompt",
         accessorFn: (row) => row.tokens.input_tokens,
-        header: () => renderComponent(HeaderLabel, { label: "Prompt", tooltip: "new prompt tokens processed" }),
+        header: () => renderComponent(HeaderLabel, { label: t("activity.table.columns.prompt"), tooltip: t("activity.table.tooltips.prompt") }),
         cell: ({ row }) => row.original.tokens.input_tokens.toLocaleString(),
       },
       {
         id: "generated",
         accessorFn: (row) => row.tokens.output_tokens,
-        header: "Generated",
+        header: t("activity.table.columns.generated"),
         cell: ({ row }) => row.original.tokens.output_tokens.toLocaleString(),
       },
       {
         id: "drafted",
         accessorFn: (row) => row.tokens.draft_tokens,
-        header: () => renderComponent(HeaderLabel, { label: "Drafted", tooltip: "acceptance rate (accepted/drafted)" }),
+        header: () => renderComponent(HeaderLabel, { label: t("activity.table.columns.drafted"), tooltip: t("activity.table.tooltips.drafted") }),
         cell: ({ row }) =>
           formatDrafted(row.original.tokens.draft_tokens, row.original.tokens.draft_acc_tokens),
       },
       {
         id: "prompt_speed",
         accessorFn: (row) => row.tokens.prompt_per_second,
-        header: "Prefill",
-        cell: ({ row }) => formatSpeed(row.original.tokens.prompt_per_second),
+        header: () => renderComponent(HeaderLabel, { label: t("activity.table.columns.prefill"), tooltip: t("activity.table.tooltips.prefillSpeed") }),
+        cell: ({ row }) => formatSpeed(row.original.tokens.prompt_per_second, t("common.unknown")),
       },
       {
         id: "gen_speed",
         accessorFn: (row) => row.tokens.tokens_per_second,
-        header: "Decode",
-        cell: ({ row }) => formatSpeed(row.original.tokens.tokens_per_second),
+        header: () => renderComponent(HeaderLabel, { label: t("activity.table.columns.decode"), tooltip: t("activity.table.tooltips.decodeSpeed") }),
+        cell: ({ row }) => formatSpeed(row.original.tokens.tokens_per_second, t("common.unknown")),
       },
       {
         id: "duration",
         accessorKey: "duration_ms",
-        header: "Duration",
-        cell: ({ row }) => formatDuration(row.original.duration_ms),
-      },
-      {
-        id: "capture",
-        header: "Capture",
-        enableSorting: false,
-        cell: ({ row }) =>
-          renderComponent(ViewCaptureButton, {
-            hasCapture: row.original.has_capture,
-            loading: loadingCaptureId === row.original.id,
-            onclick: () => viewCapture(row.original.id),
-          }),
+        header: t("activity.table.columns.duration"),
+        cell: ({ row }) => formatFirstTokenDuration(row.original),
       },
       {
         id: "meta",
-        header: "Meta",
+        header: t("activity.table.columns.meta"),
         enableSorting: false,
         cell: ({ row }) =>
           renderComponent(MetaCell, { metadata: row.original.metadata }),
       }
     );
+    if (withActions) {
+      cols.push({
+        id: "actions",
+        header: t("activity.table.columns.actions"),
+        enableSorting: false,
+        cell: ({ row }) => renderComponent(ActivityRowActions, {
+          onView: onViewRow && (!canViewRow || canViewRow(row.original))
+            ? () => onViewRow(row.original)
+            : undefined,
+          onFilterSession: onFilterSession && row.original.session_id?.trim()
+            ? () => onFilterSession(row.original)
+            : undefined,
+          onDelete: onDeleteRow ? () => onDeleteRow(row.original) : undefined,
+        }),
+      });
+    }
     return cols;
   }
 
-  let columns = $derived(buildColumns(showModelColumn));
+  let columns = $derived.by(() => {
+    $locale;
+    return buildColumns(
+      showModelColumn,
+      showRowActions && (!!onViewRow || !!onFilterSession || !!onDeleteRow),
+    );
+  });
 
   const table = createSvelteTable({
     get data() {
@@ -495,12 +569,11 @@
     columnOrder.filter((id) => table.getColumn(id)?.getCanHide() ?? false)
   );
 
-  // Mirrors what is on screen (order and visibility), minus Capture: it is a
-  // button that fetches a body on click, so it has no text form to export.
+  // Mirrors the visible table order while excluding button-only row actions.
   let exportColumns = $derived(
     table
       .getVisibleLeafColumns()
-      .filter((column) => column.id !== "capture")
+      .filter((column) => column.id !== "actions")
       .map((column) => ({ id: column.id, label: columnLabelMap[column.id] ?? column.id }))
   );
 
@@ -603,6 +676,41 @@
     return `${(liveElapsedMs(request.elapsed_ms, request.client_received_at_ms, nowMs) / 1000).toFixed(2)}s`;
   }
 
+  function formatInflightTokenSpeed(
+    speed: number | undefined,
+    requestPhase: string | undefined,
+    speedPhase: "prefill" | "decode",
+  ): string {
+    return speed !== undefined && Number.isFinite(speed) && speed > 0
+      ? formatSpeed(speed, t("common.unknown"))
+      : requestPhase === speedPhase
+        ? t("activity.table.values.waitingForTelemetry")
+        : "-";
+  }
+
+  function inflightColumnTooltip(columnId: string): string | undefined {
+    switch (columnId) {
+      case "prefill_speed": return t("activity.table.tooltips.inFlightPrefillSpeed");
+      case "decode_speed": return t("activity.table.tooltips.inFlightDecodeSpeed");
+      default: return undefined;
+    }
+  }
+
+  function formatFirstTokenDuration(row: ActivityLogEntry): string {
+    const total = row.duration_ms >= 0 ? formatDuration(row.duration_ms) : "-";
+    const first = row.first_token_ms > 0 ? formatDuration(row.first_token_ms) : "-";
+    return `${first} / ${total}`;
+  }
+
+  function inflightPhaseLabel(phase?: string): string {
+    switch (phase) {
+      case "waiting": return t("activity.table.phases.waiting");
+      case "prefill": return t("activity.table.phases.prefill");
+      case "decode": return t("activity.table.phases.decode");
+      default: return t("activity.table.phases.unknown");
+    }
+  }
+
   function toggleInflightColumn(id: string, visible: boolean) {
     inflightColumnVisibility = { ...inflightColumnVisibility, [id]: visible };
     storedInflightVisibility.set(inflightColumnVisibility);
@@ -644,25 +752,28 @@
   }
 </script>
 
+{#if showInflight}
 <Card.Root class="relative p-3">
-  <div class="flex items-center gap-2 pr-16 text-sm">
-    <span class="text-muted-foreground text-xs uppercase tracking-wider">In-flight Requests</span>
-    <span>
-      <span class="font-semibold">{inflightRequests.length}</span> active
-    </span>
+  <div class="pr-16">
+    <Card.Title class="flex items-center gap-2 text-sm">
+      {$translate("activity.table.inFlightTitle")}
+      {#if inflightRequests.length > 0}
+        <Badge variant="secondary">{inflightRequests.length}</Badge>
+      {/if}
+    </Card.Title>
   </div>
 
   <div class="absolute right-2 top-2 flex items-center gap-1">
     <DropdownMenu.Root>
       <DropdownMenu.Trigger
         class="text-muted-foreground hover:bg-muted inline-flex size-6 items-center justify-center rounded-full"
-        title="Select in-flight columns"
+        title={$translate("activity.table.selectInFlightColumns")}
       >
         <Columns3 class="size-4" />
       </DropdownMenu.Trigger>
       <DropdownMenu.Content align="end" class="min-w-[18rem] max-h-[60vh] overflow-y-auto p-0">
         <DropdownMenu.Label class="text-muted-foreground border-b px-3 py-2 text-xs font-medium uppercase tracking-wider">
-          Columns <span class="text-[10px] normal-case tracking-normal">(drag to reorder)</span>
+          {$translate("activity.table.columnsMenu")} <span class="text-[10px] normal-case tracking-normal">{$translate("activity.table.dragToReorderHint")}</span>
         </DropdownMenu.Label>
         {#each inflightColumnOrder as columnId (columnId)}
           <div
@@ -670,7 +781,7 @@
             draggable="true"
             role="button"
             tabindex="-1"
-            aria-label="Drag to reorder {inflightColumnLabelMap[columnId] ?? columnId}"
+            aria-label={$translate("activity.table.dragToReorder", { label: inflightColumnLabelMap[columnId] ?? columnId })}
             ondragstart={(event) => handleInflightColDragStart(event, columnId)}
             ondragover={(event) => handleInflightColDragOver(event, columnId)}
             ondrop={handleInflightColDrop}
@@ -695,7 +806,7 @@
       size="icon-xs"
       class="text-muted-foreground rounded-full"
       onclick={() => setInflightOpen(!inflightOpen)}
-      title={inflightOpen ? "Hide in-flight requests" : "Show in-flight requests"}
+      title={$translate(inflightOpen ? "activity.table.hideInFlight" : "activity.table.showInFlight")}
     >
       {#if inflightOpen}
         <X />
@@ -711,7 +822,9 @@
         <Table.Header>
           <Table.Row>
             {#each visibleInflightColumns as columnId (columnId)}
-              <Table.Head class={inflightThClass}>{inflightColumnLabelMap[columnId] ?? columnId}</Table.Head>
+              <Table.Head class={inflightThClass} title={inflightColumnTooltip(columnId)}>
+                {inflightColumnLabelMap[columnId] ?? columnId}
+              </Table.Head>
             {/each}
           </Table.Row>
         </Table.Header>
@@ -727,8 +840,8 @@
                       class="text-muted-foreground hover:text-destructive size-6"
                       onclick={() => cancelInflight(request.id)}
                       disabled={cancelingInflightIds.includes(request.id)}
-                      title="Cancel request"
-                      aria-label="Cancel inflight request"
+                      title={$translate("activity.table.cancelRequest")}
+                      aria-label={$translate("activity.table.cancelInFlight")}
                     >
                       <CircleX class="size-4" />
                     </Button>
@@ -736,6 +849,11 @@
                     <span class="font-mono text-xs tabular-nums">
                       {formatInflightElapsed(request, inflightNowMs)}
                     </span>
+                  {:else if columnId === "phase"}
+                    <Badge
+                      variant={request.phase === "decode" ? "default" : request.phase === "prefill" ? "secondary" : "outline"}
+                      title={request.phase_message || inflightPhaseLabel(request.phase)}
+                    >{inflightPhaseLabel(request.phase)}</Badge>
                   {:else if columnId === "model"}
                     <MiddleEllipsis value={request.model} tailLength={10} className="max-w-[14rem]" />
                   {:else if columnId === "request"}
@@ -751,6 +869,10 @@
                     <MiddleEllipsis value={session} tailLength={8} className="max-w-[14rem] font-mono text-xs" />
                   {:else if columnId === "bytes_received"}
                     <span class="font-mono text-xs tabular-nums">{formatBytes(request.resp_bytes)}</span>
+                  {:else if columnId === "prefill_speed"}
+                    <span class="font-mono text-xs tabular-nums">{formatInflightTokenSpeed(request.prompt_per_second, request.phase, "prefill")}</span>
+                  {:else if columnId === "decode_speed"}
+                    <span class="font-mono text-xs tabular-nums">{formatInflightTokenSpeed(request.tokens_per_second, request.phase, "decode")}</span>
                   {/if}
                 </Table.Cell>
               {/each}
@@ -758,15 +880,58 @@
           {:else}
             <Table.Row>
               <Table.Cell colspan={Math.max(visibleInflightColumns.length, 1)} class="text-muted-foreground py-4 text-center text-sm">
-                No in-flight requests
+                {$translate("activity.table.noInFlight")}
               </Table.Cell>
             </Table.Row>
           {/each}
         </Table.Body>
       </Table.Root>
     </div>
+    {#if inflightRequests.length > 0}
+      <details
+        open
+        class="mt-2 overflow-hidden rounded-md border bg-background/40"
+        aria-label={$translate("activity.table.inFlightOutput.title")}
+      >
+        <summary class="flex cursor-pointer list-none items-center justify-between px-3 py-1.5 [&::-webkit-details-marker]:hidden">
+          <span class="flex items-center gap-1.5">
+            <ChevronDown class="size-3 shrink-0 text-muted-foreground" />
+            <span class="text-muted-foreground text-xs font-medium uppercase tracking-wider">
+              {$translate("activity.table.inFlightOutput.title")}
+            </span>
+          </span>
+          <span class="text-muted-foreground text-xs">
+            {$translate("activity.table.inFlightOutput.requestCount", { count: inflightRequests.length })}
+          </span>
+        </summary>
+        <div class="h-52 overflow-y-auto border-t">
+          {#each inflightRequests as request (request.id)}
+            {@const preview = request.output_preview || $translate("activity.table.values.noOutput")}
+            <details class="group border-b last:border-b-0">
+              <summary class="flex min-w-0 cursor-pointer list-none items-center gap-2 px-3 py-2 text-xs [&::-webkit-details-marker]:hidden">
+                <ChevronDown class="size-3 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" />
+                <span class="shrink-0 font-mono tabular-nums">#{request.id}</span>
+                <Badge
+                  variant={request.phase === "decode" ? "default" : request.phase === "prefill" ? "secondary" : "outline"}
+                  title={request.phase_message || inflightPhaseLabel(request.phase)}
+                >{inflightPhaseLabel(request.phase)}</Badge>
+                <span
+                  class="min-w-0 flex-1 truncate text-muted-foreground"
+                  title={preview}
+                  aria-label={preview}
+                >{preview}</span>
+              </summary>
+              <div class="border-t bg-muted/20 px-3 py-2">
+                <pre class="max-h-24 overflow-y-auto whitespace-pre-wrap break-words font-mono text-xs leading-relaxed">{preview}</pre>
+              </div>
+            </details>
+          {/each}
+        </div>
+      </details>
+    {/if}
   {/if}
 </Card.Root>
+{/if}
 
 <Card.Root class="mt-3 shrink-0 gap-0 overflow-hidden py-0 {cardClass}">
   <Card.Header class="flex items-center justify-between border-b px-4 py-2">
@@ -782,7 +947,7 @@
       <button
         type="button"
         class="hover:bg-muted inline-flex size-7 items-center justify-center rounded-[min(var(--radius-md),12px)]"
-        title="Export as markdown"
+        title={$translate("activity.table.exportMarkdown")}
         onclick={openExport}
       >
         <Download class="size-4" />
@@ -793,7 +958,7 @@
           class="hover:bg-muted relative inline-flex size-7 items-center justify-center rounded-[min(var(--radius-md),12px)] {filterOpen
             ? 'bg-muted'
             : ''}"
-          title={filterOpen ? "Hide filters" : "Show filters"}
+          title={$translate(filterOpen ? "activity.table.hideFilters" : "activity.table.showFilters")}
           aria-expanded={filterOpen}
           onclick={() => setFilterOpen(!filterOpen)}
         >
@@ -809,13 +974,13 @@
       <DropdownMenu.Root>
         <DropdownMenu.Trigger
           class="hover:bg-muted inline-flex size-7 items-center justify-center rounded-[min(var(--radius-md),12px)]"
-          title="Select columns"
+          title={$translate("activity.table.selectColumns")}
         >
           <Columns3 class="size-4" />
         </DropdownMenu.Trigger>
         <DropdownMenu.Content align="end" class="min-w-[18rem] max-h-[60vh] overflow-y-auto p-0">
           <DropdownMenu.Label class="text-muted-foreground border-b px-3 py-2 text-xs font-medium uppercase tracking-wider">
-            Columns <span class="text-[10px] normal-case tracking-normal">(drag to reorder)</span>
+            {$translate("activity.table.columnsMenu")} <span class="text-[10px] normal-case tracking-normal">{$translate("activity.table.dragToReorderHint")}</span>
           </DropdownMenu.Label>
           {#each menuColumnIds as columnId (columnId)}
             {@const column = table.getColumn(columnId)}
@@ -824,7 +989,7 @@
               draggable="true"
               role="button"
               tabindex="-1"
-              aria-label="Drag to reorder {columnLabelMap[columnId] ?? columnId}"
+              aria-label={$translate("activity.table.dragToReorder", { label: columnLabelMap[columnId] ?? columnId })}
               ondragstart={(e) => handleColDragStart(e, columnId)}
               ondragover={(e) => handleColDragOver(e, columnId)}
               ondrop={handleColDrop}
@@ -849,6 +1014,9 @@
     <FilterDrawer
       {filters}
       onchange={onFiltersChange}
+      {showModelFilter}
+      {showIDFilters}
+      idPrefix={filterIdPrefix}
       showRows={showPagination}
       {limit}
       onLimitChange={setServerPageSize}
@@ -906,7 +1074,7 @@
         {#if table.getRowModel().rows.length === 0}
           <Table.Row>
             <Table.Cell colspan={visibleColumnCount} class="text-muted-foreground py-6 text-center text-sm">
-              {emptyMessage}
+              {emptyMessage ?? $translate("activity.empty")}
             </Table.Cell>
           </Table.Row>
         {/if}
@@ -916,7 +1084,7 @@
     {#if showPagination && total > 0}
       <div class="flex items-center justify-between gap-2 border-t px-4 py-2 text-sm">
         <span class="text-muted-foreground text-xs">
-          Page {page} of {pageCount} · {total} total
+          {$translate("common.page.info", { page, pages: pageCount, total })}
         </span>
         <div class="flex items-center gap-1">
           <Button
@@ -924,7 +1092,7 @@
             size="icon-sm"
             onclick={() => setServerPage(1)}
             disabled={page <= 1}
-            title="First page"
+            title={$translate("common.page.first")}
           >
             <ChevronsLeft />
           </Button>
@@ -933,7 +1101,7 @@
             size="icon-sm"
             onclick={() => setServerPage(page - 1)}
             disabled={page <= 1}
-            title="Previous page"
+            title={$translate("common.page.previous")}
           >
             <ChevronLeft />
           </Button>
@@ -953,7 +1121,7 @@
             size="icon-sm"
             onclick={() => setServerPage(page + 1)}
             disabled={page >= pageCount}
-            title="Next page"
+            title={$translate("common.page.next")}
           >
             <ChevronRight />
           </Button>
@@ -962,7 +1130,7 @@
             size="icon-sm"
             onclick={() => setServerPage(pageCount)}
             disabled={page >= pageCount}
-            title="Last page"
+            title={$translate("common.page.last")}
           >
             <ChevronsRight />
           </Button>
@@ -971,7 +1139,5 @@
     {/if}
   </Card.Content>
 </Card.Root>
-
-<CaptureDialog capture={selectedCapture} open={dialogOpen} onclose={closeDialog} />
 
 <ExportDialog markdown={exportMarkdown} open={exportOpen} onclose={closeExport} />

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { formatContextLength, listCapabilityBadges, capabilityLabels, capabilityBadgeClass } from "./capabilities";
+import { formatContextLength, listCapabilityBadges, capabilityMessageKeys, capabilityBadgeClass } from "./capabilities";
 import type { Model } from "./types";
 
 describe("formatContextLength", () => {
@@ -72,8 +72,8 @@ describe("listCapabilityBadges", () => {
     const badges = listCapabilityBadges({
       capabilities: { function_calling: true, image_generation: true },
     });
-    expect(badges).toContainEqual({ key: "function_calling", label: "Function Calling" });
-    expect(badges).toContainEqual({ key: "image_generation", label: "Image Gen" });
+    expect(badges).toContainEqual({ key: "function_calling" });
+    expect(badges).toContainEqual({ key: "image_generation" });
   });
 
   it("ignores falsey capabilities", () => {
@@ -91,15 +91,13 @@ describe("listCapabilityBadges", () => {
   });
 
   it("omits the context badge when context_length is missing or zero", () => {
-    expect(listCapabilityBadges({ capabilities: { vision: true } })).toEqual([
-      { key: "vision", label: "Vision" },
-    ]);
+    expect(listCapabilityBadges({ capabilities: { vision: true } })).toEqual([{ key: "vision" }]);
     expect(
       listCapabilityBadges({ context_length: 0, capabilities: { vision: true } }).map((b) => b.key),
     ).toEqual(["vision"]);
   });
 
-  it("keeps the canonical labels map covering all known keys", () => {
+  it("keeps the canonical locale map covering all known keys", () => {
     for (const key of [
       "vision",
       "audio_transcriptions",
@@ -109,7 +107,7 @@ describe("listCapabilityBadges", () => {
       "function_calling",
       "reranker",
     ]) {
-      expect(capabilityLabels[key]).toBeTruthy();
+      expect(capabilityMessageKeys[key]).toBeTruthy();
     }
   });
 

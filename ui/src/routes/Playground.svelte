@@ -2,23 +2,20 @@
   import type { Component } from "svelte";
   import ChatInterface from "../components/playground/ChatInterface.svelte";
   import ImageInterface from "../components/playground/ImageInterface.svelte";
-  import AudioInterface from "../components/playground/AudioInterface.svelte";
-  import SpeechInterface from "../components/playground/SpeechInterface.svelte";
-  import RerankInterface from "../components/playground/RerankInterface.svelte";
+  import TranslationInterface from "../components/playground/TranslationInterface.svelte";
   import ConcurrencyInterface from "../components/playground/ConcurrencyInterface.svelte";
   import * as Card from "$lib/components/ui/card/index.js";
   import { Tabs, TabsList, TabsTrigger } from "$lib/components/ui/tabs/index.js";
   import { fetchPlaygroundModels, models } from "../stores/api";
   import { selectedPlaygroundTab, playgroundTabs, type PlaygroundTab } from "../stores/playground";
+  import { translate } from "../lib/i18n";
 
   const MODEL_REFRESH_DEBOUNCE_MS = 200;
 
   const tabComponents: Record<PlaygroundTab, Component> = {
     chat: ChatInterface,
     images: ImageInterface,
-    speech: SpeechInterface,
-    audio: AudioInterface,
-    rerank: RerankInterface,
+    translation: TranslationInterface,
     concurrency: ConcurrencyInterface,
   };
 
@@ -38,19 +35,21 @@
   });
 </script>
 
-<Card.Root class="flex h-full flex-col gap-0 overflow-hidden p-4">
+<Card.Root class="pg-card flex h-full flex-col gap-0 overflow-hidden p-0">
   <Tabs
     value={$selectedPlaygroundTab}
     onValueChange={(v: string) => v && selectedPlaygroundTab.set(v as PlaygroundTab)}
-    class="flex flex-1 w-full flex-col gap-2 overflow-hidden"
+    class="flex flex-1 w-full flex-col gap-0 overflow-hidden"
   >
-    <TabsList variant="line">
-      {#each playgroundTabs as tab (tab.id)}
-        <TabsTrigger value={tab.id}>{tab.label}</TabsTrigger>
-      {/each}
-    </TabsList>
+    <div class="flex shrink-0 items-center gap-3 border-b px-3 py-2 pg-divide">
+      <TabsList variant="default" class="pg-seg">
+        {#each playgroundTabs as tab (tab.id)}
+          <TabsTrigger value={tab.id}>{$translate(tab.labelKey)}</TabsTrigger>
+        {/each}
+      </TabsList>
+    </div>
 
-    <div class="relative flex-1 overflow-hidden">
+    <div class="relative flex-1 overflow-hidden p-3">
       {#each playgroundTabs as tab (tab.id)}
         {@const TabComponent = tabComponents[tab.id]}
         <div class="h-full" class:hidden={$selectedPlaygroundTab !== tab.id}>

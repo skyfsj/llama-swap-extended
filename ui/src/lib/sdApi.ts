@@ -1,5 +1,6 @@
 import type { SdApiTxt2ImgRequest, SdApiResponse, SdApiLora } from "./types";
 import { playgroundSessionHeaders } from "./playgroundSession";
+import { t } from "./i18n";
 
 export async function generateSdImage(
   request: SdApiTxt2ImgRequest,
@@ -17,7 +18,7 @@ export async function generateSdImage(
 
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(`SDAPI error: ${response.status} - ${errorText}`);
+    throw new Error(t("errors.sdApi", { status: response.status, detail: errorText }));
   }
 
   return response.json();
@@ -34,7 +35,7 @@ export async function fetchSdLoras(
 
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(`SDAPI loras error: ${response.status} - ${errorText}`);
+    throw new Error(t("errors.sdApiLoras", { status: response.status, detail: errorText }));
   }
 
   return response.json();

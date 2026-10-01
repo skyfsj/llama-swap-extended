@@ -9,7 +9,7 @@
   import ModelSelector from "./ModelSelector.svelte";
   import ExpandableTextarea from "./ExpandableTextarea.svelte";
   import EmptyState from "../EmptyState.svelte";
-  import { Settings, Paperclip } from "@lucide/svelte";
+  import { Settings, Paperclip, Send, Maximize2, MessagesSquare } from "@lucide/svelte";
   import { Button } from "$lib/components/ui/button/index.js";
   import { Input } from "$lib/components/ui/input/index.js";
   import { Textarea } from "$lib/components/ui/textarea/index.js";
@@ -17,6 +17,7 @@
   import * as Select from "$lib/components/ui/select/index.js";
   import * as Dialog from "$lib/components/ui/dialog/index.js";
   import { X } from "@lucide/svelte";
+  import { t, translate } from "../../lib/i18n";
 
   const selectedModelStore = persistentStore<string>("playground-selected-model", "");
   const systemPromptStore = persistentStore<string>("playground-system-prompt", "");
@@ -162,7 +163,16 @@
         $selectedModelStore,
         apiMessages,
         abortController.signal,
-        { temperature: $temperatureStore, endpoint: $endpointStore, max_tokens: $maxTokensStore }
+        {
+          temperature: $temperatureStore,
+          endpoint: $endpointStore,
+          max_tokens: $maxTokensStore,
+          // OpenAI-compatible streaming backends (including vLLM) only append
+          // final token usage when this is requested. Without it, the activity
+          // log has no authoritative prompt/completion counts for Playground
+          // conversations.
+          include_usage: $endpointStore === "v1/chat/completions",
+        }
       );
 
       for await (const chunk of stream) {
@@ -221,10 +231,10 @@
         }
       } else {
         // Show error in the assistant message
-        const errorMessage = error instanceof Error ? error.message : "An error occurred";
+        const errorMessage = error instanceof Error ? error.message : t("errors.anErrorOccurred");
         messages = messages.map((msg, i) =>
           i === messages.length - 1
-            ? { ...msg, content: msg.content + `\n\n**Error:** ${errorMessage}` }
+              ? { ...msg, content: msg.content + `\n\n**${t("common.error")}:** ${errorMessage}` }
             : msg
         );
       }
@@ -260,10 +270,10 @@
 
   function validateImageFile(file: File): string | null {
     if (!ACCEPTED_IMAGE_FORMATS.includes(file.type)) {
-      return `Invalid file type: ${file.type}. Accepted formats: JPG, PNG, GIF, WEBP`;
+      return t("errors.invalidImageType", { type: file.type });
     }
     if (file.size > MAX_IMAGE_SIZE) {
-      return `File too large: ${(file.size / 1024 / 1024).toFixed(1)}MB. Maximum size: 20MB`;
+      return t("errors.fileTooLarge", { size: (file.size / 1024 / 1024).toFixed(1) });
     }
     return null;
   }
@@ -272,7 +282,7 @@
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
       reader.onload = () => resolve(reader.result as string);
-      reader.onerror = () => reject(new Error("Failed to read file"));
+      reader.onerror = () => reject(new Error(t("errors.failedReadFile")));
       reader.readAsDataURL(file);
     });
   }
@@ -281,7 +291,7 @@
     imageError = null;
 
     if (attachedImages.length + files.length > MAX_IMAGES_PER_MESSAGE) {
-      imageError = `Maximum ${MAX_IMAGES_PER_MESSAGE} images per message`;
+      imageError = t("errors.maximumImages", { count: MAX_IMAGES_PER_MESSAGE });
       return;
     }
 
@@ -297,7 +307,7 @@
       const dataUrls = await Promise.all(files.map(fileToDataUrl));
       attachedImages = [...attachedImages, ...dataUrls];
     } catch (error) {
-      imageError = error instanceof Error ? error.message : "Failed to process images";
+      imageError = error instanceof Error ? error.message : t("errors.failedProcessImages");
     }
   }
 
@@ -318,34 +328,34 @@
 
 <div class="flex flex-col h-full">
   <!-- Model selector and controls -->
-  <div class="shrink-0 flex flex-wrap gap-2 mb-4">
-    <ModelSelector bind:value={$selectedModelStore} placeholder="Select a model..." disabled={isStreaming} />
-    <div class="flex gap-2">
-      <Button variant="outline" size="icon" onclick={() => (showSettings = true)} title="Settings">
+  <div class="shrink-0 flex flex-wrap items-center gap-2 mb-3">
+    <ModelSelector bind:value={$selectedModelStore} disabled={isStreaming} category="chat" />
+    <div class="flex items-center gap-1.5 ml-auto">
+      <Button variant="ghost" size="icon" class="pg-tool" onclick={() => (showSettings = true)} title={$translate("common.settings")}>
         <Settings />
       </Button>
-      <Button variant="outline" onclick={newChat} disabled={messages.length === 0 && !isStreaming}>
-        New Chat
+      <Button variant="outline" class="pg-control" onclick={newChat} disabled={messages.length === 0 && !isStreaming}>
+        {$translate("playground.chat.newChat")}
       </Button>
     </div>
   </div>
 
   <!-- Settings dialog -->
   <Dialog.Root bind:open={showSettings}>
-    <Dialog.Content class="max-w-xl">
+    <Dialog.Content class="pg-float max-w-xl">
       <Dialog.Header>
-        <Dialog.Title>Chat Settings</Dialog.Title>
+        <Dialog.Title>{$translate("playground.chat.settings")}</Dialog.Title>
       </Dialog.Header>
 
       <div class="space-y-4">
         <div>
-          <Label class="mb-1" for="endpoint">Endpoint</Label>
+          <Label class="mb-1" for="endpoint">{$translate("playground.chat.endpoint")}</Label>
           <Select.Root
             type="single"
             value={$endpointStore}
             onValueChange={(v) => v && endpointStore.set(v as Endpoint)}
           >
-            <Select.Trigger class="w-full">/{$endpointStore}</Select.Trigger>
+            <Select.Trigger class="pg-trigger w-full">/{$endpointStore}</Select.Trigger>
             <Select.Content>
               <Select.Item value="v1/chat/completions">/v1/chat/completions</Select.Item>
               <Select.Item value="v1/messages">/v1/messages</Select.Item>
@@ -354,11 +364,11 @@
           </Select.Root>
         </div>
         <div>
-          <Label class="mb-1" for="system-prompt">System Prompt</Label>
+          <Label class="mb-1" for="system-prompt">{$translate("playground.chat.systemPrompt")}</Label>
           <Textarea
             id="system-prompt"
             class="resize-none"
-            placeholder="You are a helpful assistant..."
+            placeholder={$translate("playground.chat.systemPromptPlaceholder")}
             rows={3}
             bind:value={$systemPromptStore}
             disabled={isStreaming}
@@ -366,7 +376,7 @@
         </div>
         <div>
           <Label class="mb-1" for="temperature">
-            Temperature: {$temperatureStore.toFixed(2)}
+            {$translate("playground.chat.temperature")}: {$temperatureStore.toFixed(2)}
           </Label>
           <input
             id="temperature"
@@ -379,35 +389,40 @@
             disabled={isStreaming}
           />
           <div class="text-muted-foreground mt-1 flex justify-between text-xs">
-            <span>Precise (0)</span>
-            <span>Creative (2)</span>
+            <span>{$translate("playground.chat.precise")}</span>
+            <span>{$translate("playground.chat.creative")}</span>
           </div>
         </div>
         <div>
-          <Label class="mb-1" for="max-tokens">Max Tokens</Label>
+          <Label class="mb-1" for="max-tokens">{$translate("playground.chat.maxTokens")}</Label>
           <Input id="max-tokens" type="number" min="1" bind:value={$maxTokensStore} disabled={isStreaming} />
-          <p class="text-muted-foreground mt-1 text-xs">Required for /v1/messages.</p>
+          <p class="text-muted-foreground mt-1 text-xs">{$translate("playground.chat.requiredForMessages")}</p>
         </div>
       </div>
 
       <Dialog.Footer>
-        <Button variant="outline" onclick={() => (showSettings = false)}>Done</Button>
+        <Button variant="outline" class="pg-control" onclick={() => (showSettings = false)}>{$translate("common.done")}</Button>
       </Dialog.Footer>
     </Dialog.Content>
   </Dialog.Root>
 
   <!-- Empty state for no models configured -->
   {#if !$hasListedModels}
-    <EmptyState message="No models configured. Add models to your configuration to start chatting." />
+    <EmptyState message={$translate("playground.chat.noModels")} />
   {:else}
     <!-- Messages area -->
     <div
-      class="mb-4 flex-1 overflow-y-auto px-2"
+      class="mb-3 flex-1 overflow-y-auto pg-scroll px-1"
       bind:this={messagesContainer}
       onscroll={handleMessagesScroll}
     >
       {#if messages.length === 0}
-        <EmptyState full message="Start a conversation by typing a message below." />
+        <div class="flex h-full flex-col items-center justify-center gap-3 text-center">
+          <div class="pg-inset flex size-11 items-center justify-center" style="border-radius: 99px">
+            <MessagesSquare class="size-5" style="color: var(--pg-ink-3)" />
+          </div>
+          <p class="pg-hint max-w-xs leading-relaxed">{$translate("playground.chat.emptyConversation")}</p>
+        </div>
       {:else}
         {#each messages as message, idx (idx)}
           <ChatMessageComponent
@@ -435,15 +450,15 @@
             <div class="group relative">
               <img
                 src={imageUrl}
-                alt="Attached image {idx + 1}"
-                class="h-20 w-20 rounded-md border object-cover"
+                alt={$translate("playground.chat.attachedImage", { index: idx + 1 })}
+                class="size-16 rounded-[var(--pg-r-control)] border border-black/10 object-cover dark:border-white/10"
               />
               <Button
                 variant="destructive"
-                size="icon-sm"
-                class="absolute -right-2 -top-2 h-6 w-6 rounded-full opacity-0 transition-opacity group-hover:opacity-100"
+                size="icon-xs"
+                class="absolute -right-1.5 -top-1.5 size-5 rounded-full opacity-0 transition-opacity group-hover:opacity-100"
                 onclick={() => removeImage(idx)}
-                title="Remove image"
+                title={$translate("playground.chat.removeImage")}
               >
                 <X class="size-3" />
               </Button>
@@ -454,12 +469,12 @@
 
       <!-- Error message -->
       {#if imageError}
-        <div class="bg-destructive/10 text-destructive mb-2 rounded-md p-2 text-sm">
+        <div class="pg-inset-soft text-destructive mb-2 px-3 py-2 text-[13px]">
           {imageError}
         </div>
       {/if}
 
-      <div class="flex gap-2">
+      <div class="pg-composer flex flex-col gap-1 p-1.5">
         <!-- Hidden file input -->
         <input
           type="file"
@@ -471,34 +486,60 @@
         />
 
         <ExpandableTextarea
+          bare
           bind:ref={inputRef}
           bind:value={userInput}
-          placeholder="Type a message..."
-          rows={3}
+          placeholder={$translate("playground.chat.inputPlaceholder")}
+          rows={2}
           onkeydown={handleKeyDown}
           disabled={isStreaming || !$selectedModelStore}
-        />
-        <div class="flex flex-col gap-2">
-          {#if isStreaming}
-            <Button variant="destructive" onclick={cancelStreaming}>Cancel</Button>
-          {:else}
+        >
+          {#snippet toolbar({ expand })}
             <Button
               variant="outline"
-              size="icon"
+              size="icon-sm"
+              class="pg-tool"
               onclick={() => fileInput?.click()}
               disabled={isStreaming || !$selectedModelStore}
-              title="Attach image"
+              title={$translate("playground.chat.attachImage")}
             >
               <Paperclip />
             </Button>
             <Button
-              onclick={sendMessage}
-              disabled={(!userInput.trim() && attachedImages.length === 0) || !$selectedModelStore}
+              variant="ghost"
+              size="icon-sm"
+              class="pg-tool"
+              onclick={expand}
+              disabled={isStreaming || !$selectedModelStore}
+              title={$translate("playground.expandable.expandToEdit")}
             >
-              Send
+              <Maximize2 />
             </Button>
-          {/if}
-        </div>
+            {#if $selectedModelStore}
+              <span class="pg-chip ml-1 hidden max-w-[14rem] truncate sm:inline-flex" title={$selectedModelStore}>
+                {$selectedModelStore}
+              </span>
+            {/if}
+            <div class="ml-auto flex items-center gap-1.5">
+              {#if isStreaming}
+                <Button variant="outline" class="pg-control pg-control--danger" onclick={cancelStreaming}>
+                  <X />
+                  {$translate("common.cancel")}
+                </Button>
+              {:else}
+                <Button
+                  class="pg-action"
+                  onclick={sendMessage}
+                  disabled={(!userInput.trim() && attachedImages.length === 0) || !$selectedModelStore}
+                  title={$translate("playground.chat.send")}
+                >
+                  <Send />
+                  {$translate("playground.chat.send")}
+                </Button>
+              {/if}
+            </div>
+          {/snippet}
+        </ExpandableTextarea>
       </div>
     </div>
   {/if}

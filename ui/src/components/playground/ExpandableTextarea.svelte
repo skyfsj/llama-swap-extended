@@ -1,8 +1,9 @@
 <script lang="ts">
-  import { untrack } from "svelte";
+  import { untrack, type Snippet } from "svelte";
   import { Maximize2, X } from "@lucide/svelte";
   import { Button } from "$lib/components/ui/button/index.js";
   import { Textarea } from "$lib/components/ui/textarea/index.js";
+  import { translate } from "../../lib/i18n";
 
   interface Props {
     value: string;
@@ -11,6 +12,15 @@
     rows?: number;
     disabled?: boolean;
     onkeydown?: (event: KeyboardEvent) => void;
+    /** Strip the frame so the textarea sits inside a surrounding composer surface. */
+    bare?: boolean;
+    /**
+     * Fill the available height instead of growing with content: the textarea
+     * scrolls internally and the toolbar row is pinned to the bottom.
+     */
+    fill?: boolean;
+    /** Controls rendered in a row below the textarea; owns the expand action. */
+    toolbar?: Snippet<[{ expand: () => void }]>;
   }
 
   let {
@@ -20,8 +30,10 @@
     rows = 3,
     disabled = false,
     onkeydown,
+    bare = false,
+    fill = false,
+    toolbar,
   }: Props = $props();
-
   let isExpanded = $state(false);
   let expandedValue = $state("");
   let expandedTextarea: HTMLTextAreaElement | undefined = $state();
@@ -56,9 +68,9 @@
   });
 </script>
 
-<div class="group relative flex min-h-0 flex-1 items-stretch">
+<div class="group relative flex min-h-0 flex-1 flex-col" class:gap-1.5={toolbar !== undefined}>
   <Textarea
-    class="resize-none pr-10"
+    class={`resize-none${toolbar === undefined ? " pr-10" : ""}${bare ? " pg-bare-textarea" : ""}${fill ? " min-h-0 flex-1 field-sizing-fixed" : ""}`}
     bind:ref
     {placeholder}
     {rows}
@@ -66,26 +78,32 @@
     {onkeydown}
     {disabled}
   />
-  <Button
-    variant="outline"
-    size="icon-sm"
-    class="absolute right-2 top-2 opacity-60 transition-opacity group-hover:opacity-100 md:opacity-0"
-    onclick={openExpanded}
-    title="Expand to edit"
-    type="button"
-    {disabled}
-  >
-    <Maximize2 />
-  </Button>
+  {#if toolbar}
+    <div class="flex shrink-0 items-center gap-1.5" class:mt-auto={fill}>
+      {@render toolbar({ expand: openExpanded })}
+    </div>
+  {:else}
+    <Button
+      variant="outline"
+      size="icon-sm"
+      class="absolute right-2 top-2 opacity-60 transition-opacity group-hover:opacity-100 md:opacity-0"
+      onclick={openExpanded}
+      title={$translate("playground.expandable.expandToEdit")}
+      type="button"
+      {disabled}
+    >
+      <Maximize2 />
+    </Button>
+  {/if}
 </div>
 
 {#if isExpanded}
   <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
-    <div class="bg-card flex h-[80vh] w-full max-w-4xl flex-col rounded-lg border shadow-xl">
+    <div class="pg-float flex h-[80vh] w-full max-w-4xl flex-col">
       <!-- Header -->
-      <div class="flex items-center justify-between border-b p-4">
-        <h3 class="pb-0 font-medium">Edit Text</h3>
-        <Button variant="ghost" size="icon-sm" onclick={closeExpanded} title="Close" type="button">
+      <div class="flex items-center justify-between border-b pg-divide px-4 py-3">
+        <h3 class="pb-0 font-medium">{$translate("playground.expandable.editText")}</h3>
+        <Button variant="ghost" size="icon-sm" class="pg-tool" onclick={closeExpanded} title={$translate("common.close")} type="button">
           <X />
         </Button>
       </div>
@@ -102,9 +120,9 @@
       </div>
 
       <!-- Footer -->
-      <div class="flex justify-end gap-2 border-t p-4">
-        <Button variant="outline" onclick={closeExpanded} type="button">Cancel</Button>
-        <Button onclick={saveExpanded} type="button">Done</Button>
+      <div class="flex justify-end gap-2 border-t pg-divide p-4">
+        <Button variant="outline" class="pg-control" onclick={closeExpanded} type="button">{$translate("common.cancel")}</Button>
+        <Button class="pg-action" onclick={saveExpanded} type="button">{$translate("common.done")}</Button>
       </div>
     </div>
   </div>

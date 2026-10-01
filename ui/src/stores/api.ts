@@ -3,10 +3,10 @@ import type {
   Model,
   ActivityPage,
   ActivityStatsData,
+  SpeedReportData,
   VersionInfo,
   LogData,
   APIEventEnvelope,
-  ReqRespCapture,
   InFlightStats,
   InflightRequestEntry,
   PerformanceResponse,
@@ -15,11 +15,17 @@ import type {
   ProfileState,
   PlaygroundModelType,
   HardwareSnapshot,
+  BackendProgressEvent,
+  ModelLoadConflict,
 } from "../lib/types";
-import { appendActivityFilters, type ActivityFilters } from "../lib/activityFilters";
+import { appendActivityFilters, emptyActivityFilters, type ActivityFilters } from "../lib/activityFilters";
+import { buildSpeedQueryParams, type SpeedWindowKey } from "../lib/speedSeries";
+import { appendToRenderedLogTail, LOG_PANEL_LENGTH_LIMIT } from "../lib/logTail";
+import { errorMessageFromPayload } from "../lib/apiError";
+import { t } from "../lib/i18n";
 import { connectionState } from "./theme";
 
-const LOG_LENGTH_LIMIT = 1024 * 100; /* 100KB of log data */
+const RUNTIME_LOG_LENGTH_LIMIT = 1024 * 256; /* 256KB per runtime operation */
 
 // Stores
 export const models = writable<Model[]>([]);
@@ -43,6 +49,12 @@ export const upstreamLogs = writable<string>("");
 export const activityRevision = writable<number>(0);
 export const inFlightRequests = writable<number>(0);
 export const inflightRequestEntries = writable<InflightRequestEntry[]>([]);
+export const backendProgress = writable<Record<string, BackendProgressEvent>>({});
+// Runtime command output is streamed independently from the latest progress
+// snapshot. Keeping it separate means a compiler chunk cannot replace the
+// useful phase/percentage shown in the table, and lets the install dialog
+// render a growing log without polling.
+export const runtimeLogs = writable<Record<string, string>>({});
 const defaultUIConfig = (): UIConfig => ({
   activity: { session_id: ["X-Session-ID", "X-Litellm-Session-Id"] },
 });
@@ -61,10 +73,10 @@ let playgroundModelsFetch: Promise<Model[]> | null = null;
 let playgroundModelsRefreshQueued = false;
 
 function appendLog(newData: string, store: typeof proxyLogs | typeof upstreamLogs): void {
-  store.update((prev) => {
-    const updatedLog = prev + newData;
-    return updatedLog.length > LOG_LENGTH_LIMIT ? updatedLog.slice(-LOG_LENGTH_LIMIT) : updatedLog;
-  });
+  // Keep a bounded tail that starts on a line boundary: slicing at an
+  // arbitrary offset leaves the panel opening inside a line, which reads as
+  // corrupted output even though the newest data is intact.
+  store.update((prev) => appendToRenderedLogTail(prev, newData, LOG_PANEL_LENGTH_LIMIT));
 }
 
 export function enableAPIEvents(enabled: boolean): void {
@@ -74,6 +86,8 @@ export function enableAPIEvents(enabled: boolean): void {
     activityRevision.set(0);
     inFlightRequests.set(0);
     inflightRequestEntries.set([]);
+    backendProgress.set({});
+    runtimeLogs.set({});
     uiConfig.set(defaultUIConfig());
     playgroundModelsRequest++;
     playgroundModelsRefreshQueued = false;
@@ -100,6 +114,8 @@ export function enableAPIEvents(enabled: boolean): void {
       activityRevision.update((n) => n + 1);
       inFlightRequests.set(0);
       inflightRequestEntries.set([]);
+      backendProgress.set({});
+      runtimeLogs.set({});
       uiConfig.set(defaultUIConfig());
       models.set([]);
       playgroundModelsRequest++;
@@ -210,6 +226,30 @@ export function handleAPIEventMessage(data: string): void {
       activeProfile.set(state.active);
       break;
     }
+
+    case "backendProgress": {
+      const progress = JSON.parse(message.data) as BackendProgressEvent;
+      const key = progress.model?.trim() || progress.runtime?.trim();
+      if (!key) break;
+      if (progress.output) {
+        runtimeLogs.update((current) => {
+          const next = appendToRenderedLogTail(
+            current[key] ?? "",
+            progress.output ?? "",
+            RUNTIME_LOG_LENGTH_LIMIT,
+          );
+          return { ...current, [key]: next };
+        });
+      } else if (["staging", "checking", "activating", "rollback"].includes(progress.phase) && progress.progress === 0 && !progress.error) {
+        runtimeLogs.update((current) => ({ ...current, [key]: "" }));
+      }
+      // Log chunks use a separate phase so the table keeps showing the last
+      // meaningful lifecycle phase while the output panel grows.
+      if (progress.phase !== "log") {
+        backendProgress.update((current) => ({ ...current, [key]: progress }));
+      }
+      break;
+    }
   }
 }
 
@@ -260,16 +300,20 @@ interface ModelListRecord {
   name?: string;
   description?: string;
   capabilities?: Model["capabilities"];
+  context_length?: number;
   meta?: {
     llamaswap?: {
       type?: PlaygroundModelType | "alias";
       aliases?: string[];
       modelID?: string;
       peerID?: string;
+      disabled?: boolean;
       strategy?: string;
       targets?: string[];
       spillover?: number;
+      context_length?: number;
     };
+    n_ctx?: number;
   };
 }
 
@@ -307,10 +351,13 @@ async function loadPlaygroundModels(request: number): Promise<Model[]> {
           name: record.name ?? "",
           description: record.description ?? "",
           unlisted: false,
+          disabled: metadata?.disabled === true,
+          maintenance: false,
           peerID: metadata?.peerID ?? "",
           playgroundType,
           aliases: [...(aliasesByModel.get(record.id) ?? [])],
           capabilities: record.capabilities,
+          context_length: record.context_length ?? record.meta?.llamaswap?.context_length ?? record.meta?.n_ctx,
           strategy: metadata?.strategy,
           targets: metadata?.targets ?? [],
           spillover: metadata?.spillover,
@@ -353,6 +400,7 @@ export async function getActivity(params: {
   sort?: string;
   order?: "asc" | "desc";
   filters?: ActivityFilters;
+  configuredOnly?: boolean;
 } = {}): Promise<ActivityPage> {
   const query = new URLSearchParams();
   if (params.model) query.set("model", params.model);
@@ -360,9 +408,9 @@ export async function getActivity(params: {
   if (params.limit) query.set("limit", String(params.limit));
   if (params.sort) query.set("sort", params.sort);
   if (params.order) query.set("order", params.order);
-  // Drawer filters only ever add id bounds, so they never conflict with a
-  // model pinned above. The API also accepts repeated "model" params and
-  // start/end timestamps, which no UI control currently produces.
+  if (params.configuredOnly) query.set("configured_only", "true");
+  // Drawer filters add model/key/session/time and id bounds. A caller-provided
+  // model remains authoritative when the same request is pinned to one model.
   if (params.filters) appendActivityFilters(query, params.filters);
   const url = query.size > 0 ? `/api/metrics/activity?${query}` : "/api/metrics/activity";
 
@@ -373,14 +421,40 @@ export async function getActivity(params: {
   return await response.json();
 }
 
-export async function getActivityStats(model?: string): Promise<ActivityStatsData> {
+export async function getActivityStats(modelOrParams?: string | { model?: string; filters?: ActivityFilters; configuredOnly?: boolean }): Promise<ActivityStatsData> {
   const query = new URLSearchParams();
+  const model = typeof modelOrParams === "string" ? modelOrParams : modelOrParams?.model;
   if (model) query.set("model", model);
+  if (typeof modelOrParams !== "string" && modelOrParams?.configuredOnly) query.set("configured_only", "true");
+  if (typeof modelOrParams !== "string" && modelOrParams?.filters) {
+    appendActivityFilters(query, modelOrParams.filters);
+  }
   const url = query.size > 0 ? `/api/metrics/stats?${query}` : "/api/metrics/stats";
 
   const response = await fetch(url);
   if (!response.ok) {
     throw new Error(`Failed to fetch activity stats: ${response.status}`);
+  }
+  return await response.json();
+}
+
+export async function getSpeedReport(params: {
+  model?: string;
+  filters?: ActivityFilters;
+  window?: SpeedWindowKey;
+  configuredOnly?: boolean;
+}): Promise<SpeedReportData> {
+  const query = buildSpeedQueryParams({
+    model: params.model ?? "",
+    filters: params.filters ?? emptyActivityFilters(),
+    window: params.window ?? "all",
+    configuredOnly: params.configuredOnly,
+  });
+  const url = query.size > 0 ? `/api/metrics/speed?${query}` : "/api/metrics/speed";
+
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Failed to fetch speed report: ${response.status}`);
   }
   return await response.json();
 }
@@ -410,6 +484,58 @@ export async function unloadSingleModel(model: string): Promise<void> {
   } catch (error) {
     console.error("Failed to unload model", model, error);
     throw error;
+	}
+}
+
+async function backendLifecycleAction(model: string, action: string): Promise<void> {
+	const response = await fetch(`/api/backends/${encodeURIComponent(model)}/${action}`, {
+		method: "POST",
+	});
+	const payload: unknown = await response.json().catch(() => ({}));
+	if (!response.ok) {
+		throw new Error(errorMessageFromPayload(payload, `Backend action failed: HTTP ${response.status}`));
+	}
+}
+
+export function sleepModel(model: string, level = 1): Promise<void> {
+	return backendLifecycleAction(model, `sleep?level=${encodeURIComponent(String(level))}`);
+}
+
+export function wakeModel(model: string): Promise<void> {
+	return backendLifecycleAction(model, "wake");
+}
+
+export async function getModelLoadConflicts(model: string): Promise<ModelLoadConflict[]> {
+  const response = await fetch(`/api/models/conflicts/${encodeURIComponent(model)}`);
+  if (!response.ok) {
+    throw new Error(`Failed to check model conflicts: ${response.status}`);
+  }
+  const payload = await response.json() as { conflicts?: unknown };
+  if (!Array.isArray(payload.conflicts)) return [];
+  return payload.conflicts.filter((value): value is ModelLoadConflict => {
+    if (!value || typeof value !== "object") return false;
+    const conflict = value as Partial<ModelLoadConflict>;
+    return typeof conflict.id === "string" && typeof conflict.name === "string" && typeof conflict.state === "string";
+  });
+}
+
+export async function restartModel(model: string): Promise<void> {
+  const response = await fetch(`/api/models/restart/${encodeURIComponent(model)}`, {
+    method: "POST",
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({})) as { message?: string; error?: string };
+    throw new Error(payload.message ?? payload.error ?? `Failed to restart model: ${response.status}`);
+  }
+}
+
+export async function forceRestartModel(model: string): Promise<void> {
+  const response = await fetch(`/api/models/force-restart/${encodeURIComponent(model)}`, {
+    method: "POST",
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({})) as { message?: string; error?: string };
+    throw new Error(payload.message ?? payload.error ?? `Failed to force restart model: ${response.status}`);
   }
 }
 
@@ -445,22 +571,6 @@ export async function loadModel(model: string, signal?: AbortSignal): Promise<vo
   }
 }
 
-export async function getCapture(id: number): Promise<ReqRespCapture | null> {
-  try {
-    const response = await fetch(`/api/captures/${id}`);
-    if (response.status === 404) {
-      return null;
-    }
-    if (!response.ok) {
-      throw new Error(`Failed to fetch capture: ${response.status}`);
-    }
-    return await response.json();
-  } catch (error) {
-    console.error("Failed to fetch capture:", error);
-    return null;
-  }
-}
-
 export async function checkPerformanceEnabled(): Promise<void> {
   try {
     const response = await fetch("/api/performance");
@@ -492,7 +602,7 @@ export async function fetchPerformance(after?: string): Promise<PerformanceRespo
 export async function getHardware(): Promise<HardwareSnapshot> {
   const response = await fetch("/api/hardware");
   if (!response.ok) {
-    throw new Error(`Failed to fetch hardware: ${response.status}`);
+    throw new Error(t("errors.hardwareRequest", { status: response.status }));
   }
   return await response.json() as HardwareSnapshot;
 }

@@ -15,6 +15,7 @@
   import { Textarea } from "$lib/components/ui/textarea/index.js";
   import * as Select from "$lib/components/ui/select/index.js";
   import { Download, X } from "@lucide/svelte";
+  import { t, translate } from "../../lib/i18n";
 
   const iface = createPlaygroundInterface("playground-image-model", playgroundStores.imageGenerating);
   const selectedModelStore = iface.selectedModel;
@@ -58,7 +59,7 @@
       lorasLoaded = true;
     } catch (err) {
       availableLoras = [];
-      loraError = err instanceof Error ? err.message : "Failed to load LoRAs";
+      loraError = err instanceof Error ? err.message : t("errors.failedLoadLoras");
       lorasLoaded = false;
     } finally {
       isLoadingLoras = false;
@@ -172,14 +173,21 @@
 <div class="flex flex-col h-full">
   <!-- Model selector and mode toggle -->
   <div class="shrink-0 flex flex-wrap gap-2 mb-4">
-    <ModelSelector bind:value={$selectedModelStore} placeholder="Select an image model..." disabled={isGenerating} capabilities={["image_generation", "image_to_image"]} matchAny={true} />
+    <ModelSelector
+      bind:value={$selectedModelStore}
+      placeholder={$translate("playground.image.modelPlaceholder")}
+      disabled={isGenerating}
+      category="image"
+      groupLabelKey="playground.modelSelector.groupImage"
+      others
+    />
 
     <Select.Root
       type="single"
       value={$apiModeStore}
       onValueChange={(v) => v && apiModeStore.set(v as ImageApiMode)}
     >
-      <Select.Trigger class="h-9 w-32">{$apiModeStore}</Select.Trigger>
+      <Select.Trigger class="pg-trigger h-9 w-32">{$apiModeStore}</Select.Trigger>
       <Select.Content>
         <Select.Item value="openai">OpenAI</Select.Item>
         <Select.Item value="sdapi">SDAPI</Select.Item>
@@ -191,23 +199,23 @@
       value={$selectedSizeStore}
       onValueChange={(v) => v && selectedSizeStore.set(v)}
     >
-      <Select.Trigger class="h-9 w-40">{$selectedSizeStore}</Select.Trigger>
+      <Select.Trigger class="pg-trigger h-9 w-40">{$selectedSizeStore}</Select.Trigger>
       <Select.Content>
         <Select.Group>
-          <Select.Label>Square</Select.Label>
+          <Select.Label>{$translate("playground.image.square")}</Select.Label>
           <Select.Item value="512x512">512x512</Select.Item>
           <Select.Item value="1024x1024">1024x1024</Select.Item>
         </Select.Group>
         <Select.Separator />
         <Select.Group>
-          <Select.Label>Landscape</Select.Label>
+          <Select.Label>{$translate("playground.image.landscape")}</Select.Label>
           <Select.Item value="1024x768">1024x768 (4:3)</Select.Item>
           <Select.Item value="1280x720">1280x720 (16:9)</Select.Item>
           <Select.Item value="1792x1024">1792x1024 (SDXL)</Select.Item>
         </Select.Group>
         <Select.Separator />
         <Select.Group>
-          <Select.Label>Portrait</Select.Label>
+          <Select.Label>{$translate("playground.image.portrait")}</Select.Label>
           <Select.Item value="768x1024">768x1024 (3:4)</Select.Item>
           <Select.Item value="720x1280">720x1280 (9:16)</Select.Item>
           <Select.Item value="1024x1792">1024x1792 (SDXL)</Select.Item>
@@ -216,18 +224,18 @@
     </Select.Root>
 
     {#if isSdapi}
-      <Button variant="outline" onclick={() => showSettings = !showSettings}>
-        {showSettings ? "Hide Settings" : "Settings"}
+      <Button variant="outline" class="pg-control" onclick={() => showSettings = !showSettings}>
+        {$translate(showSettings ? "playground.image.hideSettings" : "playground.image.settings")}
       </Button>
     {/if}
   </div>
 
   <!-- SDAPI Settings Panel -->
   {#if isSdapi && showSettings}
-    <div class="shrink-0 mb-4 p-4 rounded-md border border-border bg-background">
+    <div class="pg-inset-soft shrink-0 mb-4 p-4">
       <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-3">
         <label class="flex flex-col gap-1">
-          <span class="text-xs text-muted-foreground">Steps</span>
+          <span class="text-xs text-muted-foreground">{$translate("playground.image.steps")}</span>
           <Input
             type="number"
             class="h-8"
@@ -237,7 +245,7 @@
           />
         </label>
         <label class="flex flex-col gap-1">
-          <span class="text-xs text-muted-foreground">CFG Scale</span>
+          <span class="text-xs text-muted-foreground">{$translate("playground.image.cfgScale")}</span>
           <Input
             type="number"
             class="h-8"
@@ -248,7 +256,7 @@
           />
         </label>
         <label class="flex flex-col gap-1">
-          <span class="text-xs text-muted-foreground">Seed (-1 = random)</span>
+          <span class="text-xs text-muted-foreground">{$translate("playground.image.seed")}</span>
           <Input
             type="number"
             class="h-8"
@@ -257,7 +265,7 @@
           />
         </label>
         <label class="flex flex-col gap-1">
-          <span class="text-xs text-muted-foreground">Batch Size</span>
+          <span class="text-xs text-muted-foreground">{$translate("playground.image.batchSize")}</span>
           <Input
             type="number"
             class="h-8"
@@ -267,15 +275,15 @@
           />
         </label>
         <label class="flex flex-col gap-1">
-          <span class="text-xs text-muted-foreground">Sampler</span>
+          <span class="text-xs text-muted-foreground">{$translate("playground.image.sampler")}</span>
           <Select.Root
             type="single"
             value={$sdSamplerStore}
             onValueChange={(v) => sdSamplerStore.set(v ?? "")}
           >
-            <Select.Trigger class="h-8">{$sdSamplerStore || "Default"}</Select.Trigger>
+            <Select.Trigger class="pg-trigger h-8">{$sdSamplerStore || $translate("playground.image.default")}</Select.Trigger>
             <Select.Content>
-              <Select.Item value="">Default</Select.Item>
+              <Select.Item value="">{$translate("playground.image.default")}</Select.Item>
               <Select.Item value="euler_a">euler_a</Select.Item>
               <Select.Item value="euler">euler</Select.Item>
               <Select.Item value="heun">heun</Select.Item>
@@ -292,15 +300,15 @@
           </Select.Root>
         </label>
         <label class="flex flex-col gap-1">
-          <span class="text-xs text-muted-foreground">Scheduler</span>
+          <span class="text-xs text-muted-foreground">{$translate("playground.image.scheduler")}</span>
           <Select.Root
             type="single"
             value={$sdSchedulerStore}
             onValueChange={(v) => sdSchedulerStore.set(v ?? "")}
           >
-            <Select.Trigger class="h-8">{$sdSchedulerStore || "Auto for model"}</Select.Trigger>
+            <Select.Trigger class="pg-trigger h-8">{$sdSchedulerStore || $translate("playground.image.autoForModel")}</Select.Trigger>
             <Select.Content>
-              <Select.Item value="">Auto for model</Select.Item>
+              <Select.Item value="">{$translate("playground.image.autoForModel")}</Select.Item>
               <Select.Item value="discrete">discrete</Select.Item>
               <Select.Item value="karras">karras</Select.Item>
               <Select.Item value="exponential">exponential</Select.Item>
@@ -312,25 +320,25 @@
       </div>
 
       <label class="flex flex-col gap-1 mb-3">
-        <span class="text-xs text-muted-foreground">Negative Prompt</span>
+        <span class="text-xs text-muted-foreground">{$translate("playground.image.negativePrompt")}</span>
         <Textarea
           bind:value={$sdNegativePromptStore}
           rows={2}
-          placeholder="Elements to avoid..."
+          placeholder={$translate("playground.image.negativePromptPlaceholder")}
         ></Textarea>
       </label>
 
       <!-- LoRA Selection -->
       <div>
-        <span class="text-xs text-muted-foreground block mb-1">LoRAs</span>
+        <span class="text-xs text-muted-foreground block mb-1">{$translate("playground.image.loras")}</span>
         <div class="flex items-center gap-2 mb-2">
           <Button
             variant="outline"
-            size="sm"
+            class="pg-control"
             onclick={loadLoras}
             disabled={!$selectedModelStore || isLoadingLoras}
           >
-            {isLoadingLoras ? "Loading..." : lorasLoaded ? "Reload LoRAs" : "Load LoRAs"}
+            {isLoadingLoras ? $translate("playground.image.loading") : lorasLoaded ? $translate("playground.image.reloadLoras") : $translate("playground.image.loadLoras")}
           </Button>
           {#if lorasLoaded && availableLoras.length > 0}
             <Select.Root
@@ -345,7 +353,7 @@
                 }
               }}
             >
-              <Select.Trigger class="h-8 flex-1">Add a LoRA...</Select.Trigger>
+              <Select.Trigger class="pg-trigger h-8 flex-1">{$translate("playground.image.addLora")}</Select.Trigger>
               <Select.Content>
                 {#each availableLoras.filter((l) => !selectedLoras.some((s) => s.path === l.path)) as lora (lora.path)}
                   <Select.Item value={lora.path}>{lora.name}</Select.Item>
@@ -358,7 +366,7 @@
           <p class="text-xs text-red-500 mb-1">{loraError}</p>
         {/if}
         {#if lorasLoaded && availableLoras.length === 0}
-          <p class="text-xs text-muted-foreground">No LoRAs available</p>
+          <p class="text-xs text-muted-foreground">{$translate("playground.image.noLoras")}</p>
         {/if}
         {#if selectedLoras.length > 0}
           <div class="flex flex-col gap-1.5">
@@ -379,7 +387,7 @@
                   size="sm"
                   class="h-7 px-1.5 text-xs hover:bg-destructive hover:text-destructive-foreground"
                   onclick={() => removeLora(lora.path)}
-                  aria-label="Remove LoRA"
+                  aria-label={$translate("playground.image.removeLora")}
                 >
                   <X class="size-3" />
                 </Button>
@@ -393,18 +401,18 @@
 
   <!-- Empty state for no models configured -->
   {#if !$hasListedModels}
-    <EmptyState message="No models configured. Add models to your configuration to generate images." />
+    <EmptyState message={$translate("playground.image.noModels")} />
   {:else}
     <!-- Image display area -->
-    <div class="flex-1 overflow-auto mb-4 flex items-center justify-center bg-background border border-border rounded-md">
+    <div class="pg-inset flex-1 overflow-auto mb-4 flex items-center justify-center">
       {#if isGenerating}
         <div class="text-center text-muted-foreground">
           <div class="inline-block w-8 h-8 border-4 border-primary border-t-transparent rounded-full animate-spin mb-2"></div>
-          <p>Generating image...</p>
+          <p>{$translate("playground.image.generating")}</p>
         </div>
       {:else if $error}
         <div class="text-center text-red-500 p-4">
-          <p class="font-medium">Error</p>
+          <p class="font-medium">{$translate("common.error")}</p>
           <p class="text-sm mt-1">{$error}</p>
         </div>
       {:else if generatedImages.length > 1}
@@ -414,11 +422,11 @@
               <button
                 class="p-0 border-0 bg-transparent cursor-pointer"
                 onclick={() => openFullscreen(i)}
-                aria-label="View fullscreen"
+                aria-label={$translate("playground.image.viewFullscreen")}
               >
                 <img
                   src={img}
-                  alt="AI generated content {i + 1}"
+                  alt={$translate("playground.image.alt", { index: i + 1 })}
                   class="max-w-full max-h-full object-contain hover:opacity-90 transition-opacity"
                 />
               </button>
@@ -427,7 +435,7 @@
                 size="icon"
                 class="absolute bottom-2 right-2 h-8 w-8 bg-black/60 hover:bg-black/80 text-white"
                 onclick={(e) => { e.stopPropagation(); downloadImage(i); }}
-                aria-label="Download image"
+                aria-label={$translate("playground.image.download")}
               >
                 <Download class="size-4" />
               </Button>
@@ -439,11 +447,11 @@
           <button
             class="p-0 border-0 bg-transparent cursor-pointer"
             onclick={() => openFullscreen(0)}
-            aria-label="View fullscreen"
+            aria-label={$translate("playground.image.viewFullscreen")}
           >
             <img
               src={generatedImages[0]}
-              alt="AI generated content"
+              alt={$translate("playground.image.alt", { index: 1 })}
               class="max-w-full max-h-full object-contain hover:opacity-90 transition-opacity"
             />
           </button>
@@ -452,14 +460,14 @@
             size="icon"
             class="absolute bottom-2 right-2 bg-black/60 hover:bg-black/80 text-white"
             onclick={(e) => { e.stopPropagation(); downloadImage(0); }}
-            aria-label="Download image"
+            aria-label={$translate("playground.image.download")}
           >
             <Download class="size-5" />
           </Button>
         </div>
       {:else}
         <div class="text-center text-muted-foreground">
-          <p>Enter a prompt below to generate an image</p>
+          <p>{$translate("playground.image.empty")}</p>
         </div>
       {/if}
     </div>
@@ -468,31 +476,31 @@
     <div class="shrink-0 flex flex-col md:flex-row gap-2">
       <ExpandableTextarea
         bind:value={prompt}
-        placeholder="Describe the image you want to generate..."
+        placeholder={$translate("playground.image.promptPlaceholder")}
         rows={3}
         onkeydown={handleKeyDown}
         disabled={isGenerating || !$selectedModelStore}
       />
       <div class="flex flex-row md:flex-col gap-2">
         {#if isGenerating}
-          <Button variant="destructive" class="flex-1 md:flex-none" onclick={cancelGeneration}>
-            Cancel
+          <Button variant="outline" class="pg-control pg-control--danger flex-1 md:flex-none" onclick={cancelGeneration}>
+            {$translate("common.cancel")}
           </Button>
         {:else}
           <Button
-            class="flex-1 md:flex-none"
+            class="pg-action flex-1 md:flex-none"
             onclick={generate}
             disabled={!prompt.trim() || !$selectedModelStore}
           >
-            Generate
+            {$translate("playground.image.generate")}
           </Button>
           <Button
             variant="outline"
-            class="flex-1 md:flex-none"
+            class="pg-control flex-1 md:flex-none"
             onclick={clearImage}
             disabled={generatedImages.length === 0 && !$error && !prompt.trim()}
           >
-            Clear
+            {$translate("common.clear")}
           </Button>
         {/if}
       </div>
@@ -515,13 +523,13 @@
       size="icon"
       class="absolute top-4 right-4 bg-black/60 hover:bg-black/80 text-white"
       onclick={() => closeFullscreen()}
-      aria-label="Close fullscreen"
+      aria-label={$translate("playground.image.closeFullscreen")}
     >
       <X class="size-6" />
     </Button>
     <img
       src={generatedImages[fullscreenIndex]}
-      alt="AI generated content"
+      alt={$translate("playground.image.alt", { index: fullscreenIndex + 1 })}
       class="max-w-full max-h-full object-contain pointer-events-none"
     />
   </div>

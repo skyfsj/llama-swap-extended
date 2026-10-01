@@ -38,9 +38,14 @@ export function isPending(id: string): boolean {
 export function onToggleLoad(m: Model): void {
   if (m.state === "stopped" && isPending(m.id)) {
     cancelLoad(m.id);
+    // Aborting the load fetch does not reach the backend: the swap goroutine
+    // waits on the server's own context, not the request's. Ask for an unload
+    // as well so a start that already crossed into the backend is aborted; on
+    // a backend that has not started yet the unload is a harmless no-op.
+    void unloadSingleModel(m.id).catch(() => {});
   } else if (m.state === "stopped") {
     void handleLoadModel(m.id);
-  } else if (m.state === "ready") {
+  } else if (m.state === "ready" || m.state === "sleeping") {
     void unloadSingleModel(m.id);
   }
 }
@@ -48,6 +53,7 @@ export function onToggleLoad(m: Model): void {
 export function statusDotColor(m: Model | undefined): string {
   if (!m) return "bg-muted-foreground/40";
   if (m.state === "ready") return "bg-success";
+  if (m.state === "sleeping") return "bg-info";
   if (m.state === "starting" || m.state === "stopping") return "bg-warning";
   return "bg-muted-foreground/40";
 }

@@ -9,6 +9,7 @@
   import { formatDuration } from "../../lib/format";
   import { copyText } from "../../lib/clipboard";
   import { isSubmitEnter } from "../../lib/ime";
+  import { t, translate } from "../../lib/i18n";
 
   interface Props {
     role: "user" | "assistant" | "system";
@@ -100,7 +101,7 @@
     }
   }
 
-  const COPY_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>`;
+  const COPY_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c0 1.1.9 2 2 2"/></svg>`;
   const CHECK_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>`;
 
   function codeBlockCopy(node: HTMLElement) {
@@ -109,7 +110,7 @@
         pre.setAttribute('data-copy-btn', 'true');
         const btn = document.createElement('button');
         btn.className = 'code-copy-btn';
-        btn.title = 'Copy code';
+        btn.title = t("playground.chat.copyCode");
         btn.innerHTML = COPY_SVG;
         btn.addEventListener('click', async () => {
           const text = pre.querySelector('code')?.textContent ?? pre.textContent ?? '';
@@ -129,112 +130,17 @@
   }
 </script>
 
-<div class="flex {role === 'user' ? 'justify-end' : 'justify-start'} mb-4">
-  <div
-    class="group relative rounded-lg px-4 py-2 {role === 'user'
-      ? 'bg-primary text-primary-foreground max-w-[85%]'
-      : 'bg-card w-full border sm:w-4/5'}"
-  >
-    {#if role === "assistant"}
-      {#if reasoning_content || isReasoning}
-        <div class="mb-3 overflow-hidden rounded-md border">
-          <button
-            class="bg-muted/50 hover:bg-muted flex w-full items-center gap-2 px-3 py-2 text-sm transition-colors"
-            onclick={() => showReasoning = !showReasoning}
-          >
-            {#if showReasoning}
-              <ChevronDown class="size-4" />
-            {:else}
-              <ChevronRight class="size-4" />
-            {/if}
-            <Brain class="size-4" />
-            <span class="font-medium">Reasoning</span>
-            <span class="text-muted-foreground ml-2">
-              ({reasoning_content.length} chars{#if !isReasoning && reasoningTimeMs > 0}, {formatDuration(reasoningTimeMs, { precision: 1, subSecondMs: true })}{/if})
-            </span>
-            {#if isReasoning}
-              <span class="text-muted-foreground ml-auto flex items-center gap-1">
-                <span class="bg-primary h-1.5 w-1.5 animate-pulse rounded-full"></span>
-                reasoning...
-              </span>
-            {/if}
-          </button>
-          {#if showReasoning}
-            <div class="bg-muted/30 text-muted-foreground whitespace-pre-wrap px-3 py-2 font-mono text-sm">
-              {reasoning_content}{#if isReasoning}<span class="ml-0.5 inline-block h-4 w-1.5 animate-pulse bg-current"></span>{/if}
-            </div>
-          {/if}
-        </div>
-      {/if}
-      {#if hasImages}
-        <div class="mb-3 flex flex-wrap gap-2">
-          {#each imageUrls as imageUrl, idx (idx)}
-            <button
-              onclick={() => openModal(imageUrl)}
-              class="cursor-pointer rounded-md border transition-opacity hover:opacity-80"
-            >
-              <img
-                src={imageUrl}
-                alt="Image {idx + 1}"
-                class="max-h-64 rounded-md"
-              />
-            </button>
-          {/each}
-        </div>
-      {/if}
-      {#if showRaw}
-        <div class="whitespace-pre-wrap font-mono text-sm">{textContent}</div>
-      {:else}
-        <div class="prose prose-sm dark:prose-invert max-w-none" use:codeBlockCopy>
-          {#each renderedParts.blocks as block (block.id)}
-            {@html block.html}
-          {/each}
-          {@html renderedParts.pendingHtml}
-          {#if isStreaming && !isReasoning}
-            <span class="inline-block w-2 h-4 bg-current animate-pulse ml-0.5"></span>
-          {/if}
-        </div>
-      {/if}
-      {#if !isStreaming}
-        <div class="mt-2 flex gap-1 border-t pt-1">
-          {#if onRegenerate}
-            <Button variant="ghost" size="icon-xs" class="text-muted-foreground" onclick={onRegenerate} title="Regenerate response">
-              <RefreshCw />
-            </Button>
-          {/if}
-          <Button
-            variant="ghost"
-            size="icon-xs"
-            class="text-muted-foreground"
-            onclick={copyToClipboard}
-            title={copied ? "Copied!" : "Copy to clipboard"}
-          >
-            {#if copied}
-              <Check class="text-success" />
-            {:else}
-              <Copy />
-            {/if}
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon-xs"
-            class={showRaw ? "text-primary" : "text-muted-foreground"}
-            onclick={() => showRaw = !showRaw}
-            title={showRaw ? "Show rendered" : "Show raw"}
-          >
-            <Code />
-          </Button>
-        </div>
-      {/if}
-    {:else}
+<div class="flex {role === 'user' ? 'justify-end' : 'justify-start'} mb-3 last:mb-0">
+  {#if role === "user"}
+    <div class="pg-bubble group relative max-w-[85%] px-3.5 py-2.5">
       {#if isEditing}
         <div class="flex min-w-[300px] flex-col gap-2">
           <Textarea class="resize-none" rows={3} bind:value={editContent} onkeydown={handleKeyDown} />
           <div class="flex justify-end gap-2">
-            <Button variant="ghost" size="icon-sm" onclick={cancelEdit} title="Cancel">
+            <Button variant="ghost" size="icon-sm" class="pg-tool" onclick={cancelEdit} title={$translate("common.cancel")}>
               <X />
             </Button>
-            <Button variant="ghost" size="icon-sm" onclick={saveEdit} title="Save">
+            <Button variant="ghost" size="icon-sm" class="pg-tool" onclick={saveEdit} title={$translate("common.save")}>
               <Save />
             </Button>
           </div>
@@ -245,30 +151,123 @@
             {#each imageUrls as imageUrl, idx (idx)}
               <button
                 onclick={() => openModal(imageUrl)}
-                class="cursor-pointer rounded-md border border-white/20 transition-opacity hover:opacity-80"
+                class="cursor-pointer overflow-hidden rounded-[var(--pg-r-control)] border border-black/10 transition-opacity hover:opacity-80 dark:border-white/10"
               >
                 <img
                   src={imageUrl}
-                  alt="Image {idx + 1}"
-                  class="max-w-[200px] rounded-md"
+                  alt={$translate("playground.chat.image", { index: idx + 1 })}
+                  class="max-w-[200px]"
                 />
               </button>
             {/each}
           </div>
         {/if}
-        <div class="whitespace-pre-wrap pr-8">{textContent}</div>
+        <div class="whitespace-pre-wrap pr-7 text-[0.9375rem] leading-relaxed">{textContent}</div>
         {#if canEdit}
           <button
-            class="absolute right-2 top-2 rounded-lg bg-white/20 p-1.5 opacity-0 shadow-sm transition-opacity hover:bg-white/30 group-hover:opacity-100"
+            class="absolute right-1.5 top-1.5 rounded-[var(--pg-r-chip)] p-1 text-current/60 opacity-0 transition-opacity hover:bg-black/5 hover:text-current group-hover:opacity-100 dark:hover:bg-white/10"
             onclick={startEdit}
-            title="Edit message"
+            title={$translate("playground.chat.editMessage")}
           >
-            <Pencil class="size-4" />
+            <Pencil class="size-3.5" />
           </button>
         {/if}
       {/if}
-    {/if}
-  </div>
+    </div>
+  {:else}
+    <div class="pg-panel group relative w-full px-4 py-3">
+      {#if reasoning_content || isReasoning}
+        <div class="pg-inset mb-3 overflow-hidden">
+          <button
+            class="flex w-full items-center gap-2 px-3 py-1.5 text-[13px] text-[color:var(--pg-ink-2)] transition-colors hover:text-[color:var(--pg-ink)]"
+            onclick={() => showReasoning = !showReasoning}
+          >
+            {#if showReasoning}
+              <ChevronDown class="size-3.5" />
+            {:else}
+              <ChevronRight class="size-3.5" />
+            {/if}
+            <Brain class="size-3.5" />
+            <span class="font-medium">{$translate("capture.reasoning")}</span>
+            <span class="pg-chip">
+              {reasoning_content.length}{$translate("playground.chat.characters")}{#if !isReasoning && reasoningTimeMs > 0} · {formatDuration(reasoningTimeMs, { precision: 1, subSecondMs: true })}{/if}
+            </span>
+            {#if isReasoning}
+              <span class="ml-auto flex items-center gap-1.5">
+                <span class="size-1.5 animate-pulse rounded-full bg-primary"></span>
+                {$translate("status.request.reasoning")}...
+              </span>
+            {/if}
+          </button>
+          {#if showReasoning}
+            <div class="text-[color:var(--pg-ink-3)] border-t pg-divide max-h-64 overflow-y-auto whitespace-pre-wrap px-3 py-2 font-mono text-xs leading-relaxed pg-scroll">
+              {reasoning_content}{#if isReasoning}<span class="bg-current ml-0.5 inline-block h-3 w-1.5 animate-pulse align-middle"></span>{/if}
+            </div>
+          {/if}
+        </div>
+      {/if}
+      {#if hasImages}
+        <div class="mb-3 flex flex-wrap gap-2">
+          {#each imageUrls as imageUrl, idx (idx)}
+            <button
+              onclick={() => openModal(imageUrl)}
+              class="cursor-pointer overflow-hidden rounded-[var(--pg-r-control)] border border-black/[0.06] transition-opacity hover:opacity-80 dark:border-white/10"
+            >
+              <img
+                src={imageUrl}
+                alt={$translate("playground.chat.image", { index: idx + 1 })}
+                class="max-h-64"
+              />
+            </button>
+          {/each}
+        </div>
+      {/if}
+      {#if showRaw}
+        <div class="text-[color:var(--pg-ink-2)] whitespace-pre-wrap font-mono text-[13px] leading-relaxed">{textContent}</div>
+      {:else}
+        <div class="prose prose-sm dark:prose-invert max-w-none text-[0.9375rem]" use:codeBlockCopy>
+          {#each renderedParts.blocks as block (block.id)}
+            {@html block.html}
+          {/each}
+          {@html renderedParts.pendingHtml}
+          {#if isStreaming && !isReasoning}
+            <span class="pg-caret"></span>
+          {/if}
+        </div>
+      {/if}
+      {#if !isStreaming}
+        <div class="mt-1.5 flex items-center gap-0.5">
+          {#if onRegenerate}
+            <Button variant="ghost" size="icon-xs" class="pg-tool" onclick={onRegenerate} title={$translate("playground.chat.regenerate")}>
+              <RefreshCw />
+            </Button>
+          {/if}
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            class="pg-tool"
+            onclick={copyToClipboard}
+            title={copied ? $translate("common.copied") : $translate("common.copy")}
+          >
+            {#if copied}
+              <Check class="text-success" />
+            {:else}
+              <Copy />
+            {/if}
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            class={showRaw ? "pg-tool text-primary" : "pg-tool"}
+            onclick={() => showRaw = !showRaw}
+            title={$translate(showRaw ? "playground.chat.showRendered" : "playground.chat.showRaw")}
+          >
+            <Code />
+          </Button>
+        </div>
+      {/if}
+    </div>
+  {/if}
 </div>
 
 <!-- Full-size image modal -->
@@ -283,7 +282,7 @@
     <button
       class="absolute right-4 top-4 rounded-lg bg-white/10 p-2 text-white transition-colors hover:bg-white/20"
       onclick={() => closeModal()}
-      title="Close"
+      title={$translate("common.close")}
     >
       <X class="size-6" />
     </button>
@@ -298,9 +297,9 @@
 <style>
   .prose :global(pre) {
     position: relative;
-    background-color: var(--muted);
-    border: 1px solid var(--border);
-    border-radius: 0.375rem;
+    background-color: var(--pg-field);
+    border: 1px solid var(--pg-line);
+    border-radius: var(--pg-r-control);
     padding: 0.75rem;
     padding-right: 2.5rem;
     overflow-x: auto;
@@ -316,16 +315,17 @@
     justify-content: center;
     padding: 0.25rem;
     border-radius: 0.25rem;
-    border: 1px solid var(--border);
-    background: var(--muted);
-    color: var(--muted-foreground);
+    border: 1px solid var(--pg-line);
+    background: var(--pg-surface);
+    color: var(--pg-ink-2);
     cursor: pointer;
     transition: background-color 0.15s;
     line-height: 0;
   }
 
   .prose :global(.code-copy-btn:hover) {
-    background: var(--accent);
+    background: var(--pg-hover-2);
+    color: var(--pg-ink);
   }
 
   .prose :global(.code-copy-btn.copied) {
@@ -344,10 +344,10 @@
   }
 
   .prose :global(code:not(pre code)) {
-    background-color: var(--muted);
+    background-color: var(--pg-field);
     padding: 0.125rem 0.25rem;
-    border-radius: 0.25rem;
-    border: 1px solid var(--border);
+    border-radius: var(--pg-r-chip);
+    border: 1px solid var(--pg-line);
   }
 
   .prose :global(p) {
@@ -388,10 +388,11 @@
   }
 
   .prose :global(blockquote) {
-    border-left: 3px solid var(--primary);
+    border-left: 2px solid color-mix(in oklab, var(--primary) 50%, transparent);
     padding-left: 1rem;
     margin: 0.5rem 0;
     font-style: italic;
+    color: var(--pg-ink-2);
   }
 
   .prose :global(a) {
@@ -407,18 +408,18 @@
 
   .prose :global(th),
   .prose :global(td) {
-    border: 1px solid var(--border);
+    border: 1px solid var(--pg-line);
     padding: 0.5rem;
     text-align: left;
   }
 
   .prose :global(th) {
-    background-color: var(--muted);
+    background-color: var(--pg-field);
     font-weight: 600;
   }
 
-  /* Highlight.js theme overrides for dark mode */
-  :global(.dark) .prose :global(.hljs) {
+  /* Highlight.js theme overrides: the pre provides the surface in both modes */
+  .prose :global(pre .hljs) {
     background: transparent;
   }
 </style>

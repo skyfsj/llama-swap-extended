@@ -1,5 +1,6 @@
 import type { ImageGenerationRequest, ImageGenerationResponse } from "./types";
 import { playgroundSessionHeaders } from "./playgroundSession";
+import { t } from "./i18n";
 
 export async function generateImage(
   model: string,
@@ -26,7 +27,7 @@ export async function generateImage(
 
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(`Image API error: ${response.status} - ${errorText}`);
+    throw new Error(t("errors.imageApi", { status: response.status, detail: errorText }));
   }
 
   return response.json();

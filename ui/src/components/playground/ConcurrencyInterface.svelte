@@ -1,131 +1,202 @@
 <script lang="ts">
-  import { playgroundModels, selectorModels } from "../../stores/api";
-  import { persistentStore } from "../../stores/persistent";
-  import { streamChatCompletion } from "../../lib/chatApi";
+  import {
+    Activity,
+    CopyPlus,
+    Eraser,
+    FileText,
+    Gauge,
+    GripVertical,
+    Play,
+    Plus,
+    RotateCcw,
+    Square,
+    Trash2,
+    Users,
+  } from "@lucide/svelte";
   import { Button } from "$lib/components/ui/button/index.js";
   import { Input } from "$lib/components/ui/input/index.js";
   import { Textarea } from "$lib/components/ui/textarea/index.js";
-  import { X } from "@lucide/svelte";
+  import * as ToggleGroup from "$lib/components/ui/toggle-group/index.js";
+  import { playgroundModels, profileModels, selectorModels } from "../../stores/api";
+  import { persistentStore } from "../../stores/persistent";
+  import { streamChatCompletion, type StreamUsage } from "../../lib/chatApi";
+  import { t, translate } from "../../lib/i18n";
+  import {
+    createBenchmarkPlans,
+    delayWithAbort,
+    estimateTokens,
+    runWithConcurrency,
+    summarizeBenchmarkRuns,
+    DEFAULT_CONTEXT_TOKENS,
+    DEFAULT_PREFILL_REQUESTS,
+    type BenchmarkMode,
+    type BenchmarkPhase,
+    type BenchmarkPlan,
+    type BenchmarkQueueEntry,
+    type BenchmarkRunView,
+  } from "../../lib/playgroundBenchmark";
+  import BenchmarkRunLedger from "./BenchmarkRunLedger.svelte";
+  import BenchmarkTimeline from "./BenchmarkTimeline.svelte";
+  import ModelSelector from "./ModelSelector.svelte";
 
-  type Status = "waiting" | "streaming" | "done" | "error";
-  type Phase = "waiting" | "loading" | "reasoning" | "content";
-  type RunState = {
-    status: Status;
-    loadingText: string;
-    reasoningContent: string;
-    content: string;
-    loadingDone: boolean;
-    waitingMs: number;
-    loadingMs: number;
-    reasoningMs: number;
-    contentMs: number;
-    phase: Phase;
-    elapsedMs: number;
-    error?: string;
-  };
-  type TestEntry = { id: string; model: string };
+  type RunState = BenchmarkRunView & { usage?: StreamUsage };
+  type TestEntry = BenchmarkQueueEntry;
 
   const LOAD_MARKER = "━━━━━";
-
   const DEFAULT_PROMPT = "Write a few sentences about the history of computing.";
   const DEFAULT_MAX_TOKENS = 256;
 
+  const modeStore = persistentStore<BenchmarkMode>("playground-benchmark-mode", "concurrency");
   const promptStore = persistentStore<string>("concurrency-prompt", DEFAULT_PROMPT);
   const maxTokensStore = persistentStore<number>("concurrency-max-tokens", DEFAULT_MAX_TOKENS);
+  const parallelismStore = persistentStore<number>("benchmark-parallelism", 0);
+  const contextTokensStore = persistentStore<number>("benchmark-context-tokens", DEFAULT_CONTEXT_TOKENS);
+  const prefillRequestsStore = persistentStore<number>("benchmark-prefill-requests", DEFAULT_PREFILL_REQUESTS);
+  const prefillTokensStore = persistentStore<number>("benchmark-prefill-tokens", DEFAULT_CONTEXT_TOKENS);
+  const probeDelayStore = persistentStore<number>("benchmark-probe-delay", 100);
   const testListStore = persistentStore<TestEntry[]>("concurrency-test-list", []);
+  const timelineCollapsedStore = persistentStore<boolean>("concurrency-timeline-collapsed", false);
 
   let runs = $state<Record<string, RunState>>({});
+  let activePlans = $state<BenchmarkPlan[]>([]);
   let isRunning = $state(false);
   let abortController: AbortController | null = null;
+  let selectedModel = $state("");
   let dragIndex = $state<number | null>(null);
   let dragOverIndex = $state<number | null>(null);
 
-  const timelineCollapsedStore = persistentStore<boolean>("concurrency-timeline-collapsed", false);
+  let previewPlans = $derived.by(() => createBenchmarkPlans({
+    mode: $modeStore,
+    queue: $testListStore,
+    prompt: $promptStore,
+    maxTokens: $maxTokensStore,
+    contextTokens: $modeStore === "async-prefill" ? $prefillTokensStore : $contextTokensStore,
+    prefillRequests: $prefillRequestsStore,
+  }));
+  let visiblePlans = $derived(activePlans.length > 0 ? activePlans : previewPlans);
+  let hasModels = $derived($playgroundModels.length + $profileModels.length + $selectorModels.length > 0);
+  let canRun = $derived(!isRunning && $testListStore.length > 0 && (
+    $modeStore !== "concurrency" || $promptStore.trim() !== ""
+  ));
 
-  let timelineMaxMs = $derived(Math.max(100, ...Object.values(runs).map((r) => r.elapsedMs)));
-
-  let availableModels = $derived(
-    $playgroundModels.filter(
-      (model) => model.playgroundType !== "selector" && model.playgroundType !== "peer"
-    )
-  );
-  let peerModels = $derived(
-    $playgroundModels.filter((model) => model.playgroundType === "peer")
-  );
-  let modeSections = $derived([
-    { label: "Selectors", ids: $selectorModels.map((model) => model.id) },
-    { label: "Models", ids: availableModels.map((model) => model.id) },
-    { label: "Peers", ids: peerModels.map((model) => model.id) },
-  ].filter((section) => section.ids.length > 0));
-  let hasModels = $derived(modeSections.length > 0);
-  let canRun = $derived(!isRunning && $testListStore.length > 0 && $promptStore.trim() !== "");
-
-  function newId(): string {
-    if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
-      return crypto.randomUUID();
-    }
-    return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  }
-
-  function addModel(modelId: string) {
-    if (isRunning) return;
-    testListStore.update((list) => [...list, { id: newId(), model: modelId }]);
-  }
-
-  function removeEntry(id: string) {
-    if (isRunning) return;
-    testListStore.update((list) => list.filter((e) => e.id !== id));
-    const next = { ...runs };
-    delete next[id];
-    runs = next;
-  }
-
-  function clearAll() {
-    if (isRunning) return;
-    testListStore.set([]);
-    runs = {};
-  }
-
-  function onDragStart(i: number, e: DragEvent) {
-    if (isRunning) return;
-    dragIndex = i;
-    if (e.dataTransfer) {
-      e.dataTransfer.effectAllowed = "move";
-      e.dataTransfer.setData("text/plain", String(i));
-    }
-  }
-
-  function onDragOver(i: number, e: DragEvent) {
-    if (isRunning || dragIndex === null) return;
-    e.preventDefault();
-    if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
-    dragOverIndex = i;
-  }
-
-  function onDrop(i: number, e: DragEvent) {
-    if (isRunning || dragIndex === null) return;
-    e.preventDefault();
-    const from = dragIndex;
-    const to = i;
-    dragIndex = null;
-    dragOverIndex = null;
-    if (from === to) return;
-    testListStore.update((list) => {
-      const next = [...list];
-      const [moved] = next.splice(from, 1);
-      next.splice(to, 0, moved);
-      return next;
+  function samplesFor(plans: BenchmarkPlan[]) {
+    return plans.map((plan) => {
+      const run = runs[plan.id];
+      return {
+        status: run?.status ?? "waiting" as const,
+        elapsedMs: run?.elapsedMs ?? 0,
+        firstTokenMs: run?.firstTokenMs ?? null,
+        promptTokens: run?.promptTokens ?? plan.estimatedPromptTokens,
+        outputTokens: run?.outputTokens ?? 0,
+      };
     });
   }
 
-  function onDragEnd() {
+  let summary = $derived.by(() => summarizeBenchmarkRuns(samplesFor(visiblePlans)));
+  let probeSummary = $derived.by(() => summarizeBenchmarkRuns(samplesFor(
+    visiblePlans.filter((plan) => plan.kind === "probe"),
+  )));
+  let terminalCount = $derived(summary.completed + summary.failed + summary.cancelled);
+  let progressPercent = $derived(summary.total > 0 ? Math.min(100, (terminalCount / summary.total) * 100) : 0);
+  let plannedParallelism = $derived(parallelLimit(visiblePlans.length));
+  let runStatusKey = $derived.by(() => {
+    if (isRunning) return "playground.concurrency.runStatusRunning";
+    if (activePlans.length === 0) {
+      return visiblePlans.length > 0
+        ? "playground.concurrency.runStatusReady"
+        : "playground.concurrency.runStatusEmpty";
+    }
+    if (summary.failed + summary.cancelled > 0) return "playground.concurrency.runStatusAttention";
+    return "playground.concurrency.runStatusComplete";
+  });
+
+  function clearResults(): void {
+    activePlans = [];
+    runs = {};
+  }
+
+  function newId(): string {
+    if (typeof crypto !== "undefined" && "randomUUID" in crypto) return crypto.randomUUID();
+    return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  }
+
+  function addModel(modelId = selectedModel): void {
+    if (isRunning || !modelId) return;
+    clearResults();
+    testListStore.update((list) => [...list, { id: newId(), model: modelId }]);
+  }
+
+  function duplicateEntry(id: string): void {
+    if (isRunning) return;
+    testListStore.update((list) => {
+      const index = list.findIndex((entry) => entry.id === id);
+      if (index < 0) return list;
+      const next = [...list];
+      next.splice(index + 1, 0, { id: newId(), model: list[index].model });
+      return next;
+    });
+    clearResults();
+  }
+
+  function removeEntry(id: string): void {
+    if (isRunning) return;
+    testListStore.update((list) => list.filter((entry) => entry.id !== id));
+    clearResults();
+  }
+
+  function clearQueue(): void {
+    if (isRunning) return;
+    testListStore.set([]);
+    clearResults();
+  }
+
+  function onDragStart(index: number, event: DragEvent): void {
+    if (isRunning) return;
+    dragIndex = index;
+    if (event.dataTransfer) {
+      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.setData("text/plain", String(index));
+    }
+  }
+
+  function onDragOver(index: number, event: DragEvent): void {
+    if (isRunning || dragIndex === null) return;
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+    dragOverIndex = index;
+  }
+
+  function onDrop(index: number, event: DragEvent): void {
+    if (isRunning || dragIndex === null) return;
+    event.preventDefault();
+    const from = dragIndex;
+    dragIndex = null;
+    dragOverIndex = null;
+    if (from === index) return;
+    testListStore.update((list) => {
+      const next = [...list];
+      const [moved] = next.splice(from, 1);
+      next.splice(index, 0, moved);
+      return next;
+    });
+    clearResults();
+  }
+
+  function onDragEnd(): void {
     dragIndex = null;
     dragOverIndex = null;
   }
 
-  function emptyRun(): RunState {
+  function changeMode(value: string | undefined): void {
+    if (!value || isRunning || value === $modeStore) return;
+    modeStore.set(value as BenchmarkMode);
+    clearResults();
+  }
+
+  function emptyRun(plan?: Pick<BenchmarkPlan, "kind" | "estimatedPromptTokens">): RunState {
     return {
       status: "waiting",
+      kind: plan?.kind ?? "request",
       loadingText: "",
       reasoningContent: "",
       content: "",
@@ -136,15 +207,16 @@
       contentMs: 0,
       phase: "waiting",
       elapsedMs: 0,
+      firstTokenMs: null,
+      promptTokens: plan?.estimatedPromptTokens ?? 0,
+      outputTokens: 0,
     };
   }
 
-  // Detect and split the llama-swap loading block (wrapped in ━━━━━ markers,
-  // delivered as reasoning_content) from the model's own reasoning tokens.
   function ingestReasoning(
     prev: RunState,
-    chunk: string
-  ): { loadingText: string; reasoningContent: string; loadingDone: boolean; nowPhase: Phase } {
+    chunk: string,
+  ): { loadingText: string; reasoningContent: string; loadingDone: boolean; nowPhase: BenchmarkPhase } {
     if (prev.loadingDone) {
       return {
         loadingText: prev.loadingText,
@@ -155,7 +227,6 @@
     }
 
     const combined = prev.loadingText + chunk;
-    // Not enough to decide whether this is a loading marker
     if (combined.length < LOAD_MARKER.length) {
       if (LOAD_MARKER.startsWith(combined)) {
         return { loadingText: combined, reasoningContent: prev.reasoningContent, loadingDone: false, nowPhase: "loading" };
@@ -177,73 +248,81 @@
       };
     }
 
-    // We're inside a loading block — look for the closing marker
-    const closingIdx = combined.indexOf(LOAD_MARKER, LOAD_MARKER.length);
-    if (closingIdx < 0) {
+    const closingIndex = combined.indexOf(LOAD_MARKER, LOAD_MARKER.length);
+    if (closingIndex < 0) {
       return { loadingText: combined, reasoningContent: prev.reasoningContent, loadingDone: false, nowPhase: "loading" };
     }
-    const newlineIdx = combined.indexOf("\n", closingIdx);
-    const sliceEnd = newlineIdx >= 0 ? newlineIdx + 1 : combined.length;
-    const loadingPart = combined.substring(0, sliceEnd);
-    // Strip the trailing " \n" the loader sends after the closing marker
+    const newlineIndex = combined.indexOf("\n", closingIndex);
+    const sliceEnd = newlineIndex >= 0 ? newlineIndex + 1 : combined.length;
+    const loadingText = combined.substring(0, sliceEnd);
     const remainder = combined.substring(sliceEnd).replace(/^[ \t]*\n?/, "");
     return {
-      loadingText: loadingPart,
+      loadingText,
       reasoningContent: prev.reasoningContent + remainder,
       loadingDone: true,
       nowPhase: remainder ? "reasoning" : "waiting",
     };
   }
 
-  async function runOne(entry: TestEntry, signal: AbortSignal) {
+  async function runOne(plan: BenchmarkPlan, signal: AbortSignal): Promise<void> {
     const start = performance.now();
     let phaseStart = start;
-    runs[entry.id] = { ...emptyRun(), status: "streaming" };
+    runs[plan.id] = { ...emptyRun(plan), status: "streaming" };
 
-    const accrue = (
-      prev: RunState,
-      now: number
-    ): { waitingMs: number; loadingMs: number; reasoningMs: number; contentMs: number } => {
+    const accrue = (prev: RunState, now: number) => {
       const delta = now - phaseStart;
-      const base = {
+      const durations = {
         waitingMs: prev.waitingMs,
         loadingMs: prev.loadingMs,
         reasoningMs: prev.reasoningMs,
         contentMs: prev.contentMs,
       };
-      if (prev.phase === "waiting") return { ...base, waitingMs: base.waitingMs + delta };
-      if (prev.phase === "loading") return { ...base, loadingMs: base.loadingMs + delta };
-      if (prev.phase === "reasoning") return { ...base, reasoningMs: base.reasoningMs + delta };
-      if (prev.phase === "content") return { ...base, contentMs: base.contentMs + delta };
-      return base;
+      if (prev.phase === "waiting") durations.waitingMs += delta;
+      else if (prev.phase === "loading") durations.loadingMs += delta;
+      else if (prev.phase === "reasoning") durations.reasoningMs += delta;
+      else durations.contentMs += delta;
+      return durations;
     };
 
     const ticker = window.setInterval(() => {
-      const prev = runs[entry.id];
+      const prev = runs[plan.id];
       if (!prev || prev.status !== "streaming") return;
       const now = performance.now();
-      const accrued = accrue(prev, now);
+      const durations = accrue(prev, now);
       phaseStart = now;
-      runs[entry.id] = { ...prev, ...accrued, elapsedMs: now - start };
+      runs[plan.id] = { ...prev, ...durations, elapsedMs: now - start };
     }, 50);
 
     try {
-      const stream = streamChatCompletion(entry.model, [{ role: "user", content: $promptStore }], signal, {
+      const stream = streamChatCompletion(plan.model, [{ role: "user", content: plan.prompt }], signal, {
         endpoint: "v1/chat/completions",
-        max_tokens: $maxTokensStore,
+        max_tokens: plan.maxTokens,
+        include_usage: true,
       });
       for await (const chunk of stream) {
-        if (chunk.done) break;
-        const prev = runs[entry.id];
+        const prev = runs[plan.id];
         if (!prev) break;
         const now = performance.now();
-        const accrued = accrue(prev, now);
+        const durations = accrue(prev, now);
         phaseStart = now;
 
-        let nextPhase: Phase = prev.phase;
+        if (chunk.done) {
+          runs[plan.id] = {
+            ...prev,
+            ...durations,
+            usage: chunk.usage ?? prev.usage,
+            promptTokens: chunk.usage?.prompt_tokens ?? prev.promptTokens,
+            outputTokens: chunk.usage?.completion_tokens ?? prev.outputTokens,
+            elapsedMs: now - start,
+          };
+          break;
+        }
+
+        let nextPhase = prev.phase;
         let loadingText = prev.loadingText;
         let reasoningContent = prev.reasoningContent;
         let loadingDone = prev.loadingDone;
+        let receivedModelToken = false;
 
         if (chunk.reasoning_content) {
           const parsed = ingestReasoning(prev, chunk.reasoning_content);
@@ -251,409 +330,508 @@
           reasoningContent = parsed.reasoningContent;
           loadingDone = parsed.loadingDone;
           nextPhase = parsed.nowPhase;
+          receivedModelToken = reasoningContent.length > prev.reasoningContent.length;
         }
-        if (chunk.content) nextPhase = "content";
+        if (chunk.content) {
+          nextPhase = "content";
+          receivedModelToken = true;
+        }
 
-        runs[entry.id] = {
+        const usage = chunk.usage ?? prev.usage;
+        const content = prev.content + (chunk.content ?? "");
+        runs[plan.id] = {
           ...prev,
-          ...accrued,
+          ...durations,
           loadingText,
           reasoningContent,
-          content: prev.content + (chunk.content ?? ""),
+          content,
           loadingDone,
           phase: nextPhase,
+          firstTokenMs: prev.firstTokenMs ?? (receivedModelToken ? now - start : null),
+          promptTokens: usage?.prompt_tokens ?? prev.promptTokens,
+          outputTokens: usage?.completion_tokens ?? estimateTokens(reasoningContent + content),
+          usage,
           elapsedMs: now - start,
         };
       }
-      const prev = runs[entry.id];
+
+      const prev = runs[plan.id];
       if (prev) {
         const now = performance.now();
-        const accrued = accrue(prev, now);
-        runs[entry.id] = { ...prev, ...accrued, status: "done", elapsedMs: now - start };
+        const durations = accrue(prev, now);
+        runs[plan.id] = { ...prev, ...durations, status: "done", elapsedMs: now - start };
       }
-    } catch (err) {
-      const prev = runs[entry.id] ?? emptyRun();
+    } catch (error) {
+      const prev = runs[plan.id] ?? emptyRun(plan);
       const now = performance.now();
-      const accrued = accrue(prev, now);
-      const aborted = err instanceof Error && err.name === "AbortError";
-      runs[entry.id] = {
+      const durations = accrue(prev, now);
+      const aborted = error instanceof Error && error.name === "AbortError";
+      runs[plan.id] = {
         ...prev,
-        ...accrued,
-        status: "error",
+        ...durations,
+        status: aborted ? "cancelled" : "error",
         elapsedMs: now - start,
-        error: aborted ? "aborted" : err instanceof Error ? err.message : String(err),
+        error: aborted ? t("status.request.cancelled") : error instanceof Error ? error.message : String(error),
       };
     } finally {
       window.clearInterval(ticker);
     }
   }
 
-  async function run() {
+  function makePlans(): BenchmarkPlan[] {
+    return createBenchmarkPlans({
+      mode: $modeStore,
+      queue: $testListStore,
+      prompt: $promptStore,
+      maxTokens: $maxTokensStore,
+      contextTokens: $modeStore === "async-prefill" ? $prefillTokensStore : $contextTokensStore,
+      prefillRequests: $prefillRequestsStore,
+    });
+  }
+
+  function parallelLimit(count: number): number {
+    const requested = Number($parallelismStore);
+    if (!Number.isFinite(requested) || requested <= 0) return count;
+    return Math.max(1, Math.min(count, Math.trunc(requested)));
+  }
+
+  function markCancelled(plan: BenchmarkPlan): void {
+    runs[plan.id] = {
+      ...emptyRun(plan),
+      status: "cancelled",
+      error: t("status.request.cancelled"),
+    };
+  }
+
+  async function run(): Promise<void> {
     if (!canRun) return;
-    const entries = $testListStore;
-    const initial: Record<string, RunState> = {};
-    for (const e of entries) {
-      initial[e.id] = emptyRun();
-    }
-    runs = initial;
+    const plans = makePlans();
+    if (plans.length === 0) return;
+
+    activePlans = plans;
+    runs = Object.fromEntries(plans.map((plan) => [plan.id, emptyRun(plan)]));
     isRunning = true;
     abortController = new AbortController();
+    const signal = abortController.signal;
+
     try {
-      await Promise.allSettled(entries.map((e) => runOne(e, abortController!.signal)));
+      if ($modeStore !== "async-prefill") {
+        await runWithConcurrency(plans, parallelLimit(plans.length), (plan) => runOne(plan, signal));
+        return;
+      }
+
+      const prefillPlans = plans.filter((plan) => plan.kind === "prefill");
+      const probePlans = plans.filter((plan) => plan.kind === "probe");
+      const prefillWork = runWithConcurrency(
+        prefillPlans,
+        parallelLimit(prefillPlans.length),
+        (plan) => runOne(plan, signal),
+      );
+      let delayError: unknown = null;
+      let probeWork: Promise<void> = Promise.resolve();
+      try {
+        const delay = Number.isFinite(Number($probeDelayStore))
+          ? Math.max(0, Math.trunc(Number($probeDelayStore)))
+          : 0;
+        await delayWithAbort(delay, signal);
+        probeWork = runWithConcurrency(probePlans, probePlans.length, (plan) => runOne(plan, signal));
+      } catch (error) {
+        if (error instanceof Error && error.name === "AbortError") {
+          for (const plan of probePlans) markCancelled(plan);
+        } else {
+          delayError = error;
+        }
+      }
+      await Promise.allSettled([prefillWork, probeWork]);
+      if (delayError) throw delayError;
     } finally {
       isRunning = false;
       abortController = null;
     }
   }
 
-  function stop() {
+  function stop(): void {
     abortController?.abort();
   }
 
-  function waitingBarClass(run: RunState): string {
-    if (run.status === "error" && run.phase === "waiting") return "bg-red-500";
-    return "bg-slate-200 dark:bg-white/10";
-  }
-
-  function loadingBarClass(run: RunState): string {
-    if (run.status === "error" && run.phase === "loading") return "bg-red-500";
-    return "bg-slate-400 dark:bg-slate-500";
-  }
-
-  function reasoningBarClass(run: RunState): string {
-    if (run.status === "error" && run.phase === "reasoning") return "bg-red-500";
-    return "bg-purple-500";
-  }
-
-  function contentBarClass(run: RunState): string {
-    if (run.status === "error" && run.phase === "content") return "bg-red-500";
-    if (run.status === "done") return "bg-green-500";
-    return "bg-amber-400 dark:bg-amber-500";
-  }
-
-  function niceStepMs(maxMs: number): number {
-    if (maxMs <= 500) return 100;
-    if (maxMs <= 2000) return 500;
-    if (maxMs <= 5000) return 1000;
-    if (maxMs <= 20000) return 5000;
-    if (maxMs <= 60000) return 10000;
-    return 30000;
-  }
-
-  function formatTickMs(ms: number): string {
-    if (ms < 1000) return `${ms}`;
-    return `${(ms / 1000).toFixed(ms % 1000 === 0 ? 0 : 1)}s`;
-  }
-
-  let timelineTicks = $derived.by(() => {
-    const step = niceStepMs(timelineMaxMs);
-    const ticks: number[] = [];
-    for (let t = 0; t <= timelineMaxMs; t += step) ticks.push(t);
-    return ticks;
-  });
-
-  function statusBadgeClass(status: Status): string {
-    switch (status) {
-      case "waiting":
-        return "bg-gray-200 text-gray-700 dark:bg-gray-700 dark:text-gray-200";
-      case "streaming":
-        return "bg-amber-200 text-amber-900 dark:bg-amber-500/30 dark:text-amber-200";
-      case "done":
-        return "bg-green-200 text-green-900 dark:bg-green-500/30 dark:text-green-200";
-      case "error":
-        return "bg-red-200 text-red-900 dark:bg-red-500/30 dark:text-red-200";
-    }
-  }
-
-  function formatElapsed(ms: number): string {
-    if (ms < 1000) return `${Math.round(ms)}ms`;
-    return `${(ms / 1000).toFixed(2)}s`;
-  }
-
-  function resetDefaults() {
+  function resetDefaults(): void {
     promptStore.set(DEFAULT_PROMPT);
     maxTokensStore.set(DEFAULT_MAX_TOKENS);
+    contextTokensStore.set(DEFAULT_CONTEXT_TOKENS);
+    prefillTokensStore.set(DEFAULT_CONTEXT_TOKENS);
+    prefillRequestsStore.set(DEFAULT_PREFILL_REQUESTS);
+    parallelismStore.set(0);
+    probeDelayStore.set(100);
+    clearResults();
+  }
+
+  function formatTokens(tokens: number): string {
+    return Math.max(0, Math.round(tokens)).toLocaleString();
+  }
+
+  function formatElapsed(ms: number | null): string {
+    if (ms === null) return "—";
+    if (ms < 1_000) return `${Math.round(ms)}ms`;
+    return `${(ms / 1_000).toFixed(2)}s`;
   }
 </script>
 
-<div class="flex flex-col md:flex-row gap-4 h-full min-h-0">
-  <!-- Left column: run controls, model picker, settings -->
-  <div class="md:w-72 shrink-0 flex flex-col gap-3 min-h-0">
-    <!-- Run controls -->
-    <div class="flex items-center gap-2">
+<div class="h-full min-h-0 overflow-y-auto lg:grid lg:grid-cols-[21rem_minmax(0,1fr)] lg:overflow-hidden">
+  <aside class="flex flex-col border-b border-border lg:min-h-0 lg:overflow-y-auto lg:border-r lg:border-b-0" aria-label={$translate("playground.concurrency.testPlan")}>
+    <section class="order-1 border-b border-border p-3">
+      <div class="mb-2 flex items-center justify-between">
+        <h2 class="text-xs font-semibold">{$translate("playground.concurrency.scenario")}</h2>
+        <span class="text-muted-foreground text-[10px] tabular-nums">
+          {$translate("playground.concurrency.requestCount", { count: previewPlans.length })}
+        </span>
+      </div>
+      <ToggleGroup.Root
+        type="single"
+        variant="outline"
+        size="sm"
+        value={$modeStore}
+        onValueChange={changeMode}
+        class="grid w-full grid-cols-3"
+        aria-label={$translate("playground.concurrency.testType")}
+      >
+        <ToggleGroup.Item
+          value="concurrency"
+          class="min-w-0 gap-1 px-1 text-[10px]"
+          disabled={isRunning}
+          title={$translate("playground.concurrency.modeDescription.concurrency")}
+        >
+          <Users class="size-3" /><span class="truncate">{$translate("playground.concurrency.modeConcurrency")}</span>
+        </ToggleGroup.Item>
+        <ToggleGroup.Item
+          value="long-context"
+          class="min-w-0 gap-1 px-1 text-[10px]"
+          disabled={isRunning}
+          title={$translate("playground.concurrency.modeDescription.long-context")}
+        >
+          <FileText class="size-3" /><span class="truncate">{$translate("playground.concurrency.modeLongContext")}</span>
+        </ToggleGroup.Item>
+        <ToggleGroup.Item
+          value="async-prefill"
+          class="min-w-0 gap-1 px-1 text-[10px]"
+          disabled={isRunning}
+          title={$translate("playground.concurrency.modeDescription.async-prefill")}
+        >
+          <Activity class="size-3" /><span class="truncate">{$translate("playground.concurrency.modeAsyncPrefill")}</span>
+        </ToggleGroup.Item>
+      </ToggleGroup.Root>
+    </section>
+
+    <section class="order-3 p-3">
+      <div class="mb-2 flex items-center gap-2">
+        <h2 class="text-xs font-semibold">{$translate("playground.concurrency.settings")}</h2>
+        <Button
+          variant="ghost"
+          size="icon-xs"
+          class="ml-auto"
+          onclick={resetDefaults}
+          disabled={isRunning}
+          aria-label={$translate("playground.concurrency.resetDefaults")}
+          title={$translate("playground.concurrency.resetDefaults")}
+        >
+          <RotateCcw />
+        </Button>
+      </div>
+
+      <label for="benchmark-prompt" class="text-muted-foreground text-[10px] font-medium uppercase">
+        {$translate($modeStore === "concurrency" ? "playground.concurrency.prompt" : "playground.concurrency.query")}
+      </label>
+      <Textarea
+        id="benchmark-prompt"
+        class="mt-1 resize-none text-xs leading-4"
+        rows={3}
+        bind:value={$promptStore}
+        oninput={clearResults}
+        disabled={isRunning}
+      ></Textarea>
+
+      <div class="mt-3 grid grid-cols-2 gap-2">
+        {#if $modeStore === "long-context"}
+          <div class="col-span-2">
+            <label for="benchmark-context-tokens" class="text-muted-foreground text-[10px] font-medium">
+              {$translate("playground.concurrency.contextTokens")}
+            </label>
+            <Input
+              id="benchmark-context-tokens"
+              type="number"
+              min="128"
+              max="1000000"
+              step="128"
+              class="mt-1 h-8 text-xs tabular-nums"
+              bind:value={$contextTokensStore}
+              onchange={clearResults}
+              disabled={isRunning}
+            />
+          </div>
+        {:else if $modeStore === "async-prefill"}
+          <div class="col-span-2">
+            <label for="benchmark-prefill-tokens" class="text-muted-foreground text-[10px] font-medium">
+              {$translate("playground.concurrency.prefillTokens")}
+            </label>
+            <Input
+              id="benchmark-prefill-tokens"
+              type="number"
+              min="128"
+              max="1000000"
+              step="128"
+              class="mt-1 h-8 text-xs tabular-nums"
+              bind:value={$prefillTokensStore}
+              onchange={clearResults}
+              disabled={isRunning}
+            />
+          </div>
+          <div>
+            <label for="benchmark-prefill-requests" class="text-muted-foreground text-[10px] font-medium">
+              {$translate("playground.concurrency.prefillRequests")}
+            </label>
+            <Input
+              id="benchmark-prefill-requests"
+              type="number"
+              min="1"
+              max="32"
+              class="mt-1 h-8 text-xs tabular-nums"
+              bind:value={$prefillRequestsStore}
+              onchange={clearResults}
+              disabled={isRunning}
+            />
+          </div>
+          <div>
+            <label for="benchmark-probe-delay" class="text-muted-foreground text-[10px] font-medium">
+              {$translate("playground.concurrency.probeDelay")}
+            </label>
+            <Input
+              id="benchmark-probe-delay"
+              type="number"
+              min="0"
+              max="10000"
+              step="10"
+              class="mt-1 h-8 text-xs tabular-nums"
+              bind:value={$probeDelayStore}
+              onchange={clearResults}
+              disabled={isRunning}
+            />
+          </div>
+        {/if}
+
+        <div>
+          <label for="benchmark-parallelism" class="text-muted-foreground text-[10px] font-medium">
+            {$translate("playground.concurrency.parallelism")}
+          </label>
+          <Input
+            id="benchmark-parallelism"
+            type="number"
+            min="0"
+            max="128"
+            class="mt-1 h-8 text-xs tabular-nums"
+            bind:value={$parallelismStore}
+            onchange={clearResults}
+            disabled={isRunning}
+          />
+        </div>
+        <div>
+          <label for="benchmark-max-tokens" class="text-muted-foreground text-[10px] font-medium">
+            {$translate("playground.concurrency.maxTokens")}
+          </label>
+          <Input
+            id="benchmark-max-tokens"
+            type="number"
+            min="1"
+            max="65536"
+            class="mt-1 h-8 text-xs tabular-nums"
+            bind:value={$maxTokensStore}
+            onchange={clearResults}
+            disabled={isRunning}
+          />
+        </div>
+      </div>
+    </section>
+
+    <section class="order-2 border-b border-border p-3">
+      <div class="mb-2 flex items-center gap-2">
+        <h2 class="text-xs font-semibold">{$translate("playground.concurrency.queue")}</h2>
+        <span class="bg-muted text-muted-foreground px-1.5 py-0.5 text-[10px] tabular-nums">{$testListStore.length}</span>
+        <Button
+          variant="ghost"
+          size="icon-xs"
+          class="ml-auto"
+          onclick={clearQueue}
+          disabled={isRunning || $testListStore.length === 0}
+          aria-label={$translate("playground.concurrency.clearQueue")}
+          title={$translate("playground.concurrency.clearQueue")}
+        >
+          <Trash2 />
+        </Button>
+      </div>
+
+      {#if hasModels}
+        <div class="flex gap-1.5">
+          <ModelSelector
+            bind:value={selectedModel}
+            placeholder={$translate("playground.concurrency.chooseModel")}
+            disabled={isRunning}
+            category="chat"
+          />
+          <Button
+            size="icon"
+            onclick={() => addModel()}
+            disabled={isRunning || !selectedModel}
+            aria-label={$translate("playground.concurrency.addSelected")}
+            title={$translate("playground.concurrency.addSelected")}
+          >
+            <Plus />
+          </Button>
+        </div>
+      {:else}
+        <div class="text-muted-foreground border-y border-border py-4 text-center text-xs">
+          {$translate("playground.concurrency.noModels")}
+        </div>
+      {/if}
+
+      {#if $testListStore.length === 0}
+        <div class="text-muted-foreground mt-2 border-y border-dashed border-border py-4 text-center text-xs">
+          {$translate("playground.concurrency.queueEmpty")}
+        </div>
+      {:else}
+        <div class="mt-2 max-h-44 overflow-y-auto border-y border-border" role="list">
+          {#each $testListStore as entry, index (entry.id)}
+            <div
+              class="flex items-center gap-1 border-b border-border px-1 py-1 last:border-b-0 {dragOverIndex === index && dragIndex !== index ? 'bg-primary/10' : ''} {dragIndex === index ? 'opacity-50' : ''}"
+              draggable={!isRunning}
+              ondragstart={(event) => onDragStart(index, event)}
+              ondragover={(event) => onDragOver(index, event)}
+              ondrop={(event) => onDrop(index, event)}
+              ondragend={onDragEnd}
+              role="listitem"
+            >
+              <GripVertical class="text-muted-foreground size-3.5 shrink-0 cursor-grab" aria-hidden="true" />
+              <span class="text-muted-foreground w-4 shrink-0 text-right text-[10px] tabular-nums">{index + 1}</span>
+              <span class="min-w-0 flex-1 truncate text-xs" title={entry.model}>{entry.model}</span>
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                onclick={() => duplicateEntry(entry.id)}
+                disabled={isRunning}
+                aria-label={$translate("playground.concurrency.duplicate", { model: entry.model })}
+                title={$translate("playground.concurrency.duplicate", { model: entry.model })}
+              >
+                <CopyPlus />
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                class="text-muted-foreground hover:text-destructive"
+                onclick={() => removeEntry(entry.id)}
+                disabled={isRunning}
+                aria-label={$translate("playground.concurrency.remove", { model: entry.model })}
+                title={$translate("playground.concurrency.remove", { model: entry.model })}
+              >
+                <Trash2 />
+              </Button>
+            </div>
+          {/each}
+        </div>
+      {/if}
+    </section>
+  </aside>
+
+  <section class="flex min-h-0 flex-col" aria-label={$translate("playground.concurrency.results")}>
+    <header class="flex shrink-0 flex-wrap items-center gap-2 border-b border-border px-3 py-2.5">
+      <div class="min-w-0 flex-1">
+        <div class="flex items-center gap-2">
+          <Gauge class="text-primary size-4 shrink-0" />
+          <h2 class="truncate text-sm font-semibold">
+            {$translate(`playground.concurrency.mode${$modeStore === "concurrency" ? "Concurrency" : $modeStore === "long-context" ? "LongContext" : "AsyncPrefill"}`)}
+          </h2>
+          <span class="text-muted-foreground flex shrink-0 items-center gap-1.5 text-[10px]" aria-live="polite">
+            <span class="size-1.5 rounded-full {isRunning ? 'bg-warning animate-pulse' : activePlans.length > 0 && summary.failed + summary.cancelled === 0 ? 'bg-success' : activePlans.length > 0 ? 'bg-destructive' : 'bg-border'}"></span>
+            {$translate(runStatusKey)}
+          </span>
+        </div>
+        <div class="text-muted-foreground mt-0.5 flex flex-wrap gap-x-3 text-[10px] tabular-nums">
+          <span>{$translate("playground.concurrency.requestCount", { count: visiblePlans.length })}</span>
+          <span>{$translate("playground.concurrency.parallelCount", { count: plannedParallelism })}</span>
+        </div>
+      </div>
+
+      {#if activePlans.length > 0}
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          onclick={clearResults}
+          disabled={isRunning}
+          aria-label={$translate("playground.concurrency.clearResults")}
+          title={$translate("playground.concurrency.clearResults")}
+        >
+          <Eraser />
+        </Button>
+      {/if}
       {#if isRunning}
         <Button variant="destructive" onclick={stop}>
-          <span class="mr-1 inline-block h-3 w-3 bg-current align-middle"></span>Stop
+          <Square data-icon="inline-start" />{$translate("playground.concurrency.stop")}
         </Button>
       {:else}
         <Button
           onclick={run}
           disabled={!canRun}
-          title={$testListStore.length === 0 ? "Add models from the list below" : "Run concurrent requests"}
+          title={$testListStore.length === 0 ? $translate("playground.concurrency.addModelsHint") : $translate("playground.concurrency.runHint")}
         >
-          <span class="mr-1 inline-block align-middle" aria-hidden="true">▶</span>Go
+          <Play data-icon="inline-start" />{$translate("playground.concurrency.go")}
         </Button>
       {/if}
-      <Button variant="outline" size="sm" onclick={clearAll} disabled={isRunning || $testListStore.length === 0}>
-        Clear ({$testListStore.length})
-      </Button>
+    </header>
+
+    <div class="grid shrink-0 grid-cols-2 gap-px border-b border-border bg-border sm:grid-cols-3 xl:grid-cols-6">
+      <div class="bg-background px-3 py-2">
+        <div class="text-muted-foreground text-[9px] uppercase">{$translate("playground.concurrency.completed")}</div>
+        <div class="mt-0.5 text-sm font-semibold tabular-nums">{summary.completed}/{summary.total}</div>
+      </div>
+      <div class="bg-background px-3 py-2">
+        <div class="text-muted-foreground text-[9px] uppercase">{$translate("playground.concurrency.promptLoad")}</div>
+        <div class="mt-0.5 text-sm font-semibold tabular-nums">{formatTokens(summary.totalPromptTokens)}</div>
+      </div>
+      <div class="bg-background px-3 py-2">
+        <div class="text-muted-foreground text-[9px] uppercase">{$translate("playground.concurrency.p50FirstToken")}</div>
+        <div class="mt-0.5 text-sm font-semibold tabular-nums">{formatElapsed(summary.p50FirstTokenMs)}</div>
+      </div>
+      <div class="bg-background px-3 py-2">
+        <div class="text-muted-foreground text-[9px] uppercase">
+          {$translate($modeStore === "async-prefill" ? "playground.concurrency.probeFirstToken" : "playground.concurrency.p95FirstToken")}
+        </div>
+        <div class="mt-0.5 text-sm font-semibold tabular-nums">
+          {formatElapsed($modeStore === "async-prefill" ? probeSummary.p50FirstTokenMs : summary.p95FirstTokenMs)}
+        </div>
+      </div>
+      <div class="bg-background px-3 py-2">
+        <div class="text-muted-foreground text-[9px] uppercase">{$translate("playground.concurrency.outputRate")}</div>
+        <div class="mt-0.5 text-sm font-semibold tabular-nums">
+          {activePlans.length > 0 ? `${summary.outputTokensPerSecond.toFixed(1)} t/s` : "—"}
+        </div>
+      </div>
+      <div class="bg-background px-3 py-2">
+        <div class="text-muted-foreground text-[9px] uppercase">{$translate("playground.concurrency.wallTime")}</div>
+        <div class="mt-0.5 text-sm font-semibold tabular-nums">{activePlans.length > 0 ? formatElapsed(summary.wallTimeMs) : "—"}</div>
+      </div>
+      <div class="col-span-full h-0.5 bg-muted">
+        <div class="bg-primary h-full transition-[width] duration-200" style:width={`${progressPercent}%`}></div>
+      </div>
     </div>
 
-    <!-- Available models -->
-    <div class="flex flex-col min-h-0 flex-1">
-      <div class="text-xs font-medium text-muted-foreground mb-1">
-        Models <span class="text-[10px] font-normal">— click to queue (add the same model more than once to test parallel requests)</span>
-      </div>
-      <div class="flex-1 border border-border rounded-md overflow-y-auto min-h-0">
-        {#if !hasModels}
-          <div class="p-3 text-sm text-muted-foreground text-center">No models configured.</div>
-        {:else}
-          <div class="divide-y divide-border">
-            {#each modeSections as section (section.label)}
-              <div>
-                <div class="bg-muted/50 px-2 py-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
-                  {section.label}
-                </div>
-                <div class="divide-y divide-gray-100 dark:divide-white/5">
-                  {#each section.ids as id (id)}
-                    <button
-                      type="button"
-                      class="hover:bg-accent hover:text-foreground flex w-full items-center gap-1.5 px-2 py-1.5 text-left text-sm font-normal transition-colors disabled:pointer-events-none disabled:opacity-50"
-                      onclick={() => addModel(id)}
-                      disabled={isRunning}
-                      title="Add {id}"
-                    >
-                      <span class="text-primary" aria-hidden="true">+</span>
-                      <span class="truncate flex-1">{id}</span>
-                    </button>
-                  {/each}
-                </div>
-              </div>
-            {/each}
-          </div>
+    <div class="min-h-0 flex-1 overflow-y-auto">
+      {#if visiblePlans.length === 0}
+        <div class="text-muted-foreground flex min-h-56 flex-col items-center justify-center gap-2 px-6 text-center">
+          <Gauge class="size-6 opacity-50" />
+          <p class="text-xs">{$translate("playground.concurrency.noPlan")}</p>
+        </div>
+      {:else}
+        {#if activePlans.length > 0}
+          <BenchmarkTimeline plans={visiblePlans} runs={runs} bind:collapsed={$timelineCollapsedStore} />
         {/if}
-      </div>
+        <BenchmarkRunLedger plans={visiblePlans} runs={runs} />
+      {/if}
     </div>
-
-    <!-- Settings -->
-    <div class="flex flex-col gap-2 border-t border-border pt-3">
-      <div class="flex items-center justify-between">
-        <label for="concurrency-prompt" class="text-xs font-medium text-muted-foreground">Prompt</label>
-        <Button
-          variant="link"
-          size="sm"
-          class="h-auto p-0 text-[10px]"
-          onclick={resetDefaults}
-          disabled={isRunning}
-        >
-          reset defaults
-        </Button>
-      </div>
-      <Textarea
-        id="concurrency-prompt"
-        class="resize-none text-sm"
-        rows={3}
-        bind:value={$promptStore}
-        disabled={isRunning}
-      ></Textarea>
-      <label for="concurrency-max-tokens" class="text-xs font-medium text-muted-foreground">max_tokens</label>
-      <Input
-        id="concurrency-max-tokens"
-        type="number"
-        min="1"
-        class="h-8 text-sm"
-        bind:value={$maxTokensStore}
-        disabled={isRunning}
-      />
-    </div>
-  </div>
-
-  <!-- Right column: result panels (draggable to reorder) -->
-  <div class="flex-1 min-w-0 min-h-0 overflow-y-auto">
-    {#if $testListStore.length === 0}
-      <div class="h-full flex items-center justify-center px-6">
-        <div class="max-w-md text-sm text-muted-foreground space-y-4">
-          <h4 class="text-base font-semibold text-foreground pb-0">Load Test</h4>
-          <p>
-            Fire several streaming chat completions at llama-swap at the same time to see how it handles parallel
-            loading and concurrent inference. Each request streams into its own panel with a live timer and status.
-          </p>
-          <ol class="list-decimal list-inside space-y-1">
-            <li>Click models on the left to queue them — repeat a model to hit it with parallel requests.</li>
-            <li>Tweak the prompt and <code>max_tokens</code> if you want.</li>
-            <li>Press <span class="font-semibold text-foreground">Go</span> to launch them concurrently.</li>
-          </ol>
-          <p class="text-xs">Tip: drag a result card's header to reorder, or hit × to drop it.</p>
-        </div>
-      </div>
-    {:else}
-      <!-- Gantt-style timeline -->
-      <div class="mb-3 border border-border rounded-md">
-          <button
-            class="w-full flex items-center gap-2 px-2 py-1.5 text-xs font-medium text-muted-foreground hover:bg-accent transition-colors {$timelineCollapsedStore ? 'rounded-md' : 'rounded-t border-b border-border'}"
-            onclick={() => timelineCollapsedStore.update((v) => !v)}
-            aria-expanded={!$timelineCollapsedStore}
-          >
-            <svg
-              class="w-4 h-4 transition-transform {$timelineCollapsedStore ? '-rotate-90' : ''}"
-              fill="none"
-              stroke="currentColor"
-              viewBox="0 0 24 24"
-              aria-hidden="true"
-            >
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path>
-            </svg>
-            <span>Timeline</span>
-            {#if !$timelineCollapsedStore}
-              <span class="flex items-center gap-3 text-[10px] text-muted-foreground font-normal ml-3" aria-hidden="true">
-                <span class="flex items-center gap-1"><span class="inline-block w-2.5 h-2.5 rounded-sm bg-slate-200 dark:bg-white/10 border border-gray-300 dark:border-white/10"></span>waiting</span>
-                <span class="flex items-center gap-1"><span class="inline-block w-2.5 h-2.5 rounded-sm bg-slate-400 dark:bg-slate-500"></span>loading</span>
-                <span class="flex items-center gap-1"><span class="inline-block w-2.5 h-2.5 rounded-sm bg-purple-500"></span>reasoning</span>
-                <span class="flex items-center gap-1"><span class="inline-block w-2.5 h-2.5 rounded-sm bg-amber-400 dark:bg-amber-500"></span>streaming</span>
-                <span class="flex items-center gap-1"><span class="inline-block w-2.5 h-2.5 rounded-sm bg-green-500"></span>done</span>
-                <span class="flex items-center gap-1"><span class="inline-block w-2.5 h-2.5 rounded-sm bg-red-500"></span>error</span>
-              </span>
-            {/if}
-            <span class="ml-auto tabular-nums text-muted-foreground">
-              max {formatElapsed(timelineMaxMs)} · {$testListStore.length} request{$testListStore.length === 1 ? "" : "s"}
-            </span>
-          </button>
-          {#if !$timelineCollapsedStore}
-            <div class="px-2 py-2">
-              <!-- X axis ticks -->
-              <div class="flex" aria-hidden="true">
-                <div class="w-40 shrink-0"></div>
-                <div class="relative flex-1 h-4 border-b border-border">
-                  {#each timelineTicks as t (t)}
-                    <div
-                      class="absolute top-0 bottom-0 border-l border-border"
-                      style="left: {(t / timelineMaxMs) * 100}%;"
-                    >
-                      <span class="absolute -top-0.5 left-1 text-[10px] text-muted-foreground tabular-nums">{formatTickMs(t)}</span>
-                    </div>
-                  {/each}
-                </div>
-                <div class="w-16 shrink-0"></div>
-              </div>
-              <!-- Bars -->
-              <div class="flex flex-col gap-1 mt-1">
-                {#each $testListStore as entry, i (entry.id)}
-                  {@const run = runs[entry.id]}
-                  {@const waitingPct = run ? (run.waitingMs / timelineMaxMs) * 100 : 0}
-                  {@const loadingPct = run ? (run.loadingMs / timelineMaxMs) * 100 : 0}
-                  {@const reasoningPct = run ? (run.reasoningMs / timelineMaxMs) * 100 : 0}
-                  {@const contentPct = run ? (run.contentMs / timelineMaxMs) * 100 : 0}
-                  <div class="flex items-center text-xs">
-                    <div class="w-40 shrink-0 flex items-center gap-1 pr-2 text-muted-foreground">
-                      <span class="tabular-nums w-5 text-right">{i + 1}.</span>
-                      <span class="truncate" title={entry.model}>{entry.model}</span>
-                    </div>
-                    <div class="relative flex-1 h-4">
-                      {#each timelineTicks as t (t)}
-                        <div
-                          class="absolute top-0 bottom-0 border-l border-border"
-                          style="left: {(t / timelineMaxMs) * 100}%;"
-                          aria-hidden="true"
-                        ></div>
-                      {/each}
-                      {#if run && run.waitingMs > 0}
-                        <div
-                          class="absolute top-0.5 bottom-0.5 rounded-l-sm transition-all {waitingBarClass(run)}"
-                          style="left: 0; width: {waitingPct}%;"
-                          title="waiting {formatElapsed(run.waitingMs)}"
-                        ></div>
-                      {/if}
-                      {#if run && run.loadingMs > 0}
-                        <div
-                          class="absolute top-0.5 bottom-0.5 transition-all {loadingBarClass(run)} {run.waitingMs === 0 ? 'rounded-l-sm' : ''}"
-                          style="left: {waitingPct}%; width: {loadingPct}%;"
-                          title="loading {formatElapsed(run.loadingMs)}"
-                        ></div>
-                      {/if}
-                      {#if run && run.reasoningMs > 0}
-                        <div
-                          class="absolute top-0.5 bottom-0.5 transition-all {reasoningBarClass(run)} {run.waitingMs === 0 && run.loadingMs === 0 ? 'rounded-l-sm' : ''}"
-                          style="left: {waitingPct + loadingPct}%; width: {reasoningPct}%;"
-                          title="reasoning {formatElapsed(run.reasoningMs)}"
-                        ></div>
-                      {/if}
-                      {#if run && run.contentMs > 0}
-                        <div
-                          class="absolute top-0.5 bottom-0.5 transition-all {contentBarClass(run)} {run.waitingMs === 0 && run.loadingMs === 0 && run.reasoningMs === 0 ? 'rounded-l-sm' : ''} {run.status === 'done' || run.status === 'error' ? 'rounded-r-sm' : ''}"
-                          style="left: {waitingPct + loadingPct + reasoningPct}%; width: {contentPct}%;"
-                          title="content {formatElapsed(run.contentMs)}"
-                        ></div>
-                      {/if}
-                    </div>
-                    <div class="w-16 shrink-0 pl-2 tabular-nums text-muted-foreground text-right">
-                      {run ? formatElapsed(run.elapsedMs) : "—"}
-                    </div>
-                  </div>
-                {/each}
-              </div>
-            </div>
-          {/if}
-        </div>
-      <div class="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-3" role="list">
-        {#each $testListStore as entry, i (entry.id)}
-          {@const run = runs[entry.id]}
-          {@const status = run?.status ?? "waiting"}
-          <div
-            class="border rounded-md flex flex-col min-h-0 transition-colors {dragOverIndex === i && dragIndex !== i
-              ? 'border-primary ring-2 ring-primary/40'
-              : 'border-border'} {dragIndex === i ? 'opacity-40' : ''}"
-            style="height: 280px;"
-            role="listitem"
-            ondragover={(e) => onDragOver(i, e)}
-            ondrop={(e) => onDrop(i, e)}
-          >
-            <div
-              class="shrink-0 flex items-center gap-2 px-2 py-1.5 border-b border-border bg-secondary/40 rounded-t"
-              draggable={!isRunning}
-              role="button"
-              tabindex="-1"
-              aria-label="Drag to reorder {entry.model}"
-              ondragstart={(e) => onDragStart(i, e)}
-              ondragend={onDragEnd}
-              class:cursor-grab={!isRunning}
-              title={isRunning ? "" : "Drag to reorder"}
-            >
-              <span class="text-muted-foreground select-none" aria-hidden="true">⋮⋮</span>
-              <span class="text-muted-foreground tabular-nums text-xs w-5 text-right">{i + 1}.</span>
-              <span class="flex-1 truncate text-sm font-medium" title={entry.model}>{entry.model}</span>
-              <span class="text-xs tabular-nums text-muted-foreground">
-                {run ? formatElapsed(run.elapsedMs) : "—"}
-              </span>
-              <span class="status text-[10px] {statusBadgeClass(status)}">{status}</span>
-              <Button
-                variant="ghost"
-                size="icon-sm"
-                class="h-5 w-5 text-muted-foreground hover:text-red-500"
-                onclick={() => removeEntry(entry.id)}
-                disabled={isRunning}
-                aria-label="Remove"
-                tabindex={-1}
-              >
-                <X class="size-3" />
-              </Button>
-            </div>
-            <div class="flex-1 min-h-0 overflow-y-auto font-mono text-xs px-2 py-1.5">
-              {#if run?.loadingText}
-                <div class="bg-secondary/40 dark:bg-white/5 text-muted-foreground rounded-md px-2 py-1 mb-2 whitespace-pre-wrap">{run.loadingText.trim()}</div>
-              {/if}
-              {#if run?.reasoningContent}
-                <div class="text-purple-700 dark:text-purple-300 whitespace-pre-wrap">{run.reasoningContent}</div>
-              {/if}
-              {#if run?.content}
-                <div class="whitespace-pre-wrap {run.reasoningContent ? 'mt-2' : ''}">{run.content}</div>
-              {/if}
-              {#if run?.status === "error" && run?.error}
-                <div class="text-red-500 mt-2">[error] {run.error}</div>
-              {/if}
-            </div>
-          </div>
-        {/each}
-      </div>
-    {/if}
-  </div>
+  </section>
 </div>

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { untrack } from "svelte";
-  import type { ActivityLogEntry, ActivityStatsData } from "../lib/types";
-  import { activityRevision, getActivity, getActivityStats, inflightRequestEntries } from "../stores/api";
+  import type { ActivityStatsData } from "../lib/types";
+  import { activityRevision, getActivityStats, inflightRequestEntries, models } from "../stores/api";
   import { connectionState } from "../stores/theme";
   import { persistentStore } from "../stores/persistent";
   import {
@@ -10,101 +10,64 @@
     type ActivityFilters,
   } from "../lib/activityFilters";
   import ActivityStats from "../components/ActivityStats.svelte";
-  import ActivityTable from "../components/ActivityTable.svelte";
+  import ModelUsageTable from "../components/activity/ModelUsageTable.svelte";
+  import RequestRecords from "../components/activity/RequestRecords.svelte";
+  import InferenceSpeedPanel from "../components/activity/InferenceSpeedPanel.svelte";
 
-  const storedPageSize = persistentStore<number>("activity-page-size", 25);
   const storedFilters = persistentStore<ActivityFilters>(
     "activity-filters",
-    emptyActivityFilters()
+    emptyActivityFilters(),
   );
 
-  let rows = $state<ActivityLogEntry[]>([]);
+  const initialFilters = normalizeActivityFilters($storedFilters);
+
   let stats = $state<ActivityStatsData | null>(null);
-  let page = $state(1);
-  let limit = $state($storedPageSize);
-  let sort = $state("id");
-  let order = $state<"asc" | "desc">("desc");
-  let total = $state(0);
-  let totalPages = $state(0);
   // svelte-ignore state_referenced_locally
-  let filters = $state<ActivityFilters>(normalizeActivityFilters($storedFilters));
-  let requestID = 0;
+  let filters = $state<ActivityFilters>(initialFilters);
+  let statsRequestID = 0;
   let refreshTimer: ReturnType<typeof setTimeout> | null = null;
   let lastRefresh = 0;
 
-  async function refreshActivity() {
+  async function refreshStats(): Promise<void> {
     if (refreshTimer !== null) {
       clearTimeout(refreshTimer);
       refreshTimer = null;
     }
     lastRefresh = Date.now();
-    const id = ++requestID;
+    const id = ++statsRequestID;
     try {
-      const [activity, activityStats] = await Promise.all([
-        getActivity({ page, limit, sort, order, filters }),
-        // Stats stay unfiltered: the cards describe all recorded activity, not
-        // the current table view.
-        getActivityStats(),
-      ]);
-      if (id !== requestID) return;
-      rows = activity.data;
-      total = activity.total;
-      totalPages = activity.total_pages;
-      stats = activityStats;
+      const result = await getActivityStats({ filters, configuredOnly: true });
+      if (id === statsRequestID) stats = result;
     } catch (error) {
-      console.error("Failed to refresh activity:", error);
+      console.error("Failed to refresh activity stats:", error);
     }
   }
 
-  function setPage(nextPage: number) {
-    page = nextPage;
+  function setFilters(nextFilters: ActivityFilters): void {
+    filters = { ...nextFilters };
+    storedFilters.set(filters);
   }
 
-  function setPageSize(nextLimit: number) {
-    limit = nextLimit;
-    page = 1;
-    storedPageSize.set(nextLimit);
-  }
-
-  function setSort(nextSort: string, nextOrder: "asc" | "desc") {
-    sort = nextSort;
-    order = nextOrder;
-    page = 1;
-  }
-
-  function setFilters(nextFilters: ActivityFilters) {
-    filters = nextFilters;
-    page = 1;
-    storedFilters.set(nextFilters);
-  }
-
-  // scheduleRefresh throttles SSE-driven refreshes to one per second; a
-  // user-driven refreshActivity cancels any pending timer.
-  function scheduleRefresh() {
+  // Keep the summary cards current without making the table and the summary
+  // maintain separate refresh loops for the same request-record dataset.
+  function scheduleRefresh(): void {
     if (refreshTimer !== null) return;
     const wait = Math.max(0, 1000 - (Date.now() - lastRefresh));
     refreshTimer = setTimeout(() => {
       refreshTimer = null;
-      refreshActivity();
+      void refreshStats();
     }, wait);
   }
 
-  // Refresh immediately on connect and when the user changes paging/sorting.
   $effect(() => {
     if ($connectionState !== "connected") return;
-    page;
-    limit;
-    sort;
-    order;
+    $models;
     filters;
     untrack(() => {
-      refreshActivity();
+      void refreshStats();
     });
   });
 
-  // New activity only changes what page 1 shows; skip SSE-driven refreshes
-  // while browsing older pages. seenRevision keeps the effect's initial run
-  // (and re-runs from other deps) from scheduling a redundant fetch.
   let seenRevision = $activityRevision;
   $effect(() => {
     if ($connectionState !== "connected") return;
@@ -112,7 +75,7 @@
     untrack(() => {
       if (revision === seenRevision) return;
       seenRevision = revision;
-      if (page === 1) scheduleRefresh();
+      scheduleRefresh();
     });
   });
 
@@ -128,24 +91,19 @@
     <ActivityStats {stats} />
   </div>
 
-  <ActivityTable
-    metrics={rows}
-    inflightRequests={$inflightRequestEntries}
+  <div class="mb-4">
+    <InferenceSpeedPanel filters={filters} inflightRequests={$inflightRequestEntries} />
+  </div>
+
+  <div class="mb-4">
+    <ModelUsageTable rows={stats?.by_model} />
+  </div>
+
+  <RequestRecords
     storagePrefix="activity"
     showModelColumn={true}
-    showPagination={true}
-    {page}
-    {limit}
-    {total}
-    totalPages={totalPages}
-    onPageChange={setPage}
-    onPageSizeChange={setPageSize}
-    {sort}
-    {order}
-    onSortChange={setSort}
-    {filters}
-    onFiltersChange={setFilters}
-    cardClass="min-h-[30rem] overflow-auto"
-    emptyMessage="No activity recorded"
+    inflightRequests={$inflightRequestEntries}
+    configuredOnly={true}
+    onFiltersChanged={setFilters}
   />
 </div>

@@ -9,6 +9,8 @@ function makeModel(overrides: Partial<Model> = {}): Model {
     name: "Test Model",
     description: "",
     unlisted: false,
+    disabled: false,
+    maintenance: false,
     peerID: "",
     ...overrides,
   };

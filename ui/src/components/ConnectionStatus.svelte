@@ -1,5 +1,6 @@
 <script lang="ts">
   import { connectionState } from "../stores/theme";
+  import { translate } from "../lib/i18n";
 
   let eventStatusColor = $derived.by(() => {
     switch ($connectionState) {
@@ -13,7 +14,11 @@
     }
   });
 
-  let tooltipText = $derived(`Event Stream: ${$connectionState ?? "unknown"}`);
+  let tooltipText = $derived(
+    $translate("status.eventStream", {
+      status: $translate(`status.${$connectionState ?? "unknown"}`),
+    }),
+  );
 </script>
 
 <div class="flex items-center" title={tooltipText}>

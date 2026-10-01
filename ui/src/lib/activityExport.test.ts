@@ -19,7 +19,8 @@ function entry(overrides: Partial<ActivityLogEntry> = {}): ActivityLogEntry {
     resp_content_type: "application/json",
     resp_status_code: 200,
     duration_ms: 1000,
-    has_capture: false,
+    first_token_ms: -1,
+    has_audit: false,
     ...overrides,
     tokens: {
       cache_tokens: 0,
@@ -181,6 +182,11 @@ describe("activityCellText", () => {
     resp_status_code: 500,
     resp_content_type: "text/event-stream",
     duration_ms: 2500,
+    first_token_ms: 1200,
+    cache_creation_tokens: 256,
+    cache_hit_ratio: 0.75,
+    repair_applied: true,
+    prefix_hash: "0123456789abcdef",
     metadata: { user: "bob", tier: "gold" },
     tokens: {
       cache_tokens: 1024,
@@ -201,12 +207,16 @@ describe("activityCellText", () => {
     expect(activityCellText(row, "resp_status_code")).toBe("500");
     expect(activityCellText(row, "resp_content_type")).toBe("text/event-stream");
     expect(activityCellText(row, "cached")).toBe((1024).toLocaleString());
+    expect(activityCellText(row, "cache_creation")).toBe((256).toLocaleString());
+    expect(activityCellText(row, "cache_hit_ratio")).toBe("75.0%");
+    expect(activityCellText(row, "repair_applied")).toBe("Applied");
+    expect(activityCellText(row, "prefix_stability")).toBe("0123456789ab…");
     expect(activityCellText(row, "prompt")).toBe((2048).toLocaleString());
     expect(activityCellText(row, "generated")).toBe((512).toLocaleString());
     expect(activityCellText(row, "drafted")).toBe("50.0% (5/10)");
     expect(activityCellText(row, "prompt_speed")).toBe("123.46 t/s");
     expect(activityCellText(row, "gen_speed")).toBe("unknown");
-    expect(activityCellText(row, "duration")).toBe("2.50s");
+    expect(activityCellText(row, "duration")).toBe("1.20s / 2.50s");
     expect(activityCellText(row, "meta")).toBe("user=bob; tier=gold");
   });
 
@@ -216,6 +226,10 @@ describe("activityCellText", () => {
     expect(activityCellText(empty, "resp_content_type")).toBe("-");
     expect(activityCellText(empty, "resp_status_code")).toBe("-");
     expect(activityCellText(empty, "cached")).toBe("-");
+    expect(activityCellText(empty, "cache_creation")).toBe("-");
+    expect(activityCellText(empty, "cache_hit_ratio")).toBe("-");
+    expect(activityCellText(empty, "repair_applied")).toBe("-");
+    expect(activityCellText(empty, "prefix_stability")).toBe("-");
     expect(activityCellText(empty, "drafted")).toBe("-");
     expect(activityCellText(empty, "meta")).toBe("-");
   });
@@ -229,7 +243,7 @@ describe("activityCellText", () => {
 describe("toMarkdownTable", () => {
   it("renders columns in the given order", () => {
     const markdown = toMarkdownTable(
-      [entry({ id: 7, duration_ms: 1000 })],
+      [entry({ id: 7, duration_ms: 1000, first_token_ms: 400 })],
       [
         { id: "duration", label: "Duration" },
         { id: "id", label: "ID" },
@@ -237,7 +251,7 @@ describe("toMarkdownTable", () => {
     );
 
     expect(markdown).toBe(
-      ["| Duration | ID |", "| --- | --- |", "| 1.00s | 7 |"].join("\n")
+      ["| Duration | ID |", "| --- | --- |", "| 0.40s / 1.00s | 7 |"].join("\n")
     );
   });
 
@@ -341,5 +355,19 @@ describe("buildActivityMarkdown", () => {
       summaryMarkdown(summarizeActivity([entry()])) +
         "\n\nExported from [llama-swap](https://github.com/mostlygeek/llama-swap) at 2026-08-16 09:30:00"
     );
+  });
+
+  it("localizes generated markdown when a locale is provided", () => {
+    const markdown = buildActivityMarkdown(
+      [entry({ id: 7 })],
+      [{ id: "id", label: "编号" }],
+      new Date("2026-08-16T09:30:00Z"),
+      "zh-CN",
+    );
+
+    expect(markdown).toContain("| 摘要 | |");
+    expect(markdown).toContain("| 时间范围 | ");
+    expect(markdown).toContain("从 [llama-swap]");
+    expect(markdown).not.toContain("| Summary | |");
   });
 });

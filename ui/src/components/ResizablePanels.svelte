@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { Snippet } from "svelte";
   import { onMount } from "svelte";
+  import { translate } from "../lib/i18n";
 
   interface Props {
     direction: "horizontal" | "vertical";
@@ -139,7 +140,7 @@
     onmousedown={handleMouseDown}
     ontouchstart={handleTouchStart}
     onkeydown={handleKeyDown}
-    aria-label="Resize panels"
+    aria-label={$translate("logs.resizePanels")}
     aria-orientation={direction}
     aria-valuenow={Math.round(leftSize)}
     aria-valuemin={minSize}

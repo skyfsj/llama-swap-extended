@@ -1,5 +1,6 @@
 import type { ChatMessage, ContentPart } from "./types";
 import { playgroundSessionHeaders } from "./playgroundSession";
+import { t } from "./i18n";
 
 export type Endpoint = "v1/chat/completions" | "v1/messages" | "v1/responses";
 
@@ -7,18 +8,37 @@ export interface StreamChunk {
   content: string;
   reasoning_content?: string;
   done: boolean;
+  usage?: StreamUsage;
+}
+
+export interface StreamUsage {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
 }
 
 export interface ChatOptions {
   temperature?: number;
   endpoint?: Endpoint;
   max_tokens?: number;
+  /** Ask compatible chat endpoints to include token usage in the stream. */
+  include_usage?: boolean;
+}
+
+function parseUsage(value: unknown): StreamUsage | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const raw = value as Record<string, unknown>;
+  const usage: StreamUsage = {};
+  if (typeof raw.prompt_tokens === "number") usage.prompt_tokens = raw.prompt_tokens;
+  if (typeof raw.completion_tokens === "number") usage.completion_tokens = raw.completion_tokens;
+  if (typeof raw.total_tokens === "number") usage.total_tokens = raw.total_tokens;
+  return Object.keys(usage).length > 0 ? usage : undefined;
 }
 
 function parseDataUrl(url: string): { media_type: string; data: string } {
   const match = /^data:([^;]+);base64,(.*)$/i.exec(url);
   if (!match) {
-    throw new Error("Image is not a base64 data URL");
+    throw new Error(t("errors.invalidImageDataUrl"));
   }
   return { media_type: match[1], data: match[2] };
 }
@@ -52,6 +72,7 @@ function buildChatCompletionsBody(model: string, messages: ChatMessage[], option
     stream: true,
     temperature: options?.temperature,
     ...(options?.max_tokens ? { max_tokens: options.max_tokens } : {}),
+    ...(options?.include_usage ? { stream_options: { include_usage: true } } : {}),
   };
 }
 
@@ -132,11 +153,14 @@ function buildRequest(
 
 function parseChatCompletionsLine(line: string): StreamChunk | null {
   const trimmed = line.trim();
-  if (!trimmed || !trimmed.startsWith("data: ")) {
+  // The SSE spec allows an optional single space after the colon ("data:x"
+  // and "data: x" are equivalent). Gin-based backends emit the spaceless
+  // form, so requiring the space drops every event and renders empty replies.
+  if (!trimmed || !trimmed.startsWith("data:")) {
     return null;
   }
 
-  const data = trimmed.slice(6);
+  const data = trimmed.slice(5).trim();
   if (data === "[DONE]") {
     return { content: "", done: true };
   }
@@ -146,9 +170,10 @@ function parseChatCompletionsLine(line: string): StreamChunk | null {
     const delta = parsed.choices?.[0]?.delta;
     const content = delta?.content || "";
     const reasoning_content = delta?.reasoning_content || delta?.reasoning || "";
+    const usage = parseUsage(parsed.usage);
 
-    if (content || reasoning_content) {
-      return { content, reasoning_content, done: false };
+    if (content || reasoning_content || usage) {
+      return { content, reasoning_content, done: false, usage };
     }
     return null;
   } catch {
@@ -225,6 +250,15 @@ async function* parseMessagesStream(
         yield { content: "", done: true };
         return;
       }
+      if (parsed.event === "message_delta") {
+        try {
+          const usage = parseUsage(JSON.parse(parsed.data).usage);
+          if (usage) yield { content: "", done: false, usage };
+        } catch {
+          // ignore malformed event
+        }
+        continue;
+      }
       if (parsed.event !== "content_block_delta" || !parsed.data) continue;
       try {
         const json = JSON.parse(parsed.data);
@@ -260,7 +294,14 @@ async function* parseResponsesStream(
       const parsed = parseSSEEventBlock(block);
       if (!parsed) continue;
       if (parsed.event === "response.completed") {
-        yield { content: "", done: true };
+        let usage: StreamUsage | undefined;
+        try {
+          const completed = JSON.parse(parsed.data);
+          usage = parseUsage(completed.response?.usage ?? completed.usage);
+        } catch {
+          // ignore malformed completion metadata
+        }
+        yield { content: "", done: true, usage };
         return;
       }
       if (!parsed.data) continue;
@@ -314,12 +355,12 @@ export async function* streamChatCompletion(
 
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(`Chat API error: ${response.status} - ${errorText}`);
+    throw new Error(t("errors.chatApi", { status: response.status, detail: errorText }));
   }
 
   const reader = response.body?.getReader();
   if (!reader) {
-    throw new Error("Response body is not readable");
+    throw new Error(t("errors.responseBodyUnreadable"));
   }
 
   try {

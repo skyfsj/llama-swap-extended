@@ -2,6 +2,7 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import {
   formatDuration,
   formatSpeed,
+  formatCompactNumber,
   formatFileSize,
   formatCapacity,
   formatRelativeTime,
@@ -34,6 +35,21 @@ describe("formatSpeed", () => {
 
   it("reports negative values as unknown", () => {
     expect(formatSpeed(-1)).toBe("unknown");
+  });
+});
+
+describe("formatCompactNumber", () => {
+  it("uses Chinese ten-thousand and hundred-million units", () => {
+    expect(formatCompactNumber(16_823, "zh-CN")).toBe("1.68万");
+    expect(formatCompactNumber(1_047_387_375, "zh-CN")).toBe("10.47亿");
+  });
+
+  it("uses locale-aware Latin units in English", () => {
+    expect(formatCompactNumber(1_047_387_375, "en")).toBe("1.05B");
+  });
+
+  it("falls back to zero for non-finite values", () => {
+    expect(formatCompactNumber(Number.NaN, "zh-CN")).toBe("0");
   });
 });
 

@@ -1,6 +1,7 @@
 export type ConnectionState = "connected" | "connecting" | "disconnected";
 
-export type ModelStatus = "ready" | "starting" | "stopping" | "stopped" | "shutdown" | "unknown";
+export type ModelStatus = "ready" | "sleeping" | "starting" | "stopping" | "stopped" | "shutdown" | "unknown";
+export type ModelConfigStatus = "applied" | "modified" | "draining" | "restarting" | "rolling_back" | "apply_failed" | "removing" | "unloading";
 export type PlaygroundModelType = "model" | "peer" | "selector" | "profile";
 
 export interface ModelCapabilities {
@@ -11,14 +12,18 @@ export interface ModelCapabilities {
   image_to_image?: boolean;
   function_calling?: boolean;
   reranker?: boolean;
+  translation?: boolean;
 }
 
 export interface Model {
   id: string;
   state: ModelStatus;
+  backendType?: string;
   name: string;
   description: string;
   unlisted: boolean;
+  disabled: boolean;
+  maintenance: boolean;
   peerID: string;
   playgroundType?: PlaygroundModelType;
   aliases?: string[];
@@ -28,6 +33,81 @@ export interface Model {
   strategy?: string;
   targets?: string[];
   spillover?: number;
+  configStatus?: ModelConfigStatus;
+  appliedRevision?: number;
+  desiredRevision?: number;
+  oldRequests?: number;
+  waitingRequests?: number;
+  error?: string;
+}
+
+export interface ModelFile {
+  id: string;
+  name: string;
+  path: string;
+  relative_path: string;
+  source_id: string;
+  source_type: "directory" | "file" | "hf_cache" | "modelscope_cache" | string;
+  repository?: string;
+  revision?: string;
+  format: string;
+  size: number;
+  modified_at: string;
+  symlink?: boolean;
+  registered_models?: string[];
+  in_use_models?: string[];
+}
+
+export interface ModelFileSource {
+  id: string;
+  name: string;
+  type: "directory" | "file" | "hf_cache" | "modelscope_cache" | string;
+  path: string;
+  configured: boolean;
+  available: boolean;
+  file_count: number;
+  error?: string;
+}
+
+export interface ModelFilesResponse {
+  data: ModelFile[];
+  sources: ModelFileSource[];
+  total: number;
+  limit: number;
+  offset: number;
+  truncated: boolean;
+  scanned_at: string;
+}
+
+export type ModelDownloadStatus = "queued" | "retrying" | "downloading" | "completed" | "failed" | "canceled" | string;
+
+export interface ModelDownload {
+  id: string;
+  provider: "huggingface" | "modelscope" | string;
+  repo_id: string;
+  revision: string;
+  source_id: string;
+  include?: string[];
+  exclude?: string[];
+  status: ModelDownloadStatus;
+  current_file?: string;
+  total_files: number;
+  completed_files: number;
+  total_bytes: number;
+  downloaded_bytes: number;
+  attempts: number;
+  next_retry_at?: string;
+  error?: string;
+  created_at: string;
+  updated_at: string;
+  started_at?: string;
+  finished_at?: string;
+}
+
+export interface ModelDownloadsResponse {
+  data: ModelDownload[];
+  limit: number;
+  offset: number;
 }
 
 export interface Profile {
@@ -59,10 +139,74 @@ export interface ActivityLogEntry {
   resp_content_type: string;
   resp_status_code: number;
   tokens: TokenMetrics;
+  /** Managed key/session attribution (the raw key is never returned). */
+  key_id?: string;
+  session_id?: string;
+  /** Anthropic/cache telemetry attached by the metrics pipeline. */
+  cache_creation_tokens?: number;
+  reasoning_tokens?: number;
+  cache_hit_ratio?: number;
+  cache_creation_ratio?: number;
+  repair_applied?: boolean;
+  prefix_hash?: string;
+  estimated_cost?: number;
+  cost_estimated?: boolean;
   duration_ms: number;
-  has_capture: boolean;
+  /** Milliseconds from request admission to the first visible response token. */
+  first_token_ms: number;
+  /** Raw request/response audit details are available for this activity row. */
+  has_audit: boolean;
   error_msg?: string;
   metadata?: Record<string, string>;
+}
+
+export interface AuditConversation {
+  id: string;
+  activityId?: number;
+  requestId?: string;
+  keyId?: string;
+  model: string;
+  sessionId?: string;
+  reqPath: string;
+  timestamp: string;
+  requestHeaders?: string | number[];
+  requestBody?: string | number[];
+  responseHeaders?: string | number[];
+  responseBody?: string | number[];
+  // Persisted bodies live in the server's blob store: the detail view returns a
+  // reference and the logical size, and the body is streamed on demand. Only
+  // stores that keep bodies inline (in-memory) populate the fields above.
+  requestBodyRef?: string;
+  responseBodyRef?: string;
+  requestBodyBytes?: number;
+  responseBodyBytes?: number;
+  responseStatus: number;
+  inputTokens: number;
+  outputTokens: number;
+  cachedTokens: number;
+  cacheCreationTokens?: number;
+  cacheHitRatio?: number;
+  cacheCreationRatio?: number;
+  reasoningTokens?: number;
+  repairApplied?: boolean;
+  prefixHash?: string;
+  /** First-to-last visible token interval in ms; -1 when not measured. */
+  firstTokenMs?: number;
+  decodeMs?: number;
+  durationMs?: number;
+  /** Bounded [msSinceStart, cumulativeTokens] JSON curve; empty when not measured. */
+  speedTimeline?: string;
+  estimatedCost: number;
+  complete: boolean;
+  sizeBytes?: number;
+}
+
+export interface AuditConversationPage {
+  data: AuditConversation[];
+  page: number;
+  limit: number;
+  total: number;
+  total_pages: number;
 }
 
 export interface ActivityPage {
@@ -71,15 +215,6 @@ export interface ActivityPage {
   limit: number;
   total: number;
   total_pages: number;
-}
-
-export interface ReqRespCapture {
-  id: number;
-  req_path: string;
-  req_headers: Record<string, string>;
-  req_body: string; // base64 encoded bytes
-  resp_headers: Record<string, string>;
-  resp_body: string; // base64 encoded bytes
 }
 
 export interface LogData {
@@ -93,13 +228,29 @@ export interface InflightRequestEntry {
   model: string;
   req_path: string;
   method: string;
+  phase?: string;
+  phase_message?: string;
+  output_preview?: string;
   req_headers: Record<string, string>;
   remote_ip: string;
   resp_headers: Record<string, string>;
   resp_bytes: number;
   elapsed_ms: number;
+  /** Present only when the upstream explicitly reports token telemetry. */
+  input_tokens?: number;
+  output_tokens?: number;
+  cached_tokens?: number;
+  prompt_per_second?: number;
+  tokens_per_second?: number;
+  first_token_ms?: number;
   client_received_at_ms?: number;
   metadata?: Record<string, string>;
+}
+
+export interface ModelLoadConflict {
+  id: string;
+  name: string;
+  state: string;
 }
 
 export interface InFlightStats {
@@ -107,6 +258,405 @@ export interface InFlightStats {
   requests?: InflightRequestEntry[];
   request?: InflightRequestEntry;
   id?: string;
+}
+
+export interface BackendProgressEvent {
+  model?: string;
+  runtime?: string;
+  operationId?: string;
+  phase: string;
+  progress: number;
+  /** Bytes completed by a download/build stage; total=-1 means unknown. */
+  completed?: number;
+  total?: number;
+  message?: string;
+  error?: string;
+  outputStream?: "stdout" | "stderr" | string;
+  output?: string;
+}
+
+export interface RuntimeStatus {
+  name: string;
+  kind?: string;
+  configured?: boolean;
+  mode?: string;
+  source?: string;
+  state: string;
+  current?: string;
+  previous?: string;
+  staged?: string;
+  available?: string;
+  pinned?: string;
+  lastCheck?: string;
+  lastUpdate?: string;
+  lastError?: string;
+  operationId?: string;
+  updatedAt?: string;
+}
+
+export interface RuntimeManifest {
+  name: string;
+  version: string;
+  kind: string;
+  source: string;
+  ref?: string;
+  commit?: string;
+  python?: string;
+  pythonVersion?: string;
+  vllm?: string;
+  torch?: string;
+  cuda?: string;
+  rocm?: string;
+  checksum?: string;
+  fingerprint?: string;
+  metadata?: Record<string, string>;
+  installedAt?: string;
+}
+
+export interface RuntimeDetail {
+  status: RuntimeStatus;
+  versions?: Record<string, RuntimeManifest>;
+  operations?: RuntimeOperation[];
+}
+
+export interface RuntimeOperation {
+  id: string;
+  name: string;
+  action: string;
+  version?: string;
+  state: string;
+  error?: string;
+  timestamp?: string;
+}
+
+export interface RuntimeVersionCandidate {
+  version: string;
+  label?: string;
+  ref?: string;
+  commit?: string;
+  digest?: string;
+  installed?: boolean;
+  current?: boolean;
+  previous?: boolean;
+  staged?: boolean;
+  pinned?: boolean;
+  recommended?: boolean;
+}
+
+export interface RuntimeCatalogResponse {
+  data?: RuntimeVersionCandidate[];
+  sourceType?: string;
+  supported?: boolean;
+  fetchedAt?: string;
+}
+
+export type RuntimeReadinessLevel = "pass" | "warning" | "block";
+
+export interface RuntimeReadinessCheck {
+  code: string;
+  level: RuntimeReadinessLevel;
+  title: string;
+  detail: string;
+}
+
+export interface RuntimeIdleReason {
+  code: string;
+  title: string;
+  detail: string;
+  count?: number;
+}
+
+export interface RuntimeReadiness {
+  runtime: {
+    name: string;
+    kind: string;
+    mode: string;
+    state: string;
+    configured: boolean;
+    current?: string;
+    candidate?: string;
+    staged?: string;
+    previous?: string;
+    pinned?: string;
+  };
+  selected: {
+    version?: string;
+    kind?: string;
+    source?: string;
+    ref?: string;
+    commit?: string;
+    installed: boolean;
+    current: boolean;
+    staged: boolean;
+    previous: boolean;
+    pinned: boolean;
+  };
+  idle: {
+    scope: string;
+    ready: boolean;
+    reasons?: RuntimeIdleReason[];
+  };
+  models: RuntimeModelImpact[];
+  resources: RuntimeResourceReadiness;
+  rollback: {
+    available: boolean;
+    version?: string;
+    automatic: boolean;
+    detail: string;
+  };
+  checks: RuntimeReadinessCheck[];
+  generatedAt?: string;
+}
+
+export interface RuntimeModelImpact {
+  id: string;
+  type: string;
+  runtime: string;
+  runtimeVersion?: string;
+  state?: string;
+  loaded: boolean;
+  sleeping: boolean;
+  inflight: number;
+  legacyCommand: boolean;
+  compatible: boolean;
+  compatibility?: string;
+  willRestart: boolean;
+  declaredFootprint: boolean;
+  footprint: ResourceFootprint;
+}
+
+export interface ResourceFootprint {
+  vramMiB: number;
+  ramMiB: number;
+  gpus?: string[];
+  priority: number;
+  evictionPriority: number;
+}
+
+export interface RuntimeResourceReadiness {
+  configured: boolean;
+  budget: { vramMiB: number; ramMiB: number };
+  usageVRAMMiB: number;
+  usageRAMMiB: number;
+  models: Array<{
+    id: string;
+    loaded: boolean;
+    sleeping: boolean;
+    inflight: number;
+    declared: boolean;
+    footprint: ResourceFootprint;
+  }>;
+  hardware: {
+    detected: boolean;
+    accelerators: number;
+    vramMiB: number;
+    systemRAMMiB: number;
+  };
+}
+
+export interface BackendCacheState {
+  supported: boolean;
+  sleeping: boolean;
+  cachedTokens?: number;
+  lastReset?: string;
+}
+
+export interface BackendCacheReport {
+  hit: boolean;
+  cachedTokens: number;
+  creationTokens: number;
+  prefixHash?: string;
+  observedAt?: string;
+}
+
+export interface BackendStatus {
+  model: string;
+  type?: string;
+  runtime?: string;
+  protocol?: string;
+  apis?: string[];
+  lifecycle?: Record<string, unknown>;
+  resources?: Record<string, unknown>;
+  pricing?: Record<string, unknown>;
+  capabilities?: Record<string, boolean>;
+  cacheState?: "unknown" | "awake" | "sleeping" | string;
+  cache?: BackendCacheState;
+  cacheReport?: BackendCacheReport;
+  discovery?: {
+    type?: string;
+    version?: string;
+    models?: string[];
+    capabilities?: Record<string, boolean>;
+    serverInfo?: Record<string, string>;
+    source?: string;
+    error?: string;
+  };
+}
+
+export interface LMCacheRuntimeStatus {
+  name: string;
+  active: boolean;
+  installed: boolean;
+  version?: string;
+  error?: string;
+}
+
+export type LMCacheServerState =
+  | "NOT_INSTALLED"
+  | "STOPPED"
+  | "STARTING"
+  | "RUNNING"
+  | "STOPPING"
+  | "ERROR"
+  | "UPDATING";
+
+export interface LMCacheServerStatus {
+  enabled: boolean;
+  state: LMCacheServerState;
+  running: boolean;
+  version?: string;
+  venvPath?: string;
+  logPath?: string;
+  pid?: number;
+  startedAt?: string;
+  lastError?: string;
+  healthy: boolean;
+  healthCheckedAt?: string;
+  host: string;
+  port: number;
+  httpHost: string;
+  httpPort: number;
+  l1SizeGB: number;
+  evictionPolicy: string;
+  chunkSize: number;
+  l2Enabled: boolean;
+  l2MaxBytes: number;
+  l2UsedBytes?: number | null;
+  l3Enabled: boolean;
+  l3Path?: string;
+}
+
+export type LMCacheUpdateState =
+  | "IDLE"
+  | "CHECKING"
+  | "UPDATE_AVAILABLE"
+  | "STAGING"
+  | "DOWNLOADING"
+  | "BUILDING"
+  | "STAGED"
+  | "VERIFYING"
+  | "WAITING_FOR_IDLE"
+  | "ACTIVATING"
+  | "HEALTH_CHECK"
+  | "ACTIVE"
+  | "ROLLBACK"
+  | "DEGRADED"
+  | string;
+
+export interface LMCacheUpdateStatus {
+  policy: string;
+  channel: string;
+  targetVersion?: string;
+  current?: string;
+  previous?: string;
+  staged?: string;
+  available?: string;
+  pinned: boolean;
+  pinnedVersion?: string;
+  lastCheck?: string;
+  lastUpdate?: string;
+  state: LMCacheUpdateState;
+  lastError?: string;
+}
+
+export interface LMCacheStatus {
+  installed: boolean;
+  allInstalled: boolean;
+  version?: string;
+  runtimes: LMCacheRuntimeStatus[];
+  enabledModels: string[];
+  usingModels: string[];
+  installing: boolean;
+  pendingRestart: boolean;
+  server: LMCacheServerStatus;
+  update: LMCacheUpdateStatus;
+  error?: string;
+}
+
+export interface LMCacheDashboardHealth {
+  healthy: boolean;
+  status?: string;
+  httpStatus: number;
+  checkedAt: string;
+  error?: string;
+}
+
+export interface LMCacheDashboardStatus {
+  healthy?: boolean;
+  engineType?: string;
+  chunkSize?: number;
+  activeSessions?: number;
+  activePrefetchJobs?: number;
+  l1MemoryUsedBytes?: number;
+}
+
+export interface LMCacheDashboardVersions {
+  version?: string;
+  lmcacheVersion?: string;
+  commitId?: string;
+  versionError?: string;
+  lmcacheVersionError?: string;
+  commitIdError?: string;
+}
+
+export interface LMCacheDashboardMetrics {
+  body?: string;
+  contentType?: string;
+  fetchedAt?: string;
+  error?: string;
+}
+
+export interface LMCacheDashboardPeriodicHealth {
+  healthy?: boolean;
+  unhealthyThreads?: unknown[];
+  error?: string;
+}
+
+export interface LMCacheDashboardResponse {
+  available: boolean;
+  reason?: "stopped" | "error" | "unhealthy" | "invalid_endpoint" | "unavailable" | string;
+  checkedAt: string;
+  health: LMCacheDashboardHealth;
+  status?: LMCacheDashboardStatus;
+  adapters?: unknown;
+  versions: LMCacheDashboardVersions;
+  metrics: LMCacheDashboardMetrics;
+  periodicHealth: LMCacheDashboardPeriodicHealth;
+  errors?: Record<string, string>;
+}
+
+export interface ResourceModelStatus {
+  id: string;
+  loaded: boolean;
+  inflight: number;
+  sleeping: boolean;
+  state?: string;
+  footprint: {
+    vramMiB: number;
+    ramMiB: number;
+    gpus?: string[];
+    priority: number;
+    evictionPriority: number;
+  };
+}
+
+export interface ResourceStatus {
+  enabled: boolean;
+  budget?: { vramMiB: number; ramMiB: number };
+  usageVRAMMiB?: number;
+  usageRAMMiB?: number;
+  models: ResourceModelStatus[];
+  evictionCandidates?: string[];
 }
 
 export interface UIConfig {
@@ -156,7 +706,7 @@ export interface PerformanceResponse {
 }
 
 export interface APIEventEnvelope {
-  type: "modelStatus" | "logData" | "activity" | "inflight" | "uiConfig" | "profileChanged" | "perfsys" | "perfgpu";
+  type: "modelStatus" | "logData" | "activity" | "inflight" | "uiConfig" | "profileChanged" | "backendProgress" | "perfsys" | "perfgpu";
   data: string;
 }
 
@@ -170,13 +720,75 @@ export interface HistogramData {
   p50: number;
 }
 
+/** One time bucket of a model's inference telemetry, from /api/metrics/speed. */
+export interface SpeedPointData {
+  timestamp: string;
+  requests: number;
+  /** Average prefill (prompt) rate in tokens/sec, negative when unreported. */
+  prefill_tps: number;
+  /** Average decode (generation) rate in tokens/sec, negative when unreported. */
+  decode_tps: number;
+  /** Average time to first token in ms, negative when unreported. */
+  ttft_ms: number;
+}
+
+export interface SpeedSeriesData {
+  model: string;
+  points: SpeedPointData[];
+}
+
+/** One context-length bucket: the range is (min_tokens, max_tokens], 0 = open. */
+export interface ContextBucketData {
+  label: string;
+  min_tokens: number;
+  max_tokens: number;
+  requests: number;
+  avg_input_tokens: number;
+  avg_output_tokens: number;
+  prefill_tps: number;
+  decode_tps: number;
+  ttft_ms: number;
+}
+
+export interface ContextSeriesData {
+  model: string;
+  buckets: ContextBucketData[];
+}
+
+export interface SpeedReportData {
+  bucket_seconds: number;
+  series: SpeedSeriesData[];
+  context: ContextSeriesData[];
+}
+
 export interface ActivityStatsData {
   total_requests: number;
   total_input_tokens: number;
   total_output_tokens: number;
   total_cache_tokens: number;
+  total_cache_creation_tokens?: number;
+  total_reasoning_tokens?: number;
+  cache_hit_ratio?: number;
+  cache_creation_ratio?: number;
+  estimated_cost?: number;
+  cost_estimated?: boolean;
+  by_model?: ActivityModelUsage[];
   prompt_histogram: HistogramData | null;
   gen_histogram: HistogramData | null;
+}
+
+export interface ActivityModelUsage {
+  model: string;
+  requests: number;
+  inputTokens: number;
+  outputTokens: number;
+  cachedTokens: number;
+  cacheCreationTokens: number;
+  cacheHitRatio?: number;
+  cacheCreationRatio?: number;
+  reasoningTokens: number;
+  estimatedCost: number;
+  costEstimated: boolean;
 }
 
 export interface VersionInfo {

@@ -20,20 +20,20 @@ export type ThemeName =
   | "mc"
   | "solarized";
 
-export const themes: { value: ThemeName; label: string }[] = [
+export const themes: { value: ThemeName }[] = [
   // modern
-  { value: "default", label: "Default" },
-  { value: "ocean", label: "Ocean" },
-  { value: "violet", label: "Violet" },
-  { value: "emerald", label: "Emerald" },
-  { value: "rose", label: "Rose" },
-  { value: "amber", label: "Amber" },
-  { value: "slate", label: "Slate" },
-  { value: "sunset", label: "Sunset" },
+  { value: "default" },
+  { value: "ocean" },
+  { value: "violet" },
+  { value: "emerald" },
+  { value: "rose" },
+  { value: "amber" },
+  { value: "slate" },
+  { value: "sunset" },
   // classic
-  { value: "terminal", label: "Green Terminal" },
-  { value: "mc", label: "Midnight Commander" },
-  { value: "solarized", label: "Solarized" },
+  { value: "terminal" },
+  { value: "mc" },
+  { value: "solarized" },
 ];
 
 function getInitialThemeMode(): ThemeMode {
