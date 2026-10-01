@@ -35,7 +35,11 @@ jobs:
     steps:
       - id: set
         env:
-          PLATFORMS: ${{ inputs.platforms || 'cuda,vulkan,rocm' }}
+          # rocm excluded: llama.cpp HEAD currently fails to configure
+          # against rocm/dev-ubuntu-24.04:7.2.4 (missing hipblas) — an
+          # upstream image/llama.cpp drift, not a fork issue. Re-add once
+          # upstream's containers build is green again.
+          PLATFORMS: ${{ inputs.platforms || 'cuda,vulkan' }}
           VARIANTS: ${{ inputs.variants || 'full,llamacpp,vllm,1cat-vllm' }}
         run: |
           # Build the backend x variant cross product, skipping invalid
