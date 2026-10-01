@@ -394,6 +394,9 @@ echo "=========================================="
 echo ""
 
 ROOTLESS_TAG="${DOCKER_IMAGE_TAG}-rootless"
+# buildx resolves the base FROM the registry, not the local store, so the
+# main image must be pushed before the rootless child can reference it.
+docker push "${DOCKER_IMAGE_TAG}"
 docker buildx build --load -t "${ROOTLESS_TAG}" - <<EOF
 FROM ${DOCKER_IMAGE_TAG}
 USER root
