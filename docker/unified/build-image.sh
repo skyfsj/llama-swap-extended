@@ -286,7 +286,10 @@ if [[ "$NO_CACHE" == true ]]; then
     BUILD_ARGS+=(--no-cache)
     echo "Note: Building without cache"
 elif [[ "${GITHUB_ACTIONS:-}" == "true" && "${ACT:-}" != "true" ]]; then
-    CACHE_REF="ghcr.io/mostlygeek/llama-swap:unified-${BACKEND}-cache"
+    # The cache image follows the repository namespace; import failures on
+    # the first build are non-fatal (buildx treats a missing cache as a
+    # cold cache), but the ref must point somewhere we can WRITE.
+    CACHE_REF="ghcr.io/${GITHUB_REPOSITORY:-skyfsj/llama-swap-extended}:${VARIANT}-${BACKEND}-cache"
     BUILD_ARGS+=(
         --cache-from "type=registry,ref=${CACHE_REF}"
         --cache-to "type=registry,ref=${CACHE_REF},mode=max"
