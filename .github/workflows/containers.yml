@@ -79,11 +79,11 @@ jobs:
           PACKAGE_NAME="$(echo "${{ github.repository }}" | cut -d/ -f2)"
           for attempt in 1 2 3 4 5; do
             if gh api --method PATCH "/user/packages/container/${PACKAGE_NAME}/visibility" \
-                 -f visibility=public >/dev/null 2>&1; then
+                 -f visibility=public 2>err.log; then
               echo "package visibility set to public"
               break
             fi
-            echo "attempt ${attempt}: package not found yet"
+            echo "attempt ${attempt}: $(grep -oE '"message":"[^"]*"' err.log | head -1)"
             sleep 15
           done
 
