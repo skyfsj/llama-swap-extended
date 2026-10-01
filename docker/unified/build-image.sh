@@ -377,9 +377,7 @@ if [[ "$BACKEND" == "cuda" ]]; then
     SMOKE_ARGS+=(-e "LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:/usr/local/cuda/lib64")
 fi
 
-if [[ "${VARIANT}" == "vllm" ]]; then
-    echo "audio.cpp checks skipped (not part of the vllm variant)"
-else
+if [[ "${VARIANT}" == "full" || "${VARIANT}" == "1cat-vllm" ]]; then
     if ! docker run "${SMOKE_ARGS[@]}" --entrypoint audiocpp_server "${DOCKER_IMAGE_TAG}" --help >/dev/null; then
         echo "ERROR: audiocpp_server --help failed; the binary or its runtime"
         echo "       libraries are broken in the image."
@@ -387,6 +385,8 @@ else
     fi
 
     echo "audio.cpp verified: deployment build (compiled model spec catalog), binary runs"
+else
+    echo "audio.cpp checks skipped (not part of the ${VARIANT} variant)"
 fi
 
 echo ""
