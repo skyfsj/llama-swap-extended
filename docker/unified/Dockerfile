@@ -365,7 +365,9 @@ FROM ${CUDA_DEVEL_IMAGE} AS onecat-toolchain
 # runtime manager at deploy time; this image only carries the toolchain.
 FROM full AS onecat-vllm
 ARG DEBIAN_FRONTEND=noninteractive
-COPY --from=onecat-toolchain /usr/local/cuda-12.8/ /usr/local/cuda-12.8/
+# Copy the toolkit directory the devel image actually contains (version-suffixed,
+# e.g. cuda-12.9) — a hardcoded cuda-12.8 path does not exist in the 12.9 image.
+COPY --from=onecat-toolchain /usr/local/cuda-12.9/ /usr/local/cuda-12.9/
 ENV CUDA_HOME=/usr/local/cuda \
     LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH} \
     TORCH_CUDA_ARCH_LIST="7.0" \
@@ -376,4 +378,5 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential cmake ninja-build pkg-config git \
     libnuma-dev python3-dev python3-venv \
     && rm -rf /var/lib/apt/lists/* \
+    && ln -sfn /usr/local/cuda-12.9 /usr/local/cuda \
     && mkdir -p /runtime-sources /var/lib/llama-swap/uv-cache

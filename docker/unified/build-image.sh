@@ -286,15 +286,15 @@ if [[ "$NO_CACHE" == true ]]; then
     BUILD_ARGS+=(--no-cache)
     echo "Note: Building without cache"
 elif [[ "${GITHUB_ACTIONS:-}" == "true" && "${ACT:-}" != "true" ]]; then
-    # The cache image follows the repository namespace; import failures on
-    # the first build are non-fatal (buildx treats a missing cache as a
-    # cold cache), but the ref must point somewhere we can WRITE.
+    # The cache image follows the repository namespace. Only export: a
+    # --cache-from on a not-yet-existing image makes buildx abort the whole
+    # build ("failed to configure registry cache importer"), so CI builds
+    # stay cold until the first successful export.
     CACHE_REF="ghcr.io/${GITHUB_REPOSITORY:-skyfsj/llama-swap-extended}:${VARIANT}-${BACKEND}-cache"
     BUILD_ARGS+=(
-        --cache-from "type=registry,ref=${CACHE_REF}"
-        --cache-to "type=registry,ref=${CACHE_REF},mode=max"
+        --cache-to "type=registry,ref=${CACHE_REF},mode=max,ignore-error=true"
     )
-    echo "Note: Using registry cache (${CACHE_REF})"
+    echo "Note: exporting registry cache (${CACHE_REF})"
 fi
 
 DOCKER_BUILDKIT=1 docker buildx build --load "${BUILD_ARGS[@]}" "${SCRIPT_DIR}"
