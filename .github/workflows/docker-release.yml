@@ -11,9 +11,9 @@ on:
         required: false
         default: ""
       platforms:
-        description: "Comma-separated backends: cuda,vulkan,rocm"
+        description: "Comma-separated backends: cuda,vulkan (rocm broken upstream)"
         required: false
-        default: "cuda,vulkan,rocm"
+        default: "cuda,vulkan"
       variants:
         description: "Comma-separated variants: full,llamacpp,vllm,1cat-vllm"
         required: false
