@@ -113,3 +113,24 @@ jobs:
           DATE_TAG="${BASE}-$(date -u +%Y-%m-%d)"
           docker tag "${BASE}" "${DATE_TAG}"
           docker push "${DATE_TAG}"
+
+      # GHCR creates the first version of a package as PRIVATE even for
+      # public repositories, which breaks anonymous docker pulls. Link the
+      # package to this repository and flip it public once it exists.
+      - name: Make package public
+        if: ${{ !env.ACT }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PACKAGE_NAME="$(echo "${{ github.repository }}" | cut -d/ -f2)"
+          for attempt in 1 2 3 4 5; do
+            if gh api \
+                 --method PATCH \
+                 "/user/packages/container/${PACKAGE_NAME}/visibility" \
+                 -f visibility=public >/dev/null 2>&1; then
+              echo "package visibility set to public"
+              break
+            fi
+            echo "attempt ${attempt}: package not found yet (first push may still be processing)"
+            sleep 15
+          done
