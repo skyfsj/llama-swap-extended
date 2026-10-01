@@ -105,3 +105,84 @@ describe("streamChatCompletion SSE framing tolerance", () => {
     expect(content).toBe("ab");
   });
 });
+
+describe("streamChatCompletion error frames", () => {
+  it("throws on chat.completions error frames instead of yielding an empty reply", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          [
+            'data: {"error":{"message":"extension tool round limit reached","code":502}}',
+            "",
+          ].join("\n"),
+          { headers: { "Content-Type": "text/event-stream" } },
+        ),
+      ),
+    );
+
+    await expect(async () => {
+      for await (const _chunk of streamChatCompletion("model-a", [
+        { role: "user", content: "hi" },
+      ])) {
+        // consume
+      }
+    }).rejects.toThrow("extension tool round limit reached (502)");
+  });
+
+  it("throws on anthropic error events", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          [
+            'event: error',
+            'data: {"type":"error","error":{"type":"api_error","message":"upstream disconnected"}}',
+            "",
+            "",
+          ].join("\n"),
+          { headers: { "Content-Type": "text/event-stream" } },
+        ),
+      ),
+    );
+
+    await expect(async () => {
+      for await (const _chunk of streamChatCompletion(
+        "model-a",
+        [{ role: "user", content: "hi" }],
+        undefined,
+        { endpoint: "v1/messages" },
+      )) {
+        // consume
+      }
+    }).rejects.toThrow("upstream disconnected");
+  });
+
+  it("throws on responses.failed events with the response error message", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          [
+            'event: response.failed',
+            'data: {"response":{"error":{"code":"server_error","message":"engine crashed"}}}',
+            "",
+            "",
+          ].join("\n"),
+          { headers: { "Content-Type": "text/event-stream" } },
+        ),
+      ),
+    );
+
+    await expect(async () => {
+      for await (const _chunk of streamChatCompletion(
+        "model-a",
+        [{ role: "user", content: "hi" }],
+        undefined,
+        { endpoint: "v1/responses" },
+      )) {
+        // consume
+      }
+    }).rejects.toThrow("engine crashed");
+  });
+});

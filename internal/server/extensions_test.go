@@ -699,6 +699,42 @@ func TestServer_ExtensionsChatStreamToolLoop(t *testing.T) {
 	}
 }
 
+// Regression: backends with enable_force_include_usage (production vLLM) attach
+// the cumulative usage to every frame. The stream bridge used to drop any frame
+// carrying usage, erasing the whole reply whenever a server-tool extension was
+// active. Content frames with usage must stream through, and the usage
+// high-water mark must not double-count.
+func TestServer_ExtensionsChatStreamUsageEveryFrame(t *testing.T) {
+	local := newStubRouter([]string{"m"}, "")
+	rounds := 0
+	local.serveHTTP = func(w http.ResponseWriter, r *http.Request) {
+		rounds++
+		w.Header().Set("Content-Type", "text/event-stream")
+		if rounds == 1 {
+			_, _ = io.WriteString(w, "data: {\"id\":\"a\",\"model\":\"m\",\"created\":1,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Searching \"},\"finish_reason\":null}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1,\"total_tokens\":11}}\n\n")
+			_, _ = io.WriteString(w, "data: {\"id\":\"a\",\"model\":\"m\",\"created\":1,\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"s1\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"q\\\":\\\"x\\\"}\"}}]},\"finish_reason\":null}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12}}\n\n")
+			_, _ = io.WriteString(w, "data: {\"id\":\"a\",\"model\":\"m\",\"created\":1,\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12}}\n\ndata: [DONE]\n\n")
+			return
+		}
+		_, _ = io.WriteString(w, "data: {\"id\":\"b\",\"model\":\"m\",\"created\":1,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Found\"},\"finish_reason\":null}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":3,\"total_tokens\":13}}\n\n")
+		_, _ = io.WriteString(w, "data: {\"id\":\"b\",\"model\":\"m\",\"created\":1,\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":4,\"total_tokens\":14}}\n\ndata: [DONE]\n\n")
+	}
+	s := extensionTestServer(t, local)
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	r.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, r)
+	content := w.Body.String()
+	if w.Code != http.StatusOK || rounds != 2 || !strings.Contains(content, "Searching ") || !strings.Contains(content, "Found") || strings.Count(content, "[DONE]") != 1 {
+		t.Fatalf("stream = %d rounds=%d %s", w.Code, rounds, content)
+	}
+	// The final usage chunk must report the last cumulative values once, not a
+	// sum of every per-frame usage (which would inflate completion_tokens).
+	if !strings.Contains(content, "\"completion_tokens\":4") || strings.Contains(content, "\"completion_tokens\":8") {
+		t.Fatalf("usage not high-water marked: %s", content)
+	}
+}
+
 func TestServer_ExtensionsResponsesStreamToolLoop(t *testing.T) {
 	local := newStubRouter([]string{"m"}, "")
 	rounds := 0

@@ -151,6 +151,21 @@ function buildRequest(
   }
 }
 
+function errorMessage(value: unknown): string | null {
+  if (!value) return null;
+  if (typeof value === "string") return value;
+  if (typeof value === "object") {
+    const raw = value as Record<string, unknown>;
+    const message = raw.message ?? raw.msg;
+    if (typeof message === "string" && message) {
+      const code = typeof raw.code === "string" || typeof raw.code === "number" ? ` (${raw.code})` : "";
+      return message + code;
+    }
+    return JSON.stringify(value);
+  }
+  return String(value);
+}
+
 function parseChatCompletionsLine(line: string): StreamChunk | null {
   const trimmed = line.trim();
   // The SSE spec allows an optional single space after the colon ("data:x"
@@ -165,20 +180,27 @@ function parseChatCompletionsLine(line: string): StreamChunk | null {
     return { content: "", done: true };
   }
 
+  let parsed: any;
   try {
-    const parsed = JSON.parse(data);
-    const delta = parsed.choices?.[0]?.delta;
-    const content = delta?.content || "";
-    const reasoning_content = delta?.reasoning_content || delta?.reasoning || "";
-    const usage = parseUsage(parsed.usage);
-
-    if (content || reasoning_content || usage) {
-      return { content, reasoning_content, done: false, usage };
-    }
-    return null;
+    parsed = JSON.parse(data);
   } catch {
     return null;
   }
+  // Upstream / middleware failures arrive as error frames; surfacing them
+  // beats rendering an empty reply that looks like a model answer.
+  const failure = errorMessage(parsed.error);
+  if (failure) {
+    throw new Error(failure);
+  }
+  const delta = parsed.choices?.[0]?.delta;
+  const content = delta?.content || "";
+  const reasoning_content = delta?.reasoning_content || delta?.reasoning || "";
+  const usage = parseUsage(parsed.usage);
+
+  if (content || reasoning_content || usage) {
+    return { content, reasoning_content, done: false, usage };
+  }
+  return null;
 }
 
 async function* parseChatCompletionsStream(
@@ -246,6 +268,15 @@ async function* parseMessagesStream(
     for (const block of blocks) {
       const parsed = parseSSEEventBlock(block);
       if (!parsed) continue;
+      if (parsed.event === "error") {
+        try {
+          const json = JSON.parse(parsed.data);
+          throw new Error(errorMessage(json.error) ?? parsed.data);
+        } catch (error) {
+          if (error instanceof SyntaxError) throw new Error(parsed.data);
+          throw error;
+        }
+      }
       if (parsed.event === "message_stop") {
         yield { content: "", done: true };
         return;
@@ -293,6 +324,19 @@ async function* parseResponsesStream(
     for (const block of blocks) {
       const parsed = parseSSEEventBlock(block);
       if (!parsed) continue;
+      if (parsed.event === "response.failed" || parsed.event === "error") {
+        try {
+          const json = JSON.parse(parsed.data);
+          throw new Error(
+            errorMessage(json.response?.error) ??
+              errorMessage(json.error) ??
+              parsed.data
+          );
+        } catch (error) {
+          if (error instanceof SyntaxError) throw new Error(parsed.data);
+          throw error;
+        }
+      }
       if (parsed.event === "response.completed") {
         let usage: StreamUsage | undefined;
         try {

@@ -222,9 +222,12 @@ func (w *extensionStreamWriter) consumeChat(payload map[string]any) error {
 		w.created = payload["created"]
 	}
 	w.state.streamID, w.state.streamModel, w.state.streamCreated = w.publicID, w.model, w.created
+	// Backends like vLLM (enable_force_include_usage) attach the cumulative
+	// usage to every frame, including content frames. Track the high-water
+	// mark and keep processing the choices below — dropping the frame here
+	// erased the whole reply for those backends.
 	if usage, ok := payload["usage"].(map[string]any); ok {
-		w.usage = sumUsage(w.usage, usage)
-		return nil
+		w.usage = maxUsage(w.usage, usage)
 	}
 	choices, _ := payload["choices"].([]any)
 	if len(choices) == 0 {
