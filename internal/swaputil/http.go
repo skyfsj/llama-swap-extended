@@ -3,6 +3,8 @@ package swaputil
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -11,14 +13,27 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
+	"github.com/mostlygeek/llama-swap/internal/auth"
 	"github.com/mostlygeek/llama-swap/internal/config"
+	"github.com/mostlygeek/llama-swap/internal/route"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
+
+// ConstantTimeEquals compares two API key strings in constant time. Hashing
+// both sides first keeps the comparison length-invariant, so the digest
+// length never leaks the secret's length or match position.
+func ConstantTimeEquals(a, b string) bool {
+	ha := sha256.Sum256([]byte(a))
+	hb := sha256.Sum256([]byte(b))
+	return hmac.Equal(ha[:], hb[:])
+}
 
 type contextkey struct {
 	name string
@@ -35,7 +50,10 @@ type ReqContextData struct {
 	Metadata map[string]string
 }
 
-const MaxMultiPartSize = 32 << 20
+const (
+	MaxMultiPartSize   = 32 << 20
+	MaxRequestBodySize = 64 << 20
+)
 
 var (
 	ReqContextKey        = &contextkey{"context"}
@@ -43,7 +61,24 @@ var (
 	ErrNoRouterFound     = fmt.Errorf("no router found for model")
 	ErrNoPeerModelFound  = fmt.Errorf("peer model not found")
 	ErrNoLocalModelFound = fmt.Errorf("local model not found")
+	ErrAmbiguousModel    = fmt.Errorf("model is ambiguous in request context")
+	// ErrAmbiguousModelInContext is kept as an explicit alias for callers that
+	// distinguish an omitted-model routing failure from other ambiguous model
+	// errors. Both names unwrap to the same sentinel and therefore preserve the
+	// existing HTTP 400 mapping in SendError.
+	ErrAmbiguousModelInContext = ErrAmbiguousModel
+	ErrRequestBodyTooLarge     = fmt.Errorf("request body is too large")
 )
+
+var modelRouteRegistry = func() *route.Registry {
+	registry, err := route.NewRegistry(route.DefaultDescriptors())
+	if err != nil {
+		// DefaultDescriptors is compiled into the binary. Keep request parsing
+		// fail-closed if a future edit makes the registry invalid.
+		return nil
+	}
+	return registry
+}()
 
 // IsWebSocketUpgrade reports whether r contains a valid websocket protocol
 // upgrade request. Header token comparisons are case-insensitive and support
@@ -180,6 +215,10 @@ func SendError(w http.ResponseWriter, r *http.Request, err error) {
 		SendResponse(w, r, http.StatusNotFound, "no peer found for requested model")
 	case errors.Is(err, ErrNoLocalModelFound):
 		SendResponse(w, r, http.StatusNotFound, "no local server found for requested model")
+	case errors.Is(err, ErrAmbiguousModel):
+		SendResponse(w, r, http.StatusBadRequest, err.Error())
+	case errors.Is(err, ErrRequestBodyTooLarge):
+		SendResponse(w, r, http.StatusRequestEntityTooLarge, err.Error())
 	case errors.Is(err, ErrNoRouterFound):
 		SendResponse(w, r, http.StatusNotFound, "no router for requested model")
 	default:
@@ -238,7 +277,18 @@ func FetchContext(r *http.Request, cfg config.Config) (ReqContextData, error) {
 		return ReqContextData{}, ErrNoModelInContext
 	}
 
-	if data, err := extractContext(r); err == nil && data.Model != "" {
+	data, extractErr := extractContext(r)
+	if errors.Is(extractErr, ErrRequestBodyTooLarge) {
+		return ReqContextData{}, extractErr
+	}
+	if extractErr == nil && data.Model == "" && modelOptionalForRequest(r) {
+		model, inferErr := inferOptionalModel(cfg)
+		if inferErr != nil {
+			return ReqContextData{}, inferErr
+		}
+		data.Model = model
+	}
+	if extractErr == nil && data.Model != "" {
 		realName, _ := cfg.RealModelName(data.Model)
 		if realName == "" {
 			realName = data.Model
@@ -252,6 +302,48 @@ func FetchContext(r *http.Request, cfg config.Config) (ReqContextData, error) {
 	}
 
 	return ReqContextData{}, ErrNoModelInContext
+}
+
+// modelOptionalForRequest consults the route registry rather than duplicating
+// path checks in request parsing and authorization. It intentionally matches
+// the original public path; version-prefix normalization happens only after
+// the request context and authorization middleware have run.
+func modelOptionalForRequest(r *http.Request) bool {
+	if r == nil || modelRouteRegistry == nil {
+		return false
+	}
+	descriptor, _, ok := modelRouteRegistry.Match(r.Method, r.URL.Path)
+	return ok && descriptor.ModelOptional
+}
+
+// ModelOptionalForRequest reports whether the request's protocol descriptor
+// permits omitting a model selector. It is used by auth middleware before the
+// normal request-context middleware runs.
+func ModelOptionalForRequest(r *http.Request) bool {
+	return modelOptionalForRequest(r)
+}
+
+// inferOptionalModel resolves an omitted model only when exactly one local
+// model is configured. A request cannot safely be dispatched to an arbitrary
+// model when multiple local backends exist, so that case is an explicit 400.
+// Peer models and selectors are deliberately excluded: neither can be chosen
+// without an unambiguous public model ID.
+func inferOptionalModel(cfg config.Config) (string, error) {
+	models := make([]string, 0, len(cfg.Models))
+	for modelID := range cfg.Models {
+		if strings.TrimSpace(modelID) != "" {
+			models = append(models, modelID)
+		}
+	}
+	sort.Strings(models)
+	switch len(models) {
+	case 0:
+		return "", ErrNoModelInContext
+	case 1:
+		return models[0], nil
+	default:
+		return "", fmt.Errorf("%w: specify model explicitly; configured local models are %s", ErrAmbiguousModel, strings.Join(models, ", "))
+	}
 }
 
 // ExtractModel returns the model name encoded in a request without caching
@@ -305,13 +397,23 @@ func ReplaceRequestModel(r *http.Request, model, replacement string) (*http.Requ
 		return invalidateRequestContext(r), nil
 	}
 
-	contentType := r.Header.Get("Content-Type")
+	// Same case-insensitivity as extractContext: an "Application/JSON" request
+	// must still have its model replaced.
+	contentType := strings.ToLower(r.Header.Get("Content-Type"))
 	switch {
 	case strings.Contains(contentType, "application/json"):
-		body, err := io.ReadAll(r.Body)
+		if r.Body == nil || r.Body == http.NoBody {
+			return r, fmt.Errorf("could not read request body")
+		}
+		body, err := io.ReadAll(io.LimitReader(r.Body, MaxRequestBodySize+1))
 		if err != nil {
 			return r, fmt.Errorf("could not read request body")
 		}
+		if len(body) > MaxRequestBodySize {
+			_ = r.Body.Close()
+			return r, fmt.Errorf("%w: request body exceeds %d bytes", ErrRequestBodyTooLarge, MaxRequestBodySize)
+		}
+		_ = r.Body.Close()
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		body, err = sjson.SetBytes(body, "model", replacement)
 		if err != nil {
@@ -319,6 +421,9 @@ func ReplaceRequestModel(r *http.Request, model, replacement string) (*http.Requ
 		}
 		replaceRequestBody(r, body)
 	case strings.Contains(contentType, "multipart/form-data"):
+		if err := bufferRequestBodyForRewrite(r); err != nil {
+			return r, err
+		}
 		if err := r.ParseMultipartForm(MaxMultiPartSize); err != nil {
 			return r, fmt.Errorf("could not parse multipart form: %w", err)
 		}
@@ -334,12 +439,18 @@ func ReplaceRequestModel(r *http.Request, model, replacement string) (*http.Requ
 		r.Header.Set("Content-Type", rewrittenContentType)
 		replaceRequestBody(r, body)
 	case strings.Contains(contentType, "application/x-www-form-urlencoded"):
+		if err := bufferRequestBodyForRewrite(r); err != nil {
+			return r, err
+		}
 		if err := r.ParseForm(); err != nil {
 			return r, fmt.Errorf("could not parse form: %w", err)
 		}
 		r.PostForm.Set("model", replacement)
 		replaceRequestBody(r, []byte(r.PostForm.Encode()))
 	default:
+		if err := bufferRequestBodyForRewrite(r); err != nil {
+			return r, err
+		}
 		if err := r.ParseForm(); err != nil {
 			return r, fmt.Errorf("could not parse form: %w", err)
 		}
@@ -362,6 +473,27 @@ func replaceRequestBody(r *http.Request, body []byte) {
 	r.Header.Del("Transfer-Encoding")
 	r.Header.Set("Content-Length", strconv.Itoa(len(body)))
 	r.ContentLength = int64(len(body))
+}
+
+// bufferRequestBodyForRewrite gives form-based model rewrites the same hard
+// request-size boundary as JSON extraction. The /upstream/<model>/... path
+// intentionally derives the model from the URL and therefore bypasses the
+// normal context parser; without this guard ParseMultipartForm/ParseForm
+// could otherwise consume an unbounded body before the proxy forwards it.
+func bufferRequestBodyForRewrite(r *http.Request) error {
+	if r == nil || r.Body == nil || r.Body == http.NoBody {
+		return nil
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, MaxRequestBodySize+1))
+	_ = r.Body.Close()
+	if err != nil {
+		return fmt.Errorf("could not read request body: %w", err)
+	}
+	if len(body) > MaxRequestBodySize {
+		return fmt.Errorf("%w: request body exceeds %d bytes", ErrRequestBodyTooLarge, MaxRequestBodySize)
+	}
+	replaceRequestBody(r, body)
+	return nil
 }
 
 func replaceMultipartModel(form *multipart.Form, replacement string) ([]byte, string, error) {
@@ -467,7 +599,7 @@ func FindModelInPath(cfg config.Config, path string) (searchName, realName, rema
 func EscapedPathSuffix(escapedPath, decodedPrefix string) string {
 	rawIndex, prefixIndex := 0, 0
 	for rawIndex < len(escapedPath) && prefixIndex < len(decodedPrefix) {
-		end := rawIndex + 1
+		var end int
 		if escapedPath[rawIndex] == '%' {
 			end = rawIndex + 3
 		} else {
@@ -539,15 +671,28 @@ func extractContext(r *http.Request) (ReqContextData, error) {
 		}, nil
 	}
 
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		return ReqContextData{}, fmt.Errorf("error reading request body: %w", err)
+	var bodyBytes []byte
+	if r.Body != nil && r.Body != http.NoBody {
+		var readErr error
+		bodyBytes, readErr = io.ReadAll(io.LimitReader(r.Body, MaxRequestBodySize+1))
+		if readErr != nil {
+			return ReqContextData{}, fmt.Errorf("error reading request body: %w", readErr)
+		}
+		if len(bodyBytes) > MaxRequestBodySize {
+			defer func() {
+				r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			}()
+			return ReqContextData{}, fmt.Errorf("%w: request body exceeds %d bytes", ErrRequestBodyTooLarge, MaxRequestBodySize)
+		}
 	}
 	defer func() {
 		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	}()
 
-	contentType := r.Header.Get("Content-Type")
+	// Media types are case-insensitive (RFC 9110), so "Application/JSON" is a
+	// valid JSON request. Matching case-sensitively sent it down the form parser
+	// instead, where no model could be found and the client got a 404.
+	contentType := strings.ToLower(r.Header.Get("Content-Type"))
 
 	if strings.Contains(contentType, "application/json") {
 		return ReqContextData{
@@ -583,9 +728,12 @@ func extractContext(r *http.Request) (ReqContextData, error) {
 // extractAPIKey pulls a candidate API key from the request, preferring Basic,
 // then Bearer, then x-api-key.
 func ExtractAPIKey(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
 	var bearerKey, basicKey string
 	if auth := r.Header.Get("Authorization"); auth != "" {
-		scheme, credentials, ok := strings.Cut(auth, " ")
+		scheme, credentials, ok := splitAuthHeader(auth)
 		if ok {
 			switch strings.ToLower(scheme) {
 			case "bearer":
@@ -605,7 +753,44 @@ func ExtractAPIKey(r *http.Request) string {
 		return basicKey
 	case bearerKey != "":
 		return bearerKey
-	default:
-		return r.Header.Get("x-api-key")
+	case strings.TrimSpace(r.Header.Get("x-api-key")) != "":
+		return strings.TrimSpace(r.Header.Get("x-api-key"))
 	}
+	// Browsers cannot attach a custom Authorization header to EventSource.
+	// The control plane therefore accepts the short-lived, same-origin session
+	// cookie created by /api/auth/session as a final fallback. URL escaping keeps
+	// legacy keys containing cookie-special characters round-trippable.
+	if cookie, err := r.Cookie(auth.SessionCookieName); err == nil {
+		if value, err := url.QueryUnescape(cookie.Value); err == nil {
+			return value
+		}
+	}
+	return ""
+}
+
+// splitAuthHeader separates an HTTP authentication scheme from its opaque
+// credentials while accepting optional whitespace (including HTAB) between
+// them. Credentials themselves are trimmed because API key formats do not
+// contain whitespace; this keeps proxy-added padding from changing the key
+// value without accepting a header that contains multiple credentials.
+func splitAuthHeader(value string) (scheme, credentials string, ok bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", "", false
+	}
+	separator := strings.IndexFunc(value, unicode.IsSpace)
+	if separator < 0 {
+		return "", "", false
+	}
+	scheme = value[:separator]
+	credentials = strings.TrimSpace(value[separator:])
+	if scheme == "" || credentials == "" {
+		return "", "", false
+	}
+	for _, r := range credentials {
+		if unicode.IsSpace(r) {
+			return "", "", false
+		}
+	}
+	return scheme, credentials, true
 }

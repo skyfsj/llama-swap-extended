@@ -82,7 +82,7 @@ models:
 ```
 
 When llama-swap stops the model, it will:
-1. Send a sleep request to the vLLM daemon (POST to `/sleep` with JSON `{"level": 1}`).
+1. Send a sleep request to the vLLM daemon (POST to `/sleep?level=1`, the vLLM online-serving API form).
 2. If `--stop-pid` is provided, send SIGTERM to the specified `vllm-wrapper serve` process after the sleep request succeeds.
 3. Exit with status 0, leaving the vLLM daemon running but asleep while allowing llama-swap to complete the unload operation.
 
@@ -203,11 +203,11 @@ sudo -u llama env \
 1. **Health check**: Sends a GET request to `${vllm-url}${health-path}` (default `/health`). If the response is HTTP 200, the daemon is considered healthy and awake, and we proceed to step 4.
 2. **Wake up**: If the health check fails (non‑200 or connection error), send a POST request to `${vllm-url}/wake_up`. If the wake‑up succeeds (HTTP 200 or 204), proceed to step 4.
 3. **Start daemon**: If the wake‑up fails (indicating the daemon is not running), use the command specified after `--` (argv-based, launched via `exec.Command`). The wrapper starts the command as a child process, then waits for the daemon to become healthy by polling the health path.
-4. **Reverse proxy**: Once the daemon is healthy, start an HTTP server listening on `${PORT}` (or the address provided to `--listen`) that proxies all requests to the vLLM upstream URL. The proxy preserves streaming responses by setting `X-Accel-Buffering: no`.
+4. **Reverse proxy**: Once the daemon is healthy, start an HTTP server listening on `${PORT}` (or the address provided to `--listen`) that proxies inference requests to the vLLM upstream URL. vLLM operational-control paths (sleep/wake, pause/resume/abort, cache reset, LoRA/weight update, elastic scaling, server/tokenizer inspection, collective RPC and profiling endpoints) are denied on this listener, including their `/v1/...` spellings where vLLM exposes them. Use the local `sleep` command or a separately protected loopback endpoint for lifecycle operations instead. The proxy preserves streaming responses by setting `X-Accel-Buffering: no`.
 
 ### sleep subcommand
 
-1. Sends a POST request to `${vllm-url}/sleep` with a JSON body `{"level": <level>}` where `<level>` is the sleep level (default 1).
+1. Sends a POST request to `${vllm-url}/sleep?level=<level>` where `<level>` is 1 or 2 (default 1).
 2. If `--stop-pid` is provided, sends SIGTERM to the specified `vllm-wrapper serve` process after the sleep request succeeds.
 3. Exits with status 0, leaving the vLLM daemon running in sleep mode.
 

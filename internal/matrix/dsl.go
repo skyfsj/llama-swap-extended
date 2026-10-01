@@ -208,3 +208,92 @@ func walk(root *node, visit func(*node) error) error {
 	}
 	return nil
 }
+
+// FilterDefinition returns the given set expression with every leaf and
+// reference the keep predicate rejects removed. A leaf names a model; a
+// reference (+name) names another set, so both are checked against keep. AND
+// and OR nodes drop the children that do not survive, and a node left with no
+// children disappears too — an empty AND is falsy and an empty OR has no
+// alternatives. A definition whose whole expression disappears is dropped from
+// the returned slice, which is why callers filter set names through keep as
+// well: dropping a set makes every reference to it vanish, which can empty the
+// sets that referenced it.
+//
+// The returned expression is re-rendered in canonical form (a leaf, a chain of
+// "a & b", "a | b", and parenthesized groups). The rendering is semantically
+// identical — the same leaf and reference names in the same order — so only
+// expressions that actually lose a token are rewritten.
+func FilterDefinition(definition Definition, keep func(ident string) bool) (Definition, bool) {
+	root, err := parseDSL(definition.DSL)
+	if err != nil {
+		// An expression that does not parse is left untouched: the caller's
+		// compile step reports it with the real message.
+		return definition, true
+	}
+	filtered := filterNode(root, keep)
+	if filtered == nil {
+		return Definition{}, false
+	}
+	rendered := renderNode(filtered)
+	if rendered == "" {
+		return Definition{}, false
+	}
+	definition.DSL = rendered
+	return definition, true
+}
+
+func filterNode(n *node, keep func(ident string) bool) *node {
+	switch n.kind {
+	case nodeLeaf, nodeRef:
+		if keep(n.name) {
+			return n
+		}
+		return nil
+	case nodeAnd, nodeOr:
+		children := make([]*node, 0, len(n.children))
+		for _, child := range n.children {
+			if kept := filterNode(child, keep); kept != nil {
+				children = append(children, kept)
+			}
+		}
+		if len(children) == 0 {
+			return nil
+		}
+		if len(children) == 1 {
+			// A single survivor needs no operator, so the group renders as the
+			// child itself and any redundant parenthesis disappears with it.
+			return children[0]
+		}
+		return &node{kind: n.kind, children: children}
+	}
+	return nil
+}
+
+func renderNode(n *node) string {
+	switch n.kind {
+	case nodeLeaf, nodeRef:
+		if n.kind == nodeRef {
+			return "+" + n.name
+		}
+		return n.name
+	case nodeAnd, nodeOr:
+		operator := " & "
+		if n.kind == nodeOr {
+			operator = " | "
+		}
+		parts := make([]string, 0, len(n.children))
+		for _, child := range n.children {
+			rendered := renderNode(child)
+			if rendered == "" {
+				continue
+			}
+			// An operator child must be grouped or the precedence would change.
+			if child.kind == nodeAnd || child.kind == nodeOr {
+				rendered = "(" + rendered + ")"
+			}
+			parts = append(parts, rendered)
+		}
+		return strings.Join(parts, operator)
+	}
+	return ""
+}

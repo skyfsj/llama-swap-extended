@@ -258,6 +258,77 @@ func TestLogMonitor_DropsWhenSubscriberBlocked(t *testing.T) {
 	}
 }
 
+func TestLogMonitor_Close(t *testing.T) {
+	lm := NewWriter(io.Discard)
+
+	received := make(chan []byte, 16)
+	cancel := lm.OnLogData(func(data []byte) {
+		received <- data
+	})
+	defer cancel()
+
+	lm.Write([]byte("before close"))
+	select {
+	case data := <-received:
+		if string(data) != "before close" {
+			t.Fatalf("received %q before close", data)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("subscriber did not receive the pre-close write")
+	}
+
+	lm.Close()
+	if !lm.IsClosed() {
+		t.Fatal("IsClosed() = false after Close")
+	}
+	// Idempotent: a second Close must not panic.
+	lm.Close()
+
+	lm.Write([]byte("after close"))
+	select {
+	case data := <-received:
+		t.Fatalf("closed monitor broadcast %q", data)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// History (including post-close writes) stays readable for late callers
+	// such as crash archives and reconnecting clients.
+	history := string(lm.GetHistory())
+	if !strings.Contains(history, "before close") || !strings.Contains(history, "after close") {
+		t.Fatalf("history after close = %q, want both pre- and post-close writes", history)
+	}
+}
+
+func TestLogMonitor_SeedHistory(t *testing.T) {
+	lm := NewWriter(io.Discard)
+	lm.SeedHistory([]byte("inherited tail"))
+
+	if got := string(lm.GetHistory()); got != "inherited tail" {
+		t.Fatalf("GetHistory after seed = %q", got)
+	}
+
+	received := make(chan []byte, 16)
+	cancel := lm.OnLogData(func(data []byte) {
+		received <- data
+	})
+	defer cancel()
+
+	// Live writes still broadcast; the seeded history must not be replayed
+	// to subscribers nor forwarded through the stdout sink a second time.
+	lm.Write([]byte("live line"))
+	select {
+	case data := <-received:
+		if string(data) != "live line" {
+			t.Fatalf("subscriber received %q, want only the live write", data)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("subscriber did not receive the live write")
+	}
+	if got := string(lm.GetHistory()); !strings.Contains(got, "inherited tail") || !strings.Contains(got, "live line") {
+		t.Fatalf("history = %q, want seed followed by live write", got)
+	}
+}
+
 func BenchmarkLogMonitorWrite(b *testing.B) {
 	smallMsg := []byte("small message\n")
 	mediumMsg := []byte(strings.Repeat("medium message content ", 10) + "\n")
@@ -308,4 +379,60 @@ func BenchmarkLogMonitorWrite(b *testing.B) {
 			lm.GetHistory()
 		}
 	})
+}
+
+// TestLogMonitor_StartsFreshLineAfterUnterminatedWrite covers the display bug an
+// operator hit when a model died mid-line: a progress write left the buffer
+// without a trailing newline, and the lifecycle diagnostic was appended to the
+// end of that partial line instead of starting its own.
+func TestLogMonitor_StartsFreshLineAfterUnterminatedWrite(t *testing.T) {
+	lm := NewWriter(io.Discard)
+
+	// An upstream that stops mid-line, exactly like a killed warmup progress
+	// line: no terminating newline.
+	lm.Write([]byte("SM70 long-prefill op reached tokens="))
+	lm.Error("process exited before becoming ready: exited with code 120")
+
+	history := string(lm.GetHistory())
+	lines := strings.Split(strings.TrimRight(history, "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("history has %d lines, want 2 (partial line + diagnostic):\n%q", len(lines), history)
+	}
+	if !strings.HasSuffix(lines[0], "tokens=") {
+		t.Fatalf("first line = %q, want the unterminated upstream fragment", lines[0])
+	}
+	if !strings.Contains(lines[1], "process exited before becoming ready") {
+		t.Fatalf("second line = %q, want the diagnostic on its own line", lines[1])
+	}
+}
+
+// TestLogMonitor_NoBlankLineAfterTerminatedWrite keeps the other side: when the
+// upstream did end its line, the diagnostic must not introduce a stray blank
+// line.
+func TestLogMonitor_NoBlankLineAfterTerminatedWrite(t *testing.T) {
+	lm := NewWriter(io.Discard)
+
+	lm.Write([]byte("normal line\n"))
+	lm.Error("process exited unexpectedly")
+
+	history := string(lm.GetHistory())
+	if strings.Contains(history, "\n\n") {
+		t.Fatalf("history contains a blank line:\n%q", history)
+	}
+	if !strings.Contains(history, "normal line\n") {
+		t.Fatalf("history lost its first line: %q", history)
+	}
+}
+
+// TestLogMonitor_FirstMessageDoesNotLeadWithNewline pins the empty-buffer case:
+// a monitor that has written nothing yet must not open with a newline.
+func TestLogMonitor_FirstMessageDoesNotLeadWithNewline(t *testing.T) {
+	lm := NewWriter(io.Discard)
+
+	lm.Error("first message")
+
+	history := string(lm.GetHistory())
+	if strings.HasPrefix(history, "\n") {
+		t.Fatalf("history starts with a newline: %q", history)
+	}
 }

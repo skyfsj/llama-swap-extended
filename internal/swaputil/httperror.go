@@ -109,6 +109,34 @@ type HTTPError interface {
 	Body() []byte
 }
 
+// StatusError is a small transport-neutral HTTPError for control-plane and
+// lifecycle seams that need to preserve a non-2xx status while crossing an
+// interface boundary. In particular, a failed model replacement must answer
+// waiting requests with 503 instead of being flattened to a generic 500.
+type StatusError struct {
+	Status  int
+	Message string
+	Code    string
+}
+
+func (e StatusError) Error() string { return e.Message }
+
+func (e StatusError) StatusCode() int { return e.Status }
+
+func (e StatusError) Header() http.Header {
+	h := http.Header{}
+	h.Set("Content-Type", "application/json")
+	return h
+}
+
+func (e StatusError) Body() []byte {
+	status := e.Status
+	if status == 0 {
+		status = http.StatusInternalServerError
+	}
+	return NewErrorEnvelope(status, e.Message, e.Code).JSON()
+}
+
 // ConcurrencyLimitError is an HTTPError for a 429 concurrency-limit rejection.
 // Zero-value fields fall back to sensible defaults: a 1-second Retry-After and a
 // JSON hint body.

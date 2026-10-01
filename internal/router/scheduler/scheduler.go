@@ -11,6 +11,7 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -24,6 +25,76 @@ import (
 // ErrModelNotFound is granted to callers whose model is not handled by this
 // router. It is an alias for swaputil.ErrNoLocalModelFound.
 var ErrModelNotFound = swaputil.ErrNoLocalModelFound
+
+var (
+	// ErrRestartNotPending is returned when an operator asks to restart a
+	// model whose effective process configuration is already applied.
+	ErrRestartNotPending = errors.New("model has no pending configuration restart")
+	// ErrRestartInProgress is kept separate for callers that want to render a
+	// precise control-plane status. The restart endpoint treats it as an
+	// idempotent success and returns the current lifecycle state.
+	ErrRestartInProgress = errors.New("model restart is already in progress")
+)
+
+const invalidRestartGeneration = ^uint64(0)
+
+const (
+	ConfigStatusApplied     = "applied"
+	ConfigStatusModified    = "modified"
+	ConfigStatusDraining    = "draining"
+	ConfigStatusRestarting  = "restarting"
+	ConfigStatusRollingBack = "rolling_back"
+	ConfigStatusApplyFailed = "apply_failed"
+	ConfigStatusRemoving    = "removing"
+	ConfigStatusUnloading   = "unloading"
+)
+
+// ModelLifecycleStatus is the read-only status projection used by the server
+// API and SSE modelStatus event. It is produced by the scheduler's single
+// event loop and copied before being returned to concurrent readers.
+type ModelLifecycleStatus struct {
+	ConfigStatus    string
+	AppliedRevision uint64
+	DesiredRevision uint64
+	OldRequests     int
+	WaitingRequests int
+	Error           string
+	// Maintenance reports the model is out of service after a failed
+	// configuration start, because auto-rollback is disabled. The reason is
+	// the start error; the model leaves this state once a later start
+	// succeeds and serves a request.
+	Maintenance bool
+}
+
+// RestartDone is emitted by the router process seam after a requested model
+// restart. RolledBack means the desired process failed but the last known-good
+// process was recreated and can continue serving waiting requests. Maintenance
+// means the operator disabled auto-rollback, so the desired process failed and
+// the model was left out of service instead of being restored.
+type RestartDone struct {
+	ModelID     string
+	Generation  uint64
+	Err         error
+	RolledBack  bool
+	Maintenance bool
+}
+
+// RestartProgress is emitted while a confirmed restart is draining, creating
+// the desired generation, or restoring the last known-good generation.
+type RestartProgress struct {
+	ModelID    string
+	Generation uint64
+	Status     string
+	Err        error
+}
+
+// RemovalDone is emitted after a deleted model has drained and its process has
+// been stopped and removed from the local router registry.
+type RemovalDone struct {
+	ModelID    string
+	Generation uint64
+	Err        error
+}
 
 // Swapper is the eviction policy: it decides which running models must be
 // stopped before a target can serve. It is orthogonal to the scheduling
@@ -58,9 +129,11 @@ type Scheduler interface {
 	OnSwapDone(ev SwapDone)
 	// OnServeDone handles a tracked ServeHTTP finishing (in-flight decrement).
 	OnServeDone(ev ServeDoneEvent)
-	// OnUnload reconciles scheduler state for an unload, stops the targeted
-	// processes via Effects, and drains the queue. It must block until the
-	// targeted processes have stopped.
+	// OnUnload reconciles scheduler state for an unload and drains the queue.
+	// Most targets are stopped synchronously via Effects, so Unload blocks
+	// until they exit; a target whose swap goroutine is still starting it is
+	// kept as a drain barrier and stopped from OnSwapDone once the goroutine
+	// can no longer resurrect it.
 	OnUnload(targets []string, timeout time.Duration)
 	// OnShutdown grants err to every waiter the scheduler still holds (active
 	// swap waiters and queued requests). Process teardown is the baseRouter's
@@ -133,4 +206,11 @@ type SwapDone struct {
 // ServeDoneEvent is reported when a tracked ServeHTTP handler returns.
 type ServeDoneEvent struct {
 	ModelID string
+	// Generation is the process generation that served the request. Zero is the
+	// initial generation and remains the compatible value for older embedders.
+	Generation uint64
+	// Ignored marks a websocket that intentionally bypassed normal request
+	// admission. It still participates in a confirmed config restart drain, but
+	// it never consumed a scheduler reservation or in-flight slot.
+	Ignored bool
 }

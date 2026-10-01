@@ -129,7 +129,12 @@ func TestProcessCommand_StopHonorsGracefulTimeout(t *testing.T) {
 	runErr := runAsync(t, p)
 
 	// Wait until the trap is installed before stopping.
-	trapDeadline := time.Now().Add(2 * time.Second)
+	// Race-instrumented shells can take several seconds to start while the
+	// package runs alongside the other race-instrumented packages. Keep this
+	// deadline separate from Stop's graceful timeout and make it generous
+	// enough that scheduler load does not turn a readiness probe into a flaky
+	// failure.
+	trapDeadline := time.Now().Add(15 * time.Second)
 	for {
 		if _, err := os.Stat(ready); err == nil {
 			break

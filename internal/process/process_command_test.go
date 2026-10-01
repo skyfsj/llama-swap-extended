@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -36,14 +37,23 @@ func newProcessCommand(t *testing.T, conf config.ModelConfig) *ProcessCommand {
 	return p
 }
 
+// runAsyncBudget bounds the start request and the readiness wait for tests that
+// only need the process running. It is deliberately far above the roughly one
+// second a local start takes: those tests assert behaviour (a stop that
+// returns, a forking wrapper that gets reaped), and the shared 3s
+// testStartTimeout is tight enough that CPU contention during a full
+// `-race ./...` run turns them into flakes. The failures they guard against were
+// unbounded hangs, so any reasonable cap still distinguishes pass from fail.
+const runAsyncBudget = 30 * time.Second
+
 // runAsync starts Run in a goroutine and waits until the process is ready,
 // matching the new interface contract where Run blocks until the process is
 // terminated. Returns a channel that delivers Run's eventual error.
 func runAsync(t *testing.T, p *ProcessCommand) <-chan error {
 	t.Helper()
 	ch := make(chan error, 1)
-	go func() { ch <- p.Run(testStartTimeout) }()
-	ctx, cancel := context.WithTimeout(context.Background(), testStartTimeout)
+	go func() { ch <- p.Run(runAsyncBudget) }()
+	ctx, cancel := context.WithTimeout(context.Background(), runAsyncBudget)
 	defer cancel()
 	if err := p.WaitReady(ctx); err != nil {
 		t.Fatalf("WaitReady: %v", err)
@@ -390,6 +400,67 @@ func TestProcessCommand_ParentCtxCancelDuringStart(t *testing.T) {
 	}
 }
 
+// TestProcessCommand_EnsureReadyTimeoutCancelsBlockedHealthCheck verifies that
+// the readiness timeout also cancels a health request which is waiting for
+// response headers. A zero ResponseHeader timeout is valid configuration, so
+// the start context — rather than the transport — must provide the bound.
+func TestProcessCommand_EnsureReadyTimeoutCancelsBlockedHealthCheck(t *testing.T) {
+	skipIfNoSimpleResponder(t)
+
+	healthCheckStarted := make(chan struct{}, 1)
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case healthCheckStarted <- struct{}{}:
+		default:
+		}
+		<-r.Context().Done()
+	}))
+	defer mock.Close()
+
+	cmd, _ := simpleResponderCmd(t, "-silent")
+	p := newProcessCommand(t, config.ModelConfig{
+		Cmd:                cmd,
+		Proxy:              mock.URL,
+		CheckEndpoint:      "/health",
+		HealthCheckTimeout: 10,
+		// The default is zero (no response-header timeout); the process start
+		// deadline must still interrupt the probe.
+		Timeouts: config.TimeoutsConfig{ResponseHeader: 0},
+	})
+	t.Cleanup(func() { _ = p.Stop(testStopTimeout) })
+
+	const startTimeout = 600 * time.Millisecond
+	result := make(chan error, 1)
+	go func() {
+		result <- p.EnsureReady(context.Background(), startTimeout)
+	}()
+
+	select {
+	case <-healthCheckStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("health check did not start")
+	}
+
+	select {
+	case err := <-result:
+		// The startup deadline must be attributed to the health-check window
+		// rather than reported as a bare "aborted": a bare abort is
+		// indistinguishable from an operator stop and sends anyone reading the
+		// lifecycle error looking for a cancellation that never happened.
+		if !errors.Is(err, ErrStartAborted) {
+			t.Fatalf("EnsureReady error = %v, want ErrStartAborted", err)
+		}
+		if !strings.Contains(err.Error(), "health check timed out") {
+			t.Fatalf("EnsureReady error = %v, want an explicit health check timeout", err)
+		}
+	case <-time.After(2 * time.Second):
+		_ = p.Stop(testStopTimeout)
+		t.Fatal("EnsureReady remained blocked after its startup timeout")
+	}
+
+	waitForState(t, p, StateStopped)
+}
+
 // TestProcessCommand_RunStopCycle runs several sequential start/stop pairs on
 // fresh processes to confirm they are reusable.
 func TestProcessCommand_RunStopCycle(t *testing.T) {
@@ -586,6 +657,152 @@ func TestProcessCommand_TTL_StopsAfterIdle(t *testing.T) {
 		}
 	case <-time.After(testReturnTimeout):
 		t.Fatal("Run() did not return after TTL-induced stop")
+	}
+}
+
+// TestProcessCommand_TTL_VLLMSleepMode keeps the process alive after TTL and
+// wakes the backend before the first request that follows the idle period.
+func TestProcessCommand_TTL_VLLMSleepMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("vLLM lifecycle test requires a POSIX runtime")
+	}
+
+	var sleepRequests atomic.Int32
+	var wakeRequests atomic.Int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			w.WriteHeader(http.StatusOK)
+		case "/sleep":
+			if r.Method != http.MethodPost || r.URL.Query().Get("level") != "1" {
+				http.Error(w, "invalid sleep request", http.StatusBadRequest)
+				return
+			}
+			sleepRequests.Add(1)
+			w.WriteHeader(http.StatusOK)
+		case "/wake_up":
+			if r.Method != http.MethodPost {
+				http.Error(w, "invalid wake request", http.StatusBadRequest)
+				return
+			}
+			wakeRequests.Add(1)
+			w.WriteHeader(http.StatusOK)
+		default:
+			_, _ = w.Write([]byte("awake"))
+		}
+	}))
+	defer backend.Close()
+
+	p := newProcessCommand(t, config.ModelConfig{
+		Cmd:                "sh -c 'sleep 30'",
+		Proxy:              backend.URL,
+		CheckEndpoint:      "/health",
+		HealthCheckTimeout: 3,
+		UnloadAfter:        1,
+		Backend: config.BackendConfig{
+			Type: "vllm",
+			Lifecycle: config.LifecycleConfig{
+				Mode:       "sleep",
+				SleepLevel: 1,
+			},
+		},
+	})
+	t.Cleanup(func() { _ = p.Stop(testStopTimeout) })
+	runAsync(t, p)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for sleepRequests.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(testPollInterval)
+	}
+	if got := sleepRequests.Load(); got != 1 {
+		t.Fatalf("sleep requests = %d, want 1", got)
+	}
+	if !p.sleeping.Load() || p.State() != StateReady {
+		t.Fatalf("after TTL: sleeping=%v state=%s, want sleeping=true state=%s", p.sleeping.Load(), p.State(), StateReady)
+	}
+
+	rr := httptest.NewRecorder()
+	p.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/completion", nil))
+	if rr.Code != http.StatusOK || rr.Body.String() != "awake" {
+		t.Fatalf("wake request: status=%d body=%q", rr.Code, rr.Body.String())
+	}
+	if got := wakeRequests.Load(); got != 1 || p.sleeping.Load() {
+		t.Fatalf("after wake: wake requests=%d sleeping=%v", got, p.sleeping.Load())
+	}
+}
+
+func TestProcessCommand_ManualVLLMSleepAndWake(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("vLLM lifecycle test requires a POSIX runtime")
+	}
+
+	var sleepRequests atomic.Int32
+	var wakeRequests atomic.Int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			w.WriteHeader(http.StatusOK)
+		case "/sleep":
+			if r.Method != http.MethodPost || r.URL.Query().Get("level") != "2" {
+				http.Error(w, "invalid sleep request", http.StatusBadRequest)
+				return
+			}
+			sleepRequests.Add(1)
+			w.WriteHeader(http.StatusOK)
+		case "/wake_up":
+			if r.Method != http.MethodPost {
+				http.Error(w, "invalid wake request", http.StatusBadRequest)
+				return
+			}
+			wakeRequests.Add(1)
+			w.WriteHeader(http.StatusOK)
+		default:
+			_, _ = w.Write([]byte("awake"))
+		}
+	}))
+	defer backend.Close()
+
+	p := newProcessCommand(t, config.ModelConfig{
+		Cmd:                "sleep 30",
+		Proxy:              backend.URL,
+		CheckEndpoint:      "/health",
+		HealthCheckTimeout: 3,
+		Backend: config.BackendConfig{
+			Type: "vllm",
+		},
+	})
+	t.Cleanup(func() { _ = p.Stop(testStopTimeout) })
+	runAsync(t, p)
+
+	ctx, cancel := context.WithTimeout(context.Background(), testStartTimeout)
+	defer cancel()
+	if err := p.Sleep(ctx, 2); err != nil {
+		t.Fatalf("manual Sleep: %v", err)
+	}
+	if got := sleepRequests.Load(); got != 1 {
+		t.Fatalf("sleep requests=%d, want 1", got)
+	}
+	if !p.Sleeping() || p.State() != StateReady {
+		t.Fatalf("after manual sleep: sleeping=%v state=%s, want sleeping=true state=%s", p.Sleeping(), p.State(), StateReady)
+	}
+
+	if err := p.EnsureReady(ctx, testStartTimeout); err != nil {
+		t.Fatalf("EnsureReady should wake sleeping process: %v", err)
+	}
+	if got := wakeRequests.Load(); got != 1 {
+		t.Fatalf("wake requests=%d, want 1", got)
+	}
+	if p.Sleeping() {
+		t.Fatal("process remained sleeping after EnsureReady")
+	}
+
+	rr := httptest.NewRecorder()
+	p.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/completion", nil))
+	if rr.Code != http.StatusOK || rr.Body.String() != "awake" {
+		t.Fatalf("request after manual wake: status=%d body=%q", rr.Code, rr.Body.String())
+	}
+	if got := wakeRequests.Load(); got != 1 {
+		t.Fatalf("ordinary request issued an unexpected second wake: %d", got)
 	}
 }
 
@@ -810,5 +1027,240 @@ func TestProcessCommand_ConcurrentRunStop(t *testing.T) {
 				p.Stop(testStopTimeout) //nolint: errcheck
 			}
 		}
+	}
+}
+
+// TestProcessCommand_PreStartHookBlocksStart covers the dependency gate: a
+// failing hook must fail EnsureReady with its own error, leave the state
+// Stopped, and run once per start attempt without touching the upstream.
+func TestProcessCommand_PreStartHookBlocksStart(t *testing.T) {
+	// The command is deliberately broken: reaching it would fail in a
+	// different way, so the hook error identity proves the gate held.
+	p := newProcessCommand(t, config.ModelConfig{
+		Cmd:   "definitely-missing-binary-xyz",
+		Proxy: "http://127.0.0.1:1",
+	})
+	hookErr := errors.New("dependency not ready")
+	var calls atomic.Int32
+	p.SetPreStartHook(func(context.Context) error {
+		calls.Add(1)
+		return hookErr
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for i := 0; i < 2; i++ {
+		err := p.EnsureReady(ctx, testStartTimeout)
+		if !errors.Is(err, hookErr) {
+			t.Fatalf("EnsureReady call %d = %v, want the hook error", i+1, err)
+		}
+		if got := p.State(); got != StateStopped {
+			t.Fatalf("state after failed pre-start = %s, want stopped", got)
+		}
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("hook calls = %d, want 2 (one per start attempt)", got)
+	}
+}
+
+// TestProcessCommand_PreStartHookAllowsStart verifies a passing hook lets the
+// normal start path proceed untouched.
+func TestProcessCommand_PreStartHookAllowsStart(t *testing.T) {
+	skipIfNoSimpleResponder(t)
+
+	cmd, port := simpleResponderCmd(t, "-silent")
+	p := newProcessCommand(t, config.ModelConfig{
+		Cmd:                cmd,
+		Proxy:              fmt.Sprintf("http://127.0.0.1:%d", port),
+		CheckEndpoint:      "/health",
+		HealthCheckTimeout: 10,
+	})
+	t.Cleanup(func() { p.Stop(testStopTimeout) }) //nolint: errcheck
+
+	var calls atomic.Int32
+	p.SetPreStartHook(func(context.Context) error {
+		calls.Add(1)
+		return nil
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := p.EnsureReady(ctx, testStartTimeout); err != nil {
+		t.Fatalf("EnsureReady: %v", err)
+	}
+	if got := p.State(); got != StateReady {
+		t.Fatalf("state = %s, want ready", got)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("hook calls = %d, want 1", got)
+	}
+}
+
+// TestProcessCommand_StopDuringPreStartHook verifies a Stop request is
+// honoured while the dependency gate is still running instead of queueing
+// behind it on the run loop.
+func TestProcessCommand_StopDuringPreStartHook(t *testing.T) {
+	p := newProcessCommand(t, config.ModelConfig{
+		Cmd:   "definitely-missing-binary-xyz",
+		Proxy: "http://127.0.0.1:1",
+	})
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	p.SetPreStartHook(func(ctx context.Context) error {
+		close(started)
+		select {
+		case <-release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+
+	startCtx, startCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer startCancel()
+	startErr := make(chan error, 1)
+	go func() { startErr <- p.EnsureReady(startCtx, testStartTimeout) }()
+
+	<-started
+	stopErr := make(chan error, 1)
+	go func() { stopErr <- p.Stop(testStopTimeout) }()
+	select {
+	case err := <-stopErr:
+		if err != nil {
+			t.Fatalf("Stop during pre-start hook = %v, want nil", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Stop did not return while the pre-start hook was running")
+	}
+
+	close(release)
+	if err := <-startErr; !errors.Is(err, ErrStartAborted) {
+		t.Fatalf("EnsureReady after stop = %v, want ErrStartAborted", err)
+	}
+	if got := p.State(); got != StateStopped {
+		t.Fatalf("state = %s, want stopped", got)
+	}
+}
+
+// TestProcessCommand_EnsureReadyAfterStopSpawnsSimulatedLLM uses the actual
+// simple-responder subprocess as a stand-in LLM. It verifies the complete
+// restart path: the first process is stopped and its listener disappears,
+// EnsureReady then launches a second process on the same port, and the log
+// contains two distinct start commands.
+func TestProcessCommand_EnsureReadyAfterStopSpawnsSimulatedLLM(t *testing.T) {
+	skipIfNoSimpleResponder(t)
+
+	cmd, port := simpleResponderCmd(t, "-silent", "-respond simulated-llm")
+	logBuf := &syncBuffer{}
+	logger := logmon.NewWriter(logBuf)
+	logger.SetLogLevel(logmon.LevelDebug)
+	p, err := New(context.Background(), t.Name(), config.ModelConfig{
+		Cmd:                cmd,
+		Proxy:              fmt.Sprintf("http://127.0.0.1:%d", port),
+		CheckEndpoint:      "/health",
+		HealthCheckTimeout: 10,
+	}, logger, logger)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Stop(testStopTimeout) })
+
+	var hookCalls atomic.Int32
+	p.SetPreStartHook(func(context.Context) error {
+		hookCalls.Add(1)
+		return nil
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for cycle := 1; cycle <= 2; cycle++ {
+		if err := p.EnsureReady(ctx, testStartTimeout); err != nil {
+			t.Fatalf("cycle %d EnsureReady: %v", cycle, err)
+		}
+		if got := p.State(); got != StateReady {
+			t.Fatalf("cycle %d state = %s, want ready", cycle, got)
+		}
+
+		req := httptest.NewRequest(http.MethodGet, "/test", nil)
+		rr := httptest.NewRecorder()
+		p.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK || rr.Body.String() != "simulated-llm" {
+			t.Fatalf("cycle %d response = %d %q, want 200 %q", cycle, rr.Code, rr.Body.String(), "simulated-llm")
+		}
+
+		if err := p.Stop(testStopTimeout); err != nil {
+			t.Fatalf("cycle %d Stop: %v", cycle, err)
+		}
+		if got := p.State(); got != StateStopped {
+			t.Fatalf("cycle %d state after stop = %s, want stopped", cycle, got)
+		}
+		if resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/health", port)); err == nil {
+			resp.Body.Close()
+			t.Fatalf("cycle %d simulated LLM listener still answered after Stop", cycle)
+		}
+	}
+
+	if got := hookCalls.Load(); got != 2 {
+		t.Fatalf("pre-start hook calls = %d, want one per restart", got)
+	}
+	if got := strings.Count(logBuf.String(), "Executing start command:"); got != 2 {
+		t.Fatalf("start command log count = %d, want 2; log=%q", got, logBuf.String())
+	}
+}
+
+// TestProcessCommand_PreStartHookUsesStartContext verifies that the startup
+// timeout also bounds dependency preparation. A hook runs before StateStarting
+// and before doStart, so using the long-lived parent context here can leave a
+// restart looking stopped forever without ever spawning the upstream.
+func TestProcessCommand_PreStartHookUsesStartContext(t *testing.T) {
+	parentCtx, cancelParent := context.WithCancel(context.Background())
+	t.Cleanup(cancelParent)
+	logger := logmon.NewWriter(io.Discard)
+	p, err := New(parentCtx, t.Name(), config.ModelConfig{
+		Cmd:   "definitely-missing-binary-xyz",
+		Proxy: "http://127.0.0.1:1",
+	}, logger, logger)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	hookStarted := make(chan struct{})
+	hookDone := make(chan struct{})
+	p.SetPreStartHook(func(ctx context.Context) error {
+		close(hookStarted)
+		<-ctx.Done()
+		close(hookDone)
+		return ctx.Err()
+	})
+
+	const startTimeout = 150 * time.Millisecond
+	result := make(chan error, 1)
+	go func() {
+		result <- p.EnsureReady(context.Background(), startTimeout)
+	}()
+
+	select {
+	case <-hookStarted:
+	case <-time.After(testReturnTimeout):
+		t.Fatal("pre-start hook did not run")
+	}
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("EnsureReady error = %v, want context deadline exceeded", err)
+		}
+	case <-time.After(testReturnTimeout):
+		t.Fatal("EnsureReady remained blocked in pre-start hook")
+	}
+
+	select {
+	case <-hookDone:
+	case <-time.After(testReturnTimeout):
+		t.Fatal("pre-start hook did not receive the startup timeout")
+	}
+	if got := p.State(); got != StateStopped {
+		t.Fatalf("state after bounded pre-start failure = %s, want stopped", got)
 	}
 }

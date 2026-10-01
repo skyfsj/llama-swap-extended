@@ -16,6 +16,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mostlygeek/llama-swap/internal/auth"
 	"github.com/mostlygeek/llama-swap/internal/config"
 )
 
@@ -58,6 +59,26 @@ func TestReplaceRequestModel(t *testing.T) {
 	t.Run("json", func(t *testing.T) {
 		r := withContext(httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"model":"public","prompt":"hello"}`)))
 		r.Header.Set("Content-Type", "application/json")
+		updated, err := ReplaceRequestModel(r, "public", "target")
+		if err != nil {
+			t.Fatalf("ReplaceRequestModel: %v", err)
+		}
+		body, err := io.ReadAll(updated.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if !strings.Contains(string(body), `"model":"target"`) {
+			t.Fatalf("body = %s, want target model", body)
+		}
+		assertBodyLength(t, updated, body)
+		assertContextInvalidated(t, updated)
+	})
+
+	t.Run("json case-insensitive media type", func(t *testing.T) {
+		// Media types are case-insensitive (RFC 9110). Matching case-sensitively
+		// sent this down the form parser, where no model was found.
+		r := withContext(httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"model":"public","prompt":"hello"}`)))
+		r.Header.Set("Content-Type", "Application/JSON; charset=utf-8")
 		updated, err := ReplaceRequestModel(r, "public", "target")
 		if err != nil {
 			t.Fatalf("ReplaceRequestModel: %v", err)
@@ -407,6 +428,33 @@ func TestExtractContext_JSONBodyRestored(t *testing.T) {
 	}
 }
 
+func TestFetchContextRejectsOversizedBodyWithDedicatedError(t *testing.T) {
+	body := bytes.Repeat([]byte{'x'}, MaxRequestBodySize+1)
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	r.Header.Set("Content-Type", "application/json")
+	_, err := FetchContext(r, config.Config{})
+	if !errors.Is(err, ErrRequestBodyTooLarge) {
+		t.Fatalf("FetchContext error = %v, want ErrRequestBodyTooLarge", err)
+	}
+	w := httptest.NewRecorder()
+	SendError(w, r, err)
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized body status = %d, want 413", w.Code)
+	}
+}
+
+func TestExtractContextNilPostBodyIsSafe(t *testing.T) {
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	r.Body = nil
+	data, err := extractContext(r)
+	if err != nil {
+		t.Fatalf("nil POST body error = %v", err)
+	}
+	if data.Model != "" {
+		t.Fatalf("nil POST body model = %q", data.Model)
+	}
+}
+
 func TestExtractContext_MultipartBodyRestored(t *testing.T) {
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
@@ -697,6 +745,11 @@ func TestServer_ExtractAPIKey(t *testing.T) {
 		{"lowercase basic", "basic " + base64.StdEncoding.EncodeToString([]byte("user:pw-key")), "", "pw-key"},
 		{"mixed case BEARER", "BEARER tok456", "", "tok456"},
 		{"mixed case bAsIc", "bAsIc " + base64.StdEncoding.EncodeToString([]byte("u:bk")), "", "bk"},
+		{"multiple spaces bearer", "Bearer    tok789", "", "tok789"},
+		{"tab separator bearer", "Bearer\ttok790", "", "tok790"},
+		{"padded authorization", "  Bearer tok791  ", "", "tok791"},
+		{"multiple credentials falls back to x-api-key", "Bearer tok extra", "xkey", "xkey"},
+		{"padded x-api-key", "", "  xkey-padded  ", "xkey-padded"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -711,6 +764,11 @@ func TestServer_ExtractAPIKey(t *testing.T) {
 				t.Errorf("extractAPIKey() = %q, want %q", got, c.want)
 			}
 		})
+	}
+	cookieRequest := httptest.NewRequest(http.MethodGet, "/", nil)
+	cookieRequest.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: url.QueryEscape("cookie-key")})
+	if got := ExtractAPIKey(cookieRequest); got != "cookie-key" {
+		t.Fatalf("cookie API key = %q, want cookie-key", got)
 	}
 }
 
@@ -785,6 +843,57 @@ func TestFetchContext_UpstreamPath(t *testing.T) {
 				t.Error("metadata map not initialized")
 			}
 		})
+	}
+}
+
+func TestFetchContext_BatchChatInfersOnlyConfiguredModel(t *testing.T) {
+	cfg := config.Config{Models: map[string]config.ModelConfig{"served": {}}}
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions/batch", strings.NewReader(`{"messages":[[{"role":"user","content":"hi"}]]}`))
+	r.Header.Set("Content-Type", "application/json")
+	data, err := FetchContext(r, cfg)
+	if err != nil {
+		t.Fatalf("FetchContext: %v", err)
+	}
+	if data.Model != "served" || data.ModelID != "served" {
+		t.Fatalf("inferred context = %+v, want served", data)
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		t.Fatalf("read restored body: %v", err)
+	}
+	if !strings.Contains(string(body), `"messages"`) || strings.Contains(string(body), `"model"`) {
+		t.Fatalf("body changed while inferring model: %s", body)
+	}
+}
+
+func TestFetchContext_BatchChatRejectsAmbiguousModel(t *testing.T) {
+	cfg := config.Config{Models: map[string]config.ModelConfig{"a": {}, "b": {}}}
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions/batch", strings.NewReader(`{"messages":[]}`))
+	r.Header.Set("Content-Type", "application/json")
+	_, err := FetchContext(r, cfg)
+	if !errors.Is(err, ErrAmbiguousModel) {
+		t.Fatalf("FetchContext error = %v, want ErrAmbiguousModel", err)
+	}
+	w := httptest.NewRecorder()
+	SendError(w, r, err)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "specify model explicitly") {
+		t.Fatalf("error body = %s, want explicit-model guidance", w.Body)
+	}
+}
+
+func TestFetchContext_BatchChatKeepsExplicitModel(t *testing.T) {
+	cfg := config.Config{Models: map[string]config.ModelConfig{"a": {}, "b": {}}}
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions/batch", strings.NewReader(`{"model":"b","messages":[]}`))
+	r.Header.Set("Content-Type", "application/json")
+	data, err := FetchContext(r, cfg)
+	if err != nil {
+		t.Fatalf("FetchContext: %v", err)
+	}
+	if data.Model != "b" || data.ModelID != "b" {
+		t.Fatalf("explicit context = %+v, want b", data)
 	}
 }
 

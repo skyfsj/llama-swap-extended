@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"runtime"
 	"strings"
 	"time"
 
@@ -169,9 +170,7 @@ func tryMactop(ctx context.Context, every time.Duration, logger *logmon.Monitor)
 
 func readSysStats() (SysStat, error) {
 	cpuPcts, err := cpu.Percent(0, true)
-	if err != nil {
-		return SysStat{}, err
-	}
+	cpuPcts = cpuPercentsOrZero(cpuPcts, err)
 
 	vmStat, err := mem.VirtualMemory()
 	if err != nil {
@@ -205,4 +204,19 @@ func readSysStats() (SysStat, error) {
 		LoadAvg5:       loadAvg5,
 		LoadAvg15:      loadAvg15,
 	}, nil
+}
+
+// cpuPercentsOrZero keeps the system monitor available when Darwin's Mach
+// host_processor_info transiently returns an empty CPU-load buffer. CPU usage
+// is optional telemetry; emitting zeroes is preferable to losing memory and
+// load samples altogether. A later tick refreshes the real values normally.
+func cpuPercentsOrZero(values []float64, err error) []float64 {
+	if err == nil && len(values) > 0 {
+		return values
+	}
+	cores := runtime.NumCPU()
+	if cores < 1 {
+		cores = 1
+	}
+	return make([]float64, cores)
 }

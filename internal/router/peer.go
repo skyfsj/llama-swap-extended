@@ -31,6 +31,7 @@ type peerRoute struct {
 }
 
 type Peer struct {
+	mu     sync.RWMutex
 	cfg    config.Config
 	logger *logmon.Monitor
 	peers  map[string]*peerRoute
@@ -39,6 +40,26 @@ type Peer struct {
 	shutdownFn   context.CancelFunc
 	shuttingDown atomic.Bool
 	inflight     sync.WaitGroup
+}
+
+// Reconfigure atomically publishes a new peer route table. Requests that have
+// already selected an old reverse proxy keep using it until completion; new
+// requests see the new peer configuration. The Peer object, its shutdown
+// context and the enclosing Server remain unchanged.
+func (r *Peer) Reconfigure(cfg config.Config) error {
+	next, err := NewPeer(cfg, r.logger)
+	if err != nil {
+		return err
+	}
+	r.mu.Lock()
+	r.cfg = cfg
+	r.peers = next.peers
+	r.mu.Unlock()
+	// The temporary Peer only owns the construction context. Its route proxies
+	// are now intentionally owned by r; canceling that context does not cancel
+	// requests because ServeHTTP derives from r.shutdownCtx.
+	next.shutdownFn()
+	return nil
 }
 
 func NewPeer(cfg config.Config, logger *logmon.Monitor) (*Peer, error) {
@@ -153,6 +174,8 @@ func NewPeer(cfg config.Config, logger *logmon.Monitor) (*Peer, error) {
 }
 
 func (r *Peer) Handles(model string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	_, ok := r.peers[model]
 	return ok
 }
@@ -192,13 +215,18 @@ func (r *Peer) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	r.inflight.Add(1)
 	defer r.inflight.Done()
 
-	data, err := swaputil.FetchContext(req, r.cfg)
+	r.mu.RLock()
+	conf := r.cfg
+	r.mu.RUnlock()
+	data, err := swaputil.FetchContext(req, conf)
 	if err != nil {
 		swaputil.SendError(w, req, err)
 		return
 	}
 
+	r.mu.RLock()
 	route, found := r.peers[data.ModelID]
+	r.mu.RUnlock()
 	if !found {
 		r.logger.Warnf("peer model not found: %s", data.ModelID)
 		swaputil.SendError(w, req, ErrNoPeerModelFound)

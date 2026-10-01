@@ -25,7 +25,7 @@ pieces:
 | ------------------- | ------------------------------ | ------------------------------- |
 | Process machinery   | `baseRouter`                   | `internal/router/base.go`       |
 | Scheduling strategy | `scheduler.Scheduler` (`FIFO`) | `internal/router/scheduler/`    |
-| Eviction policy     | `scheduler.Swapper`            | `groupSwapper`, `matrixSwapper` |
+| Eviction policy     | `scheduler.Swapper`            | `groupSwapper`, `matrixSwapper`, `gpusSwapper` |
 
 `baseRouter` keeps the channels, run loop, process lifecycle, and shutdown
 teardown, and exposes the side-effects a scheduler needs through the
@@ -37,7 +37,7 @@ to evict", and knows nothing about queues, channels, or processes.
 Because the seams are interfaces, you can replace the scheduling strategy
 without touching process management, or write a new eviction policy without
 touching either. `FIFO` is the first and currently only `Scheduler`;
-`groupSwapper` and `matrixSwapper` are the two `Swapper`s.
+`groupSwapper`, `matrixSwapper`, and `gpusSwapper` are the three `Swapper`s.
 
 ## Key concepts
 
@@ -168,6 +168,7 @@ All three live in `scheduler/scheduler.go`.
 ```go
 type Scheduler interface {
     OnRequest(req HandlerReq)
+    OnCancel(req HandlerReq)
     OnSwapDone(ev SwapDone)
     OnServeDone(ev ServeDoneEvent)
     OnUnload(targets []string, timeout time.Duration)
@@ -192,8 +193,10 @@ the complete `running` set, return the running model IDs that must stop. It must
 not log or mutate anything, and it does **not** inspect process state itself:
 the scheduler hands it `running` already assembled (every non-stopped process,
 unioned with the targets of in-flight swaps already committed but not yet
-visible in process state). That keeps the swapper a pure function of its inputs,
-with no reference to processes.
+visible in process state, and with models whose restart is committed — their
+replacement will reoccupy the slot even though the stopped old process is
+invisible to process state). That keeps the swapper a pure function of its
+inputs, with no reference to processes.
 
 The reason it must not log is that it is a _speculative_ query — "what would we
 evict if we started this swap right now?" — called far more often than swaps
@@ -209,6 +212,22 @@ once, at the moment a swap is committed. One log line there equals one real swap
 with the evict set that is genuinely being applied — which is why `matrixSwapper`
 re-solves and logs the full decision (set, DSL, cost) in `OnSwapStart` rather
 than in `EvictionFor`.
+
+**Semantics for models not listed in the eviction config are deliberately
+different per swapper.** For a target that appears in no group/set/card:
+
+- `groupSwapper`: the model is not routable at all — processes are only created
+  for group members, so a request for an unlisted model fails with
+  "no model config" for that router.
+- `matrixSwapper`: the model falls back to **evicting every running model**
+  (worst-case sharing assumption), so the request succeeds but at maximum
+  swap cost.
+- `gpusSwapper`: the model is treated as **occupying no card**, so it runs
+  alongside everything.
+
+This divergence is intentional — the three configs express different intents —
+but it means the same model can behave differently when `routing.router.use`
+changes. Document this when advising users on switching router types.
 
 ### `Effects`
 

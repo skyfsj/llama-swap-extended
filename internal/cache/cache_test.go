@@ -56,6 +56,22 @@ func TestCache_Get(t *testing.T) {
 		_, err := c.Get(99)
 		assert.ErrorIs(t, err, ErrNotFound)
 	})
+
+	t.Run("isolates callers from cached backing storage", func(t *testing.T) {
+		c := New(100)
+		input := []byte("stable")
+		require.NoError(t, c.Add(1, input))
+
+		input[0] = 'X'
+		got, err := c.Get(1)
+		require.NoError(t, err)
+		assert.Equal(t, []byte("stable"), got)
+
+		got[0] = 'Y'
+		again, err := c.Get(1)
+		require.NoError(t, err)
+		assert.Equal(t, []byte("stable"), again)
+	})
 }
 
 func TestCache_Has(t *testing.T) {

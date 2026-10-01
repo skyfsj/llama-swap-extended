@@ -1,6 +1,7 @@
 package router
 
 import (
+	"context"
 	"fmt"
 	"slices"
 
@@ -36,9 +37,12 @@ func NewMatrix(conf config.Config, proxylog, upstreamlog *logmon.Monitor) (*Matr
 	if err != nil {
 		return nil, fmt.Errorf("creating base router: %w", err)
 	}
+	base.setProcessFactory(func(ctx context.Context, modelID string, modelCfg config.ModelConfig) (process.Process, error) {
+		return process.New(ctx, modelID, modelCfg, logmon.NewWriter(logmon.NewLinePrefixWriter("["+modelID+"] ", upstreamlog)), proxylog)
+	})
 
 	for mid, modelCfg := range conf.Models {
-		procLog := logmon.NewWriter(upstreamlog)
+		procLog := logmon.NewWriter(logmon.NewLinePrefixWriter("["+mid+"] ", upstreamlog))
 		p, err := process.New(base.procCtx, mid, modelCfg, procLog, proxylog)
 		if err != nil {
 			base.shutdownFn()
@@ -47,10 +51,30 @@ func NewMatrix(conf config.Config, proxylog, upstreamlog *logmon.Monitor) (*Matr
 		}
 		processes[mid] = p
 	}
+	base.processMu.Lock()
+	for mid := range processes {
+		if modelCfg, ok := conf.Models[mid]; ok {
+			base.processConfigs[mid] = modelCfg
+			base.processRuntime[mid] = runtimeSnapshot(conf, modelCfg)
+		}
+	}
+	base.processMu.Unlock()
 
 	r := &Matrix{baseRouter: base}
 	go base.run()
 	return r, nil
+}
+
+// Reconfigure keeps the matrix router's process registry and scheduler alive
+// while applying a new planner/topology through the base run loop. Candidate
+// group routing is also accepted so an operator can switch router kinds
+// without recreating the HTTP server.
+func (r *Matrix) Reconfigure(conf config.Config) error {
+	planner, modelIDs, err := plannerForConfig(conf, r.logger)
+	if err != nil {
+		return err
+	}
+	return r.baseRouter.Reconfigure(conf, planner, modelIDs)
 }
 
 // matrixSwapper decides evictions by asking the matrix solver against the

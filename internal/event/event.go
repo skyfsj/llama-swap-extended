@@ -295,6 +295,12 @@ func (s *group[T]) Del(sub *consumer[T]) {
 			break
 		}
 	}
+
+	// Wake the removed subscriber: a consumer parked in Listen's c.Wait() only
+	// re-checks stop on wakeup. Without this broadcast it stays parked forever
+	// unless its event type happens to be published again, leaking one
+	// goroutine per unsubscribe of an idle event type.
+	s.cond.Broadcast()
 }
 
 // ------------------------------------- Debugging -------------------------------------

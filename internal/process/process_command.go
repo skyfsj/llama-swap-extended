@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os/exec"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -21,6 +22,12 @@ import (
 )
 
 var ErrStartAborted = fmt.Errorf("aborted")
+
+// CrashRecorder receives a snapshot when an upstream inference process exits
+// without an explicit Stop or shutdown. The log slice is an owned copy and
+// the callback must return quickly; callers that persist to disk should queue
+// that work themselves.
+type CrashRecorder func(modelID string, processLog []byte, exitErr error)
 
 // healthCheckKey marks requests issued by the health check loop, which polls
 // the upstream through the same reverse proxy. Their failures are the expected
@@ -77,12 +84,19 @@ const cmdWaitDelay = 10 * time.Second
 // bounds the rare case where a process is still alive when its context is cut.
 const parentCancelGraceTimeout = time.Second
 
+// stopCommandTimeout bounds the external CmdStop subprocess. It runs on
+// detached goroutines (killProcess) and on os/exec's context watcher
+// (cmd.Cancel), so a stop script that waits on a lock forever would otherwise
+// leak those goroutines permanently.
+const stopCommandTimeout = 30 * time.Second
+
 // startReq asks the run loop to bring the process up. Run and EnsureReady share
 // this one request type — and therefore one code path — so there is only ever a
 // single way to start a process. block selects the caller's semantics: Run parks
 // its response until the process terminates, EnsureReady is answered as soon as
 // the process is ready or the start fails.
 type startReq struct {
+	ctx     context.Context
 	timeout time.Duration
 	respond chan error
 	block   bool
@@ -90,6 +104,17 @@ type startReq struct {
 
 type stopReq struct {
 	timeout time.Duration
+	respond chan error
+}
+
+type sleepReq struct {
+	ctx     context.Context
+	level   int
+	respond chan error
+}
+
+type wakeReq struct {
+	ctx     context.Context
 	respond chan error
 }
 
@@ -120,6 +145,8 @@ type ProcessCommand struct {
 
 	startCh     chan startReq
 	stopCh      chan stopReq
+	sleepCh     chan sleepReq
+	wakeCh      chan wakeReq
 	waitReadyCh chan waitReadyReq
 
 	// current ProcessState. Written only by run(); read by State() via atomic load.
@@ -131,9 +158,29 @@ type ProcessCommand struct {
 
 	lastUse  atomic.Int64 // unix nano timestamp of last ServeHTTP completion
 	inflight atomic.Int64 // current in-flight ServeHTTP calls
+
+	// preStartHook is a dependency gate executed inside the run loop right
+	// before a start request enters doStart. A non-nil error fails the start
+	// without spawning the upstream process. Installed atomically because the
+	// decorator may run on a different goroutine than the run loop.
+	preStartHook atomic.Pointer[func(context.Context) error]
+
+	// crashRecorder is installed by the server's process decorator. It is
+	// atomic because the router may decorate existing processes while their run
+	// goroutine is handling lifecycle events.
+	crashRecorder atomic.Pointer[CrashRecorder]
+	exitMu        sync.Mutex
+	lastExitErr   error
+
+	// Sleep Mode keeps the process and HTTP handler alive while moving vLLM
+	// weights out of device memory. Serialize control calls so concurrent
+	// requests cannot issue overlapping wake-up operations.
+	sleepMu  sync.Mutex
+	sleeping atomic.Bool
 }
 
 var _ Process = (*ProcessCommand)(nil)
+var _ SleepController = (*ProcessCommand)(nil)
 
 func New(
 	parentCtx context.Context,
@@ -151,6 +198,8 @@ func New(
 
 		startCh:     make(chan startReq),
 		stopCh:      make(chan stopReq),
+		sleepCh:     make(chan sleepReq),
+		wakeCh:      make(chan wakeReq),
 		waitReadyCh: make(chan waitReadyReq),
 		waitDelay:   cmdWaitDelay,
 	}
@@ -161,6 +210,74 @@ func New(
 }
 
 func (p *ProcessCommand) Logger() *logmon.Monitor { return p.processLogger }
+
+// SetPreStartHook installs a dependency gate that runs before every start
+// attempt. A non-nil error from the hook fails the start (Run and EnsureReady
+// both report it) and the state stays Stopped. The hook runs on its own
+// goroutine — it can legitimately take minutes (dependency installs) — while
+// the run loop keeps servicing Stop and shutdown: a Stop during the gate
+// cancels the start context (the hook must honor it) and aborts the start.
+// The start request's timeout bounds the complete dependency-preparation and
+// process-start path.
+func (p *ProcessCommand) SetPreStartHook(hook func(context.Context) error) {
+	if hook == nil {
+		p.preStartHook.Store(nil)
+		return
+	}
+	p.preStartHook.Store(&hook)
+}
+
+// SetCrashRecorder installs or clears the callback used for unexpected
+// upstream exits. The callback itself is not invoked while holding any
+// ProcessCommand lock.
+func (p *ProcessCommand) SetCrashRecorder(rec CrashRecorder) {
+	if rec == nil {
+		p.crashRecorder.Store(nil)
+		return
+	}
+	p.crashRecorder.Store(&rec)
+}
+
+func (p *ProcessCommand) setLastExitErr(err error) {
+	p.exitMu.Lock()
+	p.lastExitErr = err
+	p.exitMu.Unlock()
+}
+
+func (p *ProcessCommand) getLastExitErr() error {
+	p.exitMu.Lock()
+	defer p.exitMu.Unlock()
+	return p.lastExitErr
+}
+
+// reportExit writes a lifecycle diagnostic to the model's own log.
+//
+// The model log panel reads the process monitor, not the proxy logger, so a
+// diagnostic written only to the proxy logger leaves the panel ending mid-line
+// with no explanation of why the process stopped — the operator sees output
+// "just stop". Writing here reaches the panel directly and, because the process
+// monitor forwards through a prefix writer, the shared log as well.
+func (p *ProcessCommand) reportExit(format string, args ...any) {
+	if p.processLogger != nil {
+		p.processLogger.Errorf(format, args...)
+		return
+	}
+	if p.proxyLogger != nil {
+		p.proxyLogger.Errorf("<%s> %s", p.id, fmt.Sprintf(format, args...))
+	}
+}
+
+func (p *ProcessCommand) recordCrash(exitErr error) {
+	recorder := p.crashRecorder.Load()
+	if recorder == nil {
+		return
+	}
+	var processLog []byte
+	if p.processLogger != nil {
+		processLog = p.processLogger.GetHistory()
+	}
+	(*recorder)(p.id, processLog, exitErr)
+}
 
 // run is the single-writer goroutine that owns all mutable lifecycle state
 // (current ProcessState, the running *exec.Cmd, the active reverse-proxy
@@ -186,6 +303,21 @@ func (p *ProcessCommand) run() {
 				NewState:    string(s),
 			})
 		}
+	}
+	setSleeping := func(sleeping bool) {
+		old := p.sleeping.Swap(sleeping)
+		if old == sleeping {
+			return
+		}
+		oldState, newState := string(StateReady), string(StateSleeping)
+		if !sleeping {
+			oldState, newState = newState, oldState
+		}
+		event.Emit(swaputil.ProcessStateChangeEvent{
+			ProcessName: p.id,
+			OldState:    oldState,
+			NewState:    newState,
+		})
 	}
 	var (
 		cmd          *exec.Cmd
@@ -231,6 +363,7 @@ func (p *ProcessCommand) run() {
 			// Mark shutdown before killProcess so concurrent State() readers
 			// stop treating this process as ready while the (possibly slow)
 			// teardown is in progress.
+			p.sleeping.Store(false)
 			setState(StateShutdown)
 			if cmd != nil {
 				p.handler.Store(nil)
@@ -248,15 +381,18 @@ func (p *ProcessCommand) run() {
 		// cmdDone is nil while no process is running, so this case is
 		// dormant outside of StateReady.
 		case <-cmdDone:
+			waitErr := p.getLastExitErr()
 			if cmdCancel != nil {
 				cmdCancel()
 			}
 			cmd = nil
 			cmdDone = nil
 			cmdCancel = nil
+			p.sleeping.Store(false)
 			p.handler.Store(nil)
 			setState(StateStopped)
 			p.proxyLogger.Warnf("<%s> upstream process exited unexpectedly", p.id)
+			p.recordCrash(waitErr)
 			// Safety net: readyWaiters is normally empty here because
 			// WaitReady is answered immediately while StateReady. Notifying
 			// anyway keeps the invariant that no transition into a settled
@@ -277,6 +413,55 @@ func (p *ProcessCommand) run() {
 				readyWaiters = append(readyWaiters, req)
 			}
 
+		// Sleep and wake are handled by the same run loop that owns start and
+		// stop. The upstream listener stays alive in StateReady while its vLLM
+		// weights are released, so the next request can wake it without racing a
+		// second process generation into the same proxy.
+		case req := <-p.sleepCh:
+			if !p.isVLLMBackend() {
+				req.respond <- ErrSleepUnsupported
+				continue
+			}
+			if state != StateReady || p.handler.Load() == nil {
+				req.respond <- ErrSleepUnavailable
+				continue
+			}
+			if req.level == 0 {
+				req.level = 1
+			}
+			if req.level < 1 || req.level > 2 {
+				req.respond <- fmt.Errorf("sleep level must be 1 or 2")
+				continue
+			}
+			if p.sleeping.Load() {
+				req.respond <- nil
+				continue
+			}
+			err := p.sleepVLLM(req.ctx, req.level, time.Duration(p.config.UnloadTimeout)*time.Second)
+			if err == nil {
+				setSleeping(true)
+			}
+			req.respond <- err
+
+		case req := <-p.wakeCh:
+			if !p.isVLLMBackend() {
+				req.respond <- ErrSleepUnsupported
+				continue
+			}
+			if state != StateReady || p.handler.Load() == nil {
+				req.respond <- ErrSleepUnavailable
+				continue
+			}
+			if !p.sleeping.Load() {
+				req.respond <- nil
+				continue
+			}
+			err := p.wakeVLLM(req.ctx)
+			if err == nil {
+				setSleeping(false)
+			}
+			req.respond <- err
+
 		// Start the upstream process (Run or EnsureReady — see startReq).
 		// doStart can take a long time (health-check polling), so it runs in
 		// a separate goroutine and we wait on resultCh. While waiting we also
@@ -293,6 +478,20 @@ func (p *ProcessCommand) run() {
 			if !req.block {
 				switch state {
 				case StateReady:
+					if p.sleeping.Load() {
+						wakeCtx := req.ctx
+						cancelWake := func() {}
+						if req.timeout > 0 {
+							wakeCtx, cancelWake = context.WithTimeout(req.ctx, req.timeout)
+						}
+						err := p.wakeVLLM(wakeCtx)
+						cancelWake()
+						if err != nil {
+							req.respond <- err
+							continue
+						}
+						setSleeping(false)
+					}
 					req.respond <- nil
 					continue
 				case StateShutdown:
@@ -306,9 +505,81 @@ func (p *ProcessCommand) run() {
 				req.respond <- fmt.Errorf("[%s] could not be started in %s state", p.id, state)
 				continue
 			}
+			// Bound dependency preparation and the actual start with the same
+			// caller-provided context. The pre-start hook runs before StateStarting
+			// and doStart, so passing only parentCtx here can leave a restart stuck
+			// in Stopped without ever spawning the replacement process.
+			var startCtx context.Context
+			var cancelStart context.CancelFunc
+			if req.timeout > 0 {
+				startCtx, cancelStart = context.WithTimeout(req.ctx, req.timeout)
+			} else {
+				startCtx, cancelStart = context.WithCancel(req.ctx)
+			}
+			// The pre-start hook is the dependency gate: a model whose
+			// runtime dependencies are not ready must fail here, before a
+			// single upstream process is spawned. State stays Stopped.
+			// The gate can legitimately run for minutes (dependency
+			// installs), so it runs in its own goroutine and this loop keeps
+			// servicing Stop and shutdown — the same contract as the
+			// doStart wait below.
+			hookDone := make(chan error, 1)
+			if hookPtr := p.preStartHook.Load(); hookPtr != nil {
+				hook := *hookPtr
+				go func() { hookDone <- hook(startCtx) }()
+			} else {
+				hookDone <- nil
+			}
+			select {
+			case hookErr := <-hookDone:
+				if hookErr != nil {
+					cancelStart()
+					p.proxyLogger.Warnf("<%s> pre-start check failed: %v", p.id, hookErr)
+					notifyWaiters(hookErr)
+					req.respond <- hookErr
+					continue
+				}
+
+			// Stop arrived while the dependency gate was still running. Cancel
+			// the start context (the hook honours it), drain the gate so it
+			// stays single-flight, and answer both callers.
+			case stop := <-p.stopCh:
+				cancelStart()
+				hookErr := <-hookDone
+				setState(StateStopped)
+				if hookErr == nil {
+					// The gate completed successfully, and a hook only acquires
+					// what it needs after succeeding (the LMCache reference is
+					// taken once the gate is fully satisfied). setState is a
+					// no-op here — the process never left Stopped — so no
+					// transition event is emitted, and subscribers that release
+					// on leaving the running set would never run, stranding the
+					// reference until the next successful start/stop cycle.
+					event.Emit(swaputil.ProcessStateChangeEvent{
+						ProcessName: p.id,
+						OldState:    string(StateStopped),
+						NewState:    string(StateStopped),
+					})
+				}
+				notifyWaiters(ErrStartAborted)
+				req.respond <- ErrStartAborted
+				stop.respond <- nil
+				continue
+
+			// Parent context cancelled (e.g. config reload) while the gate was
+			// still running. Mirrors the shutdown contract of the doStart wait
+			// below: the start requester unblocks through its own parentCtx
+			// send-side select.
+			case <-p.parentCtx.Done():
+				cancelStart()
+				setState(StateShutdown)
+				<-hookDone
+				notifyWaiters(fmt.Errorf("[%s] shutdown", p.id))
+				respondRun(fmt.Errorf("[%s] shutdown", p.id))
+				return
+			}
 			setState(StateStarting)
 
-			startCtx, cancelStart := context.WithCancel(context.Background())
 			resultCh := make(chan startResult, 1)
 			go func() {
 				resultCh <- p.doStart(startCtx, req.timeout)
@@ -327,6 +598,8 @@ func (p *ProcessCommand) run() {
 					cmd = res.cmd
 					cmdDone = res.cmdDone
 					cmdCancel = res.cancel
+					p.sleeping.Store(false)
+					p.lastUse.Store(time.Now().UnixNano())
 					fn := res.handlerFn
 					p.handler.Store(&fn)
 					setState(StateReady)
@@ -352,12 +625,31 @@ func (p *ProcessCommand) run() {
 								if p.State() != StateReady {
 									return
 								}
+								if p.sleeping.Load() {
+									continue
+								}
 								if p.inflight.Load() != 0 {
 									continue
 								}
 								if time.Since(time.Unix(0, p.lastUse.Load())) > ttlDuration {
+									if p.usesVLLMSleepMode() {
+										level := p.config.Backend.Lifecycle.SleepLevel
+										if level == 0 {
+											level = 1
+										}
+										p.proxyLogger.Infof("<%s> Entering vLLM Sleep Mode level %d, TTL of %ds reached", p.id, level, p.config.UnloadAfter)
+										if err := p.Sleep(context.Background(), level); err != nil {
+											p.proxyLogger.Warnf("<%s> vLLM Sleep Mode failed: %v", p.id, err)
+										}
+										continue
+									}
 									p.proxyLogger.Infof("<%s> Unloading model, TTL of %ds reached", p.id, p.config.UnloadAfter)
-									p.Stop(time.Duration(p.config.UnloadTimeout) * time.Second)
+									if err := p.Stop(time.Duration(p.config.UnloadTimeout) * time.Second); err != nil {
+										// The line above promises an unload. Without this
+										// the operator only sees that promise and keeps
+										// wondering why VRAM is still held.
+										p.proxyLogger.Warnf("<%s> TTL unload failed: %v", p.id, err)
+									}
 									return
 								}
 							}
@@ -416,6 +708,10 @@ func (p *ProcessCommand) run() {
 		case stop := <-p.stopCh:
 			toreDown := cmd != nil
 			if cmd != nil {
+				// Clear the public sleep projection before publishing Stopping;
+				// otherwise the state event can be rendered as sleeping while the
+				// process is already being torn down.
+				p.sleeping.Store(false)
 				setState(StateStopping)
 				p.killProcess(cmd, cmdCancel, cmdDone, stop.timeout)
 				cmd = nil
@@ -503,8 +799,17 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
 	// process exit (see killProcess).
 	cmdCtx, cmdCancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(cmdCtx, args[0], args[1:]...)
-	cmd.Stderr = p.processLogger
-	cmd.Stdout = p.processLogger
+	// os/exec drains these pipes with io.Copy from its own goroutine, so the
+	// writer bound here runs on the child's stdout drain path. Bind a
+	// DrainWriter rather than the logger itself: the child then only ever waits
+	// on a memory copy, while line prefixing, the merge into the shared
+	// upstream log, and the terminal write happen afterwards, off that path.
+	// Bound inline, a slow or failing sink stops the copier, the pipe fills up,
+	// and the child dies of SIGPIPE on its next write — a logging fault that is
+	// indistinguishable from a model crash.
+	childOutput := logmon.NewDrainWriter(p.processLogger)
+	cmd.Stderr = childOutput
+	cmd.Stdout = childOutput
 	cmd.Env = append(cmd.Environ(), p.config.Env...)
 	cmd.Cancel = func() error { return p.sendStopSignal(cmd) }
 	cmd.WaitDelay = p.waitDelay
@@ -513,6 +818,7 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
 	p.proxyLogger.Debugf("<%s> Executing start command: %s, env: %s", p.id, strings.Join(args, " "), strings.Join(p.config.Env, ", "))
 
 	cmdDone := make(chan struct{})
+	p.setLastExitErr(nil)
 	if err := cmd.Start(); err != nil {
 		cmdCancel()
 		return startResult{err: fmt.Errorf("failed to start command '%s': %w", strings.Join(args, " "), err)}
@@ -520,6 +826,13 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
 
 	go func() {
 		waitErr := cmd.Wait()
+		// cmd.Wait has returned, so both copier goroutines are done and every
+		// byte the child wrote is either delivered or queued. Flush before
+		// reporting: the diagnostics below decide whether to start a new line by
+		// looking at what the log currently ends with, and a crash archive reads
+		// the same buffer.
+		childOutput.Close()
+		p.setLastExitErr(waitErr)
 		switch st := p.State(); {
 		case waitErr == nil:
 			p.proxyLogger.Debugf("<%s> process exited cleanly", p.id)
@@ -528,23 +841,61 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
 			// the child with a non-zero code (e.g. taskkill /f on Windows
 			// yields exit status 1), so this is not an error.
 			p.proxyLogger.Debugf("<%s> process stopped by llama-swap: %v", p.id, waitErr)
+		case st == StateStarting:
+			// A death while a start is still in flight belongs to the start path,
+			// which reports it with the context that matters ("exited before
+			// becoming ready") and archives the crash. Reporting it here as well
+			// printed the same death twice, and it also misfired on the kills
+			// llama-swap itself performs against a starting process — a start
+			// deadline or an explicit cancel — which are deliberate teardowns,
+			// not surprises. The run loop still reports a process that dies after
+			// reaching ready, so nothing is lost.
+			p.proxyLogger.Debugf("<%s> process exited during start: %v", p.id, waitErr)
 		default:
-			if exitErr, ok := waitErr.(*exec.ExitError); ok {
-				p.proxyLogger.Debugf("<%s> process exited: code=%d, err=%v", p.id, exitErr.ExitCode(), waitErr)
-			} else {
-				p.proxyLogger.Debugf("<%s> process exited with error: %v", p.id, waitErr)
-			}
+			// An unexpected death must be visible at the default log level. It
+			// used to be logged at debug, which the default level discards, so
+			// the operator-visible log jumped from progress output straight to a
+			// bare "exit status N" with no record of what actually happened.
+			// DescribeExitWithMemory names the mechanism (signal vs exit code)
+			// and appends any memory evidence, because memory exhaustion is the
+			// silent case: no traceback, no signal, output just stops.
+			p.reportExit("process exited unexpectedly: %s",
+				DescribeExitWithMemory(waitErr, false))
 		}
 		close(cmdDone)
 	}()
 
+	// abort tears down a start that never reached ready. A bare ctx
+	// cancellation and a health-check deadline produce the same startCtx.Err()
+	// value, so report the deadline explicitly: "aborted" alone tells an
+	// operator nothing, while "health check timed out after 15m0s" points
+	// straight at a model that is simply slower to warm up than the configured
+	// window.
 	abort := func(err error) startResult {
+		// Keep ErrStartAborted in the chain — callers classify a pre-ready stop
+		// with errors.Is — while stating the deadline explicitly. "aborted"
+		// alone is indistinguishable from an operator stop and sends anyone
+		// reading the lifecycle error hunting for a cancellation that never
+		// happened.
+		if errors.Is(startCtx.Err(), context.DeadlineExceeded) {
+			err = fmt.Errorf("health check timed out after %v: %w", healthCheckTimeout, ErrStartAborted)
+		}
 		p.killProcess(cmd, cmdCancel, cmdDone, 5*time.Second)
 		return startResult{err: err}
 	}
 	prematureExit := func() startResult {
+		exitErr := p.getLastExitErr()
+		// Report before archiving so the snapshot an operator downloads carries
+		// the same explanation the live panel shows.
+		cause := DescribeExitWithMemory(exitErr, false)
+		p.reportExit("process exited before becoming ready: %s", cause)
+		if startCtx.Err() == nil {
+			p.recordCrash(exitErr)
+		}
 		cmdCancel()
-		return startResult{err: fmt.Errorf("upstream command exited prematurely")}
+		// The lifecycle error is what the control plane surfaces to the caller;
+		// the same sentence was already written to the model log above.
+		return startResult{err: fmt.Errorf("upstream command %s", cause)}
 	}
 
 	if startCtx.Err() != nil {
@@ -553,7 +904,7 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
 
 	checkEndpoint := strings.TrimSpace(p.config.CheckEndpoint)
 	if checkEndpoint == "none" {
-		return startResult{cmd: cmd, cmdDone: cmdDone, cancel: cmdCancel, handlerFn: handlerFn}
+		return p.finishVLLMStart(startCtx, cmd, cmdDone, cmdCancel, handlerFn, reverseProxy, prematureExit)
 	}
 
 	// Wait 250ms for the command to start up before health checking
@@ -580,7 +931,12 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
 		// Tagged so the proxy ErrorHandler logs a not-yet-listening upstream
 		// at debug rather than as a proxy error once per poll.
 		checkCtx := context.WithValue(startCtx, healthCheckKey{}, true)
-		req, _ := http.NewRequestWithContext(checkCtx, "GET", p.config.CheckEndpoint, nil)
+		req, err := http.NewRequestWithContext(checkCtx, "GET", p.config.CheckEndpoint, nil)
+		if err != nil {
+			// A nil request handed to reverseProxy.ServeHTTP would panic and
+			// take the whole daemon down (this runs on a bare goroutine).
+			return abort(fmt.Errorf("invalid checkEndpoint %q: %w", p.config.CheckEndpoint, err))
+		}
 		rr := httptest.NewRecorder()
 		reverseProxy.ServeHTTP(rr, req)
 		resp := rr.Result()
@@ -601,7 +957,7 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
 		}
 	}
 
-	return startResult{cmd: cmd, cmdDone: cmdDone, cancel: cmdCancel, handlerFn: handlerFn}
+	return p.finishVLLMStart(startCtx, cmd, cmdDone, cmdCancel, handlerFn, reverseProxy, prematureExit)
 }
 
 // sendStopSignal runs the configured CmdStop (if any) or sends SIGTERM to
@@ -620,7 +976,12 @@ func (p *ProcessCommand) sendStopSignal(cmd *exec.Cmd) error {
 		)
 		if err == nil {
 			p.processLogger.Debugf("<%s> sendStopSignal() running stop command: %s", p.id, strings.Join(stopArgs, " "))
-			stopCmd := exec.Command(stopArgs[0], stopArgs[1:]...)
+			// Bound the stop command: it runs on detached goroutines (killProcess)
+			// and on exec's ctx watcher (cmd.Cancel), so a hanging stop script
+			// would otherwise leak both permanently.
+			stopCtx, stopCancel := context.WithTimeout(context.Background(), stopCommandTimeout)
+			defer stopCancel()
+			stopCmd := exec.CommandContext(stopCtx, stopArgs[0], stopArgs[1:]...)
 			stopCmd.Env = cmd.Env
 			setProcAttributes(stopCmd)
 			runErr := stopCmd.Run()
@@ -707,6 +1068,7 @@ func (p *ProcessCommand) ID() string {
 
 func (p *ProcessCommand) Run(timeout time.Duration) error {
 	req := startReq{
+		ctx:     context.Background(),
 		timeout: timeout,
 		respond: make(chan error, 1),
 		block:   true,
@@ -733,7 +1095,11 @@ func (p *ProcessCommand) Run(timeout time.Duration) error {
 // not inspect State() first — that read races the run loop and is what caused
 // issue #946.
 func (p *ProcessCommand) EnsureReady(ctx context.Context, timeout time.Duration) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	req := startReq{
+		ctx:     ctx,
 		timeout: timeout,
 		respond: make(chan error, 1),
 	}
@@ -791,11 +1157,160 @@ func (p *ProcessCommand) State() ProcessState {
 	return StateStopped
 }
 
+// Sleep asks a ready vLLM process to release its model weights while keeping
+// the listener and process generation alive. The request is serialized by the
+// process run loop with starts and stops.
+func (p *ProcessCommand) Sleep(ctx context.Context, level int) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req := sleepReq{ctx: ctx, level: level, respond: make(chan error, 1)}
+	select {
+	case p.sleepCh <- req:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-p.parentCtx.Done():
+		return fmt.Errorf("[%s] shutdown", p.id)
+	}
+	select {
+	case err := <-req.respond:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-p.parentCtx.Done():
+		return fmt.Errorf("[%s] shutdown", p.id)
+	}
+}
+
+// Wake restores a sleeping vLLM process before traffic is forwarded to it.
+// Like Sleep, the operation is serialized by the process run loop.
+func (p *ProcessCommand) Wake(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req := wakeReq{ctx: ctx, respond: make(chan error, 1)}
+	select {
+	case p.wakeCh <- req:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-p.parentCtx.Done():
+		return fmt.Errorf("[%s] shutdown", p.id)
+	}
+	select {
+	case err := <-req.respond:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-p.parentCtx.Done():
+		return fmt.Errorf("[%s] shutdown", p.id)
+	}
+}
+
+func (p *ProcessCommand) Sleeping() bool {
+	return p.sleeping.Load()
+}
+
+func (p *ProcessCommand) usesVLLMSleepMode() bool {
+	return p.isVLLMBackend() && p.config.UnloadAfter > 0 &&
+		!strings.EqualFold(strings.TrimSpace(p.config.Backend.Lifecycle.Mode), "process")
+}
+
+func (p *ProcessCommand) lifecycleEndpoint(path string) (string, error) {
+	base, err := url.Parse(strings.TrimSpace(p.config.Proxy))
+	if err != nil || base.Scheme == "" || base.Host == "" {
+		if err == nil {
+			err = fmt.Errorf("proxy URL has no scheme or host")
+		}
+		return "", fmt.Errorf("invalid vLLM lifecycle proxy %q: %w", p.config.Proxy, err)
+	}
+	base.Path = strings.TrimRight(base.Path, "/") + path
+	base.RawQuery = ""
+	return base.String(), nil
+}
+
+func lifecycleHTTPTimeout(timeout time.Duration) time.Duration {
+	if timeout > 0 {
+		return timeout
+	}
+	return 30 * time.Second
+}
+
+func (p *ProcessCommand) sleepVLLM(ctx context.Context, level int, timeout time.Duration) error {
+	p.sleepMu.Lock()
+	defer p.sleepMu.Unlock()
+	if p.sleeping.Load() {
+		return nil
+	}
+	endpoint, err := p.lifecycleEndpoint("/sleep")
+	if err != nil {
+		return err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, lifecycleHTTPTimeout(timeout))
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, nil)
+	if err != nil {
+		return err
+	}
+	query := "?level=" + fmt.Sprintf("%d", level)
+	client := &http.Client{Timeout: lifecycleHTTPTimeout(timeout)}
+	req.URL.RawQuery = "level=" + fmt.Sprintf("%d", level)
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("POST %s%s: %w", endpoint, query, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("POST %s%s returned HTTP %d", endpoint, query, resp.StatusCode)
+	}
+	return nil
+}
+
+func (p *ProcessCommand) wakeVLLM(ctx context.Context) error {
+	p.sleepMu.Lock()
+	defer p.sleepMu.Unlock()
+	if !p.sleeping.Load() {
+		return nil
+	}
+	endpoint, err := p.lifecycleEndpoint("/wake_up")
+	if err != nil {
+		return err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	wakeCtx, cancel := context.WithTimeout(ctx, lifecycleHTTPTimeout(time.Duration(p.config.UnloadTimeout)*time.Second))
+	defer cancel()
+	req, err := http.NewRequestWithContext(wakeCtx, http.MethodPost, endpoint, nil)
+	if err != nil {
+		return err
+	}
+	client := &http.Client{Timeout: lifecycleHTTPTimeout(time.Duration(p.config.UnloadTimeout) * time.Second)}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("POST %s: %w", endpoint, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("POST %s returned HTTP %d", endpoint, resp.StatusCode)
+	}
+	return nil
+}
+
 func (p *ProcessCommand) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	fn := p.handler.Load()
 	if fn == nil {
 		swaputil.SendResponse(w, r, http.StatusServiceUnavailable, fmt.Sprintf("[%s] process is not ready", p.id))
 		return
+	}
+	if p.sleeping.Load() {
+		if err := p.Wake(r.Context()); err != nil {
+			p.proxyLogger.Warnf("<%s> vLLM Sleep Mode wake failed: %v", p.id, err)
+			swaputil.SendResponse(w, r, http.StatusServiceUnavailable, fmt.Sprintf("[%s] vLLM backend is sleeping and could not be woken: %v", p.id, err))
+			return
+		}
 	}
 	if p.config.Compat.IgnoreWebsockets && swaputil.IsWebSocketUpgrade(r) {
 		(*fn)(w, r)

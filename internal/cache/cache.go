@@ -51,7 +51,11 @@ func (c *Cache) Add(id int, data []byte) error {
 		}
 	}
 
-	c.items[id] = data
+	// Keep the cache ownership boundary explicit. Callers often reuse request
+	// buffers after capture; retaining that slice would let a later mutation
+	// silently rewrite the cached audit/capture payload. Store an owned copy so
+	// the cache contents remain stable until eviction or Clear.
+	c.items[id] = cloneBytes(data)
 	c.order = append(c.order, id)
 	c.size += dataSize
 	return nil
@@ -74,7 +78,18 @@ func (c *Cache) Get(id int) ([]byte, error) {
 	if !exists {
 		return nil, ErrNotFound
 	}
-	return data, nil
+	// Do not expose the cache's backing slice. Returning it directly would let
+	// callers mutate a captured request/response without going through Add.
+	return cloneBytes(data), nil
+}
+
+func cloneBytes(data []byte) []byte {
+	if data == nil {
+		return nil
+	}
+	copyData := make([]byte, len(data))
+	copy(copyData, data)
+	return copyData
 }
 
 func (c *Cache) Has(id int) bool {

@@ -64,6 +64,34 @@ type fakeEffects struct {
 	stops  []stopRec
 }
 
+// lifecycleEffects adds the optional process-replacement seams used by the
+// configuration lifecycle. Keeping these methods on a separate test double
+// leaves the existing scheduler tests focused on the legacy swap contract.
+type lifecycleEffects struct {
+	*fakeEffects
+	restarts    []string
+	removals    []string
+	nextRestart uint64
+}
+
+func newLifecycleEffects() *lifecycleEffects {
+	return &lifecycleEffects{fakeEffects: newFakeEffects()}
+}
+
+func (f *lifecycleEffects) RestartProcess(modelID string) {
+	f.restarts = append(f.restarts, modelID)
+}
+
+func (f *lifecycleEffects) RestartProcessWithGeneration(modelID string) uint64 {
+	f.restarts = append(f.restarts, modelID)
+	f.nextRestart++
+	return f.nextRestart
+}
+
+func (f *lifecycleEffects) RemoveProcess(modelID string) {
+	f.removals = append(f.removals, modelID)
+}
+
 func newFakeEffects() *fakeEffects {
 	return &fakeEffects{
 		states:      map[string]process.ProcessState{},
@@ -568,6 +596,24 @@ func TestFIFO_OnShutdown_FailsAllWaiters(t *testing.T) {
 	}
 }
 
+func TestFIFO_SwapInFlight(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateStopped
+	s := newFIFO(&stubPlanner{}, eff)
+
+	if s.SwapInFlight("a") {
+		t.Fatal("no swap registered yet")
+	}
+	s.OnRequest(req("a"))
+	if !s.SwapInFlight("a") {
+		t.Fatal("swap must be visible while the start goroutine is in flight")
+	}
+	s.OnSwapDone(SwapDone{ModelID: "a"})
+	if s.SwapInFlight("a") {
+		t.Fatal("swap must be forgotten after OnSwapDone")
+	}
+}
+
 func TestFIFO_OnUnload_ReleasesActiveWaiters(t *testing.T) {
 	eff := newFakeEffects()
 	eff.states["a"] = process.StateStopped
@@ -581,11 +627,101 @@ func TestFIFO_OnUnload_ReleasesActiveWaiters(t *testing.T) {
 	if got := eff.errored("a"); got != 2 {
 		t.Errorf("errored(a)=%d want 2 (active swap waiters released)", got)
 	}
+	// The swap goroutine may still be starting a: the stop is attempted
+	// immediately so a mid-start load is aborted instead of running to
+	// completion, and the pendingUnload barrier keeps a deferred stop behind
+	// OnSwapDone for the ordering where the immediate stop landed before the
+	// run loop consumed the start request.
 	if len(eff.stops) != 1 || len(eff.stops[0].ids) != 1 || eff.stops[0].ids[0] != "a" {
-		t.Errorf("StopProcesses=%+v want one call stopping [a]", eff.stops)
+		t.Errorf("StopProcesses=%+v want one immediate call stopping [a]", eff.stops)
 	}
 	if eff.stops[0].timeout != time.Second {
 		t.Errorf("StopProcesses timeout=%v want 1s", eff.stops[0].timeout)
+	}
+	s.OnSwapDone(SwapDone{ModelID: "a"})
+	if len(eff.stops) != 2 || len(eff.stops[1].ids) != 1 || eff.stops[1].ids[0] != "a" {
+		t.Errorf("StopProcesses=%+v want deferred barrier stop [a] after OnSwapDone", eff.stops)
+	}
+}
+
+// TestFIFO_UnloadRacingSwapDoesNotReviveModel verifies that an operator unload
+// of a model whose swap goroutine is still starting it both aborts the start
+// immediately and cannot be resurrected: the immediate stop aborts a mid-start
+// load, the pendingUnload barrier keeps a deferred stop behind OnSwapDone, and
+// a late swap completion cannot bring the process back after it.
+func TestFIFO_UnloadRacingSwapDoesNotReviveModel(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateStopped
+	s := newFIFO(&stubPlanner{}, eff)
+
+	waiter := reqCh("a")
+	s.OnRequest(waiter) // StartSwap(a); swap goroutine "in flight"
+	assertAdmitted(t, waiter)
+
+	s.OnUnload([]string{"a"}, time.Second)
+	if got := eff.errored("a"); got != 1 {
+		t.Fatalf("errored(a)=%d want 1", got)
+	}
+	if len(eff.stops) != 1 || eff.stops[0].ids[0] != "a" {
+		t.Fatalf("stops=%+v want immediate stop [a] aborting the in-flight start", eff.stops)
+	}
+
+	// A request arriving while the barrier is pending must not join the dying
+	// swap.
+	late := req("a")
+	s.OnRequest(late)
+	if got := eff.errored("a"); got != 2 {
+		t.Fatalf("late joiner errored=%d want 2", got)
+	}
+	if got := eff.served("a"); got != 0 {
+		t.Fatalf("late joiner served=%d want 0", got)
+	}
+
+	// The swap goroutine completes (EnsureReady brought the process up — the
+	// revival attempt). OnSwapDone must now stop it.
+	s.OnSwapDone(SwapDone{ModelID: "a"})
+	if len(eff.stops) != 2 || len(eff.stops[1].ids) != 1 || eff.stops[1].ids[0] != "a" {
+		t.Fatalf("stops=%+v want deferred barrier stop [a]", eff.stops)
+	}
+}
+
+// TestFIFO_RestartBlocksConflictingEvictions verifies that while a model's
+// restart is committed (draining/restarting), a request for a conflicting
+// model queues instead of starting: the replacement process will reoccupy the
+// restarting model's planner slot even though the stopped old process is
+// invisible to RunningModels.
+func TestFIFO_RestartBlocksConflictingEvictions(t *testing.T) {
+	eff := newLifecycleEffects()
+	eff.states["a"] = process.StateReady
+	eff.states["b"] = process.StateStopped
+	// b shares a card/set with a: bringing b up evicts a.
+	s := newFIFO(&stubPlanner{evict: map[string][]string{"b": {"a"}}}, eff)
+
+	s.MarkConfigModified("a")
+	if err := s.RequestRestart("a"); err != nil {
+		t.Fatalf("RequestRestart(a): %v", err)
+	}
+	// Simulate the restart window: old process stopped, replacement pending.
+	eff.states["a"] = process.StateStopped
+
+	b := reqCh("b")
+	s.OnRequest(b)
+	assertAdmitted(t, b)
+	if got := eff.startsFor("b"); got != 0 {
+		t.Fatalf("StartSwap(b)=%d want 0 while a restarts", got)
+	}
+	if len(s.queued) != 1 || s.queued[0].Model != "b" {
+		t.Fatalf("queued=%+v want [b]", s.queued)
+	}
+
+	// The restart completes; a runs again and the queued b request may now
+	// swap it out normally.
+	eff.states["a"] = process.StateReady
+	generation := eff.nextRestart
+	s.OnRestartDone(RestartDone{ModelID: "a", Generation: generation})
+	s.drainQueue()
+	if got := eff.startsFor("b"); got != 1 {
+		t.Fatalf("StartSwap(b)=%d want 1 after restart completed", got)
 	}
 }
 
@@ -944,5 +1080,326 @@ func TestFIFO_ConcurrencyLimit_CancelledQueuedWaiterReleasesReservation(t *testi
 
 	if got := len(s.queued); got != 1 {
 		t.Fatalf("queue len=%d want 1 after cancel and retry", got)
+	}
+}
+
+func TestFIFO_ConfigRestart_FencesNewRequestsUntilDone(t *testing.T) {
+	eff := newLifecycleEffects()
+	eff.states["a"] = process.StateReady
+	s := newFIFO(&stubPlanner{}, eff)
+
+	old := reqCh("a")
+	s.OnRequest(old)
+	assertAdmitted(t, old)
+	if got := eff.served("a"); got != 1 {
+		t.Fatalf("served(a)=%d want 1 before restart", got)
+	}
+
+	s.MarkConfigModified("a")
+	if err := s.RequestRestart("a"); err != nil {
+		t.Fatalf("RequestRestart(a) error=%v", err)
+	}
+	waiting := reqCh("a")
+	s.OnRequest(waiting)
+	assertAdmitted(t, waiting)
+	if got := len(eff.restarts); got != 0 {
+		t.Fatalf("restart started before old generation drained: %d", got)
+	}
+	status := s.ModelStatuses()["a"]
+	if status.ConfigStatus != ConfigStatusDraining || status.OldRequests != 1 || status.WaitingRequests != 1 {
+		t.Fatalf("status while draining=%+v", status)
+	}
+
+	eff.states["a"] = process.StateReady
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"})
+	if len(eff.restarts) != 1 || eff.restarts[0] != "a" {
+		t.Fatalf("restarts=%v want [a] after old generation drained", eff.restarts)
+	}
+	if got := s.ModelStatuses()["a"].ConfigStatus; got != ConfigStatusRestarting {
+		t.Fatalf("status=%q want %q", got, ConfigStatusRestarting)
+	}
+
+	s.OnRestartDone(RestartDone{ModelID: "a"})
+	if got := eff.served("a"); got != 2 {
+		t.Fatalf("served(a)=%d want 2 after replacement is ready", got)
+	}
+	if _, ok := s.ModelStatuses()["a"]; ok {
+		t.Fatal("successful restart should clear the lifecycle status")
+	}
+}
+
+func TestFIFO_ConfigRestart_IgnoresDuplicateCompletion(t *testing.T) {
+	eff := newLifecycleEffects()
+	eff.states["a"] = process.StateReady
+	s := newFIFO(&stubPlanner{}, eff)
+
+	s.MarkConfigModified("a")
+	if err := s.RequestRestart("a"); err != nil {
+		t.Fatalf("RequestRestart(a) error=%v", err)
+	}
+	generation := eff.nextRestart
+	if generation == 0 {
+		t.Fatal("generation-aware restart was not started")
+	}
+	// A config edit during startup creates the next pending confirmation.
+	s.lifecycle["a"].pendingAgain = true
+	s.OnRestartDone(RestartDone{ModelID: "a", Generation: generation})
+	if got := s.ModelStatuses()["a"].ConfigStatus; got != ConfigStatusModified {
+		t.Fatalf("status after first completion=%q want %q", got, ConfigStatusModified)
+	}
+
+	// A duplicate completion for the old generation must not consume the next
+	// pending lifecycle record.
+	s.OnRestartDone(RestartDone{ModelID: "a", Generation: generation})
+	if got := s.ModelStatuses()["a"].ConfigStatus; got != ConfigStatusModified {
+		t.Fatalf("status after duplicate completion=%q want %q", got, ConfigStatusModified)
+	}
+}
+
+func TestFIFO_ConfigRestart_WaitingRoomLimitAndCancel(t *testing.T) {
+	eff := newLifecycleEffects()
+	eff.states["a"] = process.StateReady
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, config.FifoConfig{}, map[string]config.ModelConfig{
+		"a": {ConcurrencyLimit: 1},
+	}, eff)
+
+	old := reqCh("a")
+	s.OnRequest(old)
+	assertAdmitted(t, old)
+	s.MarkConfigModified("a")
+	if err := s.RequestRestart("a"); err != nil {
+		t.Fatalf("RequestRestart(a) error=%v", err)
+	}
+
+	first := reqCh("a")
+	s.OnRequest(first)
+	assertAdmitted(t, first)
+	second := reqCh("a")
+	s.OnRequest(second)
+	assertAdmission429(t, second)
+	if got := s.ModelStatuses()["a"].WaitingRequests; got != 1 {
+		t.Fatalf("waiting requests=%d want 1", got)
+	}
+
+	s.OnCancel(first)
+	if got := s.ModelStatuses()["a"].WaitingRequests; got != 0 {
+		t.Fatalf("waiting requests after cancel=%d want 0", got)
+	}
+	retry := reqCh("a")
+	s.OnRequest(retry)
+	assertAdmitted(t, retry)
+	if got := s.ModelStatuses()["a"].WaitingRequests; got != 1 {
+		t.Fatalf("waiting requests after retry=%d want 1", got)
+	}
+
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"})
+	if len(eff.restarts) != 1 {
+		t.Fatalf("restarts=%v want one restart", eff.restarts)
+	}
+}
+
+func TestFIFO_ConfigRestart_RollbackReleasesWaiters(t *testing.T) {
+	eff := newLifecycleEffects()
+	eff.states["a"] = process.StateReady
+	s := newFIFO(&stubPlanner{}, eff)
+
+	s.MarkConfigModified("a")
+	if err := s.RequestRestart("a"); err != nil {
+		t.Fatalf("RequestRestart(a) error=%v", err)
+	}
+	waiting := reqCh("a")
+	s.OnRequest(waiting)
+	assertAdmitted(t, waiting)
+	s.OnRestartProgress(RestartProgress{ModelID: "a", Status: ConfigStatusRollingBack})
+	if got := s.ModelStatuses()["a"].ConfigStatus; got != ConfigStatusRollingBack {
+		t.Fatalf("status=%q want %q", got, ConfigStatusRollingBack)
+	}
+
+	s.OnRestartDone(RestartDone{ModelID: "a", Err: errors.New("desired process failed"), RolledBack: true})
+	if got := eff.served("a"); got != 1 {
+		t.Fatalf("served(a)=%d want 1 on rollback", got)
+	}
+	status := s.ModelStatuses()["a"]
+	if status.ConfigStatus != ConfigStatusApplyFailed || status.Error == "" {
+		t.Fatalf("rollback status=%+v want apply_failed with error", status)
+	}
+}
+
+func TestFIFO_ConfigRestart_Failure503(t *testing.T) {
+	eff := newLifecycleEffects()
+	eff.states["a"] = process.StateReady
+	s := newFIFO(&stubPlanner{}, eff)
+
+	s.MarkConfigModified("a")
+	if err := s.RequestRestart("a"); err != nil {
+		t.Fatalf("RequestRestart(a) error=%v", err)
+	}
+	waiting := reqCh("a")
+	s.OnRequest(waiting)
+	assertAdmitted(t, waiting)
+	s.OnRestartDone(RestartDone{ModelID: "a", Err: errors.New("desired and rollback failed")})
+
+	if got := eff.errored("a"); got != 1 {
+		t.Fatalf("errored(a)=%d want 1", got)
+	}
+	var statusErr swaputil.HTTPError
+	for _, grant := range eff.grants {
+		if grant.err != nil {
+			if !errors.As(grant.err, &statusErr) {
+				t.Fatalf("restart error=%T %v want HTTPError", grant.err, grant.err)
+			}
+			if statusErr.StatusCode() != http.StatusServiceUnavailable {
+				t.Fatalf("restart error status=%d want 503", statusErr.StatusCode())
+			}
+		}
+	}
+	if got := s.ModelStatuses()["a"].ConfigStatus; got != ConfigStatusApplyFailed {
+		t.Fatalf("status=%q want %q", got, ConfigStatusApplyFailed)
+	}
+}
+
+func TestFIFO_ConfigRemoval_DrainsAndDeletes(t *testing.T) {
+	eff := newLifecycleEffects()
+	eff.states["a"] = process.StateReady
+	s := newFIFO(&stubPlanner{}, eff)
+
+	active := reqCh("a")
+	s.OnRequest(active)
+	assertAdmitted(t, active)
+	s.MarkRemoving("a")
+	status := s.ModelStatuses()["a"]
+	if status.ConfigStatus != ConfigStatusRemoving || status.OldRequests != 1 {
+		t.Fatalf("removal status=%+v", status)
+	}
+	if len(eff.removals) != 0 {
+		t.Fatalf("removal started while old request was active: %v", eff.removals)
+	}
+
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"})
+	if len(eff.removals) != 1 || eff.removals[0] != "a" {
+		t.Fatalf("removals=%v want [a] after drain", eff.removals)
+	}
+	if got := s.ModelStatuses()["a"].ConfigStatus; got != ConfigStatusUnloading {
+		t.Fatalf("status=%q want %q", got, ConfigStatusUnloading)
+	}
+
+	if !s.OnRemoveDone(RemovalDone{ModelID: "a"}) {
+		t.Fatal("OnRemoveDone should report a completed removal")
+	}
+	if _, ok := s.ModelStatuses()["a"]; ok {
+		t.Fatal("completed removal should clear lifecycle state")
+	}
+}
+
+func TestFIFO_ConfigRemoval_ReaddCancelsPendingRemoval(t *testing.T) {
+	eff := newLifecycleEffects()
+	eff.states["a"] = process.StateReady
+	s := newFIFO(&stubPlanner{}, eff)
+
+	s.MarkRemoving("a")
+	if len(eff.removals) != 1 {
+		t.Fatalf("removals=%v want one pending removal", eff.removals)
+	}
+	s.MarkConfigModified("a")
+	if completed := s.OnRemoveDone(RemovalDone{ModelID: "a"}); completed {
+		t.Fatal("late removal completion must not delete a re-added model")
+	}
+	if got := s.ModelStatuses()["a"].ConfigStatus; got != ConfigStatusModified {
+		t.Fatalf("status=%q want %q", got, ConfigStatusModified)
+	}
+}
+
+func TestFIFO_UnloadDuringRestart(t *testing.T) {
+	eff := newLifecycleEffects()
+	eff.states["a"] = process.StateReady
+	s := newFIFO(&stubPlanner{}, eff)
+
+	s.MarkConfigModified("a")
+	if err := s.RequestRestart("a"); err != nil {
+		t.Fatalf("RequestRestart(a) error=%v", err)
+	}
+	generation := eff.nextRestart
+	waiting := reqCh("a")
+	s.OnRequest(waiting)
+	assertAdmitted(t, waiting)
+	s.OnUnload([]string{"a"}, time.Second)
+
+	if got := eff.errored("a"); got != 1 {
+		t.Fatalf("errored(a)=%d want 1 for restart waiter", got)
+	}
+	if len(eff.stops) != 1 || len(eff.stops[0].ids) != 1 || eff.stops[0].ids[0] != "a" {
+		t.Fatalf("stops=%+v want one unload stop", eff.stops)
+	}
+	if got := s.ModelStatuses()["a"].ConfigStatus; got != ConfigStatusModified {
+		t.Fatalf("status=%q want %q after canceling restart with unload", got, ConfigStatusModified)
+	}
+	s.OnRestartDone(RestartDone{ModelID: "a", Generation: generation})
+	if got := s.ModelStatuses()["a"].ConfigStatus; got != ConfigStatusModified {
+		t.Fatalf("late restart completion changed status to %q", got)
+	}
+}
+
+func TestFIFO_UnloadDuringRestartWaitsForOldGeneration(t *testing.T) {
+	eff := newLifecycleEffects()
+	eff.states["a"] = process.StateReady
+	s := newFIFO(&stubPlanner{}, eff)
+
+	old := reqCh("a")
+	s.OnRequest(old)
+	assertAdmitted(t, old)
+	s.MarkConfigModified("a")
+	if err := s.RequestRestart("a"); err != nil {
+		t.Fatalf("RequestRestart(a) error=%v", err)
+	}
+	s.OnUnload([]string{"a"}, time.Second)
+
+	if len(eff.stops) != 0 {
+		t.Fatalf("unload stopped old generation early: %+v", eff.stops)
+	}
+	if got := s.ModelStatuses()["a"].ConfigStatus; got != ConfigStatusUnloading {
+		t.Fatalf("status=%q want %q while old request is active", got, ConfigStatusUnloading)
+	}
+
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"})
+	if len(eff.stops) != 1 || eff.stops[0].ids[0] != "a" {
+		t.Fatalf("stops=%+v want [a] after old generation drained", eff.stops)
+	}
+	if got := s.ModelStatuses()["a"].ConfigStatus; got != ConfigStatusModified {
+		t.Fatalf("status=%q want %q after unload keeps pending config", got, ConfigStatusModified)
+	}
+}
+
+func TestFIFO_UnloadDuringRestartCompletesOldActiveSwap(t *testing.T) {
+	eff := newLifecycleEffects()
+	eff.states["a"] = process.StateStopped
+	s := newFIFO(&stubPlanner{}, eff)
+
+	old := reqCh("a")
+	s.OnRequest(old)
+	assertAdmitted(t, old)
+	s.MarkConfigModified("a")
+	if err := s.RequestRestart("a"); err != nil {
+		t.Fatalf("RequestRestart(a): %v", err)
+	}
+	s.OnUnload([]string{"a"}, time.Second)
+
+	if len(eff.stops) != 0 {
+		t.Fatalf("unload stopped active old swap early: %+v", eff.stops)
+	}
+	eff.states["a"] = process.StateReady
+	s.OnSwapDone(SwapDone{ModelID: "a"})
+	if got := eff.served("a"); got != 1 {
+		t.Fatalf("old active swap served=%d want 1", got)
+	}
+	if len(eff.stops) != 0 {
+		t.Fatalf("unload stopped while old handler was active: %+v", eff.stops)
+	}
+
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"})
+	if len(eff.stops) != 1 || eff.stops[0].ids[0] != "a" {
+		t.Fatalf("stops=%+v want one stop after old handler drained", eff.stops)
+	}
+	if got := s.ModelStatuses()["a"].ConfigStatus; got != ConfigStatusModified {
+		t.Fatalf("status=%q want %q after unload", got, ConfigStatusModified)
 	}
 }

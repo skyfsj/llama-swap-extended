@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -13,9 +12,11 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	pathpkg "path"
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
 )
 
 // sleepLevel represents the vLLM sleep level.
@@ -23,7 +24,22 @@ type sleepLevel int
 
 const (
 	sleepLevel1 sleepLevel = 1
+	sleepLevel2 sleepLevel = 2
 )
+
+// vllmControlClient bounds lifecycle calls made by the wrapper. A hung
+// management endpoint must not block SIGTERM shutdown or leave a cmdStop
+// process waiting forever; inference proxy requests use their own transport
+// and are intentionally not constrained by this timeout.
+var vllmControlClient = &http.Client{Timeout: 10 * time.Second, CheckRedirect: rejectVLLMRedirect}
+
+// Control and readiness requests must stay on the configured vLLM endpoint.
+// Following a redirect here could turn a health check or lifecycle operation
+// into an SSRF primitive, especially when the wrapper is exposed on a host
+// network. A redirect is an explicit backend failure instead.
+func rejectVLLMRedirect(_ *http.Request, _ []*http.Request) error {
+	return http.ErrUseLastResponse
+}
 
 // vllmWrapper serves as a cmd/cmdStop wrapper for vLLM with sleep mode.
 func main() {
@@ -65,6 +81,9 @@ func serveCmd(args []string) {
 	fs.StringVar(&journalUnit, "journal-unit", "", "User systemd unit whose logs should be forwarded to stdout")
 	fs.Parse(args)
 	startArgs := fs.Args()
+	if err := validateSleepLevel(sleepLevel); err != nil {
+		log.Fatal(err)
+	}
 
 	if vllmURL == "" {
 		log.Fatalf("--vllm-url is required")
@@ -75,9 +94,16 @@ func serveCmd(args []string) {
 	if len(startArgs) == 0 {
 		log.Fatalf("a daemon command after -- is required")
 	}
+	if err := validateVLLMBaseURL(vllmURL); err != nil {
+		log.Fatal(err)
+	}
+	if err := validateVLLMHealthPath(healthPath); err != nil {
+		log.Fatal(err)
+	}
 
-	// Ensure vLLM URL does not have trailing slash.
-	vllmURL = strings.TrimRight(vllmURL, "/")
+	// Ensure vLLM URL does not have trailing slash or accidental outer
+	// whitespace before it is handed to the reverse proxy.
+	vllmURL = strings.TrimRight(strings.TrimSpace(vllmURL), "/")
 
 	journalCtx, stopJournal := context.WithCancel(context.Background())
 	defer stopJournal()
@@ -154,6 +180,14 @@ func serveCmd(args []string) {
 	srv := &http.Server{
 		Addr: listenAddr,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if isUnsafeVLLMPath(r.URL.Path) {
+				// The wrapper listener may be reachable by an ordinary inference
+				// client. Never expose vLLM's process/weight/profile control plane
+				// through that listener; the wrapper's own sleep command talks to
+				// the configured backend URL directly.
+				http.Error(w, "vLLM management endpoint is not available through the inference proxy", http.StatusForbidden)
+				return
+			}
 			proxy.ServeHTTP(w, r)
 		}),
 	}
@@ -202,27 +236,27 @@ func sleepCmd(args []string) {
 	fs.IntVar(&sleepLevel, "sleep-level", 1, "Sleep level to use (default 1)")
 	fs.IntVar(&stopPID, "stop-pid", 0, "PID of the serve proxy to terminate after vLLM successfully enters sleep mode")
 	fs.Parse(args)
+	if err := validateSleepLevel(sleepLevel); err != nil {
+		log.Fatal(err)
+	}
 
 	if vllmURL == "" {
 		log.Fatalf("--vllm-url is required")
 	}
-	vllmURL = strings.TrimRight(vllmURL, "/")
-
-	// Prepare sleep request body.
-	body := map[string]int{"level": sleepLevel}
-	jsonBody, err := json.Marshal(body)
-	if err != nil {
-		log.Fatalf("Failed to marshal sleep request: %v", err)
+	if err := validateVLLMBaseURL(vllmURL); err != nil {
+		log.Fatal(err)
 	}
+	vllmURL = strings.TrimRight(strings.TrimSpace(vllmURL), "/")
 
-	// Send POST to /sleep endpoint.
-	resp, err := http.Post(vllmURL+"/sleep", "application/json", strings.NewReader(string(jsonBody)))
+	// Current vLLM exposes sleep level as a query parameter. Keep the request
+	// body empty so this also works with strict FastAPI validation.
+	resp, err := postSleep(vllmURL, sleepLevel)
 	if err != nil {
 		log.Fatalf("Failed to send sleep request: %v", err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	if !isSuccessfulControlStatus(resp.StatusCode) {
 		log.Fatalf("vLLM sleep request failed with status %d: %v", resp.StatusCode, resp.Status)
 	}
 
@@ -238,36 +272,157 @@ func sleepCmd(args []string) {
 
 // sleepVLLM sends a POST to /sleep to put the vLLM daemon to sleep.
 func sleepVLLM(vllmURL string, sleepLevel int) error {
-	body := map[string]int{"level": sleepLevel}
-	jsonBody, err := json.Marshal(body)
-	if err != nil {
-		return fmt.Errorf("failed to marshal sleep request: %w", err)
+	if err := validateVLLMBaseURL(vllmURL); err != nil {
+		return err
 	}
-
-	resp, err := http.Post(vllmURL+"/sleep", "application/json", strings.NewReader(string(jsonBody)))
+	resp, err := postSleep(vllmURL, sleepLevel)
 	if err != nil {
 		return fmt.Errorf("failed to send sleep request: %w", err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	if !isSuccessfulControlStatus(resp.StatusCode) {
 		return fmt.Errorf("vLLM sleep request failed with status %d: %s", resp.StatusCode, resp.Status)
 	}
 
 	return nil
 }
 
+// isSuccessfulControlStatus accepts the full successful HTTP class. vLLM
+// releases and reverse proxies have used both 200 and 204 for lifecycle
+// commands; treating a successful 2xx response uniformly keeps sleep/wake
+// idempotent without accepting redirects or other non-success responses.
+func isSuccessfulControlStatus(status int) bool {
+	return status >= http.StatusOK && status < http.StatusMultipleChoices
+}
+
+func postSleep(vllmURL string, level int) (*http.Response, error) {
+	if err := validateVLLMBaseURL(vllmURL); err != nil {
+		return nil, err
+	}
+	if err := validateSleepLevel(level); err != nil {
+		return nil, err
+	}
+	endpoint := strings.TrimRight(vllmURL, "/") + "/sleep?level=" + url.QueryEscape(fmt.Sprintf("%d", level))
+	request, err := http.NewRequest(http.MethodPost, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	return vllmControlClient.Do(request)
+}
+
+func validateSleepLevel(level int) error {
+	if level < int(sleepLevel1) || level > int(sleepLevel2) {
+		return fmt.Errorf("sleep level must be 1 or 2")
+	}
+	return nil
+}
+
+func isUnsafeVLLMPath(path string) bool {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return false
+	}
+	// Request paths can contain escaped path segments, repeated separators, or
+	// dot segments. Normalize all of them before comparing the denylist so a
+	// public inference listener cannot reach a management endpoint through a
+	// spelling variant. Matching is case-insensitive as a defensive measure for
+	// upstream routers that normalize endpoint names differently.
+	// Path may have passed through more than one proxy before reaching this
+	// listener. Decode a small bounded number of layers so a double-escaped
+	// management segment cannot bypass the denylist, while avoiding an
+	// attacker-controlled unbounded loop. Treat malformed escapes as unsafe;
+	// an inference request can be retried with a valid URL, whereas forwarding
+	// an ambiguous path to a management-capable upstream is not safe.
+	for i := 0; i < 3; i++ {
+		decoded, err := url.PathUnescape(path)
+		if err != nil {
+			return true
+		}
+		if decoded == path {
+			break
+		}
+		path = decoded
+	}
+	// Backslashes are not path separators on the Linux wrapper itself, but
+	// treating them as separators here closes the same normalization gap when
+	// a request traverses a Windows-aware proxy before arriving upstream.
+	path = strings.ReplaceAll(path, `\`, "/")
+	path = pathpkg.Clean("/" + strings.TrimPrefix(path, "/"))
+	normalized := strings.ToLower(path)
+	for _, blocked := range []string{
+		"/sleep",
+		"/wake_up",
+		"/is_sleeping",
+		"/pause",
+		"/resume",
+		"/is_paused",
+		"/abort_requests",
+		"/collective_rpc",
+		"/load_lora_adapter",
+		"/unload_lora_adapter",
+		"/remove_lora_adapter",
+		"/update_lora_adapter",
+		"/start_profile",
+		"/stop_profile",
+		"/reset_prefix_cache",
+		"/reset_mm_cache",
+		"/reset_encoder_cache",
+		"/reload_weights",
+		"/init_weight_transfer_engine",
+		"/start_weight_update",
+		"/update_weights",
+		"/finish_weight_update",
+		"/update_weight_version",
+		"/weight_info",
+		"/get_world_size",
+		"/scale_elastic_ep",
+		"/is_scaling_elastic_ep",
+		"/server_info",
+		"/tokenizer_info",
+		"/shutdown",
+	} {
+		blocked = strings.ToLower(blocked)
+		for _, candidate := range []string{normalized, stripVLLMVersionPrefix(normalized)} {
+			if candidate == blocked || strings.HasPrefix(candidate, blocked+"/") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// stripVLLMVersionPrefix returns the unversioned spelling used by vLLM's
+// development endpoints. Some releases expose a management endpoint at both
+// /foo and /v1/foo (notably the LoRA helpers), so the public wrapper must
+// apply the same denylist to either form.
+func stripVLLMVersionPrefix(path string) string {
+	if strings.HasPrefix(path, "/v1/") {
+		return path[len("/v1"):]
+	}
+	return path
+}
+
 // wakeUpVLLM sends a POST to /wake_up to wake the vLLM daemon.
 func wakeUpVLLM(vllmURL string) error {
+	if err := validateVLLMBaseURL(vllmURL); err != nil {
+		return err
+	}
 	// The wake_up endpoint may not require a body; we'll send a POST with empty body.
-	resp, err := http.Post(vllmURL+"/wake_up", "application/json", strings.NewReader(""))
+	request, err := http.NewRequest(http.MethodPost, strings.TrimRight(vllmURL, "/")+"/wake_up", strings.NewReader(""))
+	if err != nil {
+		return fmt.Errorf("failed to create /wake_up request: %w", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	resp, err := vllmControlClient.Do(request)
 	if err != nil {
 		return fmt.Errorf("failed to POST /wake_up: %w", err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		// Some versions might return 204 No Content.
+	if !isSuccessfulControlStatus(resp.StatusCode) {
+		// vLLM and compatible reverse proxies may return any successful 2xx
+		// status for an idempotent lifecycle operation.
 		return fmt.Errorf("/wake_up returned unexpected status %d: %s", resp.StatusCode, resp.Status)
 	}
 	return nil
@@ -275,23 +430,43 @@ func wakeUpVLLM(vllmURL string) error {
 
 // waitForHealthyWithPath polls the vLLM daemon's health endpoint at the given path.
 func waitForHealthyWithPath(vllmURL string, healthPath string, timeout time.Duration) error {
+	if err := validateVLLMBaseURL(vllmURL); err != nil {
+		return err
+	}
+	if err := validateVLLMHealthPath(healthPath); err != nil {
+		return err
+	}
+	if timeout <= 0 {
+		// A non-positive timeout must never be interpreted as "already
+		// healthy". Callers use this helper as the readiness gate before
+		// exposing the proxy, so an empty polling window is an explicit
+		// deadline failure.
+		return context.DeadlineExceeded
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	deadline := time.Now().Add(timeout)
+	healthURL := joinVLLMPath(vllmURL, healthPath)
 	for time.Now().Before(deadline) {
 		// Create a request with context.
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, vllmURL+healthPath, nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
 		if err != nil {
 			return err
 		}
-		resp, err := http.DefaultClient.Do(req)
+		// Readiness is part of the control plane just like sleep/wake. Use the
+		// redirect-disabled client so a 3xx response cannot move polling to an
+		// unrelated host after the configured endpoint has been checked.
+		resp, err := vllmControlClient.Do(req)
 		if err != nil {
 			// If context canceled, break.
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			// Wait a bit before retrying.
-			time.Sleep(1 * time.Second)
+			// Wait a bit before retrying, but never sleep past the caller's
+			// deadline. This keeps short health timeouts genuinely bounded.
+			if !waitForHealthRetry(ctx, time.Second) {
+				return ctx.Err()
+			}
 			continue
 		}
 		if resp.StatusCode == http.StatusOK {
@@ -299,21 +474,118 @@ func waitForHealthyWithPath(vllmURL string, healthPath string, timeout time.Dura
 			return nil
 		}
 		resp.Body.Close()
-		// Wait a bit before retrying.
-		time.Sleep(1 * time.Second)
+		if !waitForHealthRetry(ctx, time.Second) {
+			return ctx.Err()
+		}
 	}
 	return ctx.Err()
 }
 
+// joinVLLMPath accepts the path forms used by config files and avoids making
+// readiness depend on whether an operator included a trailing slash in the
+// base URL or a leading slash in the health path.
+func joinVLLMPath(vllmURL, healthPath string) string {
+	base := strings.TrimRight(strings.TrimSpace(vllmURL), "/")
+	path := strings.TrimSpace(healthPath)
+	if path == "" {
+		path = "/"
+	} else if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	return base + path
+}
+
+func waitForHealthRetry(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
 // checkHealthy sends a GET request to the health path and returns nil if the response status is 200 OK.
 func checkHealthy(vllmURL string, healthPath string) error {
-	resp, err := http.Get(vllmURL + healthPath)
+	if err := validateVLLMBaseURL(vllmURL); err != nil {
+		return err
+	}
+	if err := validateVLLMHealthPath(healthPath); err != nil {
+		return err
+	}
+	resp, err := vllmControlClient.Get(joinVLLMPath(vllmURL, healthPath))
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// validateVLLMBaseURL keeps the wrapper's control and inference targets
+// explicit. Credentials, query strings and fragments are not meaningful for a
+// backend base URL and can accidentally leak into reverse-proxy requests or
+// control endpoints. Callers may still use a path-bearing base URL for a
+// reverse proxy mounted below a prefix.
+func validateVLLMBaseURL(raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || strings.ContainsAny(raw, "\x00\r\n") {
+		return fmt.Errorf("vLLM URL must be a valid HTTP(S) URL")
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || u.Hostname() == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("vLLM URL must be an absolute HTTP(S) URL without credentials, query, or fragment")
+	}
+	if err := validateVLLMPathValue(u.EscapedPath(), "vLLM URL path"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateVLLMHealthPath(raw string) error {
+	if err := validateVLLMPathValue(raw, "vLLM health path"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateVLLMPathValue validates a path before it is concatenated with a
+// configured backend URL. URL parsing decodes only one layer and different
+// reverse proxies normalize dot segments at different points, so perform a
+// bounded decode and reject ambiguous path data before constructing requests.
+func validateVLLMPathValue(raw, label string) error {
+	if raw != strings.TrimSpace(raw) {
+		return fmt.Errorf("%s contains invisible or whitespace data", label)
+	}
+	value := raw
+	if value == "" {
+		return nil
+	}
+	for i := 0; i < 3; i++ {
+		decoded, err := url.PathUnescape(value)
+		if err != nil {
+			return fmt.Errorf("%s contains malformed escaping", label)
+		}
+		if decoded == value {
+			break
+		}
+		value = decoded
+	}
+	if strings.ContainsAny(value, "?#\\\x00\r\n") {
+		return fmt.Errorf("%s must be a path without query, fragment, backslash, or control data", label)
+	}
+	for _, r := range value {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || unicode.IsSpace(r) {
+			return fmt.Errorf("%s contains invisible or whitespace data", label)
+		}
+	}
+	for _, segment := range strings.Split(strings.TrimPrefix(value, "/"), "/") {
+		if segment == "." || segment == ".." {
+			return fmt.Errorf("%s must not contain dot path segments", label)
+		}
 	}
 	return nil
 }
@@ -348,18 +620,40 @@ func startJournalForwarder(ctx context.Context, unit string) error {
 
 // startDaemon executes the start command and waits for the vLLM daemon to become healthy.
 func startDaemon(startArgs []string, vllmURL string, healthPath string, waitTimeout time.Duration) error {
+	// A failed readiness probe must still give a short-lived helper enough time
+	// to finish its exec/argv handling before it is killed.  Under the race
+	// detector the whole repository is tested concurrently and process
+	// scheduling can be delayed well beyond the normal sub-second path; keep the
+	// grace bounded, but generous enough that diagnostics are not lost merely
+	// because the host is busy.
+	const processExitGrace = 10 * time.Second
 	cmd := exec.Command(startArgs[0], startArgs[1:]...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("failed to start daemon command: %w", err)
 	}
+	// Always reap the child. Besides avoiding a zombie when a daemon exits
+	// during startup, observing its exit before killing it prevents a very
+	// short-lived command from being terminated before it has run its argv
+	// handling (which made diagnostics and tests race the exec boundary).
+	processDone := make(chan error, 1)
+	go func() { processDone <- cmd.Wait() }()
 	// Wait for healthy state.
 	log.Printf("Started daemon with PID %d, waiting for healthy state", cmd.Process.Pid)
 	err := waitForHealthyWithPath(vllmURL, healthPath, waitTimeout)
 	if err != nil {
-		// If we fail to become healthy, kill the started process.
-		_ = cmd.Process.Kill()
+		// If the command already exited, let its side effects and exit status be
+		// observed before returning. Otherwise kill it and wait for reaping. The
+		// bounded grace keeps a hung child from extending the health timeout while
+		// avoiding a race with very short-lived helpers that have not reached their
+		// argv handling yet.
+		select {
+		case <-processDone:
+		case <-time.After(processExitGrace):
+			_ = cmd.Process.Kill()
+			<-processDone
+		}
 		return fmt.Errorf("daemon did not become healthy: %w", err)
 	}
 	// Daemon is healthy, we don't wait for the command to exit (it should keep running).

@@ -8,12 +8,17 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 )
+
+func streamRequested(query string, body []byte) bool {
+	return strings.EqualFold(strings.TrimSpace(query), "true") || gjson.GetBytes(body, "stream").Bool()
+}
 
 func main() {
 	gin.SetMode(gin.TestMode)
@@ -37,9 +42,9 @@ func main() {
 	r.POST("/v1/chat/completions", func(c *gin.Context) {
 		bodyBytes, _ := io.ReadAll(c.Request.Body)
 
-		// Check if streaming is requested
-		// Query is checked instead of JSON body since that event stream conflicts with other tests
-		isStreaming := c.Query("stream") == "true"
+		// Preserve the query switch used by existing integration tests while also
+		// honoring the standard OpenAI JSON request field used by the Playground.
+		isStreaming := streamRequested(c.Query("stream"), bodyBytes)
 
 		if isStreaming {
 			// Set headers for streaming

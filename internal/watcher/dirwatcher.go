@@ -2,6 +2,9 @@ package configwatcher
 
 import (
 	"context"
+	"errors"
+	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -74,7 +77,8 @@ func (w *DirWatcher) Run(ctx context.Context) {
 		interval = DefaultInterval
 	}
 
-	prev := scanDir(w.Path)
+	prev, prevErr := scanDir(w.Path)
+	w.reportScanError(prevErr)
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -84,7 +88,14 @@ func (w *DirWatcher) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			cur := scanDir(w.Path)
+			cur, curErr := scanDir(w.Path)
+			// A missing directory is the normal shape of an atomic reload, so
+			// only an error that persists across polls is worth a line. Report
+			// on transition rather than every tick: this polls every couple of
+			// seconds and an unreadable directory would otherwise flood the log.
+			if (curErr == nil) != (prevErr == nil) {
+				w.reportScanError(curErr)
+			}
 			// Suppress transitions involving an empty or missing directory —
 			// these are treated as transient rename-style writes, mirroring
 			// the single-file Watcher. Only present-with-content →
@@ -96,19 +107,36 @@ func (w *DirWatcher) Run(ctx context.Context) {
 				w.OnChange()
 			}
 			prev = cur
+			prevErr = curErr
 		}
 	}
 }
 
-// scanDir returns a snapshot of the *.yml/*.yaml files in dir. If the
-// directory cannot be read (missing, permission denied) the snapshot reports
-// exists=false; the next successful scan will detect the recovery and fire
+// reportScanError surfaces a directory that cannot be read at all. Without it a
+// permission or I/O failure is indistinguishable from "the directory is
+// momentarily missing during a rename", and an operator who edits a config
+// overlay sees nothing happen and nothing explaining why.
+func (w *DirWatcher) reportScanError(err error) {
+	if err == nil {
+		log.Printf("configwatcher: reading %s again", w.Path)
+		return
+	}
+	if errors.Is(err, fs.ErrNotExist) {
+		return
+	}
+	log.Printf("configwatcher: read dir %s: %v", w.Path, err)
+}
+
+// scanDir returns a snapshot of the *.yml/*.yaml files in dir. A directory that
+// cannot be read (missing, permission denied) reports exists=false and returns
+// the error, so the caller can tell a transient rename-style write apart from a
+// persistent failure; the next successful scan detects the recovery and fires
 // OnChange.
-func scanDir(dir string) dirSnapshot {
+func scanDir(dir string) (dirSnapshot, error) {
 	snap := newDirSnapshot()
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return snap // exists=false
+		return snap, err
 	}
 	snap.exists = true
 	for _, e := range entries {
@@ -133,5 +161,5 @@ func scanDir(dir string) dirSnapshot {
 		}
 	}
 	sort.Strings(snap.names)
-	return snap
+	return snap, nil
 }

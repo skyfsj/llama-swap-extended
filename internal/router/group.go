@@ -1,11 +1,13 @@
 package router
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/process"
+	"github.com/mostlygeek/llama-swap/internal/router/scheduler"
 )
 
 type Group struct {
@@ -13,6 +15,52 @@ type Group struct {
 }
 
 func NewGroup(conf config.Config, proxylog, upstreamlog *logmon.Monitor) (*Group, error) {
+	modelToGroup, err := groupModelToGroup(conf)
+	if err != nil {
+		return nil, err
+	}
+	swapper := newGroupSwapper(conf, modelToGroup)
+
+	processes := make(map[string]process.Process, len(modelToGroup))
+	base, err := newBaseRouter("group", conf, processes, proxylog, swapper)
+	if err != nil {
+		return nil, fmt.Errorf("creating base router: %w", err)
+	}
+	base.setProcessFactory(func(ctx context.Context, modelID string, modelCfg config.ModelConfig) (process.Process, error) {
+		return process.New(ctx, modelID, modelCfg, logmon.NewWriter(logmon.NewLinePrefixWriter("["+modelID+"] ", upstreamlog)), proxylog)
+	})
+
+	for mid := range modelToGroup {
+		modelCfg, _, ok := conf.FindConfig(mid)
+		if !ok {
+			base.shutdownFn()
+			base.procCancel()
+			return nil, fmt.Errorf("no model config for %q", mid)
+		}
+		procLog := logmon.NewWriter(logmon.NewLinePrefixWriter("["+mid+"] ", upstreamlog))
+		p, err := process.New(base.procCtx, mid, modelCfg, procLog, proxylog)
+		if err != nil {
+			base.shutdownFn()
+			base.procCancel()
+			return nil, fmt.Errorf("creating process for %q: %w", mid, err)
+		}
+		processes[mid] = p
+	}
+	base.processMu.Lock()
+	for mid := range processes {
+		if modelCfg, ok := conf.Models[mid]; ok {
+			base.processConfigs[mid] = modelCfg
+			base.processRuntime[mid] = runtimeSnapshot(conf, modelCfg)
+		}
+	}
+	base.processMu.Unlock()
+
+	g := &Group{baseRouter: base}
+	go base.run()
+	return g, nil
+}
+
+func groupModelToGroup(conf config.Config) (map[string]string, error) {
 	modelToGroup := make(map[string]string)
 	for gid, gcfg := range conf.Routing.Router.Settings.Groups {
 		for _, mid := range gcfg.Members {
@@ -22,38 +70,22 @@ func NewGroup(conf config.Config, proxylog, upstreamlog *logmon.Monitor) (*Group
 			modelToGroup[mid] = gid
 		}
 	}
+	return modelToGroup, nil
+}
 
-	swapper := &groupSwapper{
-		config:       conf,
-		modelToGroup: modelToGroup,
-	}
+func newGroupSwapper(conf config.Config, modelToGroup map[string]string) scheduler.Swapper {
+	return &groupSwapper{config: conf, modelToGroup: modelToGroup}
+}
 
-	processes := make(map[string]process.Process, len(modelToGroup))
-	base, err := newBaseRouter("group", conf, processes, proxylog, swapper)
+// Reconfigure preserves the Group object and its run loop while replacing the
+// planner/topology. A router kind switch is supported by selecting the same
+// base seam with the candidate planner and process set.
+func (g *Group) Reconfigure(conf config.Config) error {
+	planner, modelIDs, err := plannerForConfig(conf, g.logger)
 	if err != nil {
-		return nil, fmt.Errorf("creating base router: %w", err)
+		return err
 	}
-
-	for mid := range modelToGroup {
-		modelCfg, _, ok := conf.FindConfig(mid)
-		if !ok {
-			base.shutdownFn()
-			base.procCancel()
-			return nil, fmt.Errorf("no model config for %q", mid)
-		}
-		procLog := logmon.NewWriter(upstreamlog)
-		p, err := process.New(base.procCtx, mid, modelCfg, procLog, proxylog)
-		if err != nil {
-			base.shutdownFn()
-			base.procCancel()
-			return nil, fmt.Errorf("creating process for %q: %w", mid, err)
-		}
-		processes[mid] = p
-	}
-
-	g := &Group{baseRouter: base}
-	go base.run()
-	return g, nil
+	return g.baseRouter.Reconfigure(conf, planner, modelIDs)
 }
 
 // groupSwapper decides evictions from static group configuration.

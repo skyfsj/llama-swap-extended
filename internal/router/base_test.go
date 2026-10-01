@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -445,6 +446,48 @@ func TestBaseRouter_IgnoreWebsocketsDoesNotBlockSwap(t *testing.T) {
 	waitSignal(t, websocketDone, "websocket request finish")
 }
 
+func TestBaseRouter_UnloadDoesNotWaitForIgnoredWebsocket(t *testing.T) {
+	a := newFakeProcess("a")
+	a.markReady()
+	a.serveBlock = make(chan struct{})
+	conf := config.Config{
+		HealthCheckTimeout: 5,
+		Models: map[string]config.ModelConfig{
+			"a": {Compat: config.CompatConfig{IgnoreWebsockets: true}},
+		},
+	}
+	b := newTestBaseWithConfig(t, conf, map[string]process.Process{"a": a}, &stubPlanner{})
+
+	websocketDone := make(chan struct{})
+	go func() {
+		defer close(websocketDone)
+		r := httptest.NewRequest(http.MethodGet, "/props?model=a", nil)
+		r.Header.Set("Connection", "Upgrade")
+		r.Header.Set("Upgrade", "websocket")
+		b.ServeHTTP(httptest.NewRecorder(), r)
+	}()
+	waitSignal(t, a.serveStarted, "ignored websocket start")
+
+	unloadDone := make(chan struct{})
+	go func() {
+		b.Unload(time.Second, "a")
+		close(unloadDone)
+	}()
+	select {
+	case <-unloadDone:
+	case <-time.After(time.Second):
+		close(a.serveBlock)
+		t.Fatal("ordinary unload waited for ignored websocket")
+	}
+	if !a.stoppedWhileServing.Load() {
+		close(a.serveBlock)
+		t.Fatal("ordinary unload did not preserve compatibility websocket behavior")
+	}
+
+	close(a.serveBlock)
+	waitSignal(t, websocketDone, "ignored websocket finish")
+}
+
 // TestBaseRouter_RequestDuringStop is the router-level regression test for
 // issue #946. A process being stopped outside the router's knowledge (a TTL
 // unload, a crash, an operator kill) must not wedge the swap machinery: the
@@ -666,6 +709,459 @@ func TestBaseRouter_DispatchErrorFramedIntoLoadingStream(t *testing.T) {
 	}
 }
 
+func TestBaseRouter_ConfigRestartDrainsOldRequestAndServesWaitingRequest(t *testing.T) {
+	oldConfig := config.Config{
+		HealthCheckTimeout: 1,
+		Models: map[string]config.ModelConfig{
+			"a": {Cmd: "old"},
+		},
+	}
+	oldProcess := newFakeProcess("old-generation")
+	oldProcess.markReady()
+	oldProcess.serveBlock = make(chan struct{})
+	replacement := newFakeProcess("new-generation")
+	replacement.autoReady = true
+
+	b := newTestBaseWithConfig(t, oldConfig, map[string]process.Process{"a": oldProcess}, &stubPlanner{})
+	var factoryMu sync.Mutex
+	var factoryConfigs []config.ModelConfig
+	b.setProcessFactory(func(_ context.Context, _ string, modelConfig config.ModelConfig) (process.Process, error) {
+		factoryMu.Lock()
+		factoryConfigs = append(factoryConfigs, modelConfig)
+		factoryMu.Unlock()
+		return replacement, nil
+	})
+
+	oldResponse := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		response := httptest.NewRecorder()
+		b.ServeHTTP(response, newRequest("a"))
+		oldResponse <- response
+	}()
+	waitSignal(t, oldProcess.serveStarted, "old generation request")
+
+	desired := oldConfig
+	desired.Models = map[string]config.ModelConfig{"a": {Cmd: "new"}}
+	if err := b.Reconfigure(desired, &stubPlanner{}, map[string]struct{}{"a": {}}); err != nil {
+		t.Fatalf("Reconfigure: %v", err)
+	}
+	if status := b.ModelLifecycleStatuses()["a"]; status.ConfigStatus != scheduler.ConfigStatusModified {
+		t.Fatalf("config status=%q want %q", status.ConfigStatus, scheduler.ConfigStatusModified)
+	}
+	if err := b.RestartModel("a"); err != nil {
+		t.Fatalf("RestartModel: %v", err)
+	}
+
+	waitingResponse := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		response := httptest.NewRecorder()
+		b.ServeHTTP(response, newRequest("a"))
+		waitingResponse <- response
+	}()
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	for {
+		status := b.ModelLifecycleStatuses()["a"]
+		if status.ConfigStatus == scheduler.ConfigStatusDraining && status.WaitingRequests == 1 {
+			break
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("restart waiting status=%+v", status)
+		case <-time.After(time.Millisecond):
+		}
+	}
+	if replacement.serveCalls.Load() != 0 {
+		t.Fatal("replacement served a request before the old generation drained")
+	}
+
+	close(oldProcess.serveBlock)
+	var oldResult *httptest.ResponseRecorder
+	select {
+	case oldResult = <-oldResponse:
+	case <-time.After(time.Second):
+		t.Fatal("old generation request did not finish")
+	}
+	if got := oldResult.Body.String(); got != "ok:old-generation" {
+		t.Fatalf("old response=%q want old generation", got)
+	}
+	waitSignal(t, replacement.ensureAsked, "replacement readiness")
+
+	var newResult *httptest.ResponseRecorder
+	select {
+	case newResult = <-waitingResponse:
+	case <-time.After(time.Second):
+		t.Fatal("waiting request did not continue after replacement became ready")
+	}
+	if got := newResult.Body.String(); got != "ok:new-generation" {
+		t.Fatalf("waiting response=%q want new generation", got)
+	}
+	if oldProcess.stoppedWhileServing.Load() {
+		t.Fatal("old process was stopped while its request was still serving")
+	}
+	factoryMu.Lock()
+	defer factoryMu.Unlock()
+	if len(factoryConfigs) != 1 || factoryConfigs[0].Cmd != "new" {
+		t.Fatalf("factory configs=%v want one desired process config", factoryConfigs)
+	}
+}
+
+func TestBaseRouter_ForceRestartFencesOldGeneration(t *testing.T) {
+	oldConfig := config.Config{
+		HealthCheckTimeout: 1,
+		Models: map[string]config.ModelConfig{
+			"a": {Cmd: "old"},
+		},
+	}
+	oldProcess := newFakeProcess("old-generation")
+	oldProcess.markReady()
+	oldProcess.serveBlock = make(chan struct{})
+	replacement := newFakeProcess("new-generation")
+	replacement.autoReady = true
+
+	b := newTestBaseWithConfig(t, oldConfig, map[string]process.Process{"a": oldProcess}, &stubPlanner{})
+	b.setProcessFactory(func(_ context.Context, _ string, modelConfig config.ModelConfig) (process.Process, error) {
+		if modelConfig.Cmd != "new" {
+			return nil, fmt.Errorf("unexpected restart command %q", modelConfig.Cmd)
+		}
+		return replacement, nil
+	})
+
+	oldResponse := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		response := httptest.NewRecorder()
+		b.ServeHTTP(response, newRequest("a"))
+		oldResponse <- response
+	}()
+	waitSignal(t, oldProcess.serveStarted, "old generation request")
+
+	desired := oldConfig
+	desired.Models = map[string]config.ModelConfig{"a": {Cmd: "new"}}
+	if err := b.Reconfigure(desired, &stubPlanner{}, map[string]struct{}{"a": {}}); err != nil {
+		t.Fatalf("Reconfigure: %v", err)
+	}
+	if err := b.RestartModel("a"); err != nil {
+		t.Fatalf("RestartModel: %v", err)
+	}
+
+	waitingResponse := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		response := httptest.NewRecorder()
+		b.ServeHTTP(response, newRequest("a"))
+		waitingResponse <- response
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		status := b.ModelLifecycleStatuses()["a"]
+		if status.ConfigStatus == scheduler.ConfigStatusDraining && status.WaitingRequests == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("restart waiting status=%+v", status)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	if err := b.ForceRestartModel("a"); err != nil {
+		t.Fatalf("ForceRestartModel: %v", err)
+	}
+	waitSignal(t, replacement.ensureAsked, "forced replacement readiness")
+
+	select {
+	case response := <-waitingResponse:
+		if got := response.Body.String(); got != "ok:new-generation" {
+			t.Fatalf("waiting response=%q want new generation", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waiting request did not reach the replacement generation")
+	}
+	if oldProcess.State() != process.StateStopped {
+		t.Fatalf("old process state=%q want stopped after force restart", oldProcess.State())
+	}
+
+	// The old handler is deliberately released after the replacement has served.
+	// Its generation-0 completion must retire only the fenced old counters.
+	close(oldProcess.serveBlock)
+	select {
+	case response := <-oldResponse:
+		if got := response.Body.String(); got != "ok:old-generation" {
+			t.Fatalf("old response=%q want old generation", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("old generation request did not finish after force restart")
+	}
+
+	deadline = time.Now().Add(time.Second)
+	for {
+		if _, ok := b.ModelLifecycleStatuses()["a"]; !ok {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("force restart lifecycle remained pending: %+v", b.ModelLifecycleStatuses()["a"])
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestBaseRouter_ConfigChangeKeepsPendingRestartAfterOnlineEdit(t *testing.T) {
+	oldConfig := config.Config{
+		HealthCheckTimeout: 1,
+		Models: map[string]config.ModelConfig{
+			"a": {Cmd: "old"},
+		},
+	}
+	a := newFakeProcess("a")
+	a.markReady()
+	b := newTestBaseWithConfig(t, oldConfig, map[string]process.Process{"a": a}, &stubPlanner{})
+
+	first := oldConfig
+	first.Models = map[string]config.ModelConfig{"a": {Cmd: "new"}}
+	if err := b.Reconfigure(first, &stubPlanner{}, map[string]struct{}{"a": {}}); err != nil {
+		t.Fatalf("first Reconfigure: %v", err)
+	}
+	second := first
+	second.Models = map[string]config.ModelConfig{"a": {Cmd: "new", Name: "display-only"}}
+	if err := b.Reconfigure(second, &stubPlanner{}, map[string]struct{}{"a": {}}); err != nil {
+		t.Fatalf("second Reconfigure: %v", err)
+	}
+	status := b.ModelLifecycleStatuses()["a"]
+	if status.ConfigStatus != scheduler.ConfigStatusModified {
+		t.Fatalf("config status=%q want pending modified after online edit", status.ConfigStatus)
+	}
+}
+
+func TestBaseRouter_ReaddDuringRemovalKeepsReplacement(t *testing.T) {
+	oldConfig := config.Config{
+		HealthCheckTimeout: 1,
+		UnloadTimeout:      1,
+		Models: map[string]config.ModelConfig{
+			"a": {Cmd: "old"},
+		},
+	}
+	oldProcess := newFakeProcess("old-generation")
+	oldProcess.markReady()
+	oldProcess.stopBlock = make(chan struct{})
+	b := newTestBaseWithConfig(t, oldConfig, map[string]process.Process{"a": oldProcess}, &stubPlanner{})
+	b.testRemovalProcessed = make(chan struct{}, 1)
+
+	replacement := newFakeProcess("re-added-generation")
+	replacement.autoReady = true
+	b.setProcessFactory(func(_ context.Context, _ string, modelConfig config.ModelConfig) (process.Process, error) {
+		if modelConfig.Cmd != "new" {
+			return nil, fmt.Errorf("unexpected re-add command %q", modelConfig.Cmd)
+		}
+		return replacement, nil
+	})
+
+	deleted := oldConfig
+	deleted.Models = nil
+	if err := b.Reconfigure(deleted, &stubPlanner{}, nil); err != nil {
+		t.Fatalf("delete Reconfigure: %v", err)
+	}
+	waitSignal(t, oldProcess.stopStarted, "removal stop start")
+
+	readded := oldConfig
+	readded.Models = map[string]config.ModelConfig{"a": {Cmd: "new"}}
+	if err := b.Reconfigure(readded, &stubPlanner{}, map[string]struct{}{"a": {}}); err != nil {
+		t.Fatalf("re-add Reconfigure: %v", err)
+	}
+
+	b.processMu.RLock()
+	got := b.processes["a"]
+	b.processMu.RUnlock()
+	if got != replacement {
+		t.Fatalf("process registry contains %v, want re-added replacement %v", got, replacement)
+	}
+
+	newResponse := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		response := httptest.NewRecorder()
+		b.ServeHTTP(response, newRequest("a"))
+		newResponse <- response
+	}()
+	waitProcessed(t, b.testProcessed, 1)
+	select {
+	case <-replacement.ensureAsked:
+		t.Fatal("replacement started before the old removal finished")
+	default:
+	}
+
+	// Let the old asynchronous removal finish. Its generation is stale now and
+	// must not delete the replacement that was installed by the re-add; only
+	// after that stop completes may the replacement begin serving.
+	close(oldProcess.stopBlock)
+	waitSignal(t, b.testRemovalProcessed, "stale removal completion")
+	waitSignal(t, replacement.ensureAsked, "replacement readiness")
+	select {
+	case response := <-newResponse:
+		if response.Code != http.StatusOK || response.Body.String() != "ok:re-added-generation" {
+			t.Fatalf("re-added response=%d %q", response.Code, response.Body.String())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("re-added request did not complete")
+	}
+	b.processMu.RLock()
+	got = b.processes["a"]
+	b.processMu.RUnlock()
+	if got != replacement {
+		t.Fatal("stale removal completion deleted the re-added process")
+	}
+}
+
+func TestBaseRouter_IgnoredWebsocketDrainsBeforeConfigRestart(t *testing.T) {
+	oldConfig := config.Config{
+		HealthCheckTimeout: 1,
+		Models: map[string]config.ModelConfig{
+			"a": {Cmd: "old", Compat: config.CompatConfig{IgnoreWebsockets: true}},
+		},
+	}
+	oldProcess := newFakeProcess("old-generation")
+	oldProcess.markReady()
+	oldProcess.serveBlock = make(chan struct{})
+	replacement := newFakeProcess("new-generation")
+	replacement.autoReady = true
+	b := newTestBaseWithConfig(t, oldConfig, map[string]process.Process{"a": oldProcess}, &stubPlanner{})
+	b.setProcessFactory(func(_ context.Context, _ string, modelConfig config.ModelConfig) (process.Process, error) {
+		if modelConfig.Cmd != "new" {
+			return nil, fmt.Errorf("unexpected restart command %q", modelConfig.Cmd)
+		}
+		return replacement, nil
+	})
+
+	websocketDone := make(chan struct{})
+	go func() {
+		defer close(websocketDone)
+		r := httptest.NewRequest(http.MethodGet, "/props?model=a", nil)
+		r.Header.Set("Connection", "Upgrade")
+		r.Header.Set("Upgrade", "websocket")
+		b.ServeHTTP(httptest.NewRecorder(), r)
+	}()
+	waitSignal(t, oldProcess.serveStarted, "ignored websocket start")
+
+	desired := oldConfig
+	desired.Models = map[string]config.ModelConfig{
+		"a": {Cmd: "new", Compat: config.CompatConfig{IgnoreWebsockets: true}},
+	}
+	if err := b.Reconfigure(desired, &stubPlanner{}, map[string]struct{}{"a": {}}); err != nil {
+		t.Fatalf("Reconfigure: %v", err)
+	}
+	if err := b.RestartModel("a"); err != nil {
+		t.Fatalf("RestartModel: %v", err)
+	}
+	if got := oldProcess.stopCalls.Load(); got != 0 {
+		t.Fatalf("old process stopped before websocket drained: %d calls", got)
+	}
+	select {
+	case <-replacement.ensureAsked:
+		t.Fatal("replacement started before the existing websocket drained")
+	default:
+	}
+
+	close(oldProcess.serveBlock)
+	waitSignal(t, websocketDone, "ignored websocket finish")
+	waitSignal(t, oldProcess.stopStarted, "restart stop start")
+	waitSignal(t, replacement.ensureAsked, "replacement readiness")
+	if oldProcess.stoppedWhileServing.Load() {
+		t.Fatal("old process stopped while ignored websocket was serving")
+	}
+}
+
+func TestBaseRouter_RuntimeRestartFailureRestoresExactOldGeneration(t *testing.T) {
+	oldConfig := config.Config{
+		HealthCheckTimeout: 1,
+		Models: map[string]config.ModelConfig{
+			"a": {Backend: config.BackendConfig{Type: "vllm", Runtime: "vllm", Arguments: []string{"/runtime/vllm/versions/old/.venv/bin/vllm", "serve", "model"}}},
+		},
+	}
+	oldProcess := newFakeProcess("old-generation")
+	oldProcess.markReady()
+	oldProcess.serveBlock = make(chan struct{})
+	candidate := newFakeProcess("candidate-generation")
+	candidate.ensureErr = fmt.Errorf("candidate generation failed")
+	rollback := newFakeProcess("rollback-generation")
+	rollback.autoReady = true
+
+	b := newTestBaseWithConfig(t, oldConfig, map[string]process.Process{"a": oldProcess}, &stubPlanner{})
+	var factoryMu sync.Mutex
+	var factoryConfigs []config.ModelConfig
+	b.setProcessFactory(func(_ context.Context, _ string, modelConfig config.ModelConfig) (process.Process, error) {
+		factoryMu.Lock()
+		factoryConfigs = append(factoryConfigs, modelConfig)
+		factoryMu.Unlock()
+		if strings.Contains(modelConfig.Backend.Arguments[0], "/versions/new/") {
+			return candidate, nil
+		}
+		if strings.Contains(modelConfig.Backend.Arguments[0], "/versions/old/") {
+			return rollback, nil
+		}
+		return nil, fmt.Errorf("unexpected runtime executable %q", modelConfig.Backend.Arguments)
+	})
+
+	oldResponse := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		response := httptest.NewRecorder()
+		b.ServeHTTP(response, newRequest("a"))
+		oldResponse <- response
+	}()
+	waitSignal(t, oldProcess.serveStarted, "old runtime generation request")
+
+	desired := oldConfig
+	desired.Models = map[string]config.ModelConfig{
+		"a": {Backend: config.BackendConfig{Type: "vllm", Runtime: "vllm", Arguments: []string{"/runtime/vllm/versions/new/.venv/bin/vllm", "serve", "model"}}},
+	}
+	if err := b.Reconfigure(desired, &stubPlanner{}, map[string]struct{}{"a": {}}); err != nil {
+		t.Fatalf("Reconfigure: %v", err)
+	}
+	if err := b.RestartModel("a"); err != nil {
+		t.Fatalf("RestartModel: %v", err)
+	}
+	waitingResponse := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		response := httptest.NewRecorder()
+		b.ServeHTTP(response, newRequest("a"))
+		waitingResponse <- response
+	}()
+	select {
+	case <-candidate.ensureAsked:
+		t.Fatal("candidate started before the in-flight old request drained")
+	default:
+	}
+	if oldProcess.stopCalls.Load() != 0 {
+		t.Fatal("old runtime generation stopped while its request was in flight")
+	}
+
+	close(oldProcess.serveBlock)
+	select {
+	case response := <-oldResponse:
+		if got := response.Body.String(); got != "ok:old-generation" {
+			t.Fatalf("old response=%q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("old runtime generation request did not finish")
+	}
+	waitSignal(t, candidate.ensureAsked, "candidate readiness attempt")
+	waitSignal(t, rollback.ensureAsked, "rollback runtime generation")
+	select {
+	case response := <-waitingResponse:
+		if response.Code != http.StatusOK || response.Body.String() != "ok:rollback-generation" {
+			t.Fatalf("waiting response=%d %q", response.Code, response.Body.String())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waiting request did not reach the restored runtime generation")
+	}
+	if oldProcess.stoppedWhileServing.Load() {
+		t.Fatal("old runtime generation was stopped while serving")
+	}
+	if status := b.ModelLifecycleStatuses()["a"]; status.ConfigStatus != scheduler.ConfigStatusApplyFailed {
+		t.Fatalf("lifecycle status=%+v want apply_failed after rollback", status)
+	}
+	factoryMu.Lock()
+	defer factoryMu.Unlock()
+	if len(factoryConfigs) != 2 || !strings.Contains(factoryConfigs[0].Backend.Arguments[0], "/versions/new/") || !strings.Contains(factoryConfigs[1].Backend.Arguments[0], "/versions/old/") {
+		t.Fatalf("runtime factory configs=%v want candidate then exact old generation", factoryConfigs)
+	}
+}
+
 func TestBaseRouter_Shutdown_StopsAllProcesses(t *testing.T) {
 	a := newFakeProcess("a")
 	a.markReady()
@@ -696,5 +1192,448 @@ func TestBaseRouter_Shutdown_StopsAllProcesses(t *testing.T) {
 	// Second Shutdown should report already in progress.
 	if err := b.Shutdown(0); err == nil {
 		t.Errorf("second Shutdown returned nil, want error")
+	}
+}
+
+// TestBaseRouter_SetProcessDecorator covers the server seam: existing
+// *ProcessCommands are decorated synchronously (non-ProcessCommand doubles
+// are skipped) and every later process creation goes through the decorator.
+func TestBaseRouter_SetProcessDecorator(t *testing.T) {
+	logger := logmon.NewWriter(io.Discard)
+	existing, err := process.New(context.Background(), "existing", config.ModelConfig{Cmd: "true"}, logger, logger)
+	if err != nil {
+		t.Fatalf("process.New: %v", err)
+	}
+	t.Cleanup(func() { existing.Stop(time.Second) }) //nolint: errcheck
+
+	b := newTestBase(t, map[string]process.Process{
+		"existing": existing,
+		"fake":     newFakeProcess("fake"),
+	}, &stubPlanner{})
+
+	var (
+		mu        sync.Mutex
+		decorated []string
+	)
+	b.SetProcessDecorator(func(modelID string, p *process.ProcessCommand) {
+		mu.Lock()
+		decorated = append(decorated, modelID)
+		mu.Unlock()
+	})
+
+	mu.Lock()
+	got := append([]string(nil), decorated...)
+	mu.Unlock()
+	if len(got) != 1 || got[0] != "existing" {
+		t.Fatalf("existing decorations = %v, want [existing] (fake double skipped)", got)
+	}
+
+	created, err := b.newManagedProcess("created", config.ModelConfig{Cmd: "true"})
+	if err != nil {
+		t.Fatalf("newManagedProcess: %v", err)
+	}
+	if _, ok := created.(*process.ProcessCommand); !ok {
+		t.Fatalf("newManagedProcess returned %T, want *process.ProcessCommand", created)
+	}
+	created.Stop(time.Second) //nolint: errcheck
+
+	mu.Lock()
+	got = append([]string(nil), decorated...)
+	mu.Unlock()
+	if len(got) != 2 || got[0] != "existing" || got[1] != "created" {
+		t.Fatalf("decorations = %v, want [existing created]", got)
+	}
+}
+
+func TestBaseRouter_ReconfigureReplacementCarriesLogHistory(t *testing.T) {
+	oldConfig := config.Config{
+		HealthCheckTimeout: 1,
+		Models: map[string]config.ModelConfig{
+			"a": {Cmd: "old"},
+		},
+	}
+	oldMonitor := logmon.NewWriter(io.Discard)
+	oldMonitor.Write([]byte("previous run output"))
+	oldProcess := newFakeProcess("old-generation")
+	oldProcess.logger = oldMonitor // stopped by default, so reconfigure refreshes the object
+	b := newTestBaseWithConfig(t, oldConfig, map[string]process.Process{"a": oldProcess}, &stubPlanner{})
+
+	desired := oldConfig
+	desired.Models = map[string]config.ModelConfig{"a": {Cmd: "new"}}
+	if err := b.Reconfigure(desired, &stubPlanner{}, map[string]struct{}{"a": {}}); err != nil {
+		t.Fatalf("Reconfigure: %v", err)
+	}
+
+	replacementLog, ok := b.ProcessLogger("a")
+	if !ok {
+		t.Fatal("model a has no process logger after reconfigure")
+	}
+	if replacementLog == oldMonitor {
+		t.Fatal("reconfigure kept the replaced process's monitor")
+	}
+	history := string(replacementLog.GetHistory())
+	if !strings.Contains(history, "previous run output") {
+		t.Fatalf("replacement history = %q, want inherited previous-run output", history)
+	}
+	if !strings.Contains(history, processReplacedMarker) {
+		t.Fatalf("replacement history = %q, want the replacement marker", history)
+	}
+	if !oldMonitor.IsClosed() {
+		t.Fatal("replaced process's log monitor was not closed")
+	}
+}
+
+func TestBaseRouter_ConfigRestartCarriesLogHistory(t *testing.T) {
+	oldConfig := config.Config{
+		HealthCheckTimeout: 1,
+		Models: map[string]config.ModelConfig{
+			"a": {Cmd: "old"},
+		},
+	}
+	oldMonitor := logmon.NewWriter(io.Discard)
+	oldMonitor.Write([]byte("previous generation output"))
+	oldProcess := newFakeProcess("old-generation")
+	oldProcess.logger = oldMonitor
+	oldProcess.markReady()
+	b := newTestBaseWithConfig(t, oldConfig, map[string]process.Process{"a": oldProcess}, &stubPlanner{})
+
+	replacementMonitor := logmon.NewWriter(io.Discard)
+	replacement := newFakeProcess("new-generation")
+	replacement.autoReady = true
+	replacement.logger = replacementMonitor
+	b.setProcessFactory(func(_ context.Context, _ string, _ config.ModelConfig) (process.Process, error) {
+		return replacement, nil
+	})
+
+	desired := oldConfig
+	desired.Models = map[string]config.ModelConfig{"a": {Cmd: "new"}}
+	if err := b.Reconfigure(desired, &stubPlanner{}, map[string]struct{}{"a": {}}); err != nil {
+		t.Fatalf("Reconfigure: %v", err)
+	}
+	if err := b.RestartModel("a"); err != nil {
+		t.Fatalf("RestartModel: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if log, ok := b.ProcessLogger("a"); ok && log == replacementMonitor {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("restart did not install the replacement process")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	history := string(replacementMonitor.GetHistory())
+	if !strings.Contains(history, "previous generation output") {
+		t.Fatalf("replacement history = %q, want inherited previous-generation output", history)
+	}
+	if !strings.Contains(history, processReplacedMarker) {
+		t.Fatalf("replacement history = %q, want the replacement marker", history)
+	}
+	if !oldMonitor.IsClosed() {
+		t.Fatal("replaced process's log monitor was not closed after the restart")
+	}
+}
+
+func TestBaseRouter_ConfigRestartExposesPendingProcess(t *testing.T) {
+	oldConfig := config.Config{
+		HealthCheckTimeout: 5,
+		Models: map[string]config.ModelConfig{
+			"a": {Cmd: "old"},
+		},
+	}
+	oldProcess := newFakeProcess("old-generation")
+	oldProcess.markReady()
+	candidate := newFakeProcess("new-generation")
+	b := newTestBaseWithConfig(t, oldConfig, map[string]process.Process{"a": oldProcess}, &stubPlanner{})
+	b.setProcessFactory(func(_ context.Context, _ string, modelConfig config.ModelConfig) (process.Process, error) {
+		if modelConfig.Cmd != "new" {
+			return nil, fmt.Errorf("unexpected restart command %q", modelConfig.Cmd)
+		}
+		return candidate, nil
+	})
+
+	desired := oldConfig
+	desired.Models = map[string]config.ModelConfig{"a": {Cmd: "new"}}
+	if err := b.Reconfigure(desired, &stubPlanner{}, map[string]struct{}{"a": {}}); err != nil {
+		t.Fatalf("Reconfigure: %v", err)
+	}
+	if err := b.RestartModel("a"); err != nil {
+		t.Fatalf("RestartModel: %v", err)
+	}
+	waitSignal(t, candidate.ensureAsked, "candidate readiness")
+
+	if state := b.RunningModels()["a"]; state != process.StateStarting {
+		t.Fatalf("running state=%q want candidate starting state", state)
+	}
+	log, ok := b.ProcessLogger("a")
+	if !ok || log != candidate.Logger() {
+		t.Fatalf("process logger=%p ok=%v want candidate logger", log, ok)
+	}
+
+	candidate.markReady()
+	deadline := time.Now().Add(time.Second)
+	for {
+		b.processMu.RLock()
+		installed := b.processes["a"] == candidate
+		b.processMu.RUnlock()
+		if installed {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("candidate process was not installed after readiness")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestBaseRouter_CanceledRestartPublishesTerminalStatus(t *testing.T) {
+	oldConfig := config.Config{
+		HealthCheckTimeout: 1,
+		Models: map[string]config.ModelConfig{
+			"a": {Cmd: "old"},
+		},
+	}
+	oldProcess := newFakeProcess("old-generation")
+	oldProcess.markReady()
+	oldProcess.stopBlock = make(chan struct{})
+	b := newTestBaseWithConfig(t, oldConfig, map[string]process.Process{"a": oldProcess}, &stubPlanner{})
+	b.setProcessFactory(func(_ context.Context, _ string, _ config.ModelConfig) (process.Process, error) {
+		return newFakeProcess("unexpected-generation"), nil
+	})
+
+	desired := oldConfig
+	desired.Models = map[string]config.ModelConfig{"a": {Cmd: "new"}}
+	if err := b.Reconfigure(desired, &stubPlanner{}, map[string]struct{}{"a": {}}); err != nil {
+		t.Fatalf("Reconfigure: %v", err)
+	}
+	if err := b.RestartModel("a"); err != nil {
+		t.Fatalf("RestartModel: %v", err)
+	}
+	waitSignal(t, oldProcess.stopStarted, "restart stop")
+
+	b.restartMu.Lock()
+	control, ok := b.restartCancels["a"]
+	if ok {
+		control.cancel()
+	}
+	b.restartMu.Unlock()
+	if !ok {
+		t.Fatal("restart control was not registered")
+	}
+	close(oldProcess.stopBlock)
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		status := b.ModelLifecycleStatuses()["a"]
+		if status.ConfigStatus == scheduler.ConfigStatusApplyFailed {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("restart remained non-terminal: %+v", status)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestBaseRouter_RemoveProcessClosesLogMonitor(t *testing.T) {
+	oldConfig := config.Config{
+		HealthCheckTimeout: 1,
+		UnloadTimeout:      1,
+		Models: map[string]config.ModelConfig{
+			"a": {Cmd: "old"},
+		},
+	}
+	monitor := logmon.NewWriter(io.Discard)
+	monitor.Write([]byte("removed generation output"))
+	oldProcess := newFakeProcess("a")
+	oldProcess.logger = monitor
+	oldProcess.markReady()
+	b := newTestBaseWithConfig(t, oldConfig, map[string]process.Process{"a": oldProcess}, &stubPlanner{})
+	b.testRemovalProcessed = make(chan struct{}, 1)
+
+	deleted := oldConfig
+	deleted.Models = nil
+	if err := b.Reconfigure(deleted, &stubPlanner{}, nil); err != nil {
+		t.Fatalf("delete Reconfigure: %v", err)
+	}
+	waitSignal(t, b.testRemovalProcessed, "removal completion")
+
+	if _, ok := b.ProcessLogger("a"); ok {
+		t.Fatal("removed model still resolves to a process logger")
+	}
+	if !monitor.IsClosed() {
+		t.Fatal("removed process's log monitor was not closed")
+	}
+	// History stays readable for late callers such as incident archives.
+	if got := string(monitor.GetHistory()); !strings.Contains(got, "removed generation output") {
+		t.Fatalf("closed monitor history = %q, want the captured output", got)
+	}
+}
+
+// TestBaseRouter_ModelLogsAttributedUpstream pins the merged upstream log's
+// model attribution: a model's monitor forwards its output through a prefix
+// writer, so the combined log can tell which model produced each line.
+func TestBaseRouter_ModelLogsAttributedUpstream(t *testing.T) {
+	conf := config.Config{HealthCheckTimeout: 1}
+	upstream := logmon.NewWriter(io.Discard)
+	b, err := newBaseRouter("test", conf, map[string]process.Process{}, upstream, &stubPlanner{})
+	if err != nil {
+		t.Fatalf("newBaseRouter: %v", err)
+	}
+	created, err := b.newManagedProcess("attributed-model", config.ModelConfig{Cmd: "true"})
+	if err != nil {
+		t.Fatalf("newManagedProcess: %v", err)
+	}
+	created.Logger().Write([]byte("inference output line\n"))
+
+	history := string(upstream.GetHistory())
+	if !strings.Contains(history, "[attributed-model] inference output line") {
+		t.Fatalf("upstream history = %q, want the model-prefixed line", history)
+	}
+}
+
+// TestBaseRouter_ReconfigureDuringManualStartKeepsProcess verifies that a
+// config reconcile arriving while a manual start's swap goroutine is between
+// its registry read and EnsureReady does not replace the process object. The
+// swap goroutine may still read the registry and start the old generation;
+// replacing the object in that window orphans that process outside every
+// lifecycle fence while the registry shows a stopped replacement.
+func TestBaseRouter_ReconfigureDuringManualStartKeepsProcess(t *testing.T) {
+	oldConfig := config.Config{
+		HealthCheckTimeout: 5,
+		Models: map[string]config.ModelConfig{
+			"a": {Cmd: "old"},
+		},
+	}
+	oldProcess := newFakeProcess("a")
+	// autoReady=false: EnsureReady blocks until the test releases it, and the
+	// test parks the swap goroutine before it can flip the state to starting
+	// by holding the fake's opMu (the same serialization point EnsureReady
+	// crosses after closing ensureAsked).
+	b := newTestBaseWithConfig(t, oldConfig, map[string]process.Process{"a": oldProcess}, &stubPlanner{})
+	replacement := newFakeProcess("new-generation")
+	replacement.autoReady = true
+	var factoryCalls atomic.Int32
+	b.setProcessFactory(func(_ context.Context, _ string, _ config.ModelConfig) (process.Process, error) {
+		factoryCalls.Add(1)
+		return replacement, nil
+	})
+
+	oldProcess.opMu.Lock()
+	response := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		b.ServeHTTP(rec, newRequest("a"))
+		response <- rec
+	}()
+	// The swap goroutine reached EnsureReady (ensureAsked closed) while the
+	// process still reads StateStopped: the exact race window.
+	waitSignal(t, oldProcess.ensureAsked, "swap goroutine EnsureReady")
+	select {
+	case <-b.testProcessed:
+	default:
+		t.Fatal("request not yet processed by the run loop")
+	}
+
+	desired := oldConfig
+	desired.Models = map[string]config.ModelConfig{"a": {Cmd: "new"}}
+	if err := b.Reconfigure(desired, &stubPlanner{}, map[string]struct{}{"a": {}}); err != nil {
+		t.Fatalf("Reconfigure: %v", err)
+	}
+
+	if got := factoryCalls.Load(); got != 0 {
+		t.Fatalf("factory called %d times during in-flight swap; the process object must not be replaced", got)
+	}
+	b.processMu.RLock()
+	registered := b.processes["a"]
+	b.processMu.RUnlock()
+	if registered != process.Process(oldProcess) {
+		t.Fatalf("registry holds %v, want the old-generation process", registered)
+	}
+	if status := b.ModelLifecycleStatuses()["a"]; status.ConfigStatus != scheduler.ConfigStatusModified {
+		t.Fatalf("config status=%q want %q", status.ConfigStatus, scheduler.ConfigStatusModified)
+	}
+
+	// Release the swap goroutine: the old-generation start completes and the
+	// manually started request is served normally.
+	oldProcess.opMu.Unlock()
+	oldProcess.markReady()
+	rec := <-response
+	if rec.Code != http.StatusOK {
+		t.Fatalf("manual start request status=%d body=%q", rec.Code, rec.Body.String())
+	}
+
+	// The pending modified config stays restartable after the swap settles.
+	if err := b.RestartModel("a"); err != nil {
+		t.Fatalf("RestartModel after swap settled: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		b.processMu.RLock()
+		state := b.processes["a"].State()
+		b.processMu.RUnlock()
+		if state == process.StateReady {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("replacement process never became ready, state=%v", state)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestBaseRouter_StopAdoptsPendingConfig pins the rule an operator expects: once
+// a model is stopped there is nothing left to disturb, so its next start has to
+// use the configuration saved after it last ran — and the pending-restart flag
+// has nothing left to describe.
+//
+// Before this, stopping kept both the flag and the stale process object, so a
+// manual stop-then-start silently ran the previous configuration while the UI
+// kept asking for a restart the operator had just performed.
+func TestBaseRouter_StopAdoptsPendingConfig(t *testing.T) {
+	original := config.Config{
+		HealthCheckTimeout: 1,
+		Models:             map[string]config.ModelConfig{"a": {Cmd: "a-one"}},
+	}
+	running := newFakeProcess("running")
+	running.markReady()
+	b := newTestBaseWithConfig(t, original, map[string]process.Process{"a": running}, &stubPlanner{})
+
+	adopted := newFakeProcess("adopted")
+	var mu sync.Mutex
+	var built []config.ModelConfig
+	b.setProcessFactory(func(_ context.Context, _ string, modelConfig config.ModelConfig) (process.Process, error) {
+		mu.Lock()
+		built = append(built, modelConfig)
+		mu.Unlock()
+		return adopted, nil
+	})
+
+	pending := original
+	pending.Models = map[string]config.ModelConfig{"a": {Cmd: "a-two"}}
+	if err := b.Reconfigure(pending, &stubPlanner{}, map[string]struct{}{"a": {}}); err != nil {
+		t.Fatalf("Reconfigure: %v", err)
+	}
+	if got := b.ModelLifecycleStatuses()["a"].ConfigStatus; got != scheduler.ConfigStatusModified {
+		t.Fatalf("config status=%q, want %q while the change is pending", got, scheduler.ConfigStatusModified)
+	}
+
+	b.Unload(time.Second, "a")
+
+	if got := b.ModelLifecycleStatuses()["a"].ConfigStatus; got == scheduler.ConfigStatusModified {
+		t.Fatalf("config status=%q, want the pending restart cleared once the model stopped", got)
+	}
+	b.processMu.RLock()
+	registered := b.processes["a"]
+	b.processMu.RUnlock()
+	if registered != process.Process(adopted) {
+		t.Fatalf("registered process=%v, want the replacement built from the saved configuration", registered)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(built) != 1 || built[0].Cmd != "a-two" {
+		t.Fatalf("built=%+v, want exactly one process from the pending configuration (Cmd=a-two)", built)
 	}
 }

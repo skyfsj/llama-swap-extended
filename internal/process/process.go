@@ -2,6 +2,7 @@ package process
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"time"
 
@@ -15,10 +16,33 @@ const (
 	StateStarting ProcessState = ProcessState("starting")
 	StateReady    ProcessState = ProcessState("ready")
 	StateStopping ProcessState = ProcessState("stopping")
+	// StateSleeping is the public lifecycle projection used by status events
+	// while a vLLM process remains alive and can be woken for the next request.
+	// Process.State itself intentionally remains StateReady so the router does
+	// not start a second process for a sleeping-but-reusable listener.
+	StateSleeping ProcessState = ProcessState("sleeping")
 
 	// process is shutdown and will not be restarted
 	StateShutdown ProcessState = ProcessState("shutdown")
 )
+
+var (
+	// ErrSleepUnsupported means the process does not expose the vLLM sleep
+	// control surface.
+	ErrSleepUnsupported = errors.New("process sleep control is not supported")
+	// ErrSleepUnavailable means the process exists but is not currently ready
+	// for an explicit sleep/wake operation.
+	ErrSleepUnavailable = errors.New("process is not ready for sleep control")
+)
+
+// SleepController is an optional process capability. It is deliberately kept
+// outside Process so embedders with custom Process implementations do not need
+// to add lifecycle methods they cannot support.
+type SleepController interface {
+	Sleep(context.Context, int) error
+	Wake(context.Context) error
+	Sleeping() bool
+}
 
 type Process interface {
 	// Run starts the process blocks until the process is terminated.

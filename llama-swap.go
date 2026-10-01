@@ -13,12 +13,11 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/config"
-	"github.com/mostlygeek/llama-swap/internal/event"
+	"github.com/mostlygeek/llama-swap/internal/extensions"
 	"github.com/mostlygeek/llama-swap/internal/hw"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/perf"
@@ -79,6 +78,10 @@ func runValidate(configPath, configDir string, out io.Writer) int {
 }
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == "-extension-worker" {
+		extensions.RunWorker(os.Stdin, os.Stdout)
+		return
+	}
 	flagConfig := flag.String("config", "", "path to config file")
 	flagConfigDir := flag.String("config-dir", "", "directory of *.yml/*.yaml config files (additive to -config)")
 	flagListen := flag.String("listen", "", "listen address (default :8080 or :8443 for TLS)")
@@ -198,42 +201,27 @@ func main() {
 		initialStore.Close()
 		os.Exit(1)
 	}
-
-	// activeSrv is swapped atomically during hot reload.
-	var activeMu sync.RWMutex
-	activeSrv := initialSrv
-	activeStore := initialStore
-	activeStorePath := initialStorePath
-
-	httpServer := &http.Server{
-		Addr: listenAddr,
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			activeMu.RLock()
-			srv := activeSrv
-			activeMu.RUnlock()
-			srv.ServeHTTP(w, r)
-		}),
+	var configManager *config.ConfigManager
+	if manager, managerErr := config.NewConfigManager(*flagConfig, *flagConfigDir); managerErr != nil {
+		proxyLog.Warnf("config manager unavailable: %v", managerErr)
+	} else {
+		configManager = manager
+		initialSrv.SetConfigManager(configManager)
 	}
 
-	// reload guards against overlapping reloads triggered by concurrent signals
-	// or file-watcher callbacks.
-	var reloading bool
-	var reloadMu sync.Mutex
+	httpServer := &http.Server{
+		Addr:    listenAddr,
+		Handler: initialSrv,
+		// These two timeouts cannot break SSE or long inference streams (they
+		// only cover connection setup and idle keep-alives), but they stop a
+		// slowloris-style client from holding goroutines and file descriptors
+		// forever. WriteTimeout is deliberately absent: it would cap streaming
+		// responses.
+		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 
 	reload := func() {
-		reloadMu.Lock()
-		if reloading {
-			reloadMu.Unlock()
-			return
-		}
-		reloading = true
-		reloadMu.Unlock()
-		defer func() {
-			reloadMu.Lock()
-			reloading = false
-			reloadMu.Unlock()
-		}()
-
 		proxyLog.Info("reloading configuration")
 
 		newCfg, err := config.LoadConfigSources(*flagConfig, *flagConfigDir)
@@ -241,60 +229,11 @@ func main() {
 			proxyLog.Warnf("failed to reload config: %v", err)
 			return
 		}
-
-		if perfMon != nil {
-			perfMon.UpdateConfig(newCfg.Performance)
-		}
-
-		newStorePath := configStorePath(newCfg)
-		activeMu.RLock()
-		currentStore := activeStore
-		currentStorePath := activeStorePath
-		activeMu.RUnlock()
-
-		newStore := currentStore
-		storeChanged := newStorePath != currentStorePath
-		if storeChanged {
-			newStore, err = store.New(newStorePath)
-			if err != nil {
-				proxyLog.Warnf("failed to create new store during reload: %v", err)
-				return
-			}
-		}
-
-		newSrv, err := server.New(newCfg, muxLog, proxyLog, upstreamLog, perfMon, newStore, buildInfo, hardwareSnapshot)
-		if err != nil {
-			proxyLog.Warnf("failed to build new server during reload: %v", err)
-			if storeChanged {
-				newStore.Close()
-			}
+		if err := initialSrv.ReconcileConfig(newCfg); err != nil {
+			proxyLog.Warnf("failed to apply configuration: %v", err)
 			return
 		}
-
-		activeMu.Lock()
-		old := activeSrv
-		oldStore := activeStore
-		activeSrv = newSrv
-		activeStore = newStore
-		activeStorePath = newStorePath
-		activeMu.Unlock()
-
 		applyLogSettings(newCfg)
-
-		if err := old.Shutdown(shutdownTimeout); err != nil {
-			proxyLog.Warnf("error shutting down old server during reload: %v", err)
-		}
-		if storeChanged {
-			if err := oldStore.Close(); err != nil {
-				proxyLog.Warnf("error closing old store during reload: %v", err)
-			}
-		}
-
-		// Notify UI after a short delay so it can refresh model state.
-		time.AfterFunc(3*time.Second, func() {
-			event.Emit(swaputil.ConfigFileChangedEvent{State: swaputil.ReloadingStateEnd})
-		})
-
 		proxyLog.Info("configuration reloaded")
 	}
 
@@ -381,14 +320,9 @@ func main() {
 					os.Exit(1)
 				}()
 
-				activeMu.RLock()
-				srv := activeSrv
-				st := activeStore
-				activeMu.RUnlock()
-
 				// Close long-lived SSE streams first so httpServer.Shutdown can
 				// drain without blocking on them for the full timeout.
-				srv.CloseStreams()
+				initialSrv.CloseStreams()
 
 				// Both phases share a single deadline so total shutdown is
 				// bounded by shutdownTimeout rather than 2x it.
@@ -406,14 +340,14 @@ func main() {
 				if remaining <= 0 {
 					remaining = time.Millisecond
 				}
-				if err := srv.Shutdown(remaining); err != nil {
+				if err := initialSrv.Shutdown(remaining); err != nil {
 					proxyLog.Warnf("router shutdown error: %v", err)
 				}
 
 				if perfMon != nil {
 					perfMon.Stop()
 				}
-				if err := st.Close(); err != nil {
+				if err := initialStore.Close(); err != nil {
 					proxyLog.Warnf("store shutdown error: %v", err)
 				}
 
