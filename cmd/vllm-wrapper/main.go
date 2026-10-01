@@ -1,3 +1,8 @@
+//go:build !windows
+
+// vllm-wrapper drives a linux vLLM serve process (sleep/wake control via the
+// vLLM HTTP API and unix signals); it has no windows build.
+
 package main
 
 import (

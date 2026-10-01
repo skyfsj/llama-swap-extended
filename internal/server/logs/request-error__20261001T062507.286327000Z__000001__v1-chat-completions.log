@@ -1,11 +1,11 @@
 event: request-error
-time: 2026-10-01T04:31:24.93255Z
+time: 2026-10-01T06:25:07.28632Z
 client: 192.0.2.1
 request: POST /v1/chat/completions HTTP/1.1
 status: 413
 body_bytes: 174
 user_agent: 
-duration: 41.500625ms
+duration: 60.322458ms
 
 response:
 {"src":"llama-swap","error":{"message":"request body is too large: request body exceeds 67108864 bytes","type":"invalid_request_error","param":null,"code":"invalid_request"}}

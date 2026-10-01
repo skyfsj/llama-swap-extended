@@ -1,9 +1,9 @@
 event: request-error
-time: 2026-10-01T04:31:24.965455Z
+time: 2026-10-01T06:25:07.328624Z
 client: 192.0.2.1
 request: GET /props HTTP/1.1
 status: 503
 body_bytes: 0
 user_agent: 
-duration: 43.583µs
+duration: 71.417µs
 model: a

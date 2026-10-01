@@ -14,7 +14,8 @@ func lmcacheDiskFreeSpace(path string) (int64, error) {
 		return 0, err
 	}
 	var freeToCaller, total, free uint64
-	if err := windows.GetDiskFreeSpaceExW(wpath, &freeToCaller, &total, &free); err != nil {
+	// x/sys exposes GetDiskFreeSpaceEx (generated from GetDiskFreeSpaceExW).
+	if err := windows.GetDiskFreeSpaceEx(wpath, &freeToCaller, &total, &free); err != nil {
 		return 0, err
 	}
 	return int64(freeToCaller), nil

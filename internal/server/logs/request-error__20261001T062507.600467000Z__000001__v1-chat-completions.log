@@ -1,11 +1,11 @@
 event: request-error
-time: 2026-10-01T04:31:25.142736Z
+time: 2026-10-01T06:25:07.600464Z
 client: 192.0.2.1
 request: POST /v1/chat/completions HTTP/1.1
 status: 404
 body_bytes: 135
 user_agent: 
-duration: 164.792µs
+duration: 154.166µs
 model: unknown-model
 
 response:

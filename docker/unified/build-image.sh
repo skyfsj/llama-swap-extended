@@ -22,7 +22,13 @@ BACKEND=""
 NO_CACHE=false
 WHISPER_FFMPEG="${WHISPER_FFMPEG:-yes}"
 
+VARIANT_VALUE_PENDING=false
 for arg in "$@"; do
+    if $VARIANT_VALUE_PENDING; then
+        VARIANT="$arg"
+        VARIANT_VALUE_PENDING=false
+        continue
+    fi
     case $arg in
         --cuda)
             BACKEND="cuda"
@@ -37,11 +43,10 @@ for arg in "$@"; do
             NO_CACHE=true
             ;;
         --variant)
-            VARIANT="$2"
-            shift
+            VARIANT_VALUE_PENDING=true
             ;;
         --variant=*)
-            VARIANT="${1#*=}"
+            VARIANT="${arg#*=}"
             ;;
         --help|-h)
             echo "Usage: ./build-image.sh --cuda|--vulkan|--rocm [--variant full|llamacpp|vllm|1cat-vllm] [--no-cache]"
