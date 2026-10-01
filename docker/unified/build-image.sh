@@ -347,11 +347,8 @@ if [[ "${VARIANT}" != "vllm" ]] && ! docker run --rm --entrypoint test "${DOCKER
     exit 1
 fi
 
-VERIFIED_LIST="llama-server, llama-cli, llama-bench, whisper-server, whisper-cli, sd-server, sd-cli, audiocpp_server, audiocpp_cli, llama-swap, vllm-wrapper"
-if [[ "$BACKEND" == "cuda" ]]; then
-    VERIFIED_LIST="${VERIFIED_LIST}, ik-llama-server"
-fi
-echo "All expected binaries verified: ${VERIFIED_LIST}"
+# Report the variant's actual expected set, not a hardcoded list.
+echo "All expected binaries verified: $(IFS=', '; echo "${EXPECTED_BINARIES[*]}")"
 
 # audio.cpp must be a deployment build: the model_specs catalog is compiled into
 # the binaries, since the image ships no model_specs/ directory for the runtime
