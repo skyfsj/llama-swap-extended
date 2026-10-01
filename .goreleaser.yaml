@@ -1,5 +1,10 @@
 version: 2
 
+# Archive names must stay `llama-swap_<version>_<os>_<arch>`: the docker
+# installers (docker/unified/install-llama-swap.sh) construct release URLs
+# from that shape regardless of the repository name.
+project_name: llama-swap
+
 builds:
   - env:
       - CGO_ENABLED=0

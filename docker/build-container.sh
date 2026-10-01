@@ -52,11 +52,10 @@ SD_IMAGE=${BASE_SDCPP_IMAGE:-ghcr.io/leejet/stable-diffusion.cpp}
 LS_REPO=${GITHUB_REPOSITORY:-mostlygeek/llama-swap}
 
 # LS_BINARY_REPO is where the llama-swap release tarball is downloaded
-# from. Decoupled from LS_REPO so forks (which usually have no releases of
-# their own) can still build a container by pulling the canonical binary
-# from upstream. Override via the LS_BINARY_REPO env var when you maintain
-# fork-side releases.
-LS_BINARY_REPO=${LS_BINARY_REPO:-mostlygeek/llama-swap}
+# from. This fork publishes its own releases (goreleaser on tag push), so
+# the default is this repository; set it to mostlygeek/llama-swap to build
+# with an upstream release binary instead.
+LS_BINARY_REPO=${LS_BINARY_REPO:-skyfsj/llama-swap-extended}
 
 # the most recent llama-swap tag
 # have to strip out the 'v' due to .tar.gz file naming.

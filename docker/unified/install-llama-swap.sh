@@ -5,7 +5,9 @@
 set -e
 
 VERSION="${1:-latest}"
-REPO="mostlygeek/llama-swap"
+# Default to this fork's releases; LS_BINARY_REPO overrides (e.g. to
+# mostlygeek/llama-swap when building with an upstream release binary).
+REPO="${LS_BINARY_REPO:-skyfsj/llama-swap-extended}"
 
 mkdir -p /install/bin
 

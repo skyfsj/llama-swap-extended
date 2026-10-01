@@ -1,11 +1,19 @@
 # Unified multi-stage Dockerfile for AI inference tools
-# Supports CUDA, Vulkan, and ROCm/HIP backends via BACKEND build arg
+# Supports CUDA, Vulkan, and ROCm/HIP backends via BACKEND build arg, and
+# image content variants via VARIANT:
+#
+#   full       everything (default): llama.cpp + whisper + sd + audio + vllm-wrapper
+#   llamacpp   llama.cpp servers only (no whisper/sd/audio)
+#   vllm       vllm-wrapper only (no llama.cpp/whisper/sd/audio builds)
+#   1cat-vllm  full CUDA image plus the 1Cat vLLM build toolchain (CUDA only;
+#              the 1Cat wheel itself is installed at deploy time by the
+#              runtime manager from a bind-mounted /runtime-sources)
 #
 # Usage:
-#   docker buildx build --build-arg BACKEND=cuda -t llama-swap:unified-cuda .
-#   docker buildx build --build-arg BACKEND=vulkan -t llama-swap:unified-vulkan .
-#   docker buildx build --build-arg BACKEND=rocm -t llama-swap:unified-rocm .
-#   docker buildx build --build-arg BACKEND=cuda --build-arg CMAKE_CUDA_ARCHITECTURES="86;89" -t llama-swap:unified-cuda .
+#   docker buildx build --build-arg BACKEND=cuda --target full -t llama-swap:unified-cuda .
+#   docker buildx build --build-arg BACKEND=cuda --target llamacpp -t llama-swap:llamacpp-cuda .
+#   docker buildx build --build-arg BACKEND=vulkan --target vllm -t llama-swap:vllm-vulkan .
+#   docker buildx build --build-arg BACKEND=cuda --target 1cat-vllm -t llama-swap:1cat-vllm-cuda .
 #
 # Each project has its own install script that handles cloning, building,
 # and installing binaries. Build stages are independent for cache efficiency.
@@ -13,10 +21,14 @@
 ARG BACKEND=cuda
 ARG ROCM_IMAGE=rocm/dev-ubuntu-24.04:7.2.4
 ARG GPU_TARGETS=""
+ARG CUDA_RUNTIME_IMAGE=nvidia/cuda:12.9.1-runtime-ubuntu24.04
+ARG CUDA_DEVEL_IMAGE=nvidia/cuda:12.9.1-devel-ubuntu24.04
+ARG GO_BUILDER_IMAGE=golang:1.26-bookworm
+ARG UBUNTU_IMAGE=ubuntu:24.04
 
 # ── Builder bases ──────────────────────────────────────────────────────
 
-FROM nvidia/cuda:12.9.1-devel-ubuntu24.04 AS builder-base-cuda
+FROM ${CUDA_DEVEL_IMAGE} AS builder-base-cuda
 
 # Compute capabilities compiled as SASS, shared by every CUDA build stage.
 # 60/61 are Pascal (P100, GTX 10xx, P40) -- the oldest architecture ggml still
@@ -151,8 +163,12 @@ ARG BACKEND=cuda
 FROM ik-llama-${BACKEND} AS ik-llama-build
 
 # ── Download llama-swap release binary ────────────────────────────────
+#
+# Plain ubuntu base: this stage only runs curl/tar, so variants that skip
+# the C++ toolchain (vllm) do not need to resolve the CUDA devel image.
 
-FROM builder-base AS llama-swap-download
+FROM ${UBUNTU_IMAGE} AS llama-swap-download
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && rm -rf /var/lib/apt/lists/*
 ARG LS_VERSION=latest
 COPY install-llama-swap.sh /build/
 RUN bash /build/install-llama-swap.sh "${LS_VERSION}"
@@ -162,7 +178,7 @@ RUN bash /build/install-llama-swap.sh "${LS_VERSION}"
 # vllm-wrapper is not shipped in the llama-swap release archives, so it is
 # compiled from the same revision as the llama-swap binary above.
 
-FROM golang:1.26-bookworm AS vllm-wrapper-build
+FROM ${GO_BUILDER_IMAGE} AS vllm-wrapper-build
 ARG LS_VERSION=latest
 COPY install-vllm-wrapper.sh /build/
 RUN --mount=type=cache,id=go-build,target=/root/.cache/go-build \
@@ -171,7 +187,7 @@ RUN --mount=type=cache,id=go-build,target=/root/.cache/go-build \
 
 # ── Runtime bases ─────────────────────────────────────────────────────
 
-FROM nvidia/cuda:12.9.1-runtime-ubuntu24.04 AS runtime-cuda
+FROM ${CUDA_RUNTIME_IMAGE} AS runtime-cuda
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH}"
@@ -216,9 +232,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
+# ── 1Cat vLLM build toolchain (CUDA only) ─────────────────────────────
+#
+# 1Cat vLLM ships as a self-built wheel; the runtime manager compiles it
+# against this image at deploy time (driver: custom, builder container =
+# this image). Toolchain only — no wheel is baked into the image.
+
+
 # ── Select runtime base by BACKEND ────────────────────────────────────
 
-FROM runtime-${BACKEND} AS runtime
+# ── Shared assembly ───────────────────────────────────────────────────
+#
+# The four variant targets (below) build FROM this stage. Each one aliases
+# the optional component stages before building, which is what selects the
+# image's contents.
+
+FROM runtime-${BACKEND} AS assemble
 
 ARG BACKEND=cuda
 ARG LLAMA_COMMIT_HASH=unknown
@@ -248,38 +277,22 @@ VOLUME ["/var/lib/llama-swap"]
 
 WORKDIR /app
 
-# Copy whisper.cpp binaries and libraries
-COPY --from=whisper-build /install/bin/whisper-server /usr/local/bin/
-COPY --from=whisper-build /install/bin/whisper-cli /usr/local/bin/
-COPY --from=whisper-build /install/lib/ /usr/local/lib/
-
-# Copy stable-diffusion.cpp binaries and libraries
-COPY --from=sd-build /install/bin/sd-server /usr/local/bin/
-COPY --from=sd-build /install/bin/sd-cli /usr/local/bin/
-COPY --from=sd-build /install/lib/ /usr/local/lib/
-
-# Copy audio.cpp binaries (statically linked, model specs compiled in via
-# AUDIOCPP_DEPLOYMENT_BUILD). The on-disk spec catalog is installed too so
-# --model-spec-override has a path to point at.
-COPY --from=audio-build /install/bin/audiocpp_server /usr/local/bin/
-COPY --from=audio-build /install/bin/audiocpp_cli /usr/local/bin/
-COPY --from=audio-build /install/share/audiocpp/ /usr/local/share/audiocpp/
-
-# Copy llama.cpp binaries (statically linked)
-COPY --from=llama-build /install/bin/llama-server /usr/local/bin/
-COPY --from=llama-build /install/bin/llama-cli /usr/local/bin/
-COPY --from=llama-build /install/bin/llama-tts /usr/local/bin/
-COPY --from=llama-build /install/bin/llama-bench /usr/local/bin/
+# Optional components are NOT copied here: each variant target below copies
+# exactly the components it includes, and BuildKit skips the build stages
+# that are not reachable from the requested target.
 
 # Keep a managed-runtime shaped copy of the bundled llama.cpp server. The
 # persistent Runtime Manager root is a volume, so this image-owned asset is
 # safe to seed once without replacing an operator-selected version later.
-RUN mkdir -p /opt/llama-swap/runtimes/llamacpp/bin /opt/llama-swap/runtimes/llamacpp/build && \
-    cp /usr/local/bin/llama-server /opt/llama-swap/runtimes/llamacpp/bin/llama-server && \
-    cp /usr/local/bin/llama-cli /opt/llama-swap/runtimes/llamacpp/bin/llama-cli && \
-    cp /usr/local/bin/llama-tts /opt/llama-swap/runtimes/llamacpp/bin/llama-tts && \
-    cp /usr/local/bin/llama-bench /opt/llama-swap/runtimes/llamacpp/bin/llama-bench && \
-    printf '%s\n' '{"mode":"native","sourceType":"bundled","builtin":"true"}' > /opt/llama-swap/runtimes/llamacpp/metadata.json
+# SKIP_LLAMA_SEED=1 in the vllm-only variant (no bundled llama.cpp binaries).
+RUN if [ -f /usr/local/bin/llama-server ]; then \
+      mkdir -p /opt/llama-swap/runtimes/llamacpp/bin /opt/llama-swap/runtimes/llamacpp/build && \
+      cp /usr/local/bin/llama-server /opt/llama-swap/runtimes/llamacpp/bin/llama-server && \
+      cp /usr/local/bin/llama-cli /opt/llama-swap/runtimes/llamacpp/bin/llama-cli && \
+      cp /usr/local/bin/llama-tts /opt/llama-swap/runtimes/llamacpp/bin/llama-tts && \
+      cp /usr/local/bin/llama-bench /opt/llama-swap/runtimes/llamacpp/bin/llama-bench && \
+      printf '%s\n' '{"mode":"native","sourceType":"bundled","builtin":"true"}' > /opt/llama-swap/runtimes/llamacpp/metadata.json; \
+    fi
 
 # Copy ik-llama-server (CUDA only; empty copy for Vulkan/ROCm)
 COPY --from=ik-llama-build /install/bin/ /usr/local/bin/
@@ -321,3 +334,46 @@ WORKDIR /models
 USER ${RUN_UID}
 ENTRYPOINT ["llama-swap"]
 CMD ["-config", "/etc/llama-swap/config/config.yaml", "-listen", "0.0.0.0:8080", "-watch-config"]
+
+# ── Variant targets ───────────────────────────────────────────────────
+#
+# BuildKit executes only the stages reachable from the requested target, so
+# each variant pays for exactly the components it includes.
+
+# full (default): everything — `--target full`
+FROM assemble AS full
+COPY --from=whisper-build /install/ /usr/local/
+COPY --from=sd-build /install/ /usr/local/
+COPY --from=audio-build /install/ /usr/local/
+COPY --from=llama-build /install/ /usr/local/
+
+# llamacpp: llama.cpp servers only — `--target llamacpp`
+FROM assemble AS llamacpp
+COPY --from=llama-build /install/ /usr/local/
+
+# vllm: vllm-wrapper and python only — `--target vllm`
+FROM assemble AS vllm
+
+# 1Cat vLLM build toolchain: nvcc + headers live only in the devel image;
+# copy the full CUDA toolkit over the runtime image's runtime-only subset
+# (standard devel-over-runtime overlay). Build toolchain apt packages are
+# installed directly in the final stage.
+FROM ${CUDA_DEVEL_IMAGE} AS onecat-toolchain
+
+# 1cat-vllm: full image + 1Cat vLLM build toolchain layered on top
+# (CUDA-only) — `--target 1cat-vllm`. The wheel itself is compiled by the
+# runtime manager at deploy time; this image only carries the toolchain.
+FROM full AS onecat-vllm
+ARG DEBIAN_FRONTEND=noninteractive
+COPY --from=onecat-toolchain /usr/local/cuda-12.8/ /usr/local/cuda-12.8/
+ENV CUDA_HOME=/usr/local/cuda \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH} \
+    TORCH_CUDA_ARCH_LIST="7.0" \
+    MAX_JOBS=12 \
+    NVCC_THREADS=1 \
+    UV_CACHE_DIR=/var/lib/llama-swap/uv-cache
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake ninja-build pkg-config git \
+    libnuma-dev python3-dev python3-venv \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /runtime-sources /var/lib/llama-swap/uv-cache

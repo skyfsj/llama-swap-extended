@@ -36,18 +36,28 @@ for arg in "$@"; do
         --no-cache)
             NO_CACHE=true
             ;;
+        --variant)
+            VARIANT="$2"
+            shift
+            ;;
+        --variant=*)
+            VARIANT="${1#*=}"
+            ;;
         --help|-h)
-            echo "Usage: ./build-image.sh --cuda|--vulkan|--rocm [--no-cache]"
+            echo "Usage: ./build-image.sh --cuda|--vulkan|--rocm [--variant full|llamacpp|vllm|1cat-vllm] [--no-cache]"
             echo ""
             echo "Options:"
             echo "  --cuda      Build CUDA image (NVIDIA GPUs)"
             echo "  --vulkan    Build Vulkan image (AMD GPUs and compatible hardware)"
             echo "  --rocm      Build ROCm/HIP image (AMD GPUs)"
+            echo "  --variant   Image contents: full (default), llamacpp, vllm, 1cat-vllm (CUDA only)"
             echo "  --no-cache  Force rebuild without using Docker cache"
             echo "  --help, -h  Show this help message"
             echo ""
             echo "Environment variables:"
-            echo "  DOCKER_IMAGE_TAG     Set custom image tag (default: llama-swap:unified-<backend>)"
+            echo "  DOCKER_IMAGE_TAG     Set custom image tag (default: llama-swap:unified-<backend>,"
+            echo "                       or llama-swap:<variant>-<backend> for non-full variants)"
+            echo "  VARIANT              Image contents variant (same as --variant)"
             echo "  ROCM_IMAGE           ROCm builder/runtime image (default: rocm/dev-ubuntu-24.04:7.2.4)"
             echo "  GPU_TARGETS          Optional semicolon-separated AMD GPU targets (e.g. gfx1100;gfx1103)"
             echo "  LLAMA_REF            Pin llama.cpp to a commit, tag, or branch"
@@ -62,21 +72,43 @@ for arg in "$@"; do
     esac
 done
 
+VARIANT="${VARIANT:-full}"
+
+case "${VARIANT}" in
+    full|llamacpp|vllm|1cat-vllm) ;;
+    *)
+        echo "Error: unknown variant '${VARIANT}' (full|llamacpp|vllm|1cat-vllm)" >&2
+        exit 1
+        ;;
+esac
+
 if [[ -z "$BACKEND" ]]; then
     echo "Error: No backend specified. Please use --cuda, --vulkan, or --rocm."
     echo ""
-    echo "Usage: ./build-image.sh --cuda|--vulkan|--rocm [--no-cache]"
+    echo "Usage: ./build-image.sh --cuda|--vulkan|--rocm [--variant full|llamacpp|vllm|1cat-vllm] [--no-cache]"
     exit 1
 fi
 
-DOCKER_IMAGE_TAG="${DOCKER_IMAGE_TAG:-llama-swap:unified-${BACKEND}}"
+# 1Cat vLLM builds only on CUDA: the wheel compile needs nvcc and the
+# torch wheel it depends on is cu128.
+if [[ "${VARIANT}" == "1cat-vllm" && "${BACKEND}" != "cuda" ]]; then
+    echo "Error: variant '1cat-vllm' requires --cuda (got --${BACKEND})" >&2
+    exit 1
+fi
+
+DEFAULT_TAG="llama-swap:unified-${BACKEND}"
+if [[ "${VARIANT}" != "full" ]]; then
+    DEFAULT_TAG="llama-swap:${VARIANT}-${BACKEND}"
+fi
+DOCKER_IMAGE_TAG="${DOCKER_IMAGE_TAG:-${DEFAULT_TAG}}"
 
 # Git repository URLs
 LLAMA_REPO="https://github.com/ggml-org/llama.cpp.git"
 WHISPER_REPO="https://github.com/ggml-org/whisper.cpp.git"
 SD_REPO="https://github.com/leejet/stable-diffusion.cpp.git"
 AUDIO_REPO="https://github.com/0xShug0/audio.cpp.git"
-LLAMA_SWAP_REPO="https://github.com/mostlygeek/llama-swap.git"
+# llama-swap source comes from this fork; override with env for upstream builds.
+LLAMA_SWAP_REPO="${LLAMA_SWAP_REPO:-https://github.com/skyfsj/llama-swap-extended.git}"
 IK_LLAMA_REPO="https://github.com/ikawrakow/ik_llama.cpp.git"
 
 # Resolve a git ref (commit hash, tag, or branch) to a full commit hash.
@@ -219,7 +251,14 @@ echo ""
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+BUILD_TARGET="${VARIANT}"
+if [[ "${VARIANT}" == "1cat-vllm" ]]; then
+    # Dockerfile stage names cannot start with a digit.
+    BUILD_TARGET="onecat-vllm"
+fi
+
 BUILD_ARGS=(
+    --target "${BUILD_TARGET}"
     --build-arg "BACKEND=${BACKEND}"
     --build-arg "LLAMA_COMMIT_HASH=${LLAMA_HASH}"
     --build-arg "WHISPER_COMMIT_HASH=${WHISPER_HASH}"
