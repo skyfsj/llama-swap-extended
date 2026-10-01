@@ -281,18 +281,6 @@ WORKDIR /app
 # exactly the components it includes, and BuildKit skips the build stages
 # that are not reachable from the requested target.
 
-# Keep a managed-runtime shaped copy of the bundled llama.cpp server. The
-# persistent Runtime Manager root is a volume, so this image-owned asset is
-# safe to seed once without replacing an operator-selected version later.
-# SKIP_LLAMA_SEED=1 in the vllm-only variant (no bundled llama.cpp binaries).
-RUN if [ -f /usr/local/bin/llama-server ]; then \
-      mkdir -p /opt/llama-swap/runtimes/llamacpp/bin /opt/llama-swap/runtimes/llamacpp/build && \
-      cp /usr/local/bin/llama-server /opt/llama-swap/runtimes/llamacpp/bin/llama-server && \
-      cp /usr/local/bin/llama-cli /opt/llama-swap/runtimes/llamacpp/bin/llama-cli && \
-      cp /usr/local/bin/llama-tts /opt/llama-swap/runtimes/llamacpp/bin/llama-tts && \
-      cp /usr/local/bin/llama-bench /opt/llama-swap/runtimes/llamacpp/bin/llama-bench && \
-      printf '%s\n' '{"mode":"native","sourceType":"bundled","builtin":"true"}' > /opt/llama-swap/runtimes/llamacpp/metadata.json; \
-    fi
 
 # Copy ik-llama-server (CUDA only; empty copy for Vulkan/ROCm)
 COPY --from=ik-llama-build /install/bin/ /usr/local/bin/
@@ -340,16 +328,27 @@ CMD ["-config", "/etc/llama-swap/config/config.yaml", "-listen", "0.0.0.0:8080",
 # BuildKit executes only the stages reachable from the requested target, so
 # each variant pays for exactly the components it includes.
 
+# Keep a managed-runtime shaped copy of the bundled llama.cpp server. The
+# persistent Runtime Manager root is a volume, so this image-owned asset is
+# safe to seed once without replacing an operator-selected version later.
+# The seed runs in the variant targets AFTER the llama.cpp copy: the
+# assemble stage executes before any variant component exists. Variants
+# without llama.cpp (vllm) skip the seed entirely.
+
 # full (default): everything — `--target full`
 FROM assemble AS full
 COPY --from=whisper-build /install/ /usr/local/
 COPY --from=sd-build /install/ /usr/local/
 COPY --from=audio-build /install/ /usr/local/
 COPY --from=llama-build /install/ /usr/local/
+COPY --chmod=755 seed-llamacpp.sh /usr/local/bin/seed-llamacpp.sh
+RUN /usr/local/bin/seed-llamacpp.sh
 
 # llamacpp: llama.cpp servers only — `--target llamacpp`
 FROM assemble AS llamacpp
 COPY --from=llama-build /install/ /usr/local/
+COPY --chmod=755 seed-llamacpp.sh /usr/local/bin/seed-llamacpp.sh
+RUN /usr/local/bin/seed-llamacpp.sh
 
 # vllm: vllm-wrapper and python only — `--target vllm`
 FROM assemble AS vllm
