@@ -52,23 +52,30 @@
 
   $effect(() => {
     const batch = $livePowerSamples;
-    for (const [key, points] of Object.entries({
-      node: batch.node ?? [],
-      ...Object.fromEntries((batch.gpu ?? []).map((point, index) => [String(index), [point]])),
-    })) {
-      if (points.length === 0) continue;
-      const bucket = liveBySource[key] ?? [];
-      // GPU batches carry every card; key them by their position marker sent
-      // from the server (the index fallback keeps ordering stable enough for
-      // a live overlay).
-      const merged = [...bucket, ...points].slice(-LIVE_SAMPLE_CAP);
-      liveBySource = { ...liveBySource, [key]: merged };
-    }
+    untrack(() => {
+      const entries: Record<string, PowerSeriesPointData[]> = {
+        node: batch.node ?? [],
+      };
+      // GPU batches carry every card; the server's stat key keeps per-card
+      // streams separable, falling back to position when no UUID exists.
+      (batch.gpu ?? []).forEach((point, index) => {
+        const key = gpuStatKeys[index] ?? String(index);
+        entries[key] = [point];
+      });
+      for (const [key, points] of Object.entries(entries)) {
+        if (points.length === 0) continue;
+        const bucket = liveBySource[key] ?? [];
+        const merged = [...bucket, ...points].slice(-LIVE_SAMPLE_CAP);
+        liveBySource = { ...liveBySource, [key]: merged };
+      }
+    });
   });
+
+  let gpuStatKeys = $derived((report?.series ?? []).filter((entry) => !entry.is_node).map((entry) => entry.source_id));
 
   let gpuSeries = $derived.by(() => {
     const stored = (report?.series ?? []).filter((entry) => !entry.is_node);
-    return stored.map((entry, index) => fuseLive(entry, liveBySource[String(index)] ?? []));
+    return stored.map((entry) => fuseLive(entry, liveBySource[entry.source_id] ?? []));
   });
   let nodeSeries = $derived.by(() => {
     const stored = (report?.series ?? []).find((entry) => entry.is_node) ?? null;
