@@ -117,9 +117,16 @@ func sampleNodePower(ctx context.Context, tool string) (NodeStat, bool) {
 	ctx, cancel := context.WithTimeout(ctx, nodePowerTimeout)
 	defer cancel()
 
-	if out, err := exec.CommandContext(ctx, tool, "dcmi", "power").Output(); err == nil {
-		if watts, ok := ParseIpmiDcmiPower(string(out)); ok {
-			return NodeStat{Timestamp: time.Now(), PowerW: watts, Source: "ipmi-dcmi"}, true
+	// Newer BMCs accept `dcmi power`; older Supermicro firmware prints the
+	// subcommand help unless the reading form is spelled out fully.
+	for _, args := range [][]string{
+		{"dcmi", "power", "reading"},
+		{"dcmi", "power"},
+	} {
+		if out, err := exec.CommandContext(ctx, tool, args...).Output(); err == nil {
+			if watts, ok := ParseIpmiDcmiPower(string(out)); ok {
+				return NodeStat{Timestamp: time.Now(), PowerW: watts, Source: "ipmi-dcmi"}, true
+			}
 		}
 	}
 	if out, err := exec.CommandContext(ctx, tool, "sensor").Output(); err == nil {

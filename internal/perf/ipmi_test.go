@@ -27,6 +27,9 @@ Instantiate Power Reading:
 	if _, ok := ParseIpmiDcmiPower("no power reading here"); ok {
 		t.Errorf("unrelated output should not parse")
 	}
+	if _, ok := ParseIpmiDcmiPower("power <command>\n    reading       Get power related readings"); ok {
+		t.Errorf("dcmi help text should not parse as a reading")
+	}
 }
 
 func TestPerf_ParseIpmiSensorPower(t *testing.T) {
