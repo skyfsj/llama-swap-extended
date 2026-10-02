@@ -40,9 +40,55 @@ describe("speedSeries", () => {
     ]);
   });
 
-  it("skips zero-duration and backwards intervals", () => {
+  // vLLM merges RequestOutputs when the engine runs ahead of the API layer,
+  // so the first frame can carry every token produced during prefill with
+  // both timestamps on the same millisecond. Dividing by that dt reported
+  // ~10-19k tokens/sec and flattened the rest of the curve. Rates are taken
+  // between anchors >=100ms apart, so quantized gaps never become a rate.
+  it("does not spike on a prefill-burst first frame", () => {
+    const series = speedSeries([
+      [1996, 0],
+      [1997, 19],
+      [2028, 20],
+      [2051, 21],
+      [2151, 25],
+    ]);
+    // 25 tokens over 1996->2151 (155ms real span)
+    expect(series).toEqual([{ t: 2073.5, tps: (25 / 155) * 1000 }]);
+  });
+
+  it("does not spike when a stall lands many frames on one millisecond", () => {
+    // Production sample 55501: 37 frames share t=26682 after an 11s stall.
+    const series = speedSeries([
+      [15623, 609],
+      [26682, 618.6],
+      [26682, 664.6],
+      [26682, 723.6],
+      [26919, 733.9],
+      [27221, 739.5],
+      [27502, 744.6],
+    ]);
+    // The window right after the stall divides the 10.3 tokens of that
+    // window by the 237ms real gap — ~43 t/s, not a spike.
+    const maxTps = Math.max(...series.slice(1).map((p) => p.tps));
+    expect(maxTps).toBeLessThan(100);
+    // The first emitted window spans 15623->26682 (the stall gap itself):
+    // 9.6 tokens over 11 seconds, honestly reported instead of compressed
+    // into the stall-exit frame.
+    expect(series[0]).toEqual({ t: 21152.5, tps: ((618.6 - 609) / (26682 - 15623)) * 1000 });
+  });
+
+  it("renders a sub-window curve as a single span average", () => {
     const series = speedSeries([
       [0, 0],
+      [40, 2],
+      [80, 4],
+    ]);
+    expect(series).toEqual([{ t: 40, tps: 50 }]);
+  });
+
+  it("skips backwards intervals without emitting a rate", () => {
+    const series = speedSeries([
       [0, 5],
       [100, 3],
     ]);
