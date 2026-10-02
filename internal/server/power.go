@@ -343,6 +343,14 @@ func aggregatePowerRows(gpuStats []perf.GpuStat, nodeStats []perf.NodeStat, from
 	}
 	accumulations := map[string]*accumulation{}
 	accumulate := func(key string, name string, ts time.Time, watts float64) {
+		// The perf ring holds about an hour of samples but the flush window is
+		// one flushInterval wide. Samples at or before the cursor were already
+		// integrated by an earlier flush — skipping them keeps both the energy
+		// sum and the cursor continuation exact; every flush restarts its
+		// integration from the cursor.
+		if !ts.After(from) {
+			return
+		}
 		acc := accumulations[key]
 		if acc == nil {
 			acc = &accumulation{
