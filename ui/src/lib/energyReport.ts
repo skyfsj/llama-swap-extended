@@ -42,26 +42,41 @@ export interface PowerChartData {
  * stay null instead of diving to zero.
  */
 export function powerChartData(series: PowerSeriesData[], bucketSeconds = 0): PowerChartData {
-  const labelToIndex = new Map<string, number>();
   const labels: string[] = [];
-  const ensureLabel = (timestamp: string): number => {
-    let index = labelToIndex.get(timestamp);
+
+  // Live SSE samples interleave with store buckets: the stored series ends at
+  // its last bucket while live points carry newer sub-bucket timestamps, and
+  // the next load appends fresh buckets after them. Collecting every point
+  // first and sorting the union by timestamp keeps the chart axis
+  // chronological; without the sort the axis jumps between bucket times and
+  // live times and the lines saw-tooth. Points that render to the same
+  // bucket label (live samples inside one store bucket at the display
+  // granularity) collapse into one axis slot — the newest timestamp wins.
+  const timestamps = new Set<string>();
+  for (const entry of series) {
+    for (const point of entry.points) timestamps.add(point.timestamp);
+  }
+  const labelIndex = new Map<string, number>();
+  const labelTimestamp = new Map<string, string>();
+  for (const timestamp of [...timestamps].sort()) {
+    const label = formatBucketTime(timestamp, bucketSeconds);
+    let index = labelIndex.get(label);
     if (index === undefined) {
       index = labels.length;
-      labelToIndex.set(timestamp, index);
-      labels.push(formatBucketTime(timestamp, bucketSeconds));
+      labelIndex.set(label, index);
+      labels.push(label);
+      labelTimestamp.set(label, timestamp);
+    } else {
+      // Same display bucket: keep the newer timestamp as the slot's key.
+      labelTimestamp.set(label, timestamp);
     }
-    return index;
-  };
-
-  for (const entry of series) {
-    for (const point of entry.points) ensureLabel(point.timestamp);
   }
 
   const values = series.map((entry) => {
     const column = new Array<null | number>(labels.length).fill(null);
     for (const point of entry.points) {
-      const index = labelToIndex.get(point.timestamp);
+      const label = formatBucketTime(point.timestamp, bucketSeconds);
+      const index = labelIndex.get(label);
       if (index !== undefined) column[index] = point.avg_watts;
     }
     return column;
