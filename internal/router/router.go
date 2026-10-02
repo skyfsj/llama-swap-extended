@@ -53,4 +53,16 @@ type LocalRouter interface {
 	// modelID must be a real (non-alias) config key. Returns false when the
 	// model is not known to this router.
 	ProcessLogger(modelID string) (*logmon.Monitor, bool)
+
+	// EnterMaintenance parks a model in maintenance mode: requests are
+	// refused (except operator starts) until ExitMaintenance or a successful
+	// operator-driven start that serves a request.
+	EnterMaintenance(modelID, reason string)
+
+	// ExitMaintenance releases a model from maintenance mode.
+	ExitMaintenance(modelID string)
+
+	// InMaintenance reports whether the model is parked in maintenance mode,
+	// and the reason recorded when it entered.
+	InMaintenance(modelID string) (reason string, ok bool)
 }

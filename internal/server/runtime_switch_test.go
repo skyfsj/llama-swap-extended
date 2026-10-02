@@ -30,6 +30,9 @@ func (r *runtimeSwitchRouter) RunningModels() map[string]process.ProcessState {
 	return r.running
 }
 func (*runtimeSwitchRouter) Unload(time.Duration, ...string)              {}
+func (*runtimeSwitchRouter) EnterMaintenance(string, string)              {}
+func (*runtimeSwitchRouter) ExitMaintenance(string)                       {}
+func (*runtimeSwitchRouter) InMaintenance(string) (string, bool)          { return "", false }
 func (*runtimeSwitchRouter) ProcessLogger(string) (*logmon.Monitor, bool) { return nil, false }
 func (r *runtimeSwitchRouter) Reconfigure(cfg config.Config) error {
 	r.config = cfg
@@ -138,6 +141,9 @@ func (*runtimeSwitchLifecycleRouter) Shutdown(time.Duration) error              
 func (*runtimeSwitchLifecycleRouter) ServeHTTP(http.ResponseWriter, *http.Request) {}
 func (*runtimeSwitchLifecycleRouter) Handles(string) bool                          { return true }
 func (*runtimeSwitchLifecycleRouter) Unload(time.Duration, ...string)              {}
+func (*runtimeSwitchLifecycleRouter) EnterMaintenance(string, string)              {}
+func (*runtimeSwitchLifecycleRouter) ExitMaintenance(string)                       {}
+func (*runtimeSwitchLifecycleRouter) InMaintenance(string) (string, bool)          { return "", false }
 func (*runtimeSwitchLifecycleRouter) ProcessLogger(string) (*logmon.Monitor, bool) { return nil, false }
 
 func (r *runtimeSwitchLifecycleRouter) RunningModels() map[string]process.ProcessState {
