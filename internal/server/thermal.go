@@ -62,7 +62,7 @@ func newThermalMonitor(guard *config.ThermalGuardConfig) *thermalMonitor {
 func (t *thermalMonitor) run(s *Server) {
 	defer close(t.stopped)
 
-	_, gpuCh, unsub := s.perf.Subscribe()
+	_, gpuCh, _, unsub := s.perf.Subscribe()
 	defer unsub()
 
 	for {

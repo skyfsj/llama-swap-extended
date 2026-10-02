@@ -1,8 +1,8 @@
 <script lang="ts">
   import { untrack } from "svelte";
-  import type { PowerReportData, PowerSeriesData } from "../../lib/types";
+  import type { PowerReportData, PowerSeriesData, PowerSeriesPointData } from "../../lib/types";
   import { getPowerReport } from "../../stores/api";
-  import { activityRevision } from "../../stores/api";
+  import { activityRevision, livePowerSamples } from "../../stores/api";
   import { persistentStore } from "../../stores/persistent";
   import { connectionState } from "../../stores/theme";
   import { translate } from "../../lib/i18n";
@@ -43,8 +43,37 @@
   let pollTimer: ReturnType<typeof setInterval> | null = null;
 
   let currency = $derived(report?.currency ?? "");
-  let gpuSeries = $derived((report?.series ?? []).filter((entry) => !entry.is_node));
-  let nodeSeries = $derived((report?.series ?? []).find((entry) => entry.is_node) ?? null);
+
+  // Live samples arrive via SSE between store flushes and are appended per
+  // source so the curve grows in real time. They are dropped on each store
+  // load: the report's own series then covers the same span authoritatively.
+  const LIVE_SAMPLE_CAP = 400;
+  let liveBySource = $state<Record<string, PowerSeriesPointData[]>>({});
+
+  $effect(() => {
+    const batch = $livePowerSamples;
+    for (const [key, points] of Object.entries({
+      node: batch.node ?? [],
+      ...Object.fromEntries((batch.gpu ?? []).map((point, index) => [String(index), [point]])),
+    })) {
+      if (points.length === 0) continue;
+      const bucket = liveBySource[key] ?? [];
+      // GPU batches carry every card; key them by their position marker sent
+      // from the server (the index fallback keeps ordering stable enough for
+      // a live overlay).
+      const merged = [...bucket, ...points].slice(-LIVE_SAMPLE_CAP);
+      liveBySource = { ...liveBySource, [key]: merged };
+    }
+  });
+
+  let gpuSeries = $derived.by(() => {
+    const stored = (report?.series ?? []).filter((entry) => !entry.is_node);
+    return stored.map((entry, index) => fuseLive(entry, liveBySource[String(index)] ?? []));
+  });
+  let nodeSeries = $derived.by(() => {
+    const stored = (report?.series ?? []).find((entry) => entry.is_node) ?? null;
+    return stored ? fuseLive(stored, liveBySource["node"] ?? []) : null;
+  });
   let chartSeries = $derived((nodeSeries ? [nodeSeries] : []).concat(gpuSeries));
   let chartData = $derived(powerChartData(chartSeries, report?.bucket_seconds ?? 0));
   let totals = $derived(report?.totals);
@@ -75,8 +104,22 @@
     POWER_WINDOW_OPTIONS.map((option) => ({ key: option.key, label: $translate(POWER_WINDOW_LABEL_KEYS[option.key]) })),
   );
 
+  /**
+   * fuseLive appends live SSE samples newer than the stored series' last
+   * point. The stored series stays untouched; live points only extend it so
+   * the curve keeps growing between store flushes.
+   */
+  function fuseLive(entry: PowerSeriesData, live: PowerSeriesPointData[]): PowerSeriesData {
+    if (live.length === 0) return entry;
+    const lastTs = entry.points.length > 0 ? entry.points[entry.points.length - 1].timestamp : "";
+    const newer = live.filter((point) => point.timestamp > lastTs);
+    if (newer.length === 0) return entry;
+    return { ...entry, points: [...entry.points, ...newer] };
+  }
+
   async function load(): Promise<void> {
     const id = ++requestID;
+    liveBySource = {};
     try {
       const result = await getPowerReport({
         window: POWER_WINDOW_OPTIONS.find((option) => option.key === selectedWindow)?.api,

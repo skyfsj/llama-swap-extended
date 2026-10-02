@@ -62,7 +62,7 @@ func TestSubscribe_ReturnsChannels(t *testing.T) {
 	m, err := New(config.PerformanceConfig{}, config.PowerConfig{}, newTestLogger())
 	require.NoError(t, err)
 
-	sysCh, gpuCh, unsub := m.Subscribe()
+	sysCh, gpuCh, _, unsub := m.Subscribe()
 	defer unsub()
 
 	assert.NotNil(t, sysCh)
@@ -74,7 +74,7 @@ func TestSubscribe_UnsubscribeRemovesListeners(t *testing.T) {
 	m, err := New(config.PerformanceConfig{}, config.PowerConfig{}, newTestLogger())
 	require.NoError(t, err)
 
-	_, _, unsub := m.Subscribe()
+	_, _, _, unsub := m.Subscribe()
 
 	m.mutex.RLock()
 	assert.Len(t, m.sysListeners, 1)
@@ -93,8 +93,8 @@ func TestSubscribe_MultipleSubscriptions(t *testing.T) {
 	m, err := New(config.PerformanceConfig{}, config.PowerConfig{}, newTestLogger())
 	require.NoError(t, err)
 
-	sysCh1, gpuCh1, unsub1 := m.Subscribe()
-	sysCh2, gpuCh2, unsub2 := m.Subscribe()
+	sysCh1, gpuCh1, _, unsub1 := m.Subscribe()
+	sysCh2, gpuCh2, _, unsub2 := m.Subscribe()
 	defer unsub1()
 	defer unsub2()
 
@@ -181,7 +181,7 @@ func TestStart_SubscriberReceivesStats(t *testing.T) {
 	m, err := New(config.PerformanceConfig{Every: 100 * time.Millisecond}, config.PowerConfig{}, newTestLogger())
 	require.NoError(t, err)
 
-	sysCh, _, unsub := m.Subscribe()
+	sysCh, _, _, unsub := m.Subscribe()
 	defer unsub()
 
 	m.Start()

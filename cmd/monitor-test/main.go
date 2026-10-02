@@ -78,7 +78,7 @@ func main() {
 		m, _ := perf.New(config.PerformanceConfig{Every: every}, config.PowerConfig{}, l)
 		m.Start()
 		defer m.Stop()
-		sysCh, gpuCh, unsub := m.Subscribe()
+		sysCh, gpuCh, _, unsub := m.Subscribe()
 		defer unsub()
 		for {
 			select {

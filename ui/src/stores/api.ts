@@ -5,6 +5,7 @@ import type {
   ActivityStatsData,
   SpeedReportData,
   PowerReportData,
+  PowerSeriesPointData,
   VersionInfo,
   LogData,
   APIEventEnvelope,
@@ -48,6 +49,15 @@ export const hasListedModels = derived(playgroundModels, ($playgroundModels) => 
 export const proxyLogs = writable<string>("");
 export const upstreamLogs = writable<string>("");
 export const activityRevision = writable<number>(0);
+/**
+ * Live power samples streamed from /api/events (type "powerSample"). Each
+ * event carries the newest GPU batch and/or node reading; the energy panel
+ * appends them to its curve in real time, between store flushes.
+ */
+export const livePowerSamples = writable<{ gpu: PowerSeriesPointData[]; node: PowerSeriesPointData[] }>({
+  gpu: [],
+  node: [],
+});
 export const inFlightRequests = writable<number>(0);
 export const inflightRequestEntries = writable<InflightRequestEntry[]>([]);
 export const backendProgress = writable<Record<string, BackendProgressEvent>>({});
@@ -225,6 +235,34 @@ export function handleAPIEventMessage(data: string): void {
       const state = JSON.parse(message.data) as Pick<ProfileState, "active">;
       profileRevision++;
       activeProfile.set(state.active);
+      break;
+    }
+
+    case "powerSample": {
+      const payload = JSON.parse(message.data) as {
+        gpu?: Array<{ timestamp: string; id: number; name: string; uuid: string; temp_c: number; gpu_util_pct: number; mem_used_mb: number; mem_total_mb: number; power_draw_w: number }>;
+        node?: Array<{ timestamp: string; power_w: number; source: string }>;
+      };
+      livePowerSamples.update((current) => {
+        const next = { ...current };
+        if (payload.gpu?.length) {
+          next.gpu = payload.gpu.map((g) => ({
+            timestamp: g.timestamp,
+            avg_watts: g.power_draw_w,
+            min_watts: g.power_draw_w,
+            max_watts: g.power_draw_w,
+          }));
+        }
+        if (payload.node?.length) {
+          next.node = payload.node.map((n) => ({
+            timestamp: n.timestamp,
+            avg_watts: n.power_w,
+            min_watts: n.power_w,
+            max_watts: n.power_w,
+          }));
+        }
+        return next;
+      });
       break;
     }
 

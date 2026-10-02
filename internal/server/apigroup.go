@@ -972,6 +972,7 @@ const (
 	msgTypeUIConfig        messageType = "uiConfig"
 	msgTypeProfile         messageType = "profileChanged"
 	msgTypeBackendProgress messageType = "backendProgress"
+	msgTypePowerSample     messageType = "powerSample"
 )
 
 // sendDropReportInterval is how often handleAPIEvents reports messages that
@@ -1139,6 +1140,41 @@ func (s *Server) handleAPIEvents(w http.ResponseWriter, r *http.Request) {
 	defer event.On(func(e ActivityLogEvent) { sendActivity(e.Metrics) })()
 	defer event.On(func(e swaputil.InFlightRequestsEvent) { sendInFlight(e) })()
 	defer event.On(func(e swaputil.BackendProgressEvent) { sendBackendProgress(e) })()
+
+	// Live power samples: every perf monitor batch (GPU cards + the node
+	// meter) streams to the client as it lands, so the energy panel's curve
+	// grows in real time instead of waiting for the store flush + poll cycle.
+	// The batch carries both lists in one message to keep ordering simple.
+	var gpuCh chan []perf.GpuStat
+	var nodeCh chan perf.NodeStat
+	var unsubscribePerf func()
+	if s.perf != nil {
+		_, gpuCh, nodeCh, unsubscribePerf = s.perf.Subscribe()
+		defer unsubscribePerf()
+		sendPowerSamples := func(gpus []perf.GpuStat, node *perf.NodeStat) {
+			payload := map[string]any{"gpu": gpus}
+			if node != nil {
+				payload["node"] = []perf.NodeStat{*node}
+			}
+			if j, err := json.Marshal(payload); err == nil {
+				send(messageEnvelope{Type: msgTypePowerSample, Data: string(j)})
+			}
+		}
+		go func() {
+			for {
+				select {
+				case <-r.Context().Done():
+					return
+				case <-s.shutdownCtx.Done():
+					return
+				case gpus := <-gpuCh:
+					sendPowerSamples(gpus, nil)
+				case node := <-nodeCh:
+					sendPowerSamples(nil, &node)
+				}
+			}
+		}()
+	}
 
 	// initial payload
 	sendLogData("proxy", s.proxylog.GetHistory())

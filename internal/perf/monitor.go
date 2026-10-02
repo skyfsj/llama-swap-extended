@@ -38,6 +38,7 @@ type Monitor struct {
 
 	sysListeners map[chan SysStat]struct{}
 	gpuListeners map[chan []GpuStat]struct{}
+	nodeListeners map[chan NodeStat]struct{}
 }
 
 func ringCapacity(c config.PerformanceConfig) int {
@@ -70,6 +71,7 @@ func New(c config.PerformanceConfig, power config.PowerConfig, logger *logmon.Mo
 		nodeEnergy:   &energyAccumulator{name: "node"},
 		sysListeners: make(map[chan SysStat]struct{}),
 		gpuListeners: make(map[chan []GpuStat]struct{}),
+		nodeListeners: make(map[chan NodeStat]struct{}),
 	}, nil
 }
 
@@ -117,24 +119,29 @@ func (m *Monitor) UpdateConfig(newConf config.PerformanceConfig, newPower config
 	}
 }
 
-// Subscribe returns channels to listen to system and GPU stats.
-func (m *Monitor) Subscribe() (chan SysStat, chan []GpuStat, func()) {
+// Subscribe returns channels to listen to system, GPU and node power stats.
+// GPU and node channels deliver whole batches; all are non-blocking sends so
+// a slow subscriber drops samples instead of stalling the monitor.
+func (m *Monitor) Subscribe() (chan SysStat, chan []GpuStat, chan NodeStat, func()) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 	sysChan := make(chan SysStat, 1)
 	gpuChan := make(chan []GpuStat, 1)
+	nodeChan := make(chan NodeStat, 1)
 
 	m.sysListeners[sysChan] = struct{}{}
 	m.gpuListeners[gpuChan] = struct{}{}
+	m.nodeListeners[nodeChan] = struct{}{}
 
 	unsub := func() {
 		m.mutex.Lock()
 		defer m.mutex.Unlock()
 		delete(m.sysListeners, sysChan)
 		delete(m.gpuListeners, gpuChan)
+		delete(m.nodeListeners, nodeChan)
 	}
 
-	return sysChan, gpuChan, unsub
+	return sysChan, gpuChan, nodeChan, unsub
 }
 
 func (m *Monitor) Start() {
@@ -237,6 +244,12 @@ func (m *Monitor) Start() {
 				// so the next real sample does not bill the gap at the stale
 				// wattage. Negative readings are discarded inside add().
 				m.nodeEnergy.add(n.Timestamp, n.PowerW)
+				for l := range m.nodeListeners {
+					select {
+					case l <- n:
+					default:
+					}
+				}
 				m.mutex.Unlock()
 			}
 		}
