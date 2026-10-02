@@ -118,15 +118,43 @@ export function formatGpuSeconds(seconds: number): string {
 }
 
 /**
- * monthlyEstimate extrapolates the month-to-date cost across the whole
- * calendar month. Returns 0 while there is nothing to extrapolate from.
+ * monthlyEstimate extrapolates month-to-date cost across the whole calendar
+ * month based on the span of time the data actually covers, not the wall
+ * clock since midnight: statistics start when the daemon was deployed, so a
+ * day elapsed 20 hours ago with 1.6 hours of samples would otherwise be
+ * stretched over 20 hours and understate the projection by an order of
+ * magnitude. `coverageHours` is the measured span of the month-to-date
+ * samples; when it is unknown or absurdly small the current-power based
+ * fallback is used instead.
  */
-export function monthlyEstimate(monthToDate: number, now: Date = new Date()): number {
+export function monthlyEstimate(
+  monthToDate: number,
+  coverageHours: number,
+  currentWatts: number,
+  pricePerKwh: number,
+  now: Date = new Date(),
+): number {
   if (!Number.isFinite(monthToDate) || monthToDate <= 0) return 0;
   const daysInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
-  const elapsedDays = now.getDate() - 1 + now.getHours() / 24;
-  if (elapsedDays <= 0) return monthToDate;
-  return (monthToDate / elapsedDays) * daysInMonth;
+
+  // Data-backed extrapolation: cost per covered hour × hours in the month.
+  if (Number.isFinite(coverageHours) && coverageHours >= 1) {
+    const hoursInMonth = daysInMonth * 24;
+    return (monthToDate / coverageHours) * hoursInMonth;
+  }
+
+  // Not enough history yet (< 1 h): project the live power level forward.
+  if (
+    Number.isFinite(currentWatts) &&
+    currentWatts > 0 &&
+    Number.isFinite(pricePerKwh) &&
+    pricePerKwh > 0
+  ) {
+    const hoursInMonth = daysInMonth * 24;
+    return (currentWatts / 1000) * pricePerKwh * hoursInMonth;
+  }
+
+  return 0;
 }
 
 /** tariffLabel names a tariff bucket; the empty name is the base price. */

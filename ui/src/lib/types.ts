@@ -806,6 +806,8 @@ export interface PowerTotalsData {
   today_cost: number;
   month_energy_wh: number;
   month_cost: number;
+  /** Span of time (hours) the month-to-date samples actually cover. */
+  month_coverage_hours: number;
   by_tariff: PowerTariffUsageData[];
 }
 

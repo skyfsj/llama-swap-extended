@@ -96,16 +96,26 @@ describe("isPowerWindowKey", () => {
 });
 
 describe("monthlyEstimate", () => {
-  it("extrapolates month-to-date cost across the month", () => {
-    // Day 15 noon: elapsed ≈ 14.5 days in a 31-day month.
-    const estimate = monthlyEstimate(14.5, new Date(2026, 9, 15, 12, 0, 0));
-    expect(estimate).toBeGreaterThan(30);
-    expect(estimate).toBeLessThan(32);
+  it("extrapolates by the covered span, not the wall clock", () => {
+    // 1.6 h of samples costing 0.24 in a 31-day month: the projection must
+    // follow the data span, not the hours since midnight (the old formula
+    // understated this case by an order of magnitude).
+    const estimate = monthlyEstimate(0.24, 1.6, 381, 0.55, new Date(2026, 9, 2, 13, 0, 0));
+    expect(estimate).toBeGreaterThan(105);
+    expect(estimate).toBeLessThan(115);
+  });
+
+  it("falls back to the live power projection with little history", () => {
+    const estimate = monthlyEstimate(0.05, 0.4, 381, 0.55, new Date(2026, 9, 2, 13, 0, 0));
+    // 381 W × 0.55 CNY/kWh × 744 h ≈ 155.9
+    expect(estimate).toBeGreaterThan(150);
+    expect(estimate).toBeLessThan(160);
   });
 
   it("handles empty and boundary inputs", () => {
-    expect(monthlyEstimate(0)).toBe(0);
-    expect(monthlyEstimate(5, new Date(2026, 9, 1, 0, 0, 0))).toBe(5);
+    expect(monthlyEstimate(0, 5, 381, 0.55)).toBe(0);
+    // No coverage and no live power to project from.
+    expect(monthlyEstimate(5, 0, 0, 0.55)).toBe(0);
   });
 });
 
@@ -132,6 +142,7 @@ describe("hasPowerData", () => {
         today_cost: 0,
         month_energy_wh: 0,
         month_cost: 0,
+        month_coverage_hours: 0,
         by_tariff: [],
       },
       baselines: {},

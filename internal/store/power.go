@@ -249,6 +249,12 @@ type PowerTotals struct {
 	MonthEnergyWh float64            `json:"month_energy_wh"`
 	MonthCost     float64            `json:"month_cost"`
 	ByTariff      []PowerTariffUsage `json:"by_tariff"`
+	// MonthCoverageHours is the span of time the month-to-date samples
+	// actually cover (newest minus oldest GPU sample). Statistics start when
+	// the daemon was deployed, so this is what a month projection must
+	// extrapolate from — not the wall clock since midnight. <= 0 when there
+	// is no month-to-date data yet.
+	MonthCoverageHours float64 `json:"month_coverage_hours"`
 }
 
 // PowerReport is the payload behind the activity page's energy panel.
@@ -685,11 +691,11 @@ func (s *Store) PowerReport(ctx context.Context, query PowerReportQuery) (PowerR
 	now := time.Now()
 	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
-	todayEnergy, todayCost, err := s.powerEnergySince(ctx, todayStart)
+	todayEnergy, todayCost, _, err := s.powerEnergySince(ctx, todayStart)
 	if err != nil {
 		return PowerReport{}, err
 	}
-	monthEnergy, monthCost, err := s.powerEnergySince(ctx, monthStart)
+	monthEnergy, monthCost, coverageHours, err := s.powerEnergySince(ctx, monthStart)
 	if err != nil {
 		return PowerReport{}, err
 	}
@@ -697,22 +703,29 @@ func (s *Store) PowerReport(ctx context.Context, query PowerReportQuery) (PowerR
 	report.Totals.TodayCost = todayCost
 	report.Totals.MonthEnergyWh = monthEnergy
 	report.Totals.MonthCost = monthCost
+	report.Totals.MonthCoverageHours = coverageHours
 
 	return report, nil
 }
 
-// powerEnergySince sums GPU-source energy and cost from the given local time.
-func (s *Store) powerEnergySince(ctx context.Context, since time.Time) (float64, float64, error) {
+// powerEnergySince sums GPU-source energy and cost from the given local time,
+// plus the span of time (newest minus oldest sample, in hours) the summed
+// rows actually cover — the honest denominator for a month projection when
+// statistics started mid-month.
+func (s *Store) powerEnergySince(ctx context.Context, since time.Time) (float64, float64, float64, error) {
 	var energy, cost float64
+	var coverage float64
 	err := s.db.QueryRowContext(ctx, `
-		SELECT COALESCE(SUM(energy_wh), 0), COALESCE(SUM(energy_wh * price_per_kwh) / 1000, 0)
+		SELECT COALESCE(SUM(energy_wh), 0),
+		       COALESCE(SUM(energy_wh * price_per_kwh) / 1000, 0),
+		       COALESCE(MAX(ts_end) - MIN(ts_start), 0) / 3600.0
 		FROM power_samples
 		WHERE source = 'gpu' AND ts_end > ?`,
-		since.Unix()).Scan(&energy, &cost)
+		since.Unix()).Scan(&energy, &cost, &coverage)
 	if err != nil {
-		return 0, 0, fmt.Errorf("power calendar totals: %w", err)
+		return 0, 0, 0, fmt.Errorf("power calendar totals: %w", err)
 	}
-	return energy, cost, nil
+	return energy, cost, coverage, nil
 }
 
 // clampFraction scales one row's duration proportionally when the row sticks

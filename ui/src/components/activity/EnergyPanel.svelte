@@ -48,7 +48,15 @@
   let chartSeries = $derived((nodeSeries ? [nodeSeries] : []).concat(gpuSeries));
   let chartData = $derived(powerChartData(chartSeries, report?.bucket_seconds ?? 0));
   let totals = $derived(report?.totals);
-  let estimate = $derived(totals ? monthlyEstimate(totals.month_cost) : 0);
+  let estimate = $derived.by(() => {
+    if (!totals) return 0;
+    return monthlyEstimate(
+      totals.month_cost,
+      totals.month_coverage_hours,
+      currentPower,
+      report?.price_per_kwh ?? 0,
+    );
+  });
 
   // The headline "now" reading prefers the node meter (whole machine) and
   // falls back to the busiest GPU card.
