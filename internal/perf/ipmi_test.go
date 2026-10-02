@@ -92,10 +92,26 @@ func TestPerf_EnergyAccumulator(t *testing.T) {
 		t.Errorf("gap should not add energy: totalWh = %v", acc.totalWh)
 	}
 
-	// Negative wattage clamps to zero.
+	// Negative wattage is an invalid reading: discarded without advancing
+	// the anchor, so the accumulator keeps its last real state.
 	acc.add(start.Add(5*time.Hour+time.Minute), -50)
-	if acc.lastW != 0 {
-		t.Errorf("negative watts should clamp to 0, got %v", acc.lastW)
+	if acc.lastW != 200 {
+		t.Errorf("negative watts should be discarded, lastW = %v, want 200", acc.lastW)
+	}
+
+	// A 0 W reading is valid: it advances the anchor and integrates as zero,
+	// so the next real reading does not bill the idle span at the stale
+	// wattage.
+	acc2 := &energyAccumulator{}
+	acc2.add(start, 300)
+	acc2.add(start.Add(time.Minute), 0)   // anchor advances, no energy
+	acc2.add(start.Add(2*time.Minute), 0) // still zero
+	acc2.add(start.Add(3*time.Minute), 300)
+	// Energy: 300 W × 1 min (before the 0 W) = 5 Wh; the two zero minutes
+	// integrate as zero instead of 300 W × 2 min.
+	wantZero := 300.0 / 60.0
+	if diff := acc2.totalWh - wantZero; diff > 0.01 || diff < -0.01 {
+		t.Errorf("zero-span energy = %v, want ~%v", acc2.totalWh, wantZero)
 	}
 }
 

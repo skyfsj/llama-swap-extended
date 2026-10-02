@@ -233,9 +233,10 @@ func (m *Monitor) Start() {
 				}
 				m.mutex.Lock()
 				m.nodeRing.Push(n)
-				if n.PowerW > 0 {
-					m.nodeEnergy.add(n.Timestamp, n.PowerW)
-				}
+				// 0 W is a valid reading: the accumulator advances its anchor
+				// so the next real sample does not bill the gap at the stale
+				// wattage. Negative readings are discarded inside add().
+				m.nodeEnergy.add(n.Timestamp, n.PowerW)
 				m.mutex.Unlock()
 			}
 		}
@@ -246,9 +247,6 @@ func (m *Monitor) Start() {
 // accumulators; callers must hold m.mutex.
 func (m *Monitor) integrateGpuEnergyLocked(stats []GpuStat) {
 	for _, stat := range stats {
-		if stat.PowerDrawW <= 0 {
-			continue
-		}
 		key := gpuEnergyKey{id: stat.ID, uuid: stat.UUID}.String()
 		acc := m.gpuEnergy[key]
 		if acc == nil {

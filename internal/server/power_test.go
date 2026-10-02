@@ -144,10 +144,9 @@ func TestServer_AggregatePowerRows(t *testing.T) {
 		{Timestamp: base.Add(10 * time.Second), PowerW: 400},
 	}
 
-	rows, newest := aggregatePowerRows(gpuStats, nodeStats, from, power)
-	if !newest.Equal(base.Add(20 * time.Second)) {
-		t.Errorf("newest = %v, want %v", newest, base.Add(20*time.Second))
-	}
+	cursors := newPowerCursors()
+	cursors.arm(from.Add(time.Minute), time.Minute) // default cursor = from
+	rows := aggregatePowerRows(gpuStats, nodeStats, cursors, power)
 
 	bySource := map[string]store.PowerSampleRow{}
 	for _, row := range rows {
@@ -193,7 +192,7 @@ func TestServer_AggregatePowerRowsSkipsSamplesAtOrBeforeCursor(t *testing.T) {
 	// integrated by earlier flushes; re-integrating them (chained through the
 	// ring's timestamps) multiplied the reported energy every tick.
 	base := time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC)
-	from := base.Add(40 * time.Second) // cursor: window covers [from, ...)
+	cursorAt := base.Add(40 * time.Second) // cursor: window covers [cursorAt, ...)
 
 	gpuStats := []perf.GpuStat{
 		// Already-integrated samples before the cursor.
@@ -203,14 +202,16 @@ func TestServer_AggregatePowerRowsSkipsSamplesAtOrBeforeCursor(t *testing.T) {
 		{Timestamp: base.Add(50 * time.Second), ID: 0, Name: "GPU0", UUID: "GPU-a", PowerDrawW: 200},
 		{Timestamp: base.Add(70 * time.Second), ID: 0, Name: "GPU0", UUID: "GPU-a", PowerDrawW: 200},
 	}
-	rows, newest := aggregatePowerRows(gpuStats, nil, from, config.PowerConfig{}.Effective())
+	cursors := newPowerCursors()
+	cursors.set("GPU-a", cursorAt)
+	rows := aggregatePowerRows(gpuStats, nil, cursors, config.PowerConfig{}.Effective())
 
 	if len(rows) != 1 {
 		t.Fatalf("rows = %d, want 1", len(rows))
 	}
 	row := rows[0]
-	// Window: [from, 70s) = 30 s at 200 W = 5/3 Wh. The pre-cursor samples and
-	// their wattage must not appear anywhere.
+	// Window: [cursorAt, 70s) = 30 s at 200 W = 5/3 Wh. The pre-cursor samples
+	// and their wattage must not appear anywhere.
 	want := 200.0 * 30 / 3600
 	if diff := row.EnergyWh - want; diff > 0.0001 || diff < -0.0001 {
 		t.Errorf("energy = %v, want ~%v", row.EnergyWh, want)
@@ -218,8 +219,42 @@ func TestServer_AggregatePowerRowsSkipsSamplesAtOrBeforeCursor(t *testing.T) {
 	if row.MinWatts != 200 || row.MaxWatts != 200 || row.Samples != 2 {
 		t.Errorf("stats = %+v, want only window samples", row)
 	}
-	if !newest.Equal(base.Add(70 * time.Second)) {
-		t.Errorf("newest = %v, want %v", newest, base.Add(70*time.Second))
+	if !row.End.Equal(base.Add(70 * time.Second)) {
+		t.Errorf("row end = %v, want %v", row.End, base.Add(70*time.Second))
+	}
+}
+
+func TestServer_AggregatePowerRowsPerSourceCursors(t *testing.T) {
+	// Regression: a single global cursor advanced by the fastest source made
+	// slower sources lose (fastest_last - slowest_last) seconds of energy on
+	// every window. Each source must integrate from its own cursor.
+	base := time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC)
+
+	// GPU sampled up to T+5s, node only up to T-25s (30s IPMI cadence behind).
+	gpuStats := []perf.GpuStat{
+		{Timestamp: base.Add(5 * time.Second), ID: 0, Name: "GPU0", UUID: "GPU-a", PowerDrawW: 100},
+	}
+	nodeStats := []perf.NodeStat{
+		{Timestamp: base.Add(-25 * time.Second), PowerW: 400},
+	}
+	cursors := newPowerCursors()
+	cursors.arm(base, time.Minute)
+	rows := aggregatePowerRows(gpuStats, nodeStats, cursors, config.PowerConfig{}.Effective())
+
+	bySource := map[string]store.PowerSampleRow{}
+	for _, row := range rows {
+		bySource[row.SourceID] = row
+	}
+	// The node row must extend to its own newest sample, not stop at the GPU's
+	// cursor position of a previous window.
+	node := bySource["node"]
+	if !node.End.Equal(base.Add(-25 * time.Second)) {
+		t.Errorf("node end = %v, want %v (its own newest sample)", node.End, base.Add(-25*time.Second))
+	}
+	// Node: 400 W over [base-60s(arm lookback), T-25s) = 35 s → 400*35/3600 Wh.
+	wantNode := 400.0 * 35 / 3600
+	if diff := node.EnergyWh - wantNode; diff > 0.001 || diff < -0.001 {
+		t.Errorf("node energy = %v, want ~%v", node.EnergyWh, wantNode)
 	}
 }
 

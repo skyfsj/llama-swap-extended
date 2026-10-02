@@ -250,8 +250,13 @@ type energyAccumulator struct {
 const maxEnergyGap = 3 * time.Minute
 
 func (a *energyAccumulator) add(ts time.Time, watts float64) {
-	if watts < 0 {
-		watts = 0
+	// A 0 W reading is a valid measurement (driver reset, BMC quirk): it
+	// advances the anchor and integrates as zero, so the next real reading
+	// does not bill the idle span at the pre-gap wattage. Only negative
+	// readings are discarded as invalid; a late batch (a lagging reader
+	// goroutine surviving a ring reset) must not rewind the anchor either.
+	if watts < 0 || !ts.After(a.lastTS) {
+		return
 	}
 	if !a.lastTS.IsZero() {
 		if dt := ts.Sub(a.lastTS); dt > 0 && dt <= maxEnergyGap {

@@ -123,7 +123,11 @@ func parseContainerGPUSelections(value string, hardware *hw.HardwareSnapshot) []
 				}
 				if accelerator.UUID != nil && strings.TrimSpace(*accelerator.UUID) != "" {
 					all = append(all, *accelerator.UUID)
+					continue
 				}
+				// Index-only cards must still be attributed (and guarded by
+				// the thermal monitor); fall back to their stat key form.
+				all = append(all, gpuStatKey(accelerator.Index, ""))
 			}
 		}
 		return all
@@ -232,14 +236,16 @@ func (t *powerOccupancyTracker) reconcile(s *Server) {
 }
 
 // closeAll closes every open interval; used at shutdown so a restart does not
-// inherit stale open intervals.
+// inherit stale open intervals. The shutdownCtx is already cancelled when the
+// flusher reaches this path, so the update runs on a non-cancellable context.
 func (t *powerOccupancyTracker) closeAll(s *Server) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if s == nil || s.store == nil || len(t.occupied) == 0 {
 		return
 	}
-	if _, err := s.store.CloseModelGpuIntervals(s.shutdownCtx, "", time.Now()); err != nil && s.proxylog != nil {
+	closeCtx := context.WithoutCancel(s.shutdownCtx)
+	if _, err := s.store.CloseModelGpuIntervals(closeCtx, "", time.Now()); err != nil && s.proxylog != nil {
 		s.proxylog.Warnf("power stats: close occupancy intervals at shutdown: %v", err)
 	}
 	t.occupied = make(map[string]map[string]struct{})
@@ -264,6 +270,18 @@ func (s *Server) runPowerFlusher() {
 	})
 	defer unsubscribe()
 
+	// Close intervals left open by a crashed predecessor before reconciling:
+	// an open row stretches its model's attribution coverage to every query,
+	// so a stale sweep at startup is mandatory. Models that are genuinely
+	// still running get fresh intervals from the reconcile below.
+	if closed, err := s.store.CloseStaleModelGpuIntervals(s.shutdownCtx, time.Now()); err != nil {
+		if s.proxylog != nil {
+			s.proxylog.Warnf("power stats: stale occupancy sweep: %v", err)
+		}
+	} else if closed > 0 && s.proxylog != nil {
+		s.proxylog.Infof("power stats: closed %d occupancy interval(s) left open by a previous process", closed)
+	}
+
 	// Catch models that are already running (preloaded, or started before the
 	// flusher came up).
 	s.powerTracker.reconcile(s)
@@ -271,23 +289,35 @@ func (s *Server) runPowerFlusher() {
 	ticker := time.NewTicker(flushInterval)
 	defer ticker.Stop()
 
-	cursor := time.Now().Add(-flushInterval)
-	location := time.Now().Location()
+	cursors := newPowerCursors()
+	cursors.arm(time.Now(), flushInterval)
 	lastPrune := time.Now()
 	for {
 		select {
 		case <-s.shutdownCtx.Done():
 			flushCtx := context.WithoutCancel(s.shutdownCtx)
-			s.flushPowerSamples(flushCtx, &cursor)
+			s.flushPowerSamples(flushCtx, cursors)
 			s.powerTracker.closeAll(s)
 			return
 		case <-ticker.C:
+			// Pick up reload changes each tick: a disabled flag stops the
+			// loop and a new flush interval resizes the ticker, so neither
+			// setting goes stale for the process lifetime.
+			power := s.currentConfig().Power
+			if power.Disabled {
+				return
+			}
+			if power.FlushInterval != flushInterval {
+				flushInterval = power.FlushInterval
+				ticker.Reset(flushInterval)
+			}
+
 			// Reconcile every tick too: it repairs any missed status event and
 			// picks up GPU mapping changes from config reloads.
 			s.powerTracker.reconcile(s)
 
 			flushCtx, cancel := context.WithTimeout(s.shutdownCtx, 30*time.Second)
-			s.flushPowerSamples(flushCtx, &cursor)
+			s.flushPowerSamples(flushCtx, cursors)
 			cancel()
 
 			if time.Since(lastPrune) >= 24*time.Hour {
@@ -299,22 +329,25 @@ func (s *Server) runPowerFlusher() {
 				}
 				pruneCancel()
 			}
-			_ = location
 		}
 	}
 }
 
-// flushPowerSamples aggregates every sample newer than *cursor into one row
-// per source and advances the cursor to the newest sample timestamp. The
+// flushPowerSamples aggregates every sample newer than each source's own
+// cursor into one row per source and advances that source's cursor to its
+// newest sample timestamp. Per-source cursors are required because sources
+// sample at different cadences (GPU ~5s, IPMI 30s): a single global cursor
+// set by the fastest source makes slower sources systematically lose the span
+// between their own last sample and the cursor on every window. A source's
 // cursor only advances after a successful insert, so a failed flush retries
-// with the full window next tick.
-func (s *Server) flushPowerSamples(ctx context.Context, cursor *time.Time) {
+// with that source's full window next tick.
+func (s *Server) flushPowerSamples(ctx context.Context, cursors *powerCursors) {
 	if s.perf == nil {
 		return
 	}
 	_, gpuStats, nodeStats := s.perf.Current()
 
-	rows, newest := aggregatePowerRows(gpuStats, nodeStats, *cursor, s.currentConfig().Power)
+	rows := aggregatePowerRows(gpuStats, nodeStats, cursors, s.currentConfig().Power)
 	if len(rows) == 0 {
 		return
 	}
@@ -324,39 +357,83 @@ func (s *Server) flushPowerSamples(ctx context.Context, cursor *time.Time) {
 		}
 		return
 	}
-	*cursor = newest
+	for _, row := range rows {
+		cursors.set(row.SourceID, row.End)
+	}
+}
+
+// powerCursors holds the last-integrated timestamp per source key ("node" or
+// a GPU stat key).
+type powerCursors struct {
+	mu      sync.Mutex
+	byKey   map[string]time.Time
+	defaults map[string]time.Time
+}
+
+func newPowerCursors() *powerCursors {
+	return &powerCursors{byKey: map[string]time.Time{}, defaults: map[string]time.Time{}}
+}
+
+// arm seeds a source's cursor at process start: the flush interval lookback
+// bounds how far back the first window reaches when no cursor exists yet.
+func (c *powerCursors) arm(now time.Time, lookback time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.defaults["*"] = now.Add(-lookback)
+}
+
+func (c *powerCursors) get(key string) time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if ts, ok := c.byKey[key]; ok {
+		return ts
+	}
+	if ts, ok := c.defaults["*"]; ok {
+		return ts
+	}
+	return time.Time{}
+}
+
+func (c *powerCursors) set(key string, ts time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.byKey[key] = ts
 }
 
 // aggregatePowerRows folds raw samples into one PowerSampleRow per source.
-// The first sample of a window only anchors the series: integrating it from
-// the cursor would extrapolate over a gap of unknown wattage. Consecutive
-// windows stay contiguous because the cursor advances to the newest sample.
-func aggregatePowerRows(gpuStats []perf.GpuStat, nodeStats []perf.NodeStat, from time.Time, power config.PowerConfig) ([]store.PowerSampleRow, time.Time) {
+// Each source integrates from its own cursor: the window's first sample
+// covers [cursor, ts), so consecutive windows stay contiguous per source.
+// Samples at or before the cursor were already integrated by an earlier
+// flush — skipping them keeps both the energy sum and the cursor
+// continuation exact.
+func aggregatePowerRows(gpuStats []perf.GpuStat, nodeStats []perf.NodeStat, cursors *powerCursors, power config.PowerConfig) []store.PowerSampleRow {
 	type accumulation struct {
-		sourceName string
-		last       time.Time
-		previous   time.Time
-		energyWh   float64
-		minWatts   float64
-		maxWatts   float64
-		samples    int
+		sourceName     string
+		cursor         time.Time
+		last           time.Time
+		previous       time.Time
+		energyWh       float64
+		integratedSecs float64
+		minWatts       float64
+		maxWatts       float64
+		samples        int
 	}
 	accumulations := map[string]*accumulation{}
 	accumulate := func(key string, name string, ts time.Time, watts float64) {
-		// The perf ring holds about an hour of samples but the flush window is
-		// one flushInterval wide. Samples at or before the cursor were already
-		// integrated by an earlier flush — skipping them keeps both the energy
-		// sum and the cursor continuation exact; every flush restarts its
-		// integration from the cursor.
-		if !ts.After(from) {
+		cursor := cursors.get(key)
+		// The perf ring holds about an hour of samples but the flush window
+		// is one flushInterval wide. Samples at or before the cursor were
+		// already integrated by an earlier flush.
+		if !ts.After(cursor) {
 			return
 		}
 		acc := accumulations[key]
 		if acc == nil {
 			acc = &accumulation{
 				sourceName: name,
+				cursor:     cursor,
 				last:       ts,
-				previous:   from,
+				previous:   cursor,
 				minWatts:   -1,
 			}
 			accumulations[key] = acc
@@ -364,11 +441,16 @@ func aggregatePowerRows(gpuStats []perf.GpuStat, nodeStats []perf.NodeStat, from
 		if watts <= 0 {
 			return
 		}
-		// Rectangular integration from the previous sample; the window's first
-		// sample covers [from, ts). The gap guard skips integrating across
-		// longer outages so missing data is never extrapolated.
-		if gap := ts.Sub(acc.previous); gap > 0 && gap <= powerSampleGapGuard {
-			acc.energyWh += watts * gap.Hours()
+		// Rectangular integration from the previous sample; the window's
+		// first sample covers [cursor, ts). The gap guard skips integrating
+		// across longer outages so missing data is never extrapolated; the
+		// skipped seconds are excluded from the average's denominator too,
+		// keeping AvgWatts a true sample-weighted mean.
+		if gap := ts.Sub(acc.previous); gap > 0 {
+			if gap <= powerSampleGapGuard {
+				acc.energyWh += watts * gap.Hours()
+				acc.integratedSecs += gap.Seconds()
+			}
 		}
 		acc.previous = ts
 		if ts.After(acc.last) {
@@ -390,31 +472,26 @@ func aggregatePowerRows(gpuStats []perf.GpuStat, nodeStats []perf.NodeStat, from
 		accumulate("node", "", stat.Timestamp, stat.PowerW)
 	}
 
-	newest := from
 	rows := make([]store.PowerSampleRow, 0, len(accumulations))
 	for key, acc := range accumulations {
 		if acc.samples == 0 {
 			continue
 		}
-		if acc.last.After(newest) {
-			newest = acc.last
-		}
-		duration := acc.last.Sub(from)
-		if duration <= 0 {
+		if acc.integratedSecs <= 0 {
 			continue
 		}
 		source := "gpu"
 		if key == "node" {
 			source = "node"
 		}
-		price, tariffName := power.TariffPriceFor(from)
+		price, tariffName := power.TariffPriceFor(acc.cursor)
 		rows = append(rows, store.PowerSampleRow{
-			Start:       from,
+			Start:       acc.cursor,
 			End:         acc.last,
 			Source:      source,
 			SourceID:    key,
 			SourceName:  acc.sourceName,
-			AvgWatts:    acc.energyWh / duration.Hours(),
+			AvgWatts:    acc.energyWh / (acc.integratedSecs / 3600),
 			MinWatts:    acc.minWatts,
 			MaxWatts:    acc.maxWatts,
 			Samples:     acc.samples,
@@ -423,7 +500,7 @@ func aggregatePowerRows(gpuStats []perf.GpuStat, nodeStats []perf.NodeStat, from
 			TariffName:  tariffName,
 		})
 	}
-	return rows, newest
+	return rows
 }
 
 // powerSourceStatus reports which power collectors have data, for the API

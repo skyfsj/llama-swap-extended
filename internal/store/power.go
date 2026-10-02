@@ -70,7 +70,17 @@ func (s *Store) InsertPowerSamples(ctx context.Context, rows []PowerSampleRow) e
 		INSERT INTO power_samples (
 			ts_start, ts_end, source, source_id, source_name,
 			avg_watts, min_watts, max_watts, samples, energy_wh, price_per_kwh, tariff_name
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (source, source_id, ts_start) DO UPDATE SET
+			ts_end = excluded.ts_end,
+			source_name = excluded.source_name,
+			avg_watts = excluded.avg_watts,
+			min_watts = excluded.min_watts,
+			max_watts = excluded.max_watts,
+			samples = excluded.samples,
+			energy_wh = excluded.energy_wh,
+			price_per_kwh = excluded.price_per_kwh,
+			tariff_name = excluded.tariff_name`)
 	if err != nil {
 		return fmt.Errorf("power samples prepare: %w", err)
 	}
@@ -97,7 +107,10 @@ func (s *Store) InsertPowerSamples(ctx context.Context, rows []PowerSampleRow) e
 	return tx.Commit()
 }
 
-// OpenModelGpuInterval records that a model started occupying a GPU.
+// OpenModelGpuInterval records that a model started occupying a GPU. A model
+// that is already open on the same card (a crashed predecessor's row, or a
+// race) is closed first so the open-interval unique index stays satisfied and
+// coverage is never counted twice.
 func (s *Store) OpenModelGpuInterval(ctx context.Context, row ModelGpuIntervalRow) error {
 	ctx = normalizeContext(ctx)
 	if err := s.ensureDB(); err != nil {
@@ -105,6 +118,11 @@ func (s *Store) OpenModelGpuInterval(ctx context.Context, row ModelGpuIntervalRo
 	}
 	if row.Started.IsZero() {
 		row.Started = time.Now()
+	}
+	if _, err := s.db.ExecContext(ctx, `
+		UPDATE model_gpu_intervals SET ended_ts = ? WHERE model_id = ? AND gpu_uuid = ? AND ended_ts = 0`,
+		row.Started.Unix(), row.ModelID, row.GpuUUID); err != nil {
+		return fmt.Errorf("model gpu interval supersede: %w", err)
 	}
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO model_gpu_intervals (model_id, gpu_uuid, started_ts, ended_ts)
@@ -114,6 +132,26 @@ func (s *Store) OpenModelGpuInterval(ctx context.Context, row ModelGpuIntervalRo
 		return fmt.Errorf("model gpu interval insert: %w", err)
 	}
 	return nil
+}
+
+// CloseStaleModelGpuIntervals closes every interval still open at the given
+// time, regardless of model. The flusher runs it once at startup so a crashed
+// process's open rows cannot stretch their attribution coverage forever.
+func (s *Store) CloseStaleModelGpuIntervals(ctx context.Context, ended time.Time) (int64, error) {
+	ctx = normalizeContext(ctx)
+	if err := s.ensureDB(); err != nil {
+		return 0, err
+	}
+	if ended.IsZero() {
+		ended = time.Now()
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE model_gpu_intervals SET ended_ts = ? WHERE ended_ts = 0`, ended.Unix())
+	if err != nil {
+		return 0, fmt.Errorf("model gpu interval stale sweep: %w", err)
+	}
+	count, _ := res.RowsAffected()
+	return count, nil
 }
 
 // CloseModelGpuIntervals stamps an end time onto every still-open occupancy
@@ -396,15 +434,17 @@ func (s *Store) PowerReport(ctx context.Context, query PowerReportQuery) (PowerR
 		if rowSeconds <= 0 {
 			continue
 		}
-		// Rows span one flush interval, so clipping the edges to the window
-		// proportionally is exact enough for charts and totals.
-		clipped := 1.0
-		if start.Before(query.Start) {
-			clipped *= clampFraction(query.Start.Sub(start).Seconds(), rowSeconds)
+		// Clip the row to the window by measuring the actual overlap span.
+		// (Multiplying the two edge fractions would be wrong when a short
+		// window cuts both sides of one row.)
+		overlapStart, overlapEnd := start, end
+		if overlapStart.Before(query.Start) {
+			overlapStart = query.Start
 		}
-		if end.After(query.End) {
-			clipped *= clampFraction(query.End.Sub(start).Seconds(), rowSeconds)
+		if overlapEnd.After(query.End) {
+			overlapEnd = query.End
 		}
+		clipped := clampFraction(overlapEnd.Sub(overlapStart).Seconds(), rowSeconds)
 		if clipped <= 0 {
 			continue
 		}
@@ -416,7 +456,16 @@ func (s *Store) PowerReport(ctx context.Context, query PowerReportQuery) (PowerR
 			acc = &seriesAccumulator{sourceName: sourceName, isNode: source == "node", buckets: map[int]*bucketAccumulator{}}
 			series[sourceID] = acc
 		}
+		// Rows may start before the window (partial overlap); clamp them into
+		// the first bucket instead of letting integer truncation produce a
+		// negative index, and skip rows that start at or after the window end.
+		if !start.Before(query.End) {
+			continue
+		}
 		index := int(start.Sub(query.Start).Seconds()) / bucketSeconds
+		if index < 0 {
+			index = 0
+		}
 		bucket := acc.buckets[index]
 		if bucket == nil {
 			bucket = &bucketAccumulator{}

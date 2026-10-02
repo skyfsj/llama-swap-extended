@@ -232,7 +232,8 @@ func sameGPUKey(a, b string) bool {
 
 // splitGPUKey breaks a stat key into its index and UUID parts. "index-N" is
 // the synthetic form produced when a backend reports no UUID; "index:N" is
-// the configured launch.gpus selection form, which matches the same card.
+// the configured launch.gpus selection form, and a bare integer is the
+// shorthand selection, all matching the same card.
 func splitGPUKey(key string) (index, uuid string) {
 	if rest, ok := strings.CutPrefix(key, "index-"); ok {
 		if _, err := strconv.Atoi(rest); err == nil {
@@ -243,6 +244,9 @@ func splitGPUKey(key string) (index, uuid string) {
 		if _, err := strconv.Atoi(rest); err == nil {
 			return rest, ""
 		}
+	}
+	if _, err := strconv.Atoi(key); err == nil {
+		return key, ""
 	}
 	return "", key
 }
