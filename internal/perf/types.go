@@ -24,6 +24,14 @@ type NetIOStat struct {
 	BytesSent uint64 `json:"bytes_sent"`
 }
 
+// NodeStat is one whole-node power reading, currently sourced from IPMI.
+// PowerW <= 0 means the reading is not usable.
+type NodeStat struct {
+	Timestamp time.Time `json:"timestamp"`
+	PowerW    float64   `json:"power_w"`
+	Source    string    `json:"source"`
+}
+
 type SysStat struct {
 	Timestamp time.Time `json:"timestamp"`
 

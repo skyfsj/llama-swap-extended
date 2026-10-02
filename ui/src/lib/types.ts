@@ -761,6 +761,76 @@ export interface SpeedReportData {
   context: ContextSeriesData[];
 }
 
+/** One time bucket of a power source's readings, from /api/metrics/power. */
+export interface PowerSeriesPointData {
+  timestamp: string;
+  avg_watts: number;
+  min_watts: number;
+  max_watts: number;
+}
+
+export interface PowerSeriesData {
+  source_id: string;
+  source_name: string;
+  is_node: boolean;
+  points: PowerSeriesPointData[];
+}
+
+/** One model's attributed energy over the report window. */
+export interface PowerModelUsageData {
+  model_id: string;
+  /** Net of the idle baseline; gross_energy_wh keeps the un-subtracted sum. */
+  energy_wh: number;
+  gross_energy_wh: number;
+  gpu_seconds: number;
+  requests: number;
+  cost: number;
+}
+
+/** Energy aggregated by the tariff in effect when samples were written. */
+export interface PowerTariffUsageData {
+  name: string;
+  energy_wh: number;
+  cost: number;
+}
+
+export interface PowerTotalsData {
+  energy_wh: number;
+  inference_energy_wh: number;
+  idle_energy_wh: number;
+  cost: number;
+  /** -1 when the node-level (IPMI) source has no samples. */
+  node_energy_wh: number;
+  node_cost: number;
+  today_energy_wh: number;
+  today_cost: number;
+  month_energy_wh: number;
+  month_cost: number;
+  by_tariff: PowerTariffUsageData[];
+}
+
+export interface PowerTariffConfig {
+  name: string;
+  pricePerKwh: number;
+  start: string;
+  end: string;
+}
+
+export interface PowerReportData {
+  currency: string;
+  price_per_kwh: number;
+  tariffs: PowerTariffConfig[];
+  sources: { gpu: boolean; ipmi: boolean };
+  start: string;
+  end: string;
+  bucket_seconds: number;
+  series: PowerSeriesData[];
+  models: PowerModelUsageData[];
+  totals: PowerTotalsData;
+  /** GPU source_id to idle-baseline watts; missing = baseline unavailable. */
+  baselines: Record<string, number>;
+}
+
 export interface ActivityStatsData {
   total_requests: number;
   total_input_tokens: number;

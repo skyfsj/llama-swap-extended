@@ -13,7 +13,7 @@ const mbToBytes = int64(1024 * 1024)
 // with the most recent system and GPU stats.
 func (m *Monitor) MetricsHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		sysStats, gpuStats := m.Current()
+		sysStats, gpuStats, nodeStats := m.Current()
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 
 		if len(sysStats) > 0 {
@@ -23,6 +23,12 @@ func (m *Monitor) MetricsHandler() http.HandlerFunc {
 		if len(gpuStats) > 0 {
 			writeGpuMetrics(w, latestPerGPU(gpuStats))
 		}
+
+		if len(nodeStats) > 0 {
+			writeNodeMetrics(w, nodeStats[len(nodeStats)-1])
+		}
+
+		writeEnergyMetrics(w, m.Energy())
 	}
 }
 
@@ -105,6 +111,37 @@ func writeGpuMetrics(w http.ResponseWriter, gpus []GpuStat) {
 			}
 		}
 	}
+}
+
+func writeNodeMetrics(w http.ResponseWriter, n NodeStat) {
+	fmt.Fprintf(w, "# HELP llamaswap_node_power_watts Whole-node power draw in watts (IPMI)\n")
+	fmt.Fprintf(w, "# TYPE llamaswap_node_power_watts gauge\n")
+	fmt.Fprintf(w, "llamaswap_node_power_watts{source=\"%s\"} %g\n", sanitizeLabel(n.Source), n.PowerW)
+}
+
+func writeEnergyMetrics(w http.ResponseWriter, snapshot EnergySnapshot) {
+	if len(snapshot.GPUs) == 0 && !snapshot.NodeHasValue {
+		return
+	}
+
+	fmt.Fprintf(w, "# HELP llamaswap_gpu_energy_watt_hours_total Cumulative GPU energy consumption in watt-hours since process start\n")
+	fmt.Fprintf(w, "# TYPE llamaswap_gpu_energy_watt_hours_total counter\n")
+	for _, gpu := range snapshot.GPUs {
+		if gpu.UUID != "" {
+			fmt.Fprintf(w, "llamaswap_gpu_energy_watt_hours_total{id=\"%d\",name=\"%s\",uuid=\"%s\"} %g\n",
+				gpu.ID, sanitizeLabel(gpu.Name), sanitizeLabel(gpu.UUID), gpu.WattHours)
+		} else {
+			fmt.Fprintf(w, "llamaswap_gpu_energy_watt_hours_total{id=\"%d\",name=\"%s\"} %g\n",
+				gpu.ID, sanitizeLabel(gpu.Name), gpu.WattHours)
+		}
+	}
+
+	if !snapshot.NodeHasValue {
+		return
+	}
+	fmt.Fprintf(w, "# HELP llamaswap_node_energy_watt_hours_total Cumulative whole-node energy consumption in watt-hours since process start\n")
+	fmt.Fprintf(w, "# TYPE llamaswap_node_energy_watt_hours_total counter\n")
+	fmt.Fprintf(w, "llamaswap_node_energy_watt_hours_total %g\n", snapshot.Node.WattHours)
 }
 
 // latestPerGPU returns the most recent GpuStat for each GPU ID, sorted by ID.

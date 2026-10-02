@@ -3,6 +3,8 @@ package perf
 import (
 	"context"
 	"errors"
+	"reflect"
+	"sort"
 	"sync"
 	"time"
 
@@ -17,11 +19,19 @@ var (
 )
 
 type Monitor struct {
-	mutex   sync.RWMutex
-	log     *logmon.Monitor
-	conf    config.PerformanceConfig
-	sysRing ring.Buffer[SysStat]
-	gpuRing ring.Buffer[[]GpuStat]
+	mutex    sync.RWMutex
+	log      *logmon.Monitor
+	conf     config.PerformanceConfig
+	power    config.PowerConfig
+	sysRing  ring.Buffer[SysStat]
+	gpuRing  ring.Buffer[[]GpuStat]
+	nodeRing ring.Buffer[NodeStat]
+
+	// energy accumulators integrate power samples into watt-hours since
+	// process start. They survive UpdateConfig restarts so the Prometheus
+	// counters stay monotonic for the lifetime of the process.
+	gpuEnergy  map[string]*energyAccumulator
+	nodeEnergy *energyAccumulator
 
 	stopCtx    context.Context
 	stopCancel context.CancelFunc
@@ -38,7 +48,7 @@ func ringCapacity(c config.PerformanceConfig) int {
 	return n
 }
 
-func New(c config.PerformanceConfig, logger *logmon.Monitor) (*Monitor, error) {
+func New(c config.PerformanceConfig, power config.PowerConfig, logger *logmon.Monitor) (*Monitor, error) {
 
 	if c.Every < 100*time.Millisecond {
 		c.Every = 100 * time.Millisecond
@@ -51,12 +61,26 @@ func New(c config.PerformanceConfig, logger *logmon.Monitor) (*Monitor, error) {
 	capacity := ringCapacity(c)
 	return &Monitor{
 		conf:         c,
+		power:        power,
 		log:          logger,
 		sysRing:      ring.NewBuffer[SysStat](capacity),
 		gpuRing:      ring.NewBuffer[[]GpuStat](capacity),
+		nodeRing:     ring.NewBuffer[NodeStat](nodeRingCapacity()),
+		gpuEnergy:    make(map[string]*energyAccumulator),
+		nodeEnergy:   &energyAccumulator{name: "node"},
 		sysListeners: make(map[chan SysStat]struct{}),
 		gpuListeners: make(map[chan []GpuStat]struct{}),
 	}, nil
+}
+
+// nodeRingCapacity keeps about one hour of node power samples at the fixed
+// IPMI sampling cadence.
+func nodeRingCapacity() int {
+	n := int(time.Hour / nodePowerEvery)
+	if n < 1 {
+		n = 1
+	}
+	return n
 }
 
 func (m *Monitor) Stop() {
@@ -70,9 +94,9 @@ func (m *Monitor) Stop() {
 }
 
 // UpdateConfig updates the monitor configuration and restarts if changed.
-func (m *Monitor) UpdateConfig(newConf config.PerformanceConfig) {
+func (m *Monitor) UpdateConfig(newConf config.PerformanceConfig, newPower config.PowerConfig) {
 	m.mutex.RLock()
-	changed := m.conf != newConf
+	changed := m.conf != newConf || !reflect.DeepEqual(m.power, newPower)
 	m.mutex.RUnlock()
 
 	if !changed {
@@ -82,9 +106,11 @@ func (m *Monitor) UpdateConfig(newConf config.PerformanceConfig) {
 	m.Stop()
 	m.mutex.Lock()
 	m.conf = newConf
+	m.power = newPower
 	capacity := ringCapacity(newConf)
 	m.sysRing = ring.NewBuffer[SysStat](capacity)
 	m.gpuRing = ring.NewBuffer[[]GpuStat](capacity)
+	m.nodeRing = ring.NewBuffer[NodeStat](nodeRingCapacity())
 	m.mutex.Unlock()
 	if !newConf.Disabled {
 		m.Start()
@@ -170,6 +196,7 @@ func (m *Monitor) Start() {
 				}
 				m.mutex.Lock()
 				m.gpuRing.Push(g)
+				m.integrateGpuEnergyLocked(g)
 				for l := range m.gpuListeners {
 					select {
 					case l <- g:
@@ -180,10 +207,60 @@ func (m *Monitor) Start() {
 			}
 		}
 	}()
+
+	if m.power.Ipmi.Disabled {
+		return
+	}
+
+	go func() {
+		nodeCh, err := collectNodePower(m.stopCtx, m.power.Ipmi.Command, m.log)
+		if err != nil {
+			if errors.Is(err, ErrNoNodePowerTool) {
+				m.log.Infof("node power monitoring not available: %s", err.Error())
+			} else {
+				m.log.Errorf("failed to initialize node power monitoring: %s", err.Error())
+			}
+			return
+		}
+
+		for {
+			select {
+			case <-m.stopCtx.Done():
+				return
+			case n, ok := <-nodeCh:
+				if !ok {
+					return
+				}
+				m.mutex.Lock()
+				m.nodeRing.Push(n)
+				if n.PowerW > 0 {
+					m.nodeEnergy.add(n.Timestamp, n.PowerW)
+				}
+				m.mutex.Unlock()
+			}
+		}
+	}()
 }
 
-// Current returns a copy of the current log of system and GPU stats.
-func (m *Monitor) Current() ([]SysStat, []GpuStat) {
+// integrateGpuEnergyLocked folds one batch of GPU samples into the energy
+// accumulators; callers must hold m.mutex.
+func (m *Monitor) integrateGpuEnergyLocked(stats []GpuStat) {
+	for _, stat := range stats {
+		if stat.PowerDrawW <= 0 {
+			continue
+		}
+		key := gpuEnergyKey{id: stat.ID, uuid: stat.UUID}.String()
+		acc := m.gpuEnergy[key]
+		if acc == nil {
+			acc = &energyAccumulator{id: stat.ID, name: stat.Name, uuid: stat.UUID}
+			m.gpuEnergy[key] = acc
+		}
+		acc.add(stat.Timestamp, stat.PowerDrawW)
+	}
+}
+
+// Current returns a copy of the current log of system, GPU and node stats.
+func (m *Monitor) Current() ([]SysStat, []GpuStat, []NodeStat) {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 
@@ -194,7 +271,56 @@ func (m *Monitor) Current() ([]SysStat, []GpuStat) {
 	for _, snapshot := range snapshots {
 		gpuStats = append(gpuStats, snapshot...)
 	}
-	return sysStats, gpuStats
+	return sysStats, gpuStats, m.nodeRing.Slice()
+}
+
+// GpuEnergyTotal is the cumulative energy consumption of one GPU since
+// process start.
+type GpuEnergyTotal struct {
+	ID        int
+	Name      string
+	UUID      string
+	WattHours float64
+}
+
+// EnergySnapshot reports the integrated energy totals feeding the Prometheus
+// counters.
+type EnergySnapshot struct {
+	GPUs         []GpuEnergyTotal
+	Node         GpuEnergyTotal
+	NodeHasValue bool
+}
+
+// Energy returns a snapshot of the energy accumulators.
+func (m *Monitor) Energy() EnergySnapshot {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+
+	snapshot := EnergySnapshot{Node: GpuEnergyTotal{Name: "node", WattHours: m.nodeEnergy.totalWh}}
+	snapshot.NodeHasValue = m.nodeEnergy.lastW > 0
+
+	ids := make([]string, 0, len(m.gpuEnergy))
+	for key := range m.gpuEnergy {
+		ids = append(ids, key)
+	}
+	sort.Strings(ids)
+	for _, key := range ids {
+		acc := m.gpuEnergy[key]
+		snapshot.GPUs = append(snapshot.GPUs, GpuEnergyTotal{
+			ID:        acc.id,
+			Name:      acc.name,
+			UUID:      acc.uuid,
+			WattHours: acc.totalWh,
+		})
+	}
+	return snapshot
+}
+
+// NodePowerAvailable reports whether node-level power readings have been seen.
+func (m *Monitor) NodePowerAvailable() bool {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+	return m.nodeEnergy.lastW > 0
 }
 
 func ReadSysStats() (SysStat, error) {

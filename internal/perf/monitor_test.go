@@ -19,7 +19,7 @@ func newTestLogger() *logmon.Monitor {
 func TestNew_DefaultConfig(t *testing.T) {
 	logger := newTestLogger()
 
-	m, err := New(config.PerformanceConfig{}, logger)
+	m, err := New(config.PerformanceConfig{}, config.PowerConfig{}, logger)
 	require.NoError(t, err)
 	require.NotNil(t, m)
 
@@ -33,14 +33,14 @@ func TestNew_CustomConfig(t *testing.T) {
 		Every: 500 * time.Millisecond,
 	}
 
-	m, err := New(cfg, logger)
+	m, err := New(cfg, config.PowerConfig{}, logger)
 	require.NoError(t, err)
 
 	assert.Equal(t, 500*time.Millisecond, m.conf.Every)
 }
 
 func TestNew_NilLogger(t *testing.T) {
-	m, err := New(config.PerformanceConfig{}, nil)
+	m, err := New(config.PerformanceConfig{}, config.PowerConfig{}, nil)
 	assert.Error(t, err)
 	assert.Nil(t, m)
 }
@@ -52,14 +52,14 @@ func TestNew_BelowMinimumConfig(t *testing.T) {
 		Every: 1 * time.Millisecond,
 	}
 
-	m, err := New(cfg, logger)
+	m, err := New(cfg, config.PowerConfig{}, logger)
 	require.NoError(t, err)
 
 	assert.Equal(t, 100*time.Millisecond, m.conf.Every)
 }
 
 func TestSubscribe_ReturnsChannels(t *testing.T) {
-	m, err := New(config.PerformanceConfig{}, newTestLogger())
+	m, err := New(config.PerformanceConfig{}, config.PowerConfig{}, newTestLogger())
 	require.NoError(t, err)
 
 	sysCh, gpuCh, unsub := m.Subscribe()
@@ -71,7 +71,7 @@ func TestSubscribe_ReturnsChannels(t *testing.T) {
 }
 
 func TestSubscribe_UnsubscribeRemovesListeners(t *testing.T) {
-	m, err := New(config.PerformanceConfig{}, newTestLogger())
+	m, err := New(config.PerformanceConfig{}, config.PowerConfig{}, newTestLogger())
 	require.NoError(t, err)
 
 	_, _, unsub := m.Subscribe()
@@ -90,7 +90,7 @@ func TestSubscribe_UnsubscribeRemovesListeners(t *testing.T) {
 }
 
 func TestSubscribe_MultipleSubscriptions(t *testing.T) {
-	m, err := New(config.PerformanceConfig{}, newTestLogger())
+	m, err := New(config.PerformanceConfig{}, config.PowerConfig{}, newTestLogger())
 	require.NoError(t, err)
 
 	sysCh1, gpuCh1, unsub1 := m.Subscribe()
@@ -108,23 +108,23 @@ func TestSubscribe_MultipleSubscriptions(t *testing.T) {
 }
 
 func TestCurrent_EmptyByDefault(t *testing.T) {
-	m, err := New(config.PerformanceConfig{}, newTestLogger())
+	m, err := New(config.PerformanceConfig{}, config.PowerConfig{}, newTestLogger())
 	require.NoError(t, err)
 
-	sysStats, gpuStats := m.Current()
+	sysStats, gpuStats, _ := m.Current()
 	assert.Empty(t, sysStats)
 	assert.Empty(t, gpuStats)
 }
 
 func TestCurrent_ReturnsCopies(t *testing.T) {
-	m, err := New(config.PerformanceConfig{}, newTestLogger())
+	m, err := New(config.PerformanceConfig{}, config.PowerConfig{}, newTestLogger())
 	require.NoError(t, err)
 
 	now := time.Now()
 	m.sysRing.Push(SysStat{Timestamp: now, MemTotalMB: 1024})
 	m.gpuRing.Push([]GpuStat{{Timestamp: now, ID: 0, Name: "gpu0"}})
 
-	sysStats, gpuStats := m.Current()
+	sysStats, gpuStats, _ := m.Current()
 
 	assert.Len(t, sysStats, 1)
 	assert.Len(t, gpuStats, 1)
@@ -133,7 +133,7 @@ func TestCurrent_ReturnsCopies(t *testing.T) {
 
 	// modifying the returned slice should not affect the original
 	sysStats[0].MemTotalMB = 999
-	original, _ := m.Current()
+	original, _, _ := m.Current()
 	assert.Equal(t, 1024, original[0].MemTotalMB)
 }
 
@@ -142,7 +142,7 @@ func TestStart_CollectsSysStats(t *testing.T) {
 		t.Skip("skipping slow test")
 	}
 
-	m, err := New(config.PerformanceConfig{Every: 100 * time.Millisecond}, newTestLogger())
+	m, err := New(config.PerformanceConfig{Every: 100 * time.Millisecond}, config.PowerConfig{}, newTestLogger())
 	require.NoError(t, err)
 
 	m.Start()
@@ -150,7 +150,7 @@ func TestStart_CollectsSysStats(t *testing.T) {
 	time.Sleep(350 * time.Millisecond)
 	m.Stop()
 
-	sysStats, _ := m.Current()
+	sysStats, _, _ := m.Current()
 	assert.NotEmpty(t, sysStats, "expected sys stats to be collected")
 }
 
@@ -159,7 +159,7 @@ func TestStart_StopStopsGoroutines(t *testing.T) {
 		t.Skip("skipping slow test")
 	}
 
-	m, err := New(config.PerformanceConfig{Every: 100 * time.Millisecond}, newTestLogger())
+	m, err := New(config.PerformanceConfig{Every: 100 * time.Millisecond}, config.PowerConfig{}, newTestLogger())
 	require.NoError(t, err)
 
 	m.Start()
@@ -178,7 +178,7 @@ func TestStart_SubscriberReceivesStats(t *testing.T) {
 		t.Skip("skipping slow test")
 	}
 
-	m, err := New(config.PerformanceConfig{Every: 100 * time.Millisecond}, newTestLogger())
+	m, err := New(config.PerformanceConfig{Every: 100 * time.Millisecond}, config.PowerConfig{}, newTestLogger())
 	require.NoError(t, err)
 
 	sysCh, _, unsub := m.Subscribe()
@@ -206,7 +206,7 @@ func TestReadSysStats(t *testing.T) {
 }
 
 func TestCurrent_ConcurrentAccess(t *testing.T) {
-	m, err := New(config.PerformanceConfig{}, newTestLogger())
+	m, err := New(config.PerformanceConfig{}, config.PowerConfig{}, newTestLogger())
 	require.NoError(t, err)
 
 	m.sysRing.Push(SysStat{Timestamp: time.Now(), MemTotalMB: 1024})
@@ -217,7 +217,7 @@ func TestCurrent_ConcurrentAccess(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			sys, gpu := m.Current()
+			sys, gpu, _ := m.Current()
 			assert.Len(t, sys, 1)
 			assert.Len(t, gpu, 1)
 		}()

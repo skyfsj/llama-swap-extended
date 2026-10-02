@@ -248,6 +248,7 @@ type Config struct {
 	Anthropic      AnthropicConfig      `yaml:"anthropic"`
 	Audit          AuditConfig          `yaml:"audit"`
 	Pricing        PricingConfig        `yaml:"pricing"`
+	Power          PowerConfig          `yaml:"power" json:"power"`
 }
 
 // UnmarshalYAML accepts both the historical scalar apiKeys list and the

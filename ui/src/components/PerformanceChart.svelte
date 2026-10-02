@@ -123,7 +123,7 @@
           },
         },
         title: {
-          display: true,
+          display: title !== "",
           text: title,
           color: colors.legend,
           font: { size: 14, weight: "bold" as const },

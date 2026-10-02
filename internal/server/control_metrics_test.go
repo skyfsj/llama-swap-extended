@@ -84,7 +84,7 @@ func TestServer_WriteControlMetrics_UsesCacheAndRuntimeState(t *testing.T) {
 }
 
 func TestServer_HandleMetrics_AppendsControlFamilies(t *testing.T) {
-	performance, err := perf.New(config.PerformanceConfig{Every: 5 * time.Second}, logmon.NewWriter(io.Discard))
+	performance, err := perf.New(config.PerformanceConfig{Every: 5 * time.Second}, config.PowerConfig{}, logmon.NewWriter(io.Discard))
 	if err != nil {
 		t.Fatalf("perf.New: %v", err)
 	}

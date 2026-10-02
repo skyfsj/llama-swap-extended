@@ -81,6 +81,13 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		return Config{}, fmt.Errorf("performance: %w", err)
 	}
 
+	// Power statistics apply defaults to the zero-value section and validate
+	// the tariff schedule the same way performance monitoring does.
+	config.Power = config.Power.Effective()
+	if err = config.Power.Validate(); err != nil {
+		return Config{}, fmt.Errorf("power: %w", err)
+	}
+
 	if config.StartPort < 1 {
 		return Config{}, fmt.Errorf("startPort must be greater than 1")
 	}
@@ -419,6 +426,10 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 	}
 
 	if err := ValidatePeerNamespace(config); err != nil {
+		return Config{}, err
+	}
+
+	if err := ValidateProviderNamespace(config); err != nil {
 		return Config{}, err
 	}
 

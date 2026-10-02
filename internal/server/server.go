@@ -60,7 +60,12 @@ type Server struct {
 	perf     *perf.Monitor
 	inflight *inflightTracker
 	metrics  *metricsMonitor
-	keys     *keyCache
+	// powerTracker mirrors running models into GPU occupancy intervals and
+	// runPowerFlusher persists power statistics; both power.go. thermal
+	// (thermal.go) parks models on overheating GPUs in maintenance mode.
+	powerTracker *powerOccupancyTracker
+	thermal      *thermalMonitor
+	keys         *keyCache
 	// auditDirty is the single-slot wake-up signal for the background
 	// audit maintenance task; bursts coalesce into one pass.
 	auditDirty         chan struct{}
@@ -453,8 +458,9 @@ func (s *Server) applyConfigCandidate(active, desired config.Config, changes con
 		s.metrics.configurePricing(s.store, effective)
 	}
 	if s.perf != nil {
-		s.perf.UpdateConfig(effective.Performance)
+		s.perf.UpdateConfig(effective.Performance, effective.Power)
 	}
+	s.restartThermalMonitor(effective)
 	s.refreshBackendAdapters(effective)
 	s.routes()
 	event.Emit(swaputil.ConfigFileChangedEvent{State: swaputil.ReloadingStateEnd})
@@ -685,6 +691,7 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 		proxylog:        proxylog,
 		upstreamlog:     upstreamlog,
 		perf:            perfMon,
+		powerTracker:    newPowerOccupancyTracker(),
 		inflight:        newInflightTracker(),
 		metrics:         newMetricsMonitor(proxylog, cfg.MetricsMaxInMemory, st),
 		store:           st,
@@ -935,8 +942,45 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 	go s.runResponseAffinityCleanup()
 	go s.runAuditMaintenance()
 	go s.runKeyTouchFlusher()
+	go s.runPowerFlusher()
 	go s.runExtensionPendingCleanup()
+	s.startThermalMonitor(cfg)
 	return s, nil
+}
+
+// startThermalMonitor launches the overheat guard when performance monitoring
+// and a thermalGuard block are configured. It runs until shutdown; config
+// reloads restart it through restartThermalMonitor.
+func (s *Server) startThermalMonitor(cfg config.Config) {
+	guard, err := cfg.Power.ThermalGuard.Effective()
+	if err != nil || guard == nil {
+		if err != nil && s.proxylog != nil {
+			s.proxylog.Warnf("thermal guard disabled: %v", err)
+		}
+		return
+	}
+	if s.perf == nil || cfg.Performance.Disabled {
+		if s.proxylog != nil {
+			s.proxylog.Warnf("thermal guard configured but performance monitoring is disabled; overheat protection is inactive")
+		}
+		return
+	}
+	s.thermal = newThermalMonitor(guard)
+	go s.thermal.run(s)
+	if s.proxylog != nil {
+		s.proxylog.Infof("thermal guard active: stop at %v°C, resume at %v°C after %d consecutive samples", guard.StopC, guard.ResumeC, guard.Consecutive)
+	}
+}
+
+// restartThermalMonitor reapplies the guard after a config change. Parked
+// models stay parked across the restart: the maintenance map lives on the
+// router, and a card that is still hot re-trips from fresh samples.
+func (s *Server) restartThermalMonitor(cfg config.Config) {
+	if s.thermal != nil {
+		s.thermal.Stop()
+		s.thermal = nil
+	}
+	s.startThermalMonitor(cfg)
 }
 
 // newModelBackendAdapter maps the explicit backend block to the narrow
@@ -1027,6 +1071,14 @@ func (s *Server) localPeerHandlerWithConfig(w http.ResponseWriter, r *http.Reque
 
 	switch {
 	case s.local.Handles(data.ModelID):
+		// Thermal guard failover: a model parked by the thermal guard is
+		// unusable on this host; when the request is not an operator start,
+		// forward it to a configured provider or peer so clients keep being
+		// served instead of seeing 503s. Operator starts pass through so the
+		// model can be brought back after the card cools.
+		if !s.forwardMaintenanceModel(w, r, data, cfg) {
+			return
+		}
 		s.proxylog.Debugf("dispatch: using local process for model: %s", data.ModelID)
 		s.local.ServeHTTP(w, r)
 	case s.peer.Handles(data.ModelID):
@@ -1035,6 +1087,48 @@ func (s *Server) localPeerHandlerWithConfig(w http.ResponseWriter, r *http.Reque
 	default:
 		swaputil.SendError(w, r, router.ErrNoRouterFound)
 	}
+}
+
+// forwardMaintenanceModel handles dispatch for a thermally parked local
+// model. When failover succeeds the request has been served and the return is
+// false (do not also run the local handler). Non-thermal maintenance reasons
+// and operator starts fall through to the local router, which enforces its
+// own 503.
+func (s *Server) forwardMaintenanceModel(w http.ResponseWriter, r *http.Request, data swaputil.ReqContextData, cfg config.Config) bool {
+	reason, parked := s.local.InMaintenance(data.ModelID)
+	if !parked || !strings.HasPrefix(reason, thermalGuardReason) {
+		return true
+	}
+	if swaputil.IsOperatorStart(r) {
+		return true
+	}
+	guard := cfg.Power.ThermalGuard
+	if !guard.FailoverEnabled() {
+		return true
+	}
+
+	// A provider gateway takes the request when it can route this model (the
+	// bare-name pool treats the local model as absent while it is parked).
+	if gw := s.currentGateway(); gw != nil && gw.Handles(data.ModelID) {
+		if route := gw.RouteFor(data.ModelID, false); route != nil {
+			s.proxylog.Warnf("dispatch: model %s is thermally parked, forwarding to provider %s", data.ModelID, route.ProviderID)
+			s.serveGateway(w, r, gw, route, data, cfg)
+			return false
+		}
+	}
+	// Otherwise a peer that claims the model serves it.
+	if s.peer != nil && s.peer.Handles(data.ModelID) {
+		s.proxylog.Warnf("dispatch: model %s is thermally parked, forwarding to a peer", data.ModelID)
+		s.peer.ServeHTTP(w, r)
+		return false
+	}
+
+	// Nothing to fail over to: explain the 503 instead of the generic
+	// maintenance message so operators can tell the two apart.
+	swaputil.SendResponse(w, r, http.StatusServiceUnavailable, fmt.Sprintf(
+		"model %s is thermally parked (%s) and no provider or peer is configured to take over; operator start is required once the GPU cools",
+		data.ModelID, reason))
+	return false
 }
 
 // serveGateway rewrites the model name to the upstream name and forwards the
@@ -1388,6 +1482,7 @@ func (s *Server) routes() {
 	mux.Handle("GET /api/metrics/activity", auditAPI.ThenFunc(s.handleAPIActivity))
 	mux.Handle("GET /api/metrics/stats", auditAPI.ThenFunc(s.handleAPIActivityStats))
 	mux.Handle("GET /api/metrics/speed", auditAPI.ThenFunc(s.handleAPIMetricsSpeed))
+	mux.Handle("GET /api/metrics/power", auditAPI.ThenFunc(s.handleAPIPower))
 	mux.Handle("GET /api/performance", logsAPI.ThenFunc(s.handleAPIPerformance))
 	mux.Handle("GET /api/version", inferenceAPI.ThenFunc(s.handleAPIVersion))
 	mux.Handle("GET /api/hardware", runtimeReadAPI.ThenFunc(s.handleAPIHardware))
@@ -1847,6 +1942,10 @@ func (s *Server) Shutdown(timeout time.Duration) error {
 		return nil
 	}
 	s.shutdownFn()
+	if s.thermal != nil {
+		s.thermal.Stop()
+		s.thermal = nil
+	}
 	if s.progressCancel != nil {
 		s.progressCancel()
 		s.progressCancel = nil

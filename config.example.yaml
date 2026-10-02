@@ -181,6 +181,18 @@ power:
     disabled: false
     command: ""
 
+  # thermalGuard: overheat protection (optional, off unless configured)
+  # - when a GPU crosses stopC every model occupying that card is stopped and
+  #   parked in maintenance mode until the card cools below resumeC
+  # - requests for parked models are forwarded to configured providers
+  #   (gateway) or peers instead of answering 503; set failover: false to
+  #   disable forwarding
+  # thermalGuard:
+  #   stopC: 85          # stop models at this core temperature (Celsius)
+  #   resumeC: 80        # release maintenance below this temperature
+  #   consecutive: 3     # hot samples before acting (one per performance.every)
+  #   failover: true     # forward parked models' requests to providers/peers
+
 # startPort: sets the starting port number for the automatic ${PORT} macro.
 # - optional, default: 5800
 # - the ${PORT} macro can be used in model.cmd and model.proxy settings

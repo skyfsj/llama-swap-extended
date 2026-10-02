@@ -176,7 +176,7 @@ func main() {
 	// perfMon outlives config reloads; its config is updated in place.
 	var perfMon *perf.Monitor
 	if !cfg.Performance.Disabled {
-		perfMon, err = perf.New(cfg.Performance, proxyLog)
+		perfMon, err = perf.New(cfg.Performance, cfg.Power, proxyLog)
 		if err != nil {
 			slog.Error("failed to create performance monitor", "error", err)
 			os.Exit(1)

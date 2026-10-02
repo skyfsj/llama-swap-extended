@@ -4,6 +4,7 @@ import type {
   ActivityPage,
   ActivityStatsData,
   SpeedReportData,
+  PowerReportData,
   VersionInfo,
   LogData,
   APIEventEnvelope,
@@ -455,6 +456,19 @@ export async function getSpeedReport(params: {
   const response = await fetch(url);
   if (!response.ok) {
     throw new Error(`Failed to fetch speed report: ${response.status}`);
+  }
+  return await response.json();
+}
+
+export async function getPowerReport(params: { window?: string; model?: string } = {}): Promise<PowerReportData> {
+  const query = new URLSearchParams();
+  if (params.window) query.set("window", params.window);
+  if (params.model) query.set("model", params.model);
+  const url = query.size > 0 ? `/api/metrics/power?${query}` : "/api/metrics/power";
+
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Failed to fetch power report: ${response.status}`);
   }
   return await response.json();
 }

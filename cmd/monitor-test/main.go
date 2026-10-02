@@ -75,7 +75,7 @@ func main() {
 	}
 
 	if *stream {
-		m, _ := perf.New(config.PerformanceConfig{Every: every}, l)
+		m, _ := perf.New(config.PerformanceConfig{Every: every}, config.PowerConfig{}, l)
 		m.Start()
 		defer m.Stop()
 		sysCh, gpuCh, unsub := m.Subscribe()

@@ -360,6 +360,35 @@
                     "additionalProperties": false,
                     "default": {},
                     "description": "Node-level power via local ipmitool (DCMI preferred, sensor readings as fallback). When unavailable the panel falls back to GPU power only."
+                },
+                "thermalGuard": {
+                    "type": "object",
+                    "properties": {
+                        "stopC": {
+                            "type": "number",
+                            "exclusiveMinimum": 0,
+                            "description": "GPU core temperature in Celsius at which every model occupying the card is stopped and parked in maintenance mode. Required when thermalGuard is set; sane values are 80-90."
+                        },
+                        "resumeC": {
+                            "type": "number",
+                            "description": "Temperature at which parked models leave maintenance again. Defaults to stopC minus 5. Must be lower than stopC."
+                        },
+                        "consecutive": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "default": 3,
+                            "description": "Consecutive hot samples required before acting; each sample is one performance.every tick, so a transient sensor spike does not unload serving models."
+                        },
+                        "failover": {
+                            "type": "boolean",
+                            "default": true,
+                            "description": "Forward requests for thermally parked models to configured providers (gateway) or peers instead of answering 503."
+                        }
+                    },
+                    "required": ["stopC"],
+                    "additionalProperties": false,
+                    "default": {},
+                    "description": "Overheat protection: when a GPU crosses stopC its models are stopped and parked in maintenance until the card cools below resumeC. Requests fail over to providers/peers when configured."
                 }
             },
             "additionalProperties": false,

@@ -329,6 +329,38 @@
         "ttft": "First token latency",
         "perToken": "Per-token latency"
       }
+    },
+    "energy": {
+      "title": "Power & energy",
+      "subtitle": "GPU and node power draw, energy consumption and electricity cost",
+      "unavailable": "No power readings available — enable performance monitoring with a GPU power source (nvidia-smi) or IPMI",
+      "noIpmi": "Node-level power (IPMI) not available — figures use GPU power only",
+      "chartTitle": "Power draw over time",
+      "modelsTable": "Energy by model",
+      "tariffTable": "Energy by tariff window",
+      "attributionNote": "Energy is attributed while a model occupies its configured GPUs, net of the card's idle baseline; shared periods are split by request activity.",
+      "kpi": {
+        "current": "Current power",
+        "currentNode": "whole node (IPMI)",
+        "currentGpu": "busiest GPU card",
+        "today": "Today",
+        "todayHint": "GPU energy since midnight",
+        "month": "This month",
+        "monthEstimate": "Projected: {value}",
+        "inferenceShare": "Inference share: {value}%"
+      },
+      "table": {
+        "model": "Model",
+        "energy": "Energy (net)",
+        "gross": "Energy (gross)",
+        "cost": "Electricity cost",
+        "gpuTime": "GPU time",
+        "requests": "Requests",
+        "tariff": "Tariff"
+      },
+      "windows": {
+        "thirtyDays": "Last 30 days"
+      }
     }
   },
   "capture": {
@@ -2189,6 +2221,10 @@
       "metrics": {
         "title": "Monitoring metrics",
         "description": "Control performance sampling and memory retention."
+      },
+      "power": {
+        "title": "Power & energy",
+        "description": "GPU/node power sampling, electricity pricing and IPMI collector."
       },
       "audit": {
         "title": "Audit logs",

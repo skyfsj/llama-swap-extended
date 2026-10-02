@@ -245,8 +245,10 @@ func (s *Server) modelStatus() []apiModel {
 			Disabled:    mc.Disabled,
 			// The lifecycle flag is only meaningful while the model is still
 			// configured as servable; a per-model disabled flag is the
-			// operator's own maintenance mode and wins the naming.
-			Maintenance:   !mc.Disabled && modelLifecycle.Maintenance,
+			// operator's own maintenance mode and wins the naming. Runtime
+			// parking (the thermal guard) lives on the router's maintenance
+			// map, outside the lifecycle state, so it is merged in here.
+			Maintenance:   !mc.Disabled && (modelLifecycle.Maintenance || s.maintenanceParked(id)),
 			Aliases:       mc.Aliases,
 			Capabilities:  capsMap,
 			ContextLength: ctxLen,
@@ -567,6 +569,87 @@ func (s *Server) handleAPIMetricsSpeed(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(report)
 }
 
+// powerWindowBounds are the selectable energy-panel windows.
+var powerWindowBounds = map[string]time.Duration{
+	"1h":  time.Hour,
+	"6h":  6 * time.Hour,
+	"24h": 24 * time.Hour,
+	"7d":  7 * 24 * time.Hour,
+	"30d": 30 * 24 * time.Hour,
+}
+
+// handleAPIPower serves the activity page's energy panel: per-source power
+// series, per-model attributed energy with cost, and window/calendar totals.
+// The tariff configuration is echoed back so the UI renders costs with the
+// same currency the server used.
+func (s *Server) handleAPIPower(w http.ResponseWriter, r *http.Request) {
+	if s.store == nil {
+		swaputil.SendResponse(w, r, http.StatusServiceUnavailable, "store is unavailable")
+		return
+	}
+
+	window := powerWindowBounds[r.URL.Query().Get("window")]
+	if window == 0 {
+		window = 24 * time.Hour
+	}
+	end := time.Now()
+	start := end.Add(-window)
+
+	requestedModel := strings.TrimSpace(r.URL.Query().Get("model"))
+	models, empty, scopeErr := scopedActivityModels(s.currentConfig(), identityFromContext(r.Context()), requestedModelsFromSingle(requestedModel), false)
+	if scopeErr != nil {
+		swaputil.SendResponse(w, r, http.StatusForbidden, scopeErr.Error())
+		return
+	}
+	if empty {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(store.PowerReport{Start: start, End: end, Baselines: map[string]float64{}, Totals: store.PowerTotals{NodeEnergyWh: -1}})
+		return
+	}
+	modelID := ""
+	if len(models) > 0 {
+		modelID = requestedModel
+	}
+
+	report, err := s.store.PowerReport(r.Context(), store.PowerReportQuery{
+		Start:   start,
+		End:     end,
+		ModelID: modelID,
+	})
+	if err != nil {
+		s.proxylog.Errorf("power report: %v", err)
+		swaputil.SendResponse(w, r, http.StatusInternalServerError, "failed to get power report")
+		return
+	}
+
+	power := s.currentConfig().Power
+	gpuSource, ipmiSource := s.powerSourceStatus()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"currency":      power.Currency,
+		"price_per_kwh": power.ElectricityPricePerKwh,
+		"tariffs":       power.Tariffs,
+		"sources": map[string]bool{
+			"gpu":  gpuSource,
+			"ipmi": ipmiSource,
+		},
+		"start":          report.Start,
+		"end":            report.End,
+		"bucket_seconds": report.BucketSeconds,
+		"series":         report.Series,
+		"models":         report.Models,
+		"totals":         report.Totals,
+		"baselines":      report.Baselines,
+	})
+}
+
+func requestedModelsFromSingle(model string) []string {
+	if model == "" {
+		return nil
+	}
+	return []string{model}
+}
+
 // parseActivityStatsFilter reads the filter params shared by the stats and
 // speed endpoints and resolves them against the caller's identity: key_id and
 // model scoping follow the activity table's rules so a key never reads another
@@ -783,7 +866,7 @@ func (s *Server) handleAPIPerformance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sysStats, gpuStats := s.perf.Current()
+	sysStats, gpuStats, nodeStats := s.perf.Current()
 
 	if afterStr := r.URL.Query().Get("after"); afterStr != "" {
 		after, err := time.Parse(time.RFC3339, afterStr)
@@ -806,13 +889,22 @@ func (s *Server) handleAPIPerformance(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		gpuStats = filteredGpu
+
+		filteredNode := make([]perf.NodeStat, 0, len(nodeStats))
+		for _, n := range nodeStats {
+			if n.Timestamp.After(after) {
+				filteredNode = append(filteredNode, n)
+			}
+		}
+		nodeStats = filteredNode
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"enabled":   true,
-		"sys_stats": sysStats,
-		"gpu_stats": gpuStats,
+		"enabled":    true,
+		"sys_stats":  sysStats,
+		"gpu_stats":  gpuStats,
+		"node_stats": nodeStats,
 	})
 }
 

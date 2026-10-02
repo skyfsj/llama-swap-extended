@@ -329,6 +329,38 @@
         "ttft": "首字延迟",
         "perToken": "单 token 延迟"
       }
+    },
+    "energy": {
+      "title": "电耗与能耗",
+      "subtitle": "GPU 与整机功率、能耗统计与电费",
+      "unavailable": "暂无功耗数据 —— 请在启用性能监控的同时确保有 GPU 功耗源（nvidia-smi）或 IPMI",
+      "noIpmi": "未接入节点级功耗（IPMI）—— 以下数据仅按 GPU 功耗统计",
+      "chartTitle": "功率历史曲线",
+      "modelsTable": "按模型能耗",
+      "tariffTable": "按时段电价能耗",
+      "attributionNote": "能耗按模型占用其配置 GPU 的时段归因，并扣除该卡空闲基线功率；共享时段按请求活跃时间分摊。",
+      "kpi": {
+        "current": "当前功率",
+        "currentNode": "整机（IPMI）",
+        "currentGpu": "最高负载 GPU",
+        "today": "今日",
+        "todayHint": "自然日内按 GPU 功耗累计",
+        "month": "本月",
+        "monthEstimate": "预计整月：{value}",
+        "inferenceShare": "推理占比：{value}%"
+      },
+      "table": {
+        "model": "模型",
+        "energy": "能耗（净）",
+        "gross": "能耗（毛）",
+        "cost": "电费",
+        "gpuTime": "占用时长",
+        "requests": "请求数",
+        "tariff": "时段"
+      },
+      "windows": {
+        "thirtyDays": "最近 30 天"
+      }
     }
   },
   "capture": {
@@ -2189,6 +2221,10 @@
       "metrics": {
         "title": "监控指标",
         "description": "控制性能采样和内存保留上限。"
+      },
+      "power": {
+        "title": "电耗与能耗",
+        "description": "GPU/节点功耗采样、电价与 IPMI 采集配置。"
       },
       "audit": {
         "title": "审计日志",

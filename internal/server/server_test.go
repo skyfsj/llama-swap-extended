@@ -44,6 +44,7 @@ type stubRouter struct {
 	unloadTimeout time.Duration
 	loggers       map[string]*logmon.Monitor
 	loggersMu     sync.Mutex
+	maintenance   map[string]string
 }
 
 func newStubRouter(models []string, response string) *stubRouter {
@@ -76,6 +77,22 @@ func (s *stubRouter) Unload(timeout time.Duration, models ...string) {
 	s.unloadTimeout = timeout
 	s.unloadModels = append([]string(nil), models...)
 }
+func (s *stubRouter) EnterMaintenance(modelID, reason string) {
+	if s.maintenance == nil {
+		s.maintenance = make(map[string]string)
+	}
+	s.maintenance[modelID] = reason
+}
+
+func (s *stubRouter) ExitMaintenance(modelID string) {
+	delete(s.maintenance, modelID)
+}
+
+func (s *stubRouter) InMaintenance(modelID string) (string, bool) {
+	reason, ok := s.maintenance[modelID]
+	return reason, ok
+}
+
 func (s *stubRouter) ProcessLogger(modelID string) (*logmon.Monitor, bool) {
 	s.loggersMu.Lock()
 	defer s.loggersMu.Unlock()

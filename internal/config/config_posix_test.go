@@ -303,6 +303,11 @@ groups:
 				Use: "fifo",
 			},
 		},
+		Power: PowerConfig{
+			Currency:      "CNY",
+			RetentionDays: 90,
+			FlushInterval: time.Minute,
+		},
 	}
 
 	assert.Equal(t, expected, config)

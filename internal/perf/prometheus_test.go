@@ -178,7 +178,7 @@ func TestWriteGpuMetrics_LabelSanitization(t *testing.T) {
 }
 
 func TestMetricsHandler_ContentType(t *testing.T) {
-	m, err := New(config.PerformanceConfig{}, newTestLogger())
+	m, err := New(config.PerformanceConfig{}, config.PowerConfig{}, newTestLogger())
 	require.NoError(t, err)
 
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
@@ -189,7 +189,7 @@ func TestMetricsHandler_ContentType(t *testing.T) {
 }
 
 func TestMetricsHandler_EmptyStats(t *testing.T) {
-	m, err := New(config.PerformanceConfig{}, newTestLogger())
+	m, err := New(config.PerformanceConfig{}, config.PowerConfig{}, newTestLogger())
 	require.NoError(t, err)
 
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
@@ -201,7 +201,7 @@ func TestMetricsHandler_EmptyStats(t *testing.T) {
 }
 
 func TestMetricsHandler_WithSysStats(t *testing.T) {
-	m, err := New(config.PerformanceConfig{}, newTestLogger())
+	m, err := New(config.PerformanceConfig{}, config.PowerConfig{}, newTestLogger())
 	require.NoError(t, err)
 
 	m.sysRing.Push(SysStat{Timestamp: time.Now(), CpuUtilPerCore: []float64{25.0}, MemTotalMB: 4096, MemUsedMB: 2048, MemFreeMB: 2048})
@@ -216,7 +216,7 @@ func TestMetricsHandler_WithSysStats(t *testing.T) {
 }
 
 func TestMetricsHandler_UsesLatestSysStat(t *testing.T) {
-	m, err := New(config.PerformanceConfig{}, newTestLogger())
+	m, err := New(config.PerformanceConfig{}, config.PowerConfig{}, newTestLogger())
 	require.NoError(t, err)
 
 	now := time.Now()
@@ -233,7 +233,7 @@ func TestMetricsHandler_UsesLatestSysStat(t *testing.T) {
 }
 
 func TestMetricsHandler_WithGpuStats(t *testing.T) {
-	m, err := New(config.PerformanceConfig{}, newTestLogger())
+	m, err := New(config.PerformanceConfig{}, config.PowerConfig{}, newTestLogger())
 	require.NoError(t, err)
 
 	m.gpuRing.Push([]GpuStat{{ID: 0, Name: "TestGPU", UUID: "uuid-0", TempC: 65, Timestamp: time.Now()}})

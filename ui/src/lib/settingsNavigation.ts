@@ -70,6 +70,7 @@ const groupMeta: Record<string, SettingsGroupMeta> = {
   storage: { id: "storage", titleKey: "settingsCenter.groups.storage.title", descriptionKey: "settingsCenter.groups.storage.description" },
   logging: { id: "logging", titleKey: "settingsCenter.groups.logging.title", descriptionKey: "settingsCenter.groups.logging.description" },
   metrics: { id: "metrics", titleKey: "settingsCenter.groups.metrics.title", descriptionKey: "settingsCenter.groups.metrics.description" },
+  power: { id: "power", titleKey: "settingsCenter.groups.power.title", descriptionKey: "settingsCenter.groups.power.description" },
   audit: { id: "audit", titleKey: "settingsCenter.groups.audit.title", descriptionKey: "settingsCenter.groups.audit.description" },
   pricing: { id: "pricing", titleKey: "settingsCenter.groups.pricing.title", descriptionKey: "settingsCenter.groups.pricing.description" },
   modelFiles: { id: "modelFiles", titleKey: "settingsCenter.groups.modelFiles.title", descriptionKey: "settingsCenter.groups.modelFiles.description" },
@@ -150,6 +151,7 @@ function groupID(navigationID: string, field: SettingsField): string {
     if (topLevel === "audit") return "audit";
     if (topLevel === "pricing") return "pricing";
     if (["metricsMaxInMemory", "performance"].includes(topLevel)) return "metrics";
+    if (topLevel === "power") return "power";
     return "logging";
   }
   if (navigationID === "audit") return "audit";

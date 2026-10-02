@@ -13,6 +13,7 @@
   import ModelUsageTable from "../components/activity/ModelUsageTable.svelte";
   import RequestRecords from "../components/activity/RequestRecords.svelte";
   import InferenceSpeedPanel from "../components/activity/InferenceSpeedPanel.svelte";
+  import EnergyPanel from "../components/activity/EnergyPanel.svelte";
 
   const storedFilters = persistentStore<ActivityFilters>(
     "activity-filters",
@@ -93,6 +94,10 @@
 
   <div class="mb-4">
     <InferenceSpeedPanel filters={filters} inflightRequests={$inflightRequestEntries} />
+  </div>
+
+  <div class="mb-4">
+    <EnergyPanel />
   </div>
 
   <div class="mb-4">
