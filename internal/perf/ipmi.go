@@ -34,9 +34,14 @@ const ipmiProbeBackoffBase = 3
 // `ipmitool dcmi power` output.
 var dcmiPowerRe = regexp.MustCompile(`Instantaneous power reading:\s+([0-9]+(?:\.[0-9]+)?)\s*Watts`)
 
-// sensorPowerNames are sensor labels, matched case-insensitively, whose
-// wattage reading represents whole-node power draw. Order is preference.
-var sensorPowerNames = []string{"pwr consumption", "total power", "system level", "node power", "psu"}
+// dellOemReadingRe matches the instantaneous "Reading : 189 W" line of
+// `ipmitool delloem powermonitor powerconsumption`. The cumulative/peak
+// `powermonitor` output reports kWh and must not match — it is anchored on
+// the bare "Reading" field whose unit is W (optionally decimals), never kWh.
+var dellOemReadingRe = regexp.MustCompile(`(?m)^\s*Reading\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*W\s*$`)
+
+// sensorPowerNames is an alias kept for the rank arithmetic below.
+var sensorPowerNames = sensorPowerPatterns
 
 // ParseIpmiDcmiPower extracts the instantaneous platform power in watts from
 // `ipmitool dcmi power` output.
@@ -54,8 +59,9 @@ func ParseIpmiDcmiPower(output string) (float64, bool) {
 
 // ParseIpmiSensorPower extracts a whole-node wattage from `ipmitool sensor`
 // output. Each line looks like "Sensor Name | 42.000 | Watts | ok | ...".
-// Rows are matched by known sensor names first; when none matches and there
-// is exactly one Watts row, that row is used.
+// Rows are matched by known sensor-name fragments (spanning BMC vendors)
+// first; when none matches and there is exactly one Watts row, that row is
+// used.
 func ParseIpmiSensorPower(output string) (float64, string, bool) {
 	type candidate struct {
 		name  string
@@ -79,8 +85,9 @@ func ParseIpmiSensorPower(output string) (float64, string, bool) {
 		}
 
 		rank := -1
-		for i, pattern := range sensorPowerNames {
-			if strings.Contains(strings.ToLower(name), pattern) {
+		lower := strings.ToLower(name)
+		for i, pattern := range sensorPowerPatterns {
+			if strings.Contains(lower, pattern) {
 				rank = i
 				break
 			}
@@ -111,30 +118,106 @@ func ParseIpmiSensorPower(output string) (float64, string, bool) {
 	return best.watts, best.name, true
 }
 
-// sampleNodePower runs one ipmitool round: DCMI first, plain sensors as
-// fallback. The returned source names the mechanism that produced the value.
+// sensorPowerPatterns are sensor label fragments, matched case-insensitively,
+// whose wattage reading represents whole-node power draw. The list covers the
+// labels observed across BMC vendors (order is preference): Supermicro and
+// Dell "Pwr Consumption"/"System Level", HPE "Power Meter", Lenovo "Sys
+// Power"/"System Power", Inspur "Total Power"/"SYS Pwr", GIGABYTE
+// "SYS_POWER", OpenBIC (Wiwynn/QCT) "HSC Input Power", Huawei "Power N".
+var sensorPowerPatterns = []string{
+	"pwr consumption",
+	"power meter",
+	"system level",
+	"sys power",
+	"system power",
+	"total power",
+	"sys_power",
+	"sys pwr",
+	"hsc input power",
+	"node power",
+	"power ",
+	"psu",
+}
+
+// nodePowerMinWatts and nodePowerMaxWatts bound a plausible whole-node
+// reading. Some firmware bugs report 0 W or an implausible spike (65535 W
+// has been observed on iDRAC); such values are invalid readings, not real
+// consumption.
+const (
+	nodePowerMinWatts = 1
+	nodePowerMaxWatts = 20000
+)
+
+// plausibleNodePower filters firmware garbage: 0 W, negative, or beyond the
+// sanity ceiling.
+func plausibleNodePower(watts float64) bool {
+	return watts >= nodePowerMinWatts && watts <= nodePowerMaxWatts
+}
+
+// sampleNodePower runs one ipmitool round across vendor strategies, best
+// first: standard DCMI, then Dell's OEM powermonitor, then the generic
+// sensor table. The returned source names the mechanism that produced the
+// value.
 func sampleNodePower(ctx context.Context, tool string) (NodeStat, bool) {
 	ctx, cancel := context.WithTimeout(ctx, nodePowerTimeout)
 	defer cancel()
 
-	// Newer BMCs accept `dcmi power`; older Supermicro firmware prints the
-	// subcommand help unless the reading form is spelled out fully.
-	for _, args := range [][]string{
-		{"dcmi", "power", "reading"},
-		{"dcmi", "power"},
-	} {
-		if out, err := exec.CommandContext(ctx, tool, args...).Output(); err == nil {
-			if watts, ok := ParseIpmiDcmiPower(string(out)); ok {
-				return NodeStat{Timestamp: time.Now(), PowerW: watts, Source: "ipmi-dcmi"}, true
-			}
-		}
+	type attempt struct {
+		args   []string
+		parse  func(string) (float64, string, bool)
+		source string
 	}
-	if out, err := exec.CommandContext(ctx, tool, "sensor").Output(); err == nil {
-		if watts, name, ok := ParseIpmiSensorPower(string(out)); ok {
-			return NodeStat{Timestamp: time.Now(), PowerW: watts, Source: "ipmi-sensor:" + name}, true
+	// Newer BMCs accept `dcmi power`; older Supermicro firmware prints the
+	// subcommand help unless the reading form is spelled out fully. Dell
+	// iDRAC's DCMI is missing or broken on many generations and reports
+	// garbage on others, so the OEM command outranks the sensor table there.
+	attempts := []attempt{
+		{[]string{"dcmi", "power", "reading"}, dcmiParse, "ipmi-dcmi"},
+		{[]string{"dcmi", "power"}, dcmiParse, "ipmi-dcmi"},
+		{[]string{"delloem", "powermonitor", "powerconsumption"}, dellOemParse, "ipmi-delloem"},
+		{[]string{"sensor"}, sensorParse, "ipmi-sensor"},
+	}
+	for _, a := range attempts {
+		out, err := exec.CommandContext(ctx, tool, a.args...).Output()
+		if err != nil {
+			continue
+		}
+		watts, name, ok := a.parse(string(out))
+		if ok && plausibleNodePower(watts) {
+			source := a.source
+			if name != "" {
+				source += ":" + name
+			}
+			return NodeStat{Timestamp: time.Now(), PowerW: watts, Source: source}, true
 		}
 	}
 	return NodeStat{}, false
+}
+
+// dcmiParse adapts ParseIpmiDcmiPower to the attempt table.
+func dcmiParse(output string) (float64, string, bool) {
+	watts, ok := ParseIpmiDcmiPower(output)
+	return watts, "", ok
+}
+
+// dellOemParse extracts "Reading : 189 W" from
+// `ipmitool delloem powermonitor powerconsumption`.
+func dellOemParse(output string) (float64, string, bool) {
+	match := dellOemReadingRe.FindStringSubmatch(output)
+	if match == nil {
+		return 0, "", false
+	}
+	watts, err := strconv.ParseFloat(match[1], 64)
+	if err != nil {
+		return 0, "", false
+	}
+	return watts, "", true
+}
+
+// sensorParse adapts ParseIpmiSensorPower to the attempt table.
+func sensorParse(output string) (float64, string, bool) {
+	watts, name, ok := ParseIpmiSensorPower(output)
+	return watts, name, ok
 }
 
 // collectNodePower samples node power at nodePowerEvery. It keeps probing

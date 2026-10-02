@@ -180,3 +180,87 @@ func TestPerf_PrometheusEnergyMetrics(t *testing.T) {
 		t.Errorf("node energy should be absent without a real node reading")
 	}
 }
+
+func TestPerf_VendorPowerParsing(t *testing.T) {
+	t.Run("dell delloem powermonitor powerconsumption", func(t *testing.T) {
+		const out = `Power consumption information
+System Board System Level
+Reading                : 189 W
+Warning threshold      : 917 W
+Failure threshold      : 966 W
+Amperage value: 20.1 A
+System Instantaneous Headroom : 311 W
+`
+		watts, name, ok := dellOemParse(out)
+		if !ok || watts != 189 || name != "" {
+			t.Errorf("dellOemParse = %v, %q, %v; want 189, empty, true", watts, name, ok)
+		}
+		// The cumulative form reports kWh and must not match.
+		const cumulative = `Power Consumption Statistics
+Reading : 3.2 kWh
+Peak Reading : 502 W
+`
+		if _, _, ok := dellOemParse(cumulative); ok {
+			t.Errorf("cumulative powermonitor output should not parse as instantaneous watts")
+		}
+	})
+
+	t.Run("hpe ilo power meter sensor", func(t *testing.T) {
+		const out = `Power Meter      | 214.000    | Watts      | cr    | na | na | 384.000 | na | na | na
+CPU1 Temp        | 51.000     | degrees C  | ok
+`
+		watts, name, ok := ParseIpmiSensorPower(out)
+		if !ok || watts != 214 || name != "Power Meter" {
+			t.Errorf("HPE = %v, %q, %v; want 214, Power Meter, true", watts, name, ok)
+		}
+	})
+
+	t.Run("lenovo sys power sensor", func(t *testing.T) {
+		const out = `Sys Power        | 210.000    | Watts      | ok
+Fan 1            | 1200.000   | RPM        | ok
+`
+		watts, name, ok := ParseIpmiSensorPower(out)
+		if !ok || watts != 210 || name != "Sys Power" {
+			t.Errorf("Lenovo = %v, %q, %v", watts, name, ok)
+		}
+	})
+
+	t.Run("gigabyte sys_power sensor", func(t *testing.T) {
+		const out = `SYS_POWER        | 125.000    | Watts      | ok    | na | na | na | na | na | na
+`
+		watts, name, ok := ParseIpmiSensorPower(out)
+		if !ok || watts != 125 || name != "SYS_POWER" {
+			t.Errorf("GIGABYTE = %v, %q, %v", watts, name, ok)
+		}
+	})
+
+	t.Run("openbic hsc input power", func(t *testing.T) {
+		const out = `HSC Input Power  | 320.000    | Watts      | ok
+MB_SOC Pkg Pwr   | 85.000     | Watts      | ok
+`
+		watts, name, ok := ParseIpmiSensorPower(out)
+		if !ok || watts != 320 || name != "HSC Input Power" {
+			t.Errorf("OpenBIC = %v, %q, %v", watts, name, ok)
+		}
+	})
+
+	t.Run("huawei power N sensor", func(t *testing.T) {
+		const out = `Power 1          | 240.000    | Watts      | ok
+`
+		watts, name, ok := ParseIpmiSensorPower(out)
+		if !ok || watts != 240 || name != "Power 1" {
+			t.Errorf("Huawei = %v, %q, %v", watts, name, ok)
+		}
+	})
+
+	t.Run("firmware garbage filtered", func(t *testing.T) {
+		// iDRAC has been observed reporting 0 W or 65535 W on broken firmware;
+		// sampleNodePower must treat both as invalid and keep probing.
+		if plausibleNodePower(0) || plausibleNodePower(65535) || plausibleNodePower(-5) {
+			t.Errorf("implausible readings should be rejected")
+		}
+		if !plausibleNodePower(377) {
+			t.Errorf("377 W is a plausible reading")
+		}
+	})
+}
