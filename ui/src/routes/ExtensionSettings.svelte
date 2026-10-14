@@ -20,7 +20,6 @@
     RotateCcw,
     FileCode2,
     Sliders,
-    Play,
     AlertCircle,
     Copy,
     Check,

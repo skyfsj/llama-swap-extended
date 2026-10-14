@@ -7,7 +7,7 @@
   import { replace, push } from "svelte-spa-router";
   import { Button } from "$lib/components/ui/button/index.js";
   import { Badge } from "$lib/components/ui/badge/index.js";
-  import { ArrowLeft, Save, Play, Settings2, FolderTree, Maximize2, Minimize2, ChevronDown, ChevronUp, X, FileCode2, FileJson, FileText, BookOpen, Download, Sliders, AlertTriangle, ScrollText } from "@lucide/svelte";
+  import { ArrowLeft, Save, Play, Settings2, FolderTree, Maximize2, Minimize2, ChevronDown, ChevronUp, X, FileCode2, FileJson, FileText, BookOpen, Download, Sliders, AlertTriangle } from "@lucide/svelte";
   import * as Switch from "$lib/components/ui/switch/index.js";
   import ExtensionConfiguration from "../components/extensions/ExtensionConfiguration.svelte";
   import ConfirmDialog from "../components/ConfirmDialog.svelte";
@@ -425,50 +425,458 @@
   });
 </script>
 
-<svelte:window onkeydown={(event) => { if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") { event.preventDefault(); if (dirty && !busy && !testing) void save(); } }} />
+<svelte:window onkeydown={(event) => {
+  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") {
+    event.preventDefault();
+    if (dirty && !busy && !testing) void save();
+  }
+  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "b") {
+    event.preventDefault();
+    showFiles = !showFiles;
+  }
+  if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+    event.preventDefault();
+    editorMode = "code";
+    dockTab = "debug";
+    dockOpen = true;
+  }
+}} />
 
 <svelte:head><title>{draft ? draft.manifest.name || draft.manifest.id : message("extensions.title")}</title></svelte:head>
 
 <div class="flex h-full min-h-[600px] min-w-0 flex-col overflow-hidden rounded-lg border border-border bg-card">
-  <header class="flex shrink-0 flex-wrap items-center gap-3 border-b border-border px-4 py-3">
-    <Button variant="ghost" size="icon" onclick={cancel} aria-label={message("extensions.editor.back")}><ArrowLeft class="size-4" /></Button>
-    <div class="min-w-40 flex-1"><h1 class="truncate !pb-0 text-lg font-semibold leading-tight">{draft?.manifest.name || draft?.manifest.id || message("extensions.workspace.create")}</h1><p class="mt-1 truncate text-xs text-muted-foreground">{draft?.manifest.id || message("extensions.workspace.editSubtitle")}{#if draft?.manifest.description}<span class="ml-3">{draft.manifest.description}</span>{/if}</p></div>
-    {#if draft}<Switch.Root bind:checked={draft.manifest.enabled} disabled={busy || testing} aria-label={message("extensions.enabled")} />{/if}
-    {#if dirty}<span class="rounded-full bg-warning/15 px-2 py-1 text-xs text-warning">{message("extensions.unsaved")}</span>{/if}
-    <div class="flex w-full flex-wrap items-center justify-end gap-2 sm:w-auto">
-      <Button variant="ghost" size="icon" href={docsHref} target="_blank" rel="noopener noreferrer" aria-label={message("extensions.dev.docs")}><BookOpen class="size-4" /></Button>
-      <Button variant="outline" disabled={!draft || busy} onclick={cancel}>{message("common.cancel")}</Button>
-      <Button variant="outline" disabled={!draft || busy || testing} onclick={() => { dockTab = "debug"; dockOpen = true; }}><Play class="size-4" />{message("extensions.test")}</Button>
-      <Button variant="outline" disabled={!draft || busy || testing || !draft.etag} onclick={() => void exportArchive()} aria-label={message("extensions.import.export")}><Download class="size-4" /></Button>
-      <Button disabled={busy || testing || !draft?.manifest.id.trim() || !dirty} onclick={save}><Save class="size-4" />{message("extensions.save")}</Button>
+  <!-- Header with Breadcrumbs, Mode Switcher, and Actions -->
+  <header class="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-border bg-card/80 px-4 py-2.5">
+    <div class="flex items-center gap-3 min-w-0">
+      <Button variant="ghost" size="icon" onclick={cancel} aria-label={message("extensions.editor.back")}>
+        <ArrowLeft class="size-4" />
+      </Button>
+
+      <div class="min-w-32">
+        <div class="flex items-center gap-2">
+          <h1 class="truncate !pb-0 text-base font-semibold leading-tight">
+            {draft?.manifest.name || draft?.manifest.id || message("extensions.workspace.create")}
+          </h1>
+          {#if draft}
+            <Badge variant="outline" class="font-mono text-[10px] hidden sm:inline-flex">
+              {draft.manifest.id}
+            </Badge>
+          {/if}
+        </div>
+        <p class="truncate text-[11px] text-muted-foreground">
+          {draft?.manifest.id || message("extensions.workspace.editSubtitle")}
+        </p>
+      </div>
+
+      <!-- Mode Switcher Pills -->
+      <div class="flex items-center rounded-lg border border-border bg-muted/40 p-0.5 ml-2">
+        <button
+          type="button"
+          class={`flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
+            editorMode === "code"
+              ? "bg-background text-foreground shadow-xs"
+              : "text-muted-foreground hover:text-foreground"
+          }`}
+          onclick={() => (editorMode = "code")}
+        >
+          <FileCode2 class="size-3.5" />
+          <span>{message("extensions.dev.codeMode")}</span>
+        </button>
+
+        <button
+          type="button"
+          class={`flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
+            editorMode === "settings"
+              ? "bg-background text-foreground shadow-xs"
+              : "text-muted-foreground hover:text-foreground"
+          }`}
+          onclick={() => (editorMode = "settings")}
+        >
+          <Sliders class="size-3.5" />
+          <span>{message("extensions.dev.settingsMode")}</span>
+        </button>
+
+        <button
+          type="button"
+          class={`flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
+            editorMode === "debug"
+              ? "bg-background text-foreground shadow-xs"
+              : "text-muted-foreground hover:text-foreground"
+          }`}
+          onclick={() => (editorMode = "debug")}
+        >
+          <Play class="size-3.5" />
+          <span>{message("extensions.dev.debugMode")}</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- Right Controls -->
+    <div class="flex flex-wrap items-center gap-2">
+      {#if draft}
+        <div class="flex items-center gap-1.5 mr-1 border-r border-border pr-2">
+          <Switch.Root
+            bind:checked={draft.manifest.enabled}
+            disabled={busy || testing}
+            aria-label={message("extensions.enabled")}
+          />
+          <span class="text-xs text-muted-foreground hidden md:inline">
+            {message(draft.manifest.enabled ? "extensions.workspace.enabled" : "extensions.workspace.disabled")}
+          </span>
+        </div>
+      {/if}
+
+      {#if diagnostics.length > 0}
+        <Button
+          variant="outline"
+          size="sm"
+          class="h-8 border-destructive/30 bg-destructive/10 text-destructive text-xs gap-1"
+          onclick={() => {
+            editorMode = "code";
+            dockTab = "problems";
+            dockOpen = true;
+          }}
+        >
+          <AlertTriangle class="size-3.5" />
+          <span>{diagnostics.length}</span>
+        </Button>
+      {/if}
+
+      {#if dirty}
+        <span class="rounded-full bg-warning/15 px-2 py-0.5 text-xs text-warning font-medium">
+          {message("extensions.unsaved")}
+        </span>
+      {/if}
+
+      <Button
+        variant="ghost"
+        size="icon"
+        href={docsHref}
+        target="_blank"
+        rel="noopener noreferrer"
+        aria-label={message("extensions.dev.docs")}
+      >
+        <BookOpen class="size-4" />
+      </Button>
+
+      <Button
+        variant="outline"
+        size="sm"
+        disabled={!draft || busy || testing}
+        onclick={() => {
+          if (editorMode === "code") {
+            dockTab = "debug";
+            dockOpen = true;
+          } else {
+            editorMode = "debug";
+          }
+        }}
+      >
+        <Play class="size-3.5 mr-1 text-primary" />
+        {message("extensions.test")}
+      </Button>
+
+      <Button
+        variant="outline"
+        size="icon"
+        disabled={!draft || busy || testing || !draft.etag}
+        onclick={() => void exportArchive()}
+        aria-label={message("extensions.import.export")}
+      >
+        <Download class="size-4" />
+      </Button>
+
+      <Button
+        disabled={busy || testing || !draft?.manifest.id.trim() || !dirty}
+        size="sm"
+        onclick={save}
+      >
+        <Save class="size-3.5 mr-1" />
+        {message("extensions.save")}
+      </Button>
     </div>
   </header>
-  {#if error}<p role="alert" class="shrink-0 border-b border-destructive/40 bg-destructive/10 px-3 py-1.5 text-xs text-destructive">{error}</p>{/if}
+
+  {#if error}
+    <p role="alert" class="shrink-0 border-b border-destructive/40 bg-destructive/10 px-3 py-1.5 text-xs text-destructive">
+      {error}
+    </p>
+  {/if}
 
   {#if draft}
-  <div class="flex items-center justify-end gap-1 border-b border-border px-3 py-1 lg:hidden"><Button variant="ghost" size="sm" aria-pressed={showFiles} onclick={() => showFiles = !showFiles}><FolderTree class="size-4" />{message("extensions.files.tree")}</Button><Button variant="ghost" size="sm" aria-pressed={showSettings} onclick={() => showSettings = !showSettings}><Settings2 class="size-4" />{message("extensions.settings.tab")}</Button></div>
-  <div class="editor-body flex min-h-0 flex-1 flex-col lg:flex-row">
-    <div class="flex min-h-[480px] min-w-0 flex-1 flex-col">
-      <div class="flex min-h-0 flex-1" class:hidden={dockExpanded} inert={busy}>
-        {#if showFiles}<aside class="w-36 shrink-0 overflow-hidden border-r border-border xl:w-44" aria-label={message("extensions.files.tree")}><ExtensionFileTree paths={filePaths} directories={draft.directories ?? []} {activePath} onOpen={openFile} onCreate={createEntry} onDelete={requestDelete} onMove={movePath} onDuplicate={duplicatePath} onExternalFiles={importExternalFiles} onRename={renamePath} /></aside>{/if}
-        <div class="flex min-h-0 min-w-0 flex-1 flex-col">
-          <div class="flex h-9 shrink-0 items-stretch overflow-x-auto border-b border-border bg-muted/30 text-xs" role="tablist" aria-label={message("extensions.files.tree")}>{#each openFiles as path}<div class="group flex shrink-0 items-center border-r border-border border-t-2 border-t-transparent" class:!border-t-primary={path === activePath} class:bg-background={path === activePath} role="presentation" oncontextmenu={(event) => { event.preventDefault(); tabMenu = { path, x: event.clientX, y: event.clientY }; }}><button class="flex h-full items-center gap-2 px-3" role="tab" aria-selected={path === activePath} title={path} onclick={() => openFile(path)}>{#if fileKind(path) === "javascript"}<FileCode2 class="size-3.5 text-primary" />{:else if fileKind(path) === "json"}<FileJson class="size-3.5 text-muted-foreground" />{:else}<FileText class="size-3.5 text-muted-foreground" />{/if}<span>{fileLabel(path)}</span>{#if draft.files[path] !== savedFiles[path]}<span class="size-1.5 rounded-full bg-primary" aria-label={message("extensions.unsaved")}></span>{/if}</button><button class="mr-1 rounded p-1 text-muted-foreground hover:bg-accent hover:text-foreground" aria-label={message("extensions.dev.closeFile", { path: fileLabel(path) })} onclick={() => closeFile(path)}><X class="size-3" /></button></div>{/each}</div>
-          <div class="min-h-0 flex-1 overflow-hidden">{#if activePath}{#key activePath}<ExtensionMonacoEditor value={draft.files?.[activePath] ?? ""} path={activePath} ariaLabel={message("extensions.script")} settingKeys={activePath === EXTENSION_ENTRY_POINT ? settingKeys : []} {diagnostics} {revealLocation} onChange={updateSource} />{/key}{:else}<div class="flex h-full items-center justify-center p-5 text-sm text-muted-foreground">{message("extensions.dev.selectFile")}</div>{/if}</div>
+    {#if editorMode === "settings"}
+      <!-- Mode 2: Full-Width Settings View -->
+      <div class="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6">
+        <div class="mx-auto max-w-5xl">
+          <fieldset disabled={busy || testing}>
+            <ExtensionConfiguration bind:draft errors={settingsErrors} layout="tabs" />
+          </fieldset>
         </div>
       </div>
-      <section class="dev-dock flex shrink-0 flex-col border-t border-border" class:dock-open={dockOpen} class:dock-expanded={dockExpanded}>
-        <div class="flex h-10 shrink-0 items-center gap-1 border-b border-border bg-muted/20 px-2">
-          {#each ["problems", "logs", "debug", "benchmark"] as view}<button class="h-full border-b-2 border-transparent px-3 text-xs text-muted-foreground hover:text-foreground disabled:opacity-50" class:!border-primary={dockTab === view && dockOpen} class:!text-foreground={dockTab === view && dockOpen} disabled={testing && dockTab !== view} aria-pressed={dockTab === view && dockOpen} onclick={() => { dockTab = view as typeof dockTab; dockOpen = true; }}>{message(view === "logs" ? "extensions.logs.title" : `extensions.dev.${view}`)}{#if view === "problems"}<span class="ml-1 rounded bg-muted px-1">{diagnostics.length}</span>{/if}</button>{/each}
-          <div class="ml-auto flex gap-1"><Button variant="ghost" size="icon-xs" aria-label={message(dockExpanded ? "extensions.dev.restore" : "extensions.dev.expand")} onclick={() => { dockExpanded = !dockExpanded; dockOpen = true; }}>{#if dockExpanded}<Minimize2 class="size-3.5" />{:else}<Maximize2 class="size-3.5" />{/if}</Button><Button variant="ghost" size="icon-xs" aria-label={message("extensions.layout.toggleDock")} onclick={() => { dockOpen = !dockOpen; if (!dockOpen) dockExpanded = false; }}>{#if dockOpen}<ChevronDown class="size-4" />{:else}<ChevronUp class="size-4" />{/if}</Button></div>
+    {:else if editorMode === "debug"}
+      <!-- Mode 3: Full-Width Debug Chat & Request View -->
+      <div class="min-h-0 flex-1 overflow-hidden p-4">
+        <ExtensionWorkbench
+          preferredEndpoints={draft.manifest.match.endpoints}
+          compact={false}
+          id={draft.manifest.id}
+          draftFiles={draft.files}
+          mode="debug"
+          onRunning={(value) => (testing = value)}
+        />
+      </div>
+    {:else}
+      <!-- Mode 1: Code Editor View -->
+      <div class="flex items-center justify-between border-b border-border bg-muted/10 px-3 py-1 text-xs text-muted-foreground">
+        <div class="flex items-center gap-2">
+          <Button
+            variant="ghost"
+            size="sm"
+            class="h-7 text-xs"
+            aria-pressed={showFiles}
+            onclick={() => (showFiles = !showFiles)}
+          >
+            <FolderTree class="size-3.5 mr-1" />
+            {message("extensions.files.tree")}
+          </Button>
         </div>
-        <div class="min-h-0 flex-1 overflow-y-auto p-3" class:hidden={!dockOpen || dockTab !== "problems"}><div class="mb-3 flex items-center justify-between gap-2"><span class="text-xs text-muted-foreground">{message("extensions.dev.autoCheck")} · {checking ? message("extensions.checking") : checkError ? message("extensions.dev.checkFailed") : diagnostics.length ? message("extensions.diagnosticsCount", { count: diagnostics.length }) : message("extensions.noDiagnostics")}</span>{#if checkError}<Button variant="outline" size="sm" disabled={checking} onclick={() => void runCheck()}>{message("extensions.dev.retry")}</Button>{/if}</div>{#if checkError}<p role="alert" class="text-xs text-destructive">{checkError}</p>{/if}<ul class="space-y-1">{#each diagnostics as item}<li><button class="w-full rounded-md bg-muted/40 p-2 text-left text-xs hover:bg-muted" onclick={() => { openFile(item.path || EXTENSION_ENTRY_POINT); revealLocation = { line: item.line, column: item.column }; dockExpanded = false; }}><span class="font-mono text-primary">{item.path}:{item.line}:{item.column}</span> {item.message}</button></li>{/each}</ul></div>
-        <div class="min-h-0 flex-1 flex flex-col" class:hidden={!dockOpen || dockTab !== "logs"}><ExtensionConsolePanel id={draft.manifest.id} compact={!dockExpanded} /></div>
-        <div class="flex min-h-0 flex-1 flex-col" class:hidden={!dockOpen || (dockTab !== "debug" && dockTab !== "benchmark")}><ExtensionWorkbench preferredEndpoints={draft.manifest.match.endpoints} compact={!dockExpanded} id={draft.manifest.id} draftFiles={draft.files} mode={dockTab === "benchmark" ? "benchmark" : "debug"} onRunning={(value) => testing = value} /></div>
-      </section>
-    </div>
-    {#if showSettings}<aside class="flex w-full shrink-0 flex-col border-t border-border lg:w-72 lg:border-t-0 lg:border-l" aria-label={message("extensions.settings.tab")}><div class="flex h-9 shrink-0 items-center border-b border-border bg-muted/20 px-4 text-xs font-medium">{message("extensions.dev.config")}</div><div class="min-h-0 flex-1 lg:overflow-y-auto"><fieldset disabled={busy || testing}><ExtensionConfiguration bind:draft errors={settingsErrors} /></fieldset></div></aside>{/if}
-  </div>
-  {:else}<p role="status" class="p-10 text-center text-sm text-muted-foreground">{busy ? message("common.loading") : message("extensions.workspace.loadFailed")}</p>{/if}
+
+        <div class="flex items-center gap-1">
+          <Button
+            variant="ghost"
+            size="sm"
+            class="h-7 text-xs"
+            aria-pressed={showSettings}
+            onclick={() => (showSettings = !showSettings)}
+          >
+            <Settings2 class="size-3.5 mr-1" />
+            {message("extensions.dev.quickInspector")}
+          </Button>
+        </div>
+      </div>
+
+      <div class="editor-body flex min-h-0 flex-1 flex-col lg:flex-row">
+        <div class="flex min-h-[480px] min-w-0 flex-1 flex-col">
+          <div class="flex min-h-0 flex-1" class:hidden={dockExpanded} inert={busy}>
+            {#if showFiles}
+              <aside class="w-40 shrink-0 overflow-hidden border-r border-border xl:w-48" aria-label={message("extensions.files.tree")}>
+                <ExtensionFileTree
+                  paths={filePaths}
+                  directories={draft.directories ?? []}
+                  {activePath}
+                  onOpen={openFile}
+                  onCreate={createEntry}
+                  onDelete={requestDelete}
+                  onMove={movePath}
+                  onDuplicate={duplicatePath}
+                  onExternalFiles={importExternalFiles}
+                  onRename={renamePath}
+                />
+              </aside>
+            {/if}
+
+            <div class="flex min-h-0 min-w-0 flex-1 flex-col">
+              <div
+                class="flex h-9 shrink-0 items-stretch overflow-x-auto border-b border-border bg-muted/30 text-xs"
+                role="tablist"
+                aria-label={message("extensions.files.tree")}
+              >
+                {#each openFiles as path}
+                  <div
+                    class="group flex shrink-0 items-center border-r border-border border-t-2 border-t-transparent"
+                    class:!border-t-primary={path === activePath}
+                    class:bg-background={path === activePath}
+                    role="presentation"
+                    oncontextmenu={(event) => {
+                      event.preventDefault();
+                      tabMenu = { path, x: event.clientX, y: event.clientY };
+                    }}
+                  >
+                    <button
+                      class="flex h-full items-center gap-2 px-3"
+                      role="tab"
+                      aria-selected={path === activePath}
+                      title={path}
+                      onclick={() => openFile(path)}
+                    >
+                      {#if fileKind(path) === "javascript"}
+                        <FileCode2 class="size-3.5 text-primary" />
+                      {:else if fileKind(path) === "json"}
+                        <FileJson class="size-3.5 text-muted-foreground" />
+                      {:else}
+                        <FileText class="size-3.5 text-muted-foreground" />
+                      {/if}
+                      <span>{fileLabel(path)}</span>
+                      {#if draft.files[path] !== savedFiles[path]}
+                        <span class="size-1.5 rounded-full bg-primary" aria-label={message("extensions.unsaved")}></span>
+                      {/if}
+                    </button>
+                    <button
+                      class="mr-1 rounded p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
+                      aria-label={message("extensions.dev.closeFile", { path: fileLabel(path) })}
+                      onclick={() => closeFile(path)}
+                    >
+                      <X class="size-3" />
+                    </button>
+                  </div>
+                {/each}
+              </div>
+
+              <div class="min-h-0 flex-1 overflow-hidden">
+                {#if activePath}
+                  {#key activePath}
+                    <ExtensionMonacoEditor
+                      value={draft.files?.[activePath] ?? ""}
+                      path={activePath}
+                      ariaLabel={message("extensions.script")}
+                      settingKeys={activePath === EXTENSION_ENTRY_POINT ? settingKeys : []}
+                      {diagnostics}
+                      {revealLocation}
+                      onChange={updateSource}
+                    />
+                  {/key}
+                {:else}
+                  <div class="flex h-full items-center justify-center p-5 text-sm text-muted-foreground">
+                    {message("extensions.dev.selectFile")}
+                  </div>
+                {/if}
+              </div>
+            </div>
+          </div>
+
+          <!-- Bottom Dock -->
+          <section class="dev-dock flex shrink-0 flex-col border-t border-border" class:dock-open={dockOpen} class:dock-expanded={dockExpanded}>
+            <div class="flex h-10 shrink-0 items-center gap-1 border-b border-border bg-muted/20 px-2">
+              {#each ["problems", "logs", "debug", "benchmark"] as view}
+                <button
+                  class="h-full border-b-2 border-transparent px-3 text-xs text-muted-foreground hover:text-foreground disabled:opacity-50"
+                  class:!border-primary={dockTab === view && dockOpen}
+                  class:!text-foreground={dockTab === view && dockOpen}
+                  disabled={testing && dockTab !== view}
+                  aria-pressed={dockTab === view && dockOpen}
+                  onclick={() => {
+                    dockTab = view as typeof dockTab;
+                    dockOpen = true;
+                  }}
+                >
+                  {message(view === "logs" ? "extensions.logs.title" : `extensions.dev.${view}`)}
+                  {#if view === "problems"}
+                    <span class={`ml-1 rounded px-1.5 text-[10px] ${diagnostics.length > 0 ? "bg-destructive/20 text-destructive font-semibold" : "bg-muted"}`}>
+                      {diagnostics.length}
+                    </span>
+                  {/if}
+                </button>
+              {/each}
+
+              <div class="ml-auto flex gap-1">
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label={message(dockExpanded ? "extensions.dev.restore" : "extensions.dev.expand")}
+                  onclick={() => {
+                    dockExpanded = !dockExpanded;
+                    dockOpen = true;
+                  }}
+                >
+                  {#if dockExpanded}
+                    <Minimize2 class="size-3.5" />
+                  {:else}
+                    <Maximize2 class="size-3.5" />
+                  {/if}
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label={message("extensions.layout.toggleDock")}
+                  onclick={() => {
+                    dockOpen = !dockOpen;
+                    if (!dockOpen) dockExpanded = false;
+                  }}
+                >
+                  {#if dockOpen}
+                    <ChevronDown class="size-4" />
+                  {:else}
+                    <ChevronUp class="size-4" />
+                  {/if}
+                </Button>
+              </div>
+            </div>
+
+            <!-- Dock: Problems -->
+            <div class="min-h-0 flex-1 overflow-y-auto p-3" class:hidden={!dockOpen || dockTab !== "problems"}>
+              <div class="mb-3 flex items-center justify-between gap-2">
+                <span class="text-xs text-muted-foreground">
+                  {message("extensions.dev.autoCheck")} · {checking ? message("extensions.checking") : checkError ? message("extensions.dev.checkFailed") : diagnostics.length ? message("extensions.diagnosticsCount", { count: diagnostics.length }) : message("extensions.noDiagnostics")}
+                </span>
+                {#if checkError}
+                  <Button variant="outline" size="sm" disabled={checking} onclick={() => void runCheck()}>
+                    {message("extensions.dev.retry")}
+                  </Button>
+                {/if}
+              </div>
+              {#if checkError}
+                <p role="alert" class="text-xs text-destructive">{checkError}</p>
+              {/if}
+              <ul class="space-y-1">
+                {#each diagnostics as item}
+                  <li>
+                    <button
+                      class="w-full rounded-md bg-muted/40 p-2 text-left text-xs hover:bg-muted"
+                      onclick={() => {
+                        openFile(item.path || EXTENSION_ENTRY_POINT);
+                        revealLocation = { line: item.line, column: item.column };
+                        dockExpanded = false;
+                      }}
+                    >
+                      <span class="font-mono text-primary font-medium">{item.path}:{item.line}:{item.column}</span>
+                      <span class="ml-2 text-foreground">{item.message}</span>
+                    </button>
+                  </li>
+                {/each}
+              </ul>
+            </div>
+
+            <!-- Dock: Logs -->
+            <div class="min-h-0 flex-1 flex flex-col" class:hidden={!dockOpen || dockTab !== "logs"}>
+              <ExtensionConsolePanel id={draft.manifest.id} compact={!dockExpanded} />
+            </div>
+
+            <!-- Dock: Workbench Debug & Benchmark -->
+            <div class="flex min-h-0 flex-1 flex-col" class:hidden={!dockOpen || (dockTab !== "debug" && dockTab !== "benchmark")}>
+              <ExtensionWorkbench
+                preferredEndpoints={draft.manifest.match.endpoints}
+                compact={!dockExpanded}
+                id={draft.manifest.id}
+                draftFiles={draft.files}
+                mode={dockTab === "benchmark" ? "benchmark" : "debug"}
+                onRunning={(value) => (testing = value)}
+              />
+            </div>
+          </section>
+        </div>
+
+        {#if showSettings}
+          <aside class="flex w-full shrink-0 flex-col border-t border-border lg:w-72 lg:border-t-0 lg:border-l" aria-label={message("extensions.settings.tab")}>
+            <div class="flex h-9 shrink-0 items-center justify-between border-b border-border bg-muted/20 px-3 text-xs font-medium">
+              <span>{message("extensions.dev.config")}</span>
+              <Button variant="ghost" size="icon-xs" onclick={() => (showSettings = false)}>
+                <X class="size-3" />
+              </Button>
+            </div>
+            <div class="min-h-0 flex-1 lg:overflow-y-auto">
+              <fieldset disabled={busy || testing}>
+                <ExtensionConfiguration bind:draft errors={settingsErrors} layout="sidebar" />
+              </fieldset>
+            </div>
+          </aside>
+        {/if}
+      </div>
+    {/if}
+  {:else}
+    <p role="status" class="p-10 text-center text-sm text-muted-foreground">
+      {busy ? message("common.loading") : message("extensions.workspace.loadFailed")}
+    </p>
+  {/if}
 
   <ConfirmDialog
     bind:open={deleteOpen}

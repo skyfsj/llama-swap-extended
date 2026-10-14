@@ -594,7 +594,7 @@
                 value={rawJsonDraft}
                 oninput={(e) => handleRawJsonInput(e.currentTarget.value)}
                 class="font-mono text-xs leading-relaxed bg-background"
-                placeholder="{\n  \"key\": \"value\"\n}"
+                placeholder={'{\n  "key": "value"\n}'}
               />
             </div>
           {:else}

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { link, push } from "svelte-spa-router";
+  import { push } from "svelte-spa-router";
   import {
     Plus,
     Search,
@@ -274,23 +274,19 @@
   let settingsOpen = $state(false);
   let settingsLoading = $state(false);
   let settingsSaving = $state(false);
-  let settingsDirty = $state(false);
   let settingsError = $state("");
   let settingsErrors = $state<Record<string, string>>({});
   let settingsDraft = $state<ExtensionDefinition | null>(null);
-  let settingsSnapshot = $state("");
 
   async function openQuickSettings(item: ExtensionDefinition) {
     settingsOpen = true;
     settingsLoading = true;
-    settingsDirty = false;
     settingsError = "";
     settingsErrors = {};
     settingsDraft = null;
     try {
       const fetched = await getExtension(item.manifest.id);
       settingsDraft = fetched;
-      settingsSnapshot = JSON.stringify(fetched.manifest);
     } catch (cause) {
       settingsError = String(cause);
     } finally {
