@@ -6,7 +6,8 @@
   import { exportExtension } from "../lib/extensionsApi";
   import { replace, push } from "svelte-spa-router";
   import { Button } from "$lib/components/ui/button/index.js";
-  import { ArrowLeft, Save, Play, Settings2, FolderTree, Maximize2, Minimize2, ChevronDown, ChevronUp, X, FileCode2, FileJson, FileText, BookOpen, Download } from "@lucide/svelte";
+  import { Badge } from "$lib/components/ui/badge/index.js";
+  import { ArrowLeft, Save, Play, Settings2, FolderTree, Maximize2, Minimize2, ChevronDown, ChevronUp, X, FileCode2, FileJson, FileText, BookOpen, Download, Sliders, AlertTriangle, ScrollText } from "@lucide/svelte";
   import * as Switch from "$lib/components/ui/switch/index.js";
   import ExtensionConfiguration from "../components/extensions/ExtensionConfiguration.svelte";
   import ConfirmDialog from "../components/ConfirmDialog.svelte";
@@ -32,13 +33,14 @@
 
   let { params = {} }: Props = $props();
 
+  let editorMode = $state<"code" | "settings" | "debug">("code");
   let dockTab = $state<"problems" | "logs" | "debug" | "benchmark">("debug");
   let dockOpen = $state(true);
   let dockExpanded = $state(false);
   let testing = $state(false);
   let revealLocation = $state<{ line: number; column: number } | undefined>();
   let settingsErrors = $state<Record<string, string>>({});
-  let showSettings = $state(true);
+  let showSettings = $state(false);
   let showFiles = $state(true);
   let leaveOpen = $state(false);
   let pendingHref = "#/extensions";
