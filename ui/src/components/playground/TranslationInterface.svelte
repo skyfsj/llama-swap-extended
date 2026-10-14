@@ -20,7 +20,7 @@
   import { Label } from "$lib/components/ui/label/index.js";
   import * as Select from "$lib/components/ui/select/index.js";
   import * as Dialog from "$lib/components/ui/dialog/index.js";
-  import { Copy, Check, Languages, ArrowLeftRight, Settings, X, Maximize2 } from "@lucide/svelte";
+  import { Copy, Check, Languages, ArrowLeftRight, X, Maximize2, Trash2, SlidersHorizontal } from "@lucide/svelte";
   import { copyText } from "../../lib/clipboard";
   import { formatDuration } from "../../lib/format";
   import { locale, translate } from "../../lib/i18n";
@@ -142,10 +142,17 @@
       setTimeout(() => (copied = false), 2000);
     }
   }
+
+  function handleKeyDown(event: KeyboardEvent) {
+    if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+      event.preventDefault();
+      void translateText();
+    }
+  }
 </script>
 
 <div class="flex flex-col h-full">
-  <!-- Toolbar: model + settings (holds the prompt template) -->
+  <!-- Unified Toolbar: Model, Language Switcher, Scenario, Settings -->
   <div class="shrink-0 flex flex-wrap items-center gap-2 mb-3">
     <ModelSelector
       bind:value={$selectedModelStore}
@@ -156,34 +163,19 @@
       extraCategoryLabelKey="playground.modelSelector.groupChat"
       groupLabelKey="playground.modelSelector.groupTranslation"
     />
-    <Button
-      variant="ghost"
-      size="icon"
-      class="pg-tool ml-auto"
-      onclick={() => (showSettings = true)}
-      title={$translate("playground.translation.settings")}
-    >
-      <Settings />
-    </Button>
-  </div>
 
-  {#if !hasModels && !$selectedModelStore}
-    <div class="text-muted-foreground flex flex-1 items-center justify-center text-center text-sm">
-      {$translate("playground.translation.noModels")}
-    </div>
-  {:else}
-    <!-- Language bar: source ⇄ target, scenario preset -->
-    <div class="mb-3 flex shrink-0 flex-wrap items-center gap-2 border-b pg-divide px-1 py-2">
+    <!-- Languages Selector -->
+    <div class="flex items-center gap-1 rounded-lg border border-border/60 bg-muted/30 p-0.5">
       <Select.Root
         type="single"
         value={$sourceLanguageStore}
         onValueChange={(v) => v && sourceLanguageStore.set(v)}
         disabled={$busyStore}
       >
-        <Select.Trigger class="pg-trigger h-8 w-36 border-0 bg-transparent shadow-none">
-          <span class="flex items-center gap-1.5">
-            <Languages class="size-3.5" style="color: var(--pg-ink-3)" />
-            {sourceLanguageDisplay}
+        <Select.Trigger class="pg-trigger h-8 min-w-[7.5rem] border-0 bg-transparent shadow-none px-2 text-xs">
+          <span class="flex items-center gap-1 truncate">
+            <Languages class="size-3.5 shrink-0 opacity-60" />
+            <span class="truncate">{sourceLanguageDisplay}</span>
           </span>
         </Select.Trigger>
         <Select.Content class="max-h-[60vh]">
@@ -196,13 +188,13 @@
 
       <Button
         variant="ghost"
-        size="icon"
-        class="pg-tool"
+        size="icon-xs"
+        class="size-7 shrink-0 text-muted-foreground hover:text-foreground"
         onclick={swapLanguages}
         disabled={$busyStore}
         title={$translate("playground.translation.swapLanguages")}
       >
-        <ArrowLeftRight />
+        <ArrowLeftRight class="size-3.5" />
       </Button>
 
       <Select.Root
@@ -211,10 +203,10 @@
         onValueChange={(v) => v && targetLanguageStore.set(v)}
         disabled={$busyStore}
       >
-        <Select.Trigger class="pg-trigger h-8 w-36 border-0 bg-transparent shadow-none">
-          <span class="flex items-center gap-1.5">
-            <Languages class="size-3.5" style="color: var(--pg-ink-3)" />
-            {targetLanguageDisplay}
+        <Select.Trigger class="pg-trigger h-8 min-w-[7.5rem] border-0 bg-transparent shadow-none px-2 text-xs">
+          <span class="flex items-center gap-1 truncate">
+            <Languages class="size-3.5 shrink-0 opacity-60" />
+            <span class="truncate">{targetLanguageDisplay}</span>
           </span>
         </Select.Trigger>
         <Select.Content class="max-h-[60vh]">
@@ -223,118 +215,171 @@
           {/each}
         </Select.Content>
       </Select.Root>
-
-      <div class="ml-auto flex items-center gap-2">
-        <span class="pg-hint hidden sm:inline">{$translate("playground.translation.scenario")}</span>
-        <Select.Root
-          type="single"
-          value={$presetStore}
-          onValueChange={(v) => v && handlePresetChange(v)}
-          disabled={$busyStore}
-        >
-          <Select.Trigger class="pg-trigger h-8 w-36">
-            {$translate(currentPreset.labelKey)}
-          </Select.Trigger>
-          <Select.Content>
-            {#each translationPresets as preset (preset.id)}
-              <Select.Item value={preset.id}>{$translate(preset.labelKey)}</Select.Item>
-            {/each}
-          </Select.Content>
-        </Select.Root>
-      </div>
     </div>
 
+    <!-- Scenario Preset -->
+    <div class="hidden sm:flex items-center gap-1">
+      <Select.Root
+        type="single"
+        value={$presetStore}
+        onValueChange={(v) => v && handlePresetChange(v)}
+        disabled={$busyStore}
+      >
+        <Select.Trigger class="pg-trigger h-8 w-32 text-xs">
+          <span class="truncate">{$translate(currentPreset.labelKey)}</span>
+        </Select.Trigger>
+        <Select.Content>
+          {#each translationPresets as preset (preset.id)}
+            <Select.Item value={preset.id}>{$translate(preset.labelKey)}</Select.Item>
+          {/each}
+        </Select.Content>
+      </Select.Root>
+    </div>
+
+    <!-- Settings Button -->
+    <Button
+      variant="outline"
+      size="icon"
+      class="pg-control ml-auto"
+      onclick={() => (showSettings = true)}
+      title={$translate("playground.translation.settings")}
+    >
+      <SlidersHorizontal class="size-3.5" />
+    </Button>
+  </div>
+
+  {#if !hasModels && !$selectedModelStore}
+    <div class="text-muted-foreground flex flex-1 items-center justify-center text-center text-sm">
+      {$translate("playground.translation.noModels")}
+    </div>
+  {:else}
     <!-- Two-pane: source and result -->
     <div class="grid min-h-0 flex-1 grid-cols-1 gap-3 md:grid-cols-2">
-      <div class="pg-composer flex min-h-0 flex-col p-1.5">
-        <ExpandableTextarea
-          bare
-          fill
-          bind:value={sourceText}
-          placeholder={$translate("playground.translation.sourcePlaceholder")}
-          rows={6}
-          disabled={$busyStore}
-        >
-          {#snippet toolbar({ expand })}
-            <span class="pg-chip">{sourceText.length}{$translate("playground.chat.characters")}</span>
-            <div class="ml-auto flex items-center gap-1">
+      <!-- Source Pane -->
+      <div class="pg-panel flex min-h-0 flex-col overflow-hidden border border-border/50 shadow-xs">
+        <div class="flex shrink-0 items-center justify-between border-b px-3 py-2 pg-divide bg-muted/20">
+          <span class="flex items-center gap-1.5 text-xs font-medium text-foreground">
+            <Languages class="size-3.5 text-primary" />
+            <span>{sourceLanguageDisplay}</span>
+          </span>
+          <div class="flex items-center gap-1.5">
+            <span class="pg-chip">{sourceText.length} {$translate("playground.chat.characters")}</span>
+            {#if sourceText.length > 0}
               <Button
                 variant="ghost"
-                size="icon-sm"
-                class="pg-tool"
-                onclick={expand}
+                size="icon-xs"
+                class="pg-tool text-muted-foreground hover:text-destructive"
+                onclick={() => (sourceText = "")}
                 disabled={$busyStore}
-                title={$translate("playground.expandable.expandToEdit")}
+                title={$translate("common.clear")}
               >
-                <Maximize2 />
+                <Trash2 class="size-3.5" />
               </Button>
-            </div>
-          {/snippet}
-        </ExpandableTextarea>
+            {/if}
+          </div>
+        </div>
+
+        <div class="min-h-0 flex-1 p-2 flex flex-col">
+          <ExpandableTextarea
+            bare
+            fill
+            bind:value={sourceText}
+            placeholder={$translate("playground.translation.sourcePlaceholder")}
+            rows={8}
+            disabled={$busyStore}
+            onkeydown={handleKeyDown}
+          >
+            {#snippet toolbar({ expand })}
+              <div class="flex w-full items-center justify-between pt-1">
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  class="pg-tool"
+                  onclick={expand}
+                  disabled={$busyStore}
+                  title={$translate("playground.expandable.expandToEdit")}
+                >
+                  <Maximize2 class="size-3.5" />
+                </Button>
+
+                <div class="flex items-center gap-2">
+                  <span class="text-[11px] text-muted-foreground hidden sm:inline">
+                    <kbd class="rounded border bg-muted px-1.5 py-0.5 font-mono text-[10px]">⌘/Ctrl + Enter</kbd>
+                  </span>
+                  {#if $busyStore}
+                    <Button variant="outline" class="pg-control pg-control--danger gap-1.5" onclick={() => iface.cancel()}>
+                      <X class="size-3.5" />
+                      {$translate("common.cancel")}
+                    </Button>
+                  {:else}
+                    <Button class="pg-action gap-1.5" onclick={translateText} disabled={!canTranslate}>
+                      <Languages class="size-3.5" />
+                      {$translate("playground.translation.translate")}
+                    </Button>
+                  {/if}
+                </div>
+              </div>
+            {/snippet}
+          </ExpandableTextarea>
+        </div>
       </div>
 
-      <div class="pg-panel flex min-h-0 flex-col p-4">
-        <div class="pg-scroll min-h-0 flex-1 overflow-y-auto">
+      <!-- Result Pane -->
+      <div class="pg-panel flex min-h-0 flex-col overflow-hidden border border-border/50 shadow-xs">
+        <div class="flex shrink-0 items-center justify-between border-b px-3 py-2 pg-divide bg-muted/20">
+          <span class="flex items-center gap-1.5 text-xs font-medium text-foreground">
+            <Languages class="size-3.5 text-primary" />
+            <span>{targetLanguageDisplay}</span>
+          </span>
+          <div class="flex items-center gap-1.5">
+            {#if resultText}
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                class="pg-tool"
+                onclick={copyResult}
+                title={copied ? $translate("common.copied") : $translate("playground.translation.copy")}
+              >
+                {#if copied}
+                  <Check class="size-3.5 text-success" />
+                {:else}
+                  <Copy class="size-3.5" />
+                {/if}
+              </Button>
+              <span class="pg-chip">{resultText.length} {$translate("playground.chat.characters")}</span>
+              {#if elapsedMs > 0}
+                <span class="pg-chip">{formatDuration(elapsedMs, { precision: 1, subSecondMs: true })}</span>
+              {/if}
+              {#if reasoningTimeMs > 0}
+                <span class="pg-chip">{$translate("capture.reasoning")} {formatDuration(reasoningTimeMs, { precision: 1, subSecondMs: true })}</span>
+              {/if}
+            {/if}
+          </div>
+        </div>
+
+        <div class="pg-scroll min-h-0 flex-1 overflow-y-auto p-3.5">
           {#if $busyStore && !resultText}
-            <div class="text-muted-foreground flex h-full items-center justify-center">
-              <div class="text-center">
-                <div class="inline-block w-8 h-8 border-4 border-primary border-t-transparent rounded-full animate-spin mb-2"></div>
-                <p>{$translate("playground.translation.translating")}</p>
-              </div>
+            <div class="text-muted-foreground flex h-full flex-col items-center justify-center gap-2">
+              <div class="inline-block size-6 border-2 border-primary border-t-transparent rounded-full animate-spin"></div>
+              <p class="text-xs">{$translate("playground.translation.translating")}</p>
             </div>
           {:else if $errorStore}
-            <div class="text-destructive p-2">
+            <div class="text-destructive p-3 rounded-lg bg-destructive/10 border border-destructive/20 text-xs">
               <p class="font-medium">{$translate("common.error")}</p>
-              <p class="mt-1 text-sm">{$errorStore}</p>
+              <p class="mt-1">{$errorStore}</p>
             </div>
           {:else if resultText}
-            <div class="whitespace-pre-wrap text-[0.9375rem] leading-relaxed">{resultText}{#if $busyStore}<span class="pg-caret"></span>{/if}</div>
+            <div class="whitespace-pre-wrap text-[0.9375rem] leading-relaxed select-text font-normal">
+              {resultText}{#if $busyStore}<span class="pg-caret"></span>{/if}
+            </div>
           {:else}
-            <div class="text-muted-foreground flex h-full items-center justify-center text-center text-sm">
-              {$translate("playground.translation.empty")}
+            <div class="text-muted-foreground flex h-full flex-col items-center justify-center gap-2 text-center text-xs">
+              <Languages class="size-8 opacity-25 text-primary" />
+              <p>{$translate("playground.translation.empty")}</p>
             </div>
           {/if}
         </div>
-        {#if resultText && !$busyStore}
-          <div class="mt-2 flex shrink-0 items-center gap-1.5">
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              class="pg-tool"
-              onclick={copyResult}
-              title={copied ? $translate("common.copied") : $translate("playground.translation.copy")}
-            >
-              {#if copied}
-                <Check class="text-success" />
-              {:else}
-                <Copy />
-              {/if}
-            </Button>
-            <span class="pg-chip">{resultText.length}{$translate("playground.chat.characters")}</span>
-            {#if elapsedMs > 0}
-              <span class="pg-chip">{formatDuration(elapsedMs, { precision: 1, subSecondMs: true })}</span>
-            {/if}
-            {#if reasoningTimeMs > 0}
-              <span class="pg-chip">{$translate("capture.reasoning")} {formatDuration(reasoningTimeMs, { precision: 1, subSecondMs: true })}</span>
-            {/if}
-          </div>
-        {/if}
       </div>
-    </div>
-
-    <!-- Action row -->
-    <div class="mt-3 flex shrink-0 items-center justify-end gap-2">
-      {#if $busyStore}
-        <Button variant="outline" class="pg-control pg-control--danger" onclick={() => iface.cancel()}>
-          <X />
-          {$translate("common.cancel")}
-        </Button>
-      {:else}
-        <Button class="pg-action" onclick={translateText} disabled={!canTranslate}>
-          <Languages />
-          {$translate("playground.translation.translate")}
-        </Button>
-      {/if}
     </div>
   {/if}
 

@@ -19,6 +19,7 @@
   import * as ToggleGroup from "$lib/components/ui/toggle-group/index.js";
   import { playgroundModels, profileModels, selectorModels } from "../../stores/api";
   import { persistentStore } from "../../stores/persistent";
+  import { playgroundStores } from "../../stores/playgroundActivity";
   import { streamChatCompletion, type StreamUsage } from "../../lib/chatApi";
   import { t, translate } from "../../lib/i18n";
   import {
@@ -64,6 +65,10 @@
   let selectedModel = $state("");
   let dragIndex = $state<number | null>(null);
   let dragOverIndex = $state<number | null>(null);
+
+  $effect(() => {
+    playgroundStores.concurrencyRunning.set(isRunning);
+  });
 
   let previewPlans = $derived.by(() => createBenchmarkPlans({
     mode: $modeStore,
@@ -784,38 +789,38 @@
       {/if}
     </header>
 
-    <div class="grid shrink-0 grid-cols-2 gap-px border-b border-border bg-border sm:grid-cols-3 xl:grid-cols-6">
-      <div class="bg-background px-3 py-2">
-        <div class="text-muted-foreground text-[9px] uppercase">{$translate("playground.concurrency.completed")}</div>
-        <div class="mt-0.5 text-sm font-semibold tabular-nums">{summary.completed}/{summary.total}</div>
+    <div class="grid shrink-0 grid-cols-2 gap-2 border-b border-border/60 bg-muted/20 p-2.5 sm:grid-cols-3 xl:grid-cols-6">
+      <div class="rounded-lg border border-border/50 bg-card p-2.5 shadow-xs">
+        <div class="text-muted-foreground text-[10px] uppercase font-medium">{$translate("playground.concurrency.completed")}</div>
+        <div class="mt-1 text-sm font-semibold tabular-nums">{summary.completed}/{summary.total}</div>
       </div>
-      <div class="bg-background px-3 py-2">
-        <div class="text-muted-foreground text-[9px] uppercase">{$translate("playground.concurrency.promptLoad")}</div>
-        <div class="mt-0.5 text-sm font-semibold tabular-nums">{formatTokens(summary.totalPromptTokens)}</div>
+      <div class="rounded-lg border border-border/50 bg-card p-2.5 shadow-xs">
+        <div class="text-muted-foreground text-[10px] uppercase font-medium">{$translate("playground.concurrency.promptLoad")}</div>
+        <div class="mt-1 text-sm font-semibold tabular-nums">{formatTokens(summary.totalPromptTokens)}</div>
       </div>
-      <div class="bg-background px-3 py-2">
-        <div class="text-muted-foreground text-[9px] uppercase">{$translate("playground.concurrency.p50FirstToken")}</div>
-        <div class="mt-0.5 text-sm font-semibold tabular-nums">{formatElapsed(summary.p50FirstTokenMs)}</div>
+      <div class="rounded-lg border border-border/50 bg-card p-2.5 shadow-xs">
+        <div class="text-muted-foreground text-[10px] uppercase font-medium">{$translate("playground.concurrency.p50FirstToken")}</div>
+        <div class="mt-1 text-sm font-semibold tabular-nums text-foreground">{formatElapsed(summary.p50FirstTokenMs)}</div>
       </div>
-      <div class="bg-background px-3 py-2">
-        <div class="text-muted-foreground text-[9px] uppercase">
+      <div class="rounded-lg border border-border/50 bg-card p-2.5 shadow-xs">
+        <div class="text-muted-foreground text-[10px] uppercase font-medium">
           {$translate($modeStore === "async-prefill" ? "playground.concurrency.probeFirstToken" : "playground.concurrency.p95FirstToken")}
         </div>
-        <div class="mt-0.5 text-sm font-semibold tabular-nums">
+        <div class="mt-1 text-sm font-semibold tabular-nums text-foreground">
           {formatElapsed($modeStore === "async-prefill" ? probeSummary.p50FirstTokenMs : summary.p95FirstTokenMs)}
         </div>
       </div>
-      <div class="bg-background px-3 py-2">
-        <div class="text-muted-foreground text-[9px] uppercase">{$translate("playground.concurrency.outputRate")}</div>
-        <div class="mt-0.5 text-sm font-semibold tabular-nums">
+      <div class="rounded-lg border border-border/50 bg-card p-2.5 shadow-xs">
+        <div class="text-muted-foreground text-[10px] uppercase font-medium">{$translate("playground.concurrency.outputRate")}</div>
+        <div class="mt-1 text-sm font-semibold tabular-nums text-foreground">
           {activePlans.length > 0 ? `${summary.outputTokensPerSecond.toFixed(1)} t/s` : "—"}
         </div>
       </div>
-      <div class="bg-background px-3 py-2">
-        <div class="text-muted-foreground text-[9px] uppercase">{$translate("playground.concurrency.wallTime")}</div>
-        <div class="mt-0.5 text-sm font-semibold tabular-nums">{activePlans.length > 0 ? formatElapsed(summary.wallTimeMs) : "—"}</div>
+      <div class="rounded-lg border border-border/50 bg-card p-2.5 shadow-xs">
+        <div class="text-muted-foreground text-[10px] uppercase font-medium">{$translate("playground.concurrency.wallTime")}</div>
+        <div class="mt-1 text-sm font-semibold tabular-nums text-foreground">{activePlans.length > 0 ? formatElapsed(summary.wallTimeMs) : "—"}</div>
       </div>
-      <div class="col-span-full h-0.5 bg-muted">
+      <div class="col-span-full h-1 overflow-hidden rounded-full bg-muted/60 mt-0.5">
         <div class="bg-primary h-full transition-[width] duration-200" style:width={`${progressPercent}%`}></div>
       </div>
     </div>

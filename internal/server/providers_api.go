@@ -165,6 +165,9 @@ func (s *Server) handleAPIProvidersProbe(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, map[string]string{"error": "endpoint is required"})
 		return
 	}
+	// Mirror config validation: a base URL written as .../v1 must not produce
+	// a doubled /v1/v1/models probe URL.
+	endpoint = strings.TrimSuffix(endpoint, "/v1")
 	parsed, err := url.Parse(endpoint)
 	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
 		w.WriteHeader(http.StatusBadRequest)

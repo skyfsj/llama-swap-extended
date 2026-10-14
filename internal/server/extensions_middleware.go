@@ -17,6 +17,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/chain"
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/extensions"
+	protocolrelaykit "github.com/mostlygeek/llama-swap/internal/protocol/relaykit"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
@@ -79,6 +80,9 @@ type extensionRequestState struct {
 }
 
 func extensionEndpoint(path string) string {
+	if route, ok := protocolrelaykit.RouteForRequest(http.MethodPost, path); ok && route.Format == protocolrelaykit.Gemini {
+		return "gemini.generateContent"
+	}
 	switch path {
 	case "/v1/chat/completions", "/v/chat/completions":
 		return "chat.completions"
@@ -181,6 +185,13 @@ func CreateExtensionsMiddleware(s *Server, cfg config.Config, manager *extension
 				swaputil.SendResponse(w, r, http.StatusRequestEntityTooLarge, "extension request body is too large")
 				return
 			}
+			if protocolTargetFormat(r) == protocolrelaykit.OpenAIChat || state.meta.Endpoint == "chat.completions" {
+				body, _, err = protocolrelaykit.StripHostedSearchTools(body, protocolrelaykit.OpenAIChat)
+				if err != nil {
+					swaputil.SendResponse(w, r, http.StatusBadRequest, err.Error())
+					return
+				}
+			}
 			var request map[string]any
 			if err := json.Unmarshal(body, &request); err != nil {
 				swaputil.SendResponse(w, r, http.StatusBadRequest, "extension request must be JSON")
@@ -225,16 +236,10 @@ func CreateExtensionsMiddleware(s *Server, cfg config.Config, manager *extension
 				swaputil.SendResponse(w, r, http.StatusBadRequest, "extension cannot change routed model")
 				return
 			}
-			if stream, _ := request["stream"].(bool); stream != data.Streaming {
-				swaputil.SendResponse(w, r, http.StatusBadRequest, "extension cannot change stream mode")
-				return
-			}
-			if endpoint == "anthropic.messages" {
-				for _, item := range state.items {
-					if err := injectAnthropicTools(request, item, state.owners); err != nil {
-						swaputil.SendResponse(w, r, http.StatusBadRequest, err.Error())
-						return
-					}
+			if endpoint != "gemini.generateContent" {
+				if stream, _ := request["stream"].(bool); stream != data.Streaming {
+					swaputil.SendResponse(w, r, http.StatusBadRequest, "extension cannot change stream mode")
+					return
 				}
 			}
 			if data.Streaming {
@@ -392,14 +397,31 @@ func CreateExtensionsBeforeForwardMiddleware() chain.Middleware {
 				swaputil.SendResponse(w, r, http.StatusBadRequest, "extension request must be JSON")
 				return
 			}
-			chatDialect := state.meta.Endpoint == "chat.completions" || r.Context().Value(responsesChatBackendPathKey{}) != nil
+			target := protocolTargetFormat(r)
+			chatDialect := target == protocolrelaykit.OpenAIChat || (target == "" && state.meta.Endpoint == "chat.completions")
+			claudeDialect := target == protocolrelaykit.ClaudeMessages || (target == "" && state.meta.Endpoint == "anthropic.messages")
+			geminiDialect := target == protocolrelaykit.Gemini || (target == "" && state.meta.Endpoint == "gemini.generateContent")
 			if state.meta.Endpoint != "anthropic.messages" {
 				state.owners = map[string]*extensions.Compiled{}
 			}
 			forwardModel, forwardStream := request["model"], request["stream"]
 			capture := debugCaptureFrom(r.Context())
 			for _, item := range state.items {
-				if state.meta.Endpoint != "anthropic.messages" {
+				if claudeDialect {
+					toolsBefore := extensionToolNames(request["tools"])
+					if err := injectAnthropicTools(request, item, state.owners); err != nil {
+						swaputil.SendResponse(w, r, http.StatusBadRequest, err.Error())
+						return
+					}
+					if capture != nil {
+						capture.recordInjectedTools(addedExtensionTools(toolsBefore, extensionToolNames(request["tools"])))
+					}
+				} else if geminiDialect {
+					if err := injectGeminiTools(request, item, state.owners); err != nil {
+						swaputil.SendResponse(w, r, http.StatusBadRequest, err.Error())
+						return
+					}
+				} else {
 					toolsBefore := extensionToolNames(request["tools"])
 					if err := injectExtensionTools(request, item, chatDialect, state.owners); err != nil {
 						swaputil.SendResponse(w, r, http.StatusBadRequest, err.Error())
@@ -593,6 +615,71 @@ func injectAnthropicTools(request map[string]any, item *extensions.Compiled, own
 			tools[index] = rendered
 		} else {
 			tools = append(tools, rendered)
+		}
+		if tool.Execution == "server" {
+			owners[name] = item
+		} else {
+			delete(owners, name)
+		}
+	}
+	request["tools"] = tools
+	return nil
+}
+
+func injectGeminiTools(request map[string]any, item *extensions.Compiled, owners map[string]*extensions.Compiled) error {
+	if len(item.Tools) == 0 {
+		return nil
+	}
+	tools, _ := request["tools"].([]any)
+	for _, tool := range item.Tools {
+		var function map[string]any
+		if err := json.Unmarshal(tool.Function, &function); err != nil {
+			return err
+		}
+		name, _ := function["name"].(string)
+		containerIndex, declarationIndex := -1, -1
+		for ti, rawTool := range tools {
+			toolObject, _ := rawTool.(map[string]any)
+			declarations, _ := toolObject["functionDeclarations"].([]any)
+			for di, rawDeclaration := range declarations {
+				declaration, _ := rawDeclaration.(map[string]any)
+				if declaration["name"] == name {
+					containerIndex, declarationIndex = ti, di
+					break
+				}
+			}
+			if declarationIndex >= 0 {
+				break
+			}
+		}
+		if declarationIndex >= 0 {
+			switch item.Manifest.ToolConflict {
+			case "override":
+			case "error":
+				return fmt.Errorf("extension %s tool %s conflicts with an existing tool", item.Manifest.ID, name)
+			default:
+				slog.Warn("extension tool skipped due to name conflict", "extension", item.Manifest.ID, "tool", name)
+				continue
+			}
+		}
+		declaration := map[string]any{
+			"name":       name,
+			"parameters": function["parameters"],
+		}
+		if declaration["parameters"] == nil {
+			declaration["parameters"] = map[string]any{"type": "object", "properties": map[string]any{}}
+		}
+		if description, ok := function["description"].(string); ok {
+			declaration["description"] = description
+		}
+		if declarationIndex >= 0 {
+			container, _ := tools[containerIndex].(map[string]any)
+			declarations, _ := container["functionDeclarations"].([]any)
+			declarations[declarationIndex] = declaration
+			container["functionDeclarations"] = declarations
+			tools[containerIndex] = container
+		} else {
+			tools = append(tools, map[string]any{"functionDeclarations": []any{declaration}})
 		}
 		if tool.Execution == "server" {
 			owners[name] = item

@@ -226,19 +226,13 @@ models:
 		t.Fatal(err)
 	}
 	model := cfg.Models["qwen"]
-	// Loading migrates the hand-written command into the structured launch
-	// block and reduces args to the unmanaged extras; the build merges them
-	// back into one canonical argv.
-	if model.Backend.Launch == nil {
-		t.Fatal("expected the structured launch block to be migrated on load")
+	// The hand-written command is the single source of truth: loading must not
+	// invent a structured launch block, and the rebuild only hoists the model
+	// target into the canonical launch prefix, preserving the authored order.
+	if model.Backend.Launch != nil {
+		t.Fatalf("loading created a structured launch block: %+v", model.Backend.Launch)
 	}
-	if model.Backend.Launch.Model != "/models/Qwen3.8-27B-FP8" ||
-		model.Backend.Launch.ServedModelName != "Qwen/Qwen3.8-27B-FP8" ||
-		model.Backend.Launch.ContextPerRequest != 262144 ||
-		model.Backend.Launch.MaxConcurrency != 2 {
-		t.Fatalf("launch block mismatch: %+v", model.Backend.Launch)
-	}
-	rebuilt, _, err := config.BuildManagedLaunchArguments(model.Backend.Arguments, model.Backend.Launch, "vllm", model.Proxy)
+	rebuilt, _, err := config.BuildManagedLaunchArguments(model.Backend.Arguments, model.Backend.EntryPoint, "vllm", model.Proxy)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -246,10 +240,10 @@ models:
 		"vllm", "serve", "--model", "/models/Qwen3.8-27B-FP8",
 		"--host", "127.0.0.1", "--port", "5801",
 		"--served-model-name", "Qwen/Qwen3.8-27B-FP8",
+		"--trust-remote-code",
+		"--gpu-memory-utilization", "0.90",
 		"--max-model-len", "262144",
 		"--max-num-seqs", "2",
-		"--gpu-memory-utilization", "0.9",
-		"--trust-remote-code",
 		"--max-num-batched-tokens", "8192",
 		"--attention-backend", "FLASH_ATTN_V100",
 		"--kv-cache-dtype", "fp8_e5m2",
@@ -716,4 +710,56 @@ func slicesContains(args []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// A runtime's launch metadata supplies the head and quick-config defaults the
+// models on it inherit; a model-level entrypoint or an explicit flag wins.
+func TestServer_BindManagedRuntimeLaunchConfigUsesRuntimeMetadata(t *testing.T) {
+	root := t.TempDir()
+	utilization := 0.9
+	cfg := config.Config{
+		RuntimeManager: config.RuntimeManagerConfig{Root: root},
+		Runtimes: map[string]config.RuntimeConfig{
+			"asr": {Kind: "vllm", Metadata: config.RuntimeMetadataConfig{
+				EntryPoint: "python3 /scripts/asr-server.py",
+			}},
+			"vllm": {Kind: "vllm", Metadata: config.RuntimeMetadataConfig{
+				ContextPerRequest:    32768,
+				MaxConcurrency:       2,
+				GPUMemoryUtilization: &utilization,
+			}},
+		},
+		Models: map[string]config.ModelConfig{
+			"asr-model": {
+				Proxy:   "http://127.0.0.1:5811",
+				Backend: config.BackendConfig{Type: "vllm", Runtime: "asr", Arguments: []string{"--port 5811", "--model /models/asr"}},
+			},
+			"llm": {
+				Proxy:   "http://127.0.0.1:5801",
+				Backend: config.BackendConfig{Type: "vllm", Runtime: "vllm", Arguments: []string{"--model /models/qwen", "--max-num-seqs 8"}},
+			},
+		},
+	}
+
+	bound, err := bindManagedRuntimeLaunchConfig(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The custom head runs verbatim with the operator's args and keeps argv[0]:
+	// the binding executable must not replace it.
+	asr := strings.Join(bound.Models["asr-model"].Backend.Arguments, " ")
+	if !strings.HasPrefix(asr, "python3 /scripts/asr-server.py --port 5811 --model /models/asr") {
+		t.Fatalf("custom head argv = %q", asr)
+	}
+	// The kind-default head still gets the canonical prefix plus the runtime
+	// defaults, skipping the flag the model pinned itself.
+	llm := strings.Join(bound.Models["llm"].Backend.Arguments, " ")
+	for _, want := range []string{"--max-model-len 32768", "--gpu-memory-utilization 0.9", "--max-num-seqs 8"} {
+		if !strings.Contains(llm, want) {
+			t.Fatalf("argv %q is missing %q", llm, want)
+		}
+	}
+	if strings.Contains(llm, "--max-num-seqs 2") {
+		t.Fatalf("runtime default overrode the model's own flag: %q", llm)
+	}
 }

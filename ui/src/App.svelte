@@ -59,6 +59,7 @@
     "/extensions/docs": wrap({ asyncComponent: () => import("./routes/ExtensionDocs.svelte"), loadingComponent: RouteLoading }),
     "/extensions/new": wrap({ asyncComponent: () => import("./routes/ExtensionEditor.svelte"), loadingComponent: RouteLoading }),
     "/extensions/:id/editor": wrap({ asyncComponent: () => import("./routes/ExtensionEditor.svelte"), loadingComponent: RouteLoading }),
+    "/extensions/:id/settings": wrap({ asyncComponent: () => import("./routes/ExtensionSettings.svelte"), loadingComponent: RouteLoading }),
     "/server-config": wrap({ asyncComponent: () => import("./routes/ServerConfig.svelte"), loadingComponent: RouteLoading }),
     "*": wrap({ asyncComponent: () => import("./routes/Activity.svelte"), loadingComponent: RouteLoading }),
   };
@@ -87,6 +88,9 @@
       return `${$translate("navigation.playground")} / ${$translate(`playground.tabs.${$selectedPlaygroundTab}`)}`;
     }
     if ($currentRoute === "/extensions/docs") return $translate("extensions.dev.docsTitle");
+    if ($currentRoute.endsWith("/settings") && $currentRoute.startsWith("/extensions/")) {
+      return `${$translate("navigation.extensions")} / ${$translate("extensions.settings.title")}`;
+    }
     if ($currentRoute.startsWith("/extensions/")) {
       return `${$translate("navigation.extensions")} / ${$translate("extensions.editor.open")}`;
     }

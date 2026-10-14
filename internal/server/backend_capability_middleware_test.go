@@ -32,6 +32,25 @@ func TestBackendCapabilityForPath(t *testing.T) {
 	}
 }
 
+func TestBackendProtocolCapabilityTargetsChat(t *testing.T) {
+	for _, test := range []struct {
+		path       string
+		capability string
+	}{
+		{"/v1/chat/completions", "chat"},
+		{"/v1/responses", "responses"},
+		{"/v1/messages", "anthropic"},
+		{"/v1beta/models/m:generateContent", "gemini"},
+	} {
+		if got := backendProtocolCapability(config.AdapterProtocolNative, http.MethodPost, test.path, test.capability); got != "chat" {
+			t.Errorf("backendProtocolCapability(%q) = %q, want chat", test.path, got)
+		}
+	}
+	if got := backendProtocolCapability(config.AdapterProtocolNative, http.MethodPost, "/v1/messages/count_tokens", "anthropic"); got != "anthropic" {
+		t.Fatalf("count_tokens capability = %q, want anthropic", got)
+	}
+}
+
 func TestBackendCapabilityMiddlewareExplicitAllowlist(t *testing.T) {
 	cfg := config.Config{Models: map[string]config.ModelConfig{
 		"m": {Backend: config.BackendConfig{APIs: []string{"chat"}}},
@@ -44,8 +63,8 @@ func TestBackendCapabilityMiddlewareExplicitAllowlist(t *testing.T) {
 	request = request.WithContext(swaputil.SetContext(request.Context(), swaputil.ReqContextData{ModelID: "m", Model: "m"}))
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, request)
-	if recorder.Code != http.StatusNotImplemented {
-		t.Fatalf("disabled capability status = %d, body=%s", recorder.Code, recorder.Body.String())
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("Responses-to-Chat target status = %d, body=%s", recorder.Code, recorder.Body.String())
 	}
 
 	request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
@@ -54,6 +73,18 @@ func TestBackendCapabilityMiddlewareExplicitAllowlist(t *testing.T) {
 	handler.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusNoContent {
 		t.Fatalf("enabled capability status = %d, body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	nativeCfg := config.Config{Models: map[string]config.ModelConfig{
+		"m": {Backend: config.BackendConfig{Protocol: config.AdapterProtocolNative, APIs: []string{"chat"}}},
+	}}
+	nativeHandler := CreateBackendCapabilityMiddleware(nativeCfg)(next)
+	request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"m"}`))
+	request = request.WithContext(swaputil.SetContext(request.Context(), swaputil.ReqContextData{ModelID: "m", Model: "m"}))
+	recorder = httptest.NewRecorder()
+	nativeHandler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("Chat-only backend capability status = %d, body=%s", recorder.Code, recorder.Body.String())
 	}
 }
 

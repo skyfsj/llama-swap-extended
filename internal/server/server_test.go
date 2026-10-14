@@ -2,8 +2,6 @@ package server
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"bytes"
 	"github.com/mostlygeek/llama-swap/internal/auth"
 	"github.com/mostlygeek/llama-swap/internal/backend"
 	"github.com/mostlygeek/llama-swap/internal/config"
@@ -231,30 +230,10 @@ func TestServer_AuditMaintenancePurgesExpiredAndOverBudget(t *testing.T) {
 	}
 }
 
-func countFiles(t *testing.T, root string) int {
-	t.Helper()
-	n := 0
-	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			if os.IsNotExist(err) {
-				return nil
-			}
-			return err
-		}
-		if !d.IsDir() {
-			n++
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("walk %s: %v", root, err)
-	}
-	return n
-}
-
-// Blob GC is rate-limited: the first maintenance pass reclaims files whose
-// rows are gone, a second pass inside the interval is a no-op, and a pass
-// after the interval picks up the new orphans.
+// Audit space reclamation is rate-limited: the first maintenance pass frees
+// nothing while every row is live, a pass inside the interval is a no-op even
+// after a delete, and the next pass past the interval compacts the segments and
+// keeps the surviving conversation readable.
 func TestServer_AuditMaintenanceReclaimsOrphanBlobs(t *testing.T) {
 	dir := t.TempDir()
 	st, err := store.New(filepath.Join(dir, "db.sqlite"))
@@ -269,7 +248,8 @@ func TestServer_AuditMaintenanceReclaimsOrphanBlobs(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
 	for _, id := range []string{"first", "second"} {
 		if err := st.InsertAuditConversation(context.Background(), store.AuditConversation{
-			ID: id, Model: "m", Timestamp: now, RequestBody: []byte("media-" + id),
+			ID: id, Model: "m", Timestamp: now,
+			RequestBody: bytes.Repeat([]byte("media-"+id), 200),
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -280,51 +260,54 @@ func TestServer_AuditMaintenanceReclaimsOrphanBlobs(t *testing.T) {
 		cfg:   config.Config{Audit: config.AuditConfig{Enabled: true}},
 		store: st, shutdownCtx: ctx,
 	}
-	blobs := filepath.Join(dir, "blobs")
 
+	baseline, err := st.AuditStats(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
 	// First pass reclaims nothing (both rows are live) and arms the gate.
 	s.gcAuditBlobs(ctx)
-	if got := countFiles(t, blobs); got != 2 {
-		t.Fatalf("files after first pass=%d, want 2 (rows still live)", got)
-	}
-	// Deleting a row and re-running inside the interval must be a no-op:
-	// the rate limit keeps a burst of deletes from turning into walks.
 	if err := st.DeleteAuditConversation(ctx, "first"); err != nil {
 		t.Fatal(err)
 	}
-	s.gcAuditBlobs(ctx)
-	if got := countFiles(t, blobs); got != 2 {
-		t.Fatalf("files inside GC interval=%d, want 2 (rate-limited)", got)
-	}
-	// After the interval the orphan is reclaimed, referenced files survive.
-	// Backdate the orphan past the blob grace period: it was written moments
-	// ago, so GC would otherwise treat it as possibly still-uncommitted.
-	orphan := sha256.Sum256([]byte("media-first"))
-	orphanPath := filepath.Join(blobs, hex.EncodeToString(orphan[:])[:2], hex.EncodeToString(orphan[:]))
-	stale := time.Now().Add(-2 * time.Hour)
-	if err := os.Chtimes(orphanPath, stale, stale); err != nil {
+	unchanged, err := st.AuditStats(ctx)
+	if err != nil {
 		t.Fatal(err)
 	}
+	if unchanged.Blocks != baseline.Blocks {
+		t.Fatalf("blocks changed inside the GC interval: %d -> %d (rate limit must hold)", baseline.Blocks, unchanged.Blocks)
+	}
+	// Past the interval the unreferenced blocks are dropped and the segment
+	// shrinks; the surviving row still reads its body.
 	s.auditLastGC = time.Now().Add(-time.Hour)
 	s.gcAuditBlobs(ctx)
-	if got := countFiles(t, blobs); got != 1 {
-		t.Fatalf("files after GC=%d, want 1 (only second row's blob)", got)
+	after, err := st.AuditStats(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Blocks >= baseline.Blocks {
+		t.Fatalf("blocks after compaction=%d, want fewer than %d", after.Blocks, baseline.Blocks)
+	}
+	if after.SegmentBytes >= baseline.SegmentBytes {
+		t.Fatalf("segment bytes after compaction=%d, want fewer than %d", after.SegmentBytes, baseline.SegmentBytes)
 	}
 	full, found, err := st.GetAuditConversation(ctx, "second")
 	if err != nil || !found {
-		t.Fatalf("surviving row after GC found=%v err=%v", found, err)
+		t.Fatalf("surviving row after compaction found=%v err=%v", found, err)
 	}
-	file, _, err := st.OpenBlob(full.RequestBodyRef)
+	body, _, _, err := st.OpenBody(full.RequestBodyRef)
 	if err != nil {
-		t.Fatalf("surviving row body is unreadable after GC: %v", err)
+		t.Fatalf("surviving row body is unreadable after compaction: %v", err)
 	}
-	defer file.Close()
-	body, err := io.ReadAll(file)
+	if closer, ok := body.(io.Closer); ok {
+		defer closer.Close()
+	}
+	read, err := io.ReadAll(body)
 	if err != nil {
 		t.Fatalf("read surviving row body: %v", err)
 	}
-	if string(body) != "media-second" {
-		t.Fatalf("surviving row body=%q, want %q", body, "media-second")
+	if string(read) != string(bytes.Repeat([]byte("media-second"), 200)) {
+		t.Fatalf("surviving row body has %d byte(s), want %d", len(read), 200*len("media-second"))
 	}
 }
 

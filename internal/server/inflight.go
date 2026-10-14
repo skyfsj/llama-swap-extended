@@ -16,6 +16,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/chain"
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/event"
+	protocolrelaykit "github.com/mostlygeek/llama-swap/internal/protocol/relaykit"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
@@ -767,6 +768,9 @@ func CreateUpstreamInflightMiddleware(t *inflightTracker, cfg config.Config) cha
 func isModelDispatchedRequest(method, path string) bool {
 	switch method {
 	case http.MethodPost:
+		if route, ok := protocolrelaykit.RouteForRequest(method, path); ok && route.Format == protocolrelaykit.Gemini {
+			return true
+		}
 		for _, p := range modelPostJSONRoutes {
 			if p == path {
 				return true

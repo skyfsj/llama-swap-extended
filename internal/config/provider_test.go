@@ -143,6 +143,56 @@ providers:
 	}
 }
 
+func TestConfig_ProviderEndpointV1SuffixNormalized(t *testing.T) {
+	t.Setenv("PROVIDER_TEST_KEY", "sk-test-1")
+	yaml := `
+models:
+  local-model:
+    cmd: echo ${PORT}
+providers:
+  a:
+    type: openai
+    endpoint: https://api.example.com/v1/
+    apiKeys:
+      - ${env.PROVIDER_TEST_KEY}
+    models:
+      - m1
+  b:
+    type: openai
+    endpoint: http://192.168.1.28:7863/v1
+    apiKeys:
+      - ${env.PROVIDER_TEST_KEY}
+    models:
+      - m2
+  c:
+    type: openai
+    endpoint: https://api.example.com/v1/x
+    apiKeys:
+      - ${env.PROVIDER_TEST_KEY}
+    models:
+      - m3
+`
+	cfg, err := loadProvidersYAML(t, yaml)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	cases := map[string]string{
+		"a": "https://api.example.com",
+		"b": "http://192.168.1.28:7863",
+		// only a bare /v1 suffix is stripped, deeper paths stay intact
+		"c": "https://api.example.com/v1/x",
+	}
+	for id, want := range cases {
+		p, ok := cfg.Providers[id]
+		if !ok {
+			t.Fatalf("provider %s missing", id)
+		}
+		if p.Endpoint != want {
+			t.Errorf("provider %s endpoint = %q, want %q", id, p.Endpoint, want)
+		}
+	}
+}
+
 func TestConfig_ProviderValidationErrors(t *testing.T) {
 	t.Setenv("PROVIDER_TEST_KEY", "sk-test-1")
 	cases := []struct {

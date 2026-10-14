@@ -1,7 +1,6 @@
 package config
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/mostlygeek/llama-swap/internal/launchspec"
@@ -45,16 +44,15 @@ func (l *ModelLaunchConfig) Spec() launchspec.Spec {
 	return spec
 }
 
-// launchspecReservedFlags exposes the per-kind reserved flag set for config
-// validation.
-func launchspecReservedFlags(kind string) map[string]bool {
-	return launchspec.ReservedFlags(kind)
-}
-
-// MigrateLaunchBlocks upgrades every legacy args-only managed model to the
-// structured launch block in place. Config validation and config-source
-// loading both call it so the running server sees the same normalized
-// configuration the validators accepted.
+// MigrateLaunchBlocks folds every structured launch block into backend.args
+// so the command text is the single source of truth for a managed model. The
+// structured fields (model target, context, concurrency, tensor parallelism,
+// memory utilization, served name) are rendered into the exact flags the
+// launch builder would have injected, and the GPU selector is normalized into
+// model.env. Config validation and config-source loading both call it so the
+// running server sees the same normalized configuration the validators
+// accepted. The launch block itself is cleared: nothing about the numeric
+// fields is stored twice.
 func (c Config) MigrateLaunchBlocks() {
 	for name, model := range c.Models {
 		runtimeName := strings.TrimSpace(model.Backend.Runtime)
@@ -69,63 +67,81 @@ func (c Config) MigrateLaunchBlocks() {
 		if kind != "vllm" && kind != "llamacpp" {
 			continue
 		}
-		migrateLaunchFromArguments(name, &model.Backend, kind, model.Env)
-		// Older editor versions duplicated this setting in backend.launch.gpus.
-		// Fold that legacy field into model.env and clear it so the selector has
-		// one persisted source of truth going forward.
-		model.Env = normalizeLaunchGPUEnvironment(model.Env, model.Backend.Launch)
+		if model.Backend.Launch == nil {
+			continue
+		}
+		NormalizeModelLaunch(&model, kind)
 		c.Models[name] = model
 	}
 }
 
-// migrateLaunchFromArguments upgrades a legacy args-only managed model: the
-// structured fields are extracted from the operator's command text and the
-// args list is reduced to the unmanaged extras. Migration is skipped when it
-// cannot be proven lossless (for example a ctx-size that does not divide
-// evenly across parallel slots), keeping the legacy text untouched so the
-// operator can confirm by hand.
-func migrateLaunchFromArguments(modelName string, backend *BackendConfig, kind string, environment []string) {
-	if backend == nil || backend.Launch != nil || len(backend.Arguments) == 0 {
-		return
+// foldLaunchIntoArguments renders a structured launch block into explicit
+// engine flags appended to the operator's arguments. With a launch block
+// present the validator guarantees args carry none of the reserved flags, so
+// rendering the structured values after them is lossless and keeps the
+// operator's ordering. Tensor parallelism keeps its previous launch-time
+// behavior: an unset value over a multi-GPU selection is materialized as the
+// device count so the resulting command reproduces the old argv.
+func foldLaunchIntoArguments(kind string, launch *ModelLaunchConfig, args []string, environment []string) []string {
+	if launch == nil {
+		return args
 	}
-	command := strings.Join(backend.Arguments, "\n")
-	parsed, err := launchspec.Parse(kind, command)
-	if err != nil {
-		return
+	spec := launch.Spec()
+	if kind == "vllm" && spec.TensorParallelSize == 0 && len(spec.CUDAVisibleDevices) > 1 {
+		spec.TensorParallelSize = len(spec.CUDAVisibleDevices)
 	}
-	// A warning means semantics were ambiguous; keep the legacy text whole.
-	if len(parsed.Warnings) > 0 {
-		return
-	}
-	launch := &ModelLaunchConfig{
-		Model:                parsed.Model,
-		ServedModelName:      parsed.ServedModelName,
-		ContextPerRequest:    parsed.ContextPerRequest,
-		MaxConcurrency:       parsed.MaxConcurrency,
-		GPUMemoryUtilization: parsed.GPUMemoryUtilization,
-		TensorParallelSize:   parsed.TensorParallelSize,
-		GPUs:                 parsed.CUDAVisibleDevices,
-	}
-	if len(launch.GPUs) == 0 {
-		// CUDA_VISIBLE_DEVICES is commonly declared in the model environment,
-		// not inline with backend.args. Preserve that explicit operator choice
-		// before falling back to inferred 0..N tensor-parallel ordinals.
-		launch.GPUs = CUDAVisibleDevicesFromEnvironment(environment)
-	}
-	if parsed.TensorParallelSize > 0 {
-		// Tensor parallelism is derived from the GPU selection at start; a
-		// pasted explicit value only seeds the GPU count when GPUs are unset.
-		if len(launch.GPUs) == 0 && parsed.TensorParallelSize > 1 {
-			for index := 0; index < parsed.TensorParallelSize; index++ {
-				launch.GPUs = append(launch.GPUs, fmt.Sprintf("%d", index))
-			}
+	if kind == "vllm" && spec.TensorParallelSize == 0 {
+		if devices := CUDAVisibleDevicesFromEnvironment(environment); len(devices) > 1 {
+			spec.TensorParallelSize = len(devices)
 		}
 	}
-	if launchEmpty(launch) {
-		return
+	rendered := spec.BuildArgs(kind, false)
+	if len(rendered) == 0 {
+		return args
 	}
-	backend.Launch = launch
-	backend.Arguments = parsed.ExtraArgs
+	// An operator's own flag always wins: a legacy config can carry both the
+	// structured field and the flag it renders, and appending a second copy
+	// would produce a duplicate the engine reads unpredictably.
+	present := make(map[string]bool, len(args))
+	for _, token := range SplitManagedLaunchTokens(args) {
+		if name := flagName(token); name != "" {
+			present[name] = true
+		}
+	}
+	folded := make([]string, 0, len(args)+len(rendered))
+	folded = append(folded, args...)
+	for index := 0; index < len(rendered); index++ {
+		token := rendered[index]
+		name := flagName(token)
+		if name == "" || present[name] {
+			continue
+		}
+		if strings.Contains(token, "=") {
+			folded = append(folded, token)
+			continue
+		}
+		// Keep the flag/value pair together.
+		if index+1 < len(rendered) {
+			folded = append(folded, token, rendered[index+1])
+			index++
+			continue
+		}
+		folded = append(folded, token)
+	}
+	return folded
+}
+
+// flagName returns the flag a token spells, or "" for a positional value. Both
+// the paired ("--flag") and inline ("--flag=value") forms are recognized.
+func flagName(token string) string {
+	trimmed := strings.TrimSpace(token)
+	if !strings.HasPrefix(trimmed, "-") {
+		return ""
+	}
+	if equals := strings.Index(trimmed, "="); equals > 0 {
+		return trimmed[:equals]
+	}
+	return trimmed
 }
 
 // CUDAVisibleDevicesFromEnvironment reads the portable CUDA selector from a
@@ -225,10 +241,48 @@ func cudaVisibleDeviceContinuationIndexes(environment []string) map[int]struct{}
 	return continuations
 }
 
-// launchEmpty reports a structured block that would add no managed fields.
-func launchEmpty(launch *ModelLaunchConfig) bool {
-	return launch.Model == "" && launch.ServedModelName == "" &&
-		launch.ContextPerRequest == 0 && launch.MaxConcurrency == 0 &&
-		launch.GPUMemoryUtilization == nil && launch.TensorParallelSize == 0 &&
-		len(launch.GPUs) == 0
+// NormalizeModelLaunch folds a legacy structured launch block into explicit
+// engine flags and clears it, leaving backend.args as the single source of
+// truth for the command line. It is idempotent: a model without a launch block
+// is untouched. The loader calls it for every managed model, and the launch
+// binder calls it again so programmatically constructed configs (tests,
+// embedders) behave exactly like loaded ones.
+func NormalizeModelLaunch(model *ModelConfig, kind string) {
+	selections := NormalizeModelLaunchFlags(model, kind)
+	if len(selections) == 0 {
+		return
+	}
+	// GPU selection is the sole persisted card choice; fold it into the
+	// environment. No hardware snapshot is available on this path, so the
+	// vendor filter is the launch binder's job.
+	model.Env = normalizeLaunchGPUEnvironment(model.Env, &ModelLaunchConfig{GPUs: selections})
+}
+
+// NormalizeModelLaunchFlags folds a legacy launch block into explicit engine
+// flags and clears it, returning the block's GPU selections so the caller can
+// apply its own vendor filtering before writing CUDA environment. It is
+// idempotent: a model without a launch block yields nil and is untouched.
+func NormalizeModelLaunchFlags(model *ModelConfig, kind string) []string {
+	if model == nil || model.Backend.Launch == nil {
+		return nil
+	}
+	launch := model.Backend.Launch
+	selections := append([]string(nil), launch.GPUs...)
+	model.Backend.Arguments = foldLaunchIntoArguments(kind, launch, model.Backend.Arguments, model.Env)
+	model.Backend.Launch = nil
+	return selections
+}
+
+// HasTensorParallelFlag reports whether an argument list already pins the
+// tensor parallel size, in either the paired or the inline form.
+func HasTensorParallelFlag(args []string) bool {
+	for _, token := range args {
+		if token == "--tensor-parallel-size" || token == "-tp" {
+			return true
+		}
+		if strings.HasPrefix(token, "--tensor-parallel-size=") || strings.HasPrefix(token, "-tp=") {
+			return true
+		}
+	}
+	return false
 }

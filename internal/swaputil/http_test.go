@@ -772,6 +772,14 @@ func TestServer_ExtractAPIKey(t *testing.T) {
 	}
 }
 
+func TestServer_ExtractGoogleAPIKey(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "/v1beta/models/m:generateContent", nil)
+	request.Header.Set("x-goog-api-key", "google-client-key")
+	if got := ExtractAPIKey(request); got != "google-client-key" {
+		t.Fatalf("ExtractAPIKey() = %q, want google-client-key", got)
+	}
+}
+
 func TestIsWebSocketUpgrade(t *testing.T) {
 	tests := []struct {
 		name       string

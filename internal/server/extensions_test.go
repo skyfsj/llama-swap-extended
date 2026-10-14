@@ -166,7 +166,9 @@ func TestServer_ExtensionsStreamWithoutStreamHooksPassesThrough(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const upstream = "event: ping\ndata: {\"type\":\"ping\"}\n\n: keepalive\n\ndata: [DONE]\n\n"
+	const upstream = "data: {\"id\":\"chatcmpl_1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n\n" +
+		"data: {\"id\":\"chatcmpl_1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: [DONE]\n\n"
 	local := newStubRouter([]string{"m"}, "")
 	local.serveHTTP = func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -181,7 +183,7 @@ func TestServer_ExtensionsStreamWithoutStreamHooksPassesThrough(t *testing.T) {
 	r.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	s.ServeHTTP(w, r)
-	if w.Code != http.StatusOK || w.Body.String() != upstream {
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "event: message_start") || !strings.Contains(w.Body.String(), `"text":"hello"`) || !strings.Contains(w.Body.String(), "event: message_stop") {
 		t.Fatalf("stream=%d %q", w.Code, w.Body.String())
 	}
 }
@@ -311,18 +313,18 @@ func TestServer_ExtensionsAnthropicToolInjectionAndLoop(t *testing.T) {
 	local.serveHTTP = func(w http.ResponseWriter, r *http.Request) {
 		rounds++
 		body, _ := io.ReadAll(r.Body)
-		if !strings.Contains(string(body), `"input_schema":{"properties"`) || !strings.Contains(string(body), `"name":"lookup"`) {
-			t.Fatalf("Anthropic tool not injected: %s", body)
+		if !strings.Contains(string(body), `"type":"function"`) || !strings.Contains(string(body), `"function":{"name":"lookup"`) {
+			t.Fatalf("Chat tool not injected: %s", body)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		if rounds == 1 {
-			_, _ = io.WriteString(w, `{"id":"msg-1","type":"message","role":"assistant","model":"m","content":[{"type":"text","text":"checking"},{"type":"tool_use","id":"s1","name":"lookup","input":{"q":"x"}}],"stop_reason":"tool_use","usage":{"input_tokens":2,"output_tokens":3}}`)
+			_, _ = io.WriteString(w, `{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"checking","tool_calls":[{"id":"s1","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"x\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}`)
 			return
 		}
-		if !strings.Contains(string(body), `"tool_result"`) || !strings.Contains(string(body), `"tool_use_id":"s1"`) || !strings.Contains(string(body), "found:x") {
-			t.Fatalf("Anthropic tool result missing: %s", body)
+		if !strings.Contains(string(body), `"tool_call_id":"s1"`) || !strings.Contains(string(body), "found:x") {
+			t.Fatalf("Chat tool result missing: %s", body)
 		}
-		_, _ = io.WriteString(w, `{"id":"msg-2","type":"message","role":"assistant","model":"m","content":[{"type":"text","text":"done"}],"stop_reason":"end_turn","usage":{"input_tokens":4,"output_tokens":5}}`)
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-2","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":5,"total_tokens":9}}`)
 	}
 	s := extensionTestServer(t, local)
 	r := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`))
@@ -342,13 +344,13 @@ func TestServer_ExtensionsAnthropicMixedResume(t *testing.T) {
 		body, _ := io.ReadAll(r.Body)
 		w.Header().Set("Content-Type", "application/json")
 		if rounds == 1 {
-			_, _ = io.WriteString(w, `{"id":"msg-1","type":"message","role":"assistant","model":"m","content":[{"type":"tool_use","id":"s1","name":"lookup","input":{"q":"x"}},{"type":"tool_use","id":"c1","name":"client_tool","input":{}}],"stop_reason":"tool_use"}`)
+			_, _ = io.WriteString(w, `{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","tool_calls":[{"id":"s1","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"x\"}"}},{"id":"c1","type":"function","function":{"name":"client_tool","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`)
 			return
 		}
 		if !strings.Contains(string(body), "found:x") || !strings.Contains(string(body), "client-result") {
-			t.Fatalf("Anthropic continuation missing results: %s", body)
+			t.Fatalf("Chat continuation missing results: %s", body)
 		}
-		_, _ = io.WriteString(w, `{"id":"msg-2","type":"message","role":"assistant","model":"m","content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"}`)
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-2","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}`)
 	}
 	s := extensionTestServer(t, local)
 	post := func(body string) *httptest.ResponseRecorder {
@@ -381,27 +383,23 @@ func TestServer_ExtensionsAnthropicStreamToolLoop(t *testing.T) {
 	rounds := 0
 	local.serveHTTP = func(w http.ResponseWriter, r *http.Request) {
 		rounds++
+		body, _ := io.ReadAll(r.Body)
 		w.Header().Set("Content-Type", "text/event-stream")
 		if rounds == 1 {
-			_, _ = io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"m\",\"content\":[],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}}\n\n")
-			_, _ = io.WriteString(w, "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n")
-			_, _ = io.WriteString(w, "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Searching \"}}\n\n")
-			_, _ = io.WriteString(w, "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n")
-			_, _ = io.WriteString(w, "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"s1\",\"name\":\"lookup\",\"input\":{}}}\n\n")
-			_, _ = io.WriteString(w, "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"q\\\":\\\"x\\\"}\"}}\n\n")
-			_, _ = io.WriteString(w, "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n")
-			_, _ = io.WriteString(w, "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":3}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+			if !strings.Contains(string(body), `"type":"function"`) || !strings.Contains(string(body), `"name":"lookup"`) {
+				t.Fatalf("Chat extension tool missing: %s", body)
+			}
+			_, _ = io.WriteString(w, "data: {\"id\":\"chatcmpl-1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Searching \"}}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n")
+			_, _ = io.WriteString(w, "data: {\"id\":\"chatcmpl-1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"s1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"q\\\":\"}}]}}]}\n\n")
+			_, _ = io.WriteString(w, "data: {\"id\":\"chatcmpl-1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"x\\\"}\"}}]}}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3,\"total_tokens\":5}}\n\n")
+			_, _ = io.WriteString(w, "data: {\"id\":\"chatcmpl-1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3,\"total_tokens\":5}}\n\ndata: [DONE]\n\n")
 			return
 		}
-		body, _ := io.ReadAll(r.Body)
 		if !strings.Contains(string(body), "found:x") {
-			t.Fatalf("missing Anthropic stream tool result: %s", body)
+			t.Fatalf("missing Chat stream tool result: %s", body)
 		}
-		_, _ = io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-2\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"m\",\"content\":[],\"usage\":{\"input_tokens\":4,\"output_tokens\":0}}}\n\n")
-		_, _ = io.WriteString(w, "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n")
-		_, _ = io.WriteString(w, "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Found\"}}\n\n")
-		_, _ = io.WriteString(w, "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n")
-		_, _ = io.WriteString(w, "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+		_, _ = io.WriteString(w, "data: {\"id\":\"chatcmpl-2\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Found\"}}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":2,\"total_tokens\":6}}\n\n")
+		_, _ = io.WriteString(w, "data: {\"id\":\"chatcmpl-2\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":5,\"total_tokens\":9}}\n\ndata: [DONE]\n\n")
 	}
 	s := extensionTestServer(t, local)
 	r := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m","stream":true,"max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`))
@@ -421,10 +419,8 @@ func TestServer_ExtensionsAnthropicStreamMixedResume(t *testing.T) {
 		rounds++
 		if rounds == 1 {
 			w.Header().Set("Content-Type", "text/event-stream")
-			_, _ = io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"m\",\"content\":[],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}}\n\n")
-			_, _ = io.WriteString(w, "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"s1\",\"name\":\"lookup\",\"input\":{\"q\":\"x\"}}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n")
-			_, _ = io.WriteString(w, "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"c1\",\"name\":\"client_tool\",\"input\":{}}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n")
-			_, _ = io.WriteString(w, "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":3}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+			_, _ = io.WriteString(w, "data: {\"id\":\"chatcmpl-1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"s1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"q\\\":\\\"x\\\"}\"}},{\"index\":1,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"client_tool\",\"arguments\":\"{}\"}}]}}]}\n\n")
+			_, _ = io.WriteString(w, "data: {\"id\":\"chatcmpl-1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n")
 			return
 		}
 		body, _ := io.ReadAll(r.Body)
@@ -432,7 +428,7 @@ func TestServer_ExtensionsAnthropicStreamMixedResume(t *testing.T) {
 			t.Fatalf("stream mixed continuation missing results: %s", body)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"id":"msg-2","type":"message","role":"assistant","model":"m","content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"}`)
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-2","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}`)
 	}
 	s := extensionTestServer(t, local)
 	post := func(body string) *httptest.ResponseRecorder {
@@ -587,27 +583,27 @@ func TestServer_ExtensionsResponsesAdapterToolLoop(t *testing.T) {
 	}
 }
 
-func TestServer_ExtensionsNativeResponsesToolLoop(t *testing.T) {
+func TestServer_ExtensionsResponsesToolLoopUsesChatBackend(t *testing.T) {
 	local := newStubRouter([]string{"m"}, "")
 	rounds := 0
 	local.serveHTTP = func(w http.ResponseWriter, r *http.Request) {
 		rounds++
 		body, _ := io.ReadAll(r.Body)
-		if r.URL.Path != "/v1/responses" {
-			t.Fatalf("native path = %s", r.URL.Path)
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Fatalf("backend path = %s", r.URL.Path)
 		}
 		if !strings.Contains(string(body), `"name":"lookup"`) {
-			t.Fatalf("missing native tool: %s", body)
+			t.Fatalf("missing Chat function tool: %s", body)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		if rounds == 1 {
-			_, _ = io.WriteString(w, `{"id":"resp-a","model":"m","output":[{"id":"fc-s1","type":"function_call","call_id":"s1","name":"lookup","arguments":"{\"q\":\"x\"}"}],"usage":{"input_tokens":2,"output_tokens":3}}`)
+			_, _ = io.WriteString(w, `{"id":"chatcmpl-a","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","tool_calls":[{"id":"s1","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"x\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}`)
 			return
 		}
 		if !strings.Contains(string(body), "found:x") || !strings.Contains(string(body), "hi") {
-			t.Fatalf("native continuation missing history: %s", body)
+			t.Fatalf("Chat continuation missing history: %s", body)
 		}
-		_, _ = io.WriteString(w, `{"id":"resp-b","model":"m","output":[{"id":"msg-1","type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}],"usage":{"input_tokens":4,"output_tokens":5}}`)
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-b","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":5,"total_tokens":9}}`)
 	}
 	s := extensionTestServer(t, local)
 	model := s.cfg.Models["m"]
@@ -623,7 +619,7 @@ func TestServer_ExtensionsNativeResponsesToolLoop(t *testing.T) {
 	}
 }
 
-func TestServer_ExtensionsNativeResponsesMixedResume(t *testing.T) {
+func TestServer_ExtensionsResponsesMixedResumeUsesChatBackend(t *testing.T) {
 	local := newStubRouter([]string{"m"}, "")
 	rounds := 0
 	local.serveHTTP = func(w http.ResponseWriter, r *http.Request) {
@@ -631,13 +627,13 @@ func TestServer_ExtensionsNativeResponsesMixedResume(t *testing.T) {
 		body, _ := io.ReadAll(r.Body)
 		w.Header().Set("Content-Type", "application/json")
 		if rounds == 1 {
-			_, _ = io.WriteString(w, `{"id":"resp-a","model":"m","output":[{"type":"function_call","call_id":"s1","name":"lookup","arguments":"{\"q\":\"x\"}"},{"type":"function_call","call_id":"c1","name":"client_tool","arguments":"{}"}]}`)
+			_, _ = io.WriteString(w, `{"id":"chatcmpl-a","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","tool_calls":[{"id":"s1","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"x\"}"}},{"id":"c1","type":"function","function":{"name":"client_tool","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`)
 			return
 		}
 		if !strings.Contains(string(body), "found:x") || !strings.Contains(string(body), "client-result") {
 			t.Fatalf("native mixed continuation missing results: %s", body)
 		}
-		_, _ = io.WriteString(w, `{"id":"resp-b","model":"m","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}]}`)
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-b","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}`)
 	}
 	s := extensionTestServer(t, local)
 	model := s.cfg.Models["m"]

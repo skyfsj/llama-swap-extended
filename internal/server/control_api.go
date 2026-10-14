@@ -19,6 +19,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/store"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
+	"io"
 )
 
 // handleAPIAuthSession provides the WebUI with a browser-native credential
@@ -837,8 +838,18 @@ func (s *Server) handleAPIAuditConversation(w http.ResponseWriter, r *http.Reque
 	if !ok {
 		return
 	}
+	// The detail view also reports what the whole session has accumulated: a
+	// conversation that re-sends its history every turn is only meaningful in
+	// the context of the turns around it, and the summary is one indexed row.
+	payload := struct {
+		store.AuditConversation
+		Session *store.SessionSummary `json:"session,omitempty"`
+	}{AuditConversation: conversation}
+	if summary, found, err := s.store.AuditSession(r.Context(), conversation.SessionID); err == nil && found {
+		payload.Session = &summary
+	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(conversation)
+	_ = json.NewEncoder(w).Encode(payload)
 }
 
 // handleAPIAuditConversationBody streams one stored body of a conversation.
@@ -868,7 +879,7 @@ func (s *Server) handleAPIAuditConversationBody(w http.ResponseWriter, r *http.R
 		swaputil.SendResponse(w, r, http.StatusNotFound, "body is not stored separately")
 		return
 	}
-	file, _, err := s.store.OpenBlob(ref)
+	body, _, _, err := s.store.OpenBody(ref)
 	if err != nil {
 		if errors.Is(err, store.ErrBlobNotFound) {
 			swaputil.SendResponse(w, r, http.StatusNotFound, "body is unavailable")
@@ -877,14 +888,16 @@ func (s *Server) handleAPIAuditConversationBody(w http.ResponseWriter, r *http.R
 		swaputil.SendResponse(w, r, http.StatusInternalServerError, err.Error())
 		return
 	}
-	defer file.Close()
+	if closer, ok := body.(io.Closer); ok {
+		defer closer.Close()
+	}
 	// Bodies are captured verbatim: JSON, an SSE transcript, or a proxied binary
 	// response all land here, so the bytes are served untyped rather than guessed
 	// at, and never sniffed into something the browser would try to render.
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "no-store")
-	http.ServeContent(w, r, "", time.Time{}, file)
+	http.ServeContent(w, r, "", time.Time{}, body)
 }
 
 // loadAuthorizedAuditConversation resolves a conversation by numeric activity ID

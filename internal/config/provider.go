@@ -294,6 +294,10 @@ func (p *ProviderConfig) normalize() error {
 	if endpoint == "" {
 		return fmt.Errorf("providers: endpoint is required")
 	}
+	// Users following the OpenAI SDK convention put the version prefix in the
+	// base URL, but forwarding appends /v1/... paths to this value. Strip one
+	// trailing /v1 so both spellings behave the same.
+	endpoint = strings.TrimSuffix(endpoint, "/v1")
 	parsed, err := url.Parse(endpoint)
 	if err != nil {
 		return fmt.Errorf("providers: invalid endpoint URL (%s): %w", p.Endpoint, err)

@@ -251,6 +251,21 @@ entrypoint with the immutable version path, and injects its executable/library
 directories into the child environment. Do not duplicate this binding with a
 hard-coded runtime path or a second `${RUNTIME_*}` convention in legacy `cmd`.
 
+Inference backends receive OpenAI Chat Completions requests. Llama-swap accepts
+OpenAI Chat, OpenAI Responses, Anthropic Messages, and Gemini `generateContent`
+clients, converts the latter three formats to Chat Completions, and converts
+responses back. Gemini clients use
+`/v1beta/models/{model}:generateContent` or
+`/v1beta/models/{model}:streamGenerateContent` and may authenticate with
+`x-goog-api-key`.
+
+`backend.protocol` continues to accept the legacy values `native` and
+`responsesToChat` for configuration compatibility. Neither selects a native
+Responses, Anthropic, or Gemini backend: those client formats are always
+normalized to Chat Completions. Token-count, embedding, audio, image, and
+Realtime endpoints are not part of text-format conversion. Search and other
+hosted tools remain the responsibility of Extensions.
+
 For an explicit `backend.type: vllm` model, llama-swap sends a best-effort
 non-streaming `POST /v1/chat/completions` warmup message after the readiness
 check and before publishing the process as ready. The warmup tries each
@@ -271,8 +286,9 @@ Managed runtimes use immutable version directories and `current`/`previous`
 atomic pointers. Updates can be staged and checked while a backend is busy;
 activation waits for idle and rolls back after a failed health check.
 
-A structured `backend.launch` block carries the basic fields most users set
-so `backend.args` only needs the unmanaged extra engine arguments:
+`backend.args` is the single source of truth for a managed model's command
+line: llama-swap stores exactly the engine flags you write and injects only
+the runtime-owned entrypoint plus the bind host/port from the model's proxy.
 
 ```yaml
 models:
@@ -281,27 +297,81 @@ models:
     backend:
       type: vllm
       runtime: vllm-cuda
-      launch:
-        model: /models/Qwen3.8-27B-FP8
-        servedModelName: Qwen/Qwen3.8-27B-FP8
-        contextPerRequest: 262144
-        maxConcurrency: 2
-        tensorParallelSize: 4                  # vLLM only; optional explicit shard count
-        gpus: ["GPU-xxxxxxxx", "GPU-yyyyyyyy"]  # UUIDs (preferred) or indexes
-        gpuMemoryUtilization: 0.90              # vLLM only
-      args: [--trust-remote-code, --enable-prefix-caching]
+      args:
+        - --model /models/Qwen3.8-27B-FP8
+        - --served-model-name Qwen/Qwen3.8-27B-FP8
+        - --max-model-len 262144
+        - --max-num-seqs 2
+        - --tensor-parallel-size 4
+        - --gpu-memory-utilization 0.90
+        - --trust-remote-code
+        - --enable-prefix-caching
 ```
 
-The structured fields have exclusive control over their engine flags; writing
-one of them into `backend.args` as well is a configuration error. Selecting
-more than one GPU sets `CUDA_VISIBLE_DEVICES` at start, and for vLLM derives
-`--tensor-parallel-size` automatically (one shard per GPU). For llama.cpp the
-UI semantic is context per request: without `--kv-unified-per-slot` support
-the launcher writes the legacy form `--parallel N --ctx-size C×N` itself.
-A legacy `backend.args` text that carries these flags migrates into the
-`launch` block on load when the conversion is lossless; ambiguous text is
-left untouched. The whole command remains purely lexical data — llama-swap
-never runs pasted commands through a shell.
+The model configuration UI presents the common fields (model target, served
+name, context per request, max concurrency, tensor parallelism, GPU memory
+utilization) as a *derived view*: they are read from the command text and
+written back into it when edited, so a value is never stored twice. Selecting
+more than one GPU writes `CUDA_VISIBLE_DEVICES` into the model environment and
+materializes `--tensor-parallel-size` (one shard per GPU) unless you pinned
+one yourself.
+
+A `backend.launch` block from an older configuration is folded into
+`backend.args` when the configuration loads — the flags are rendered exactly
+as the launcher would have injected them, and the block is dropped. Ambiguous
+legacy text is preserved verbatim. The whole command remains purely lexical
+data — llama-swap never runs pasted commands through a shell.
+
+### Runtime launch metadata
+
+A runtime definition carries the launch metadata its models inherit: the launch
+head and the quick-config defaults. The head is what a runtime that fronts a
+custom server declares once — a model that must run its own server under the
+runtime's environment inherits it. It runs verbatim (with the runtime's `PATH`
+and libraries) followed by the model's args, and takes over the entire command
+line: no engine flags, host or port are injected, so write `${PORT}` yourself.
+
+```yaml
+runtimes:
+  qwen-asr:
+    kind: vllm
+    update: {policy: disabled}
+    metadata:
+      entrypoint: python3 /var/lib/llama-swap/scripts/qwen-asr-server.py
+
+models:
+  asr:
+    proxy: http://127.0.0.1:${PORT}
+    backend:
+      type: vllm
+      runtime: qwen-asr
+      args:
+        - --port ${PORT}
+        - --model /models/Qwen/Qwen3-ASR-1.7B
+```
+
+The same block carries the quick-config defaults every model on the runtime
+inherits unless it pins the flag itself:
+
+```yaml
+runtimes:
+  vllm-cuda:
+    kind: vllm
+    metadata:
+      contextPerRequest: 262144
+      maxConcurrency: 2
+      tensorParallelSize: 4
+      gpuMemoryUtilization: 0.9
+```
+
+A model overrides a default by writing the corresponding flag in its own
+`backend.args` (`--max-model-len`, `--max-num-seqs`, `--tensor-parallel-size`,
+`--gpu-memory-utilization`). Defaults are never rendered when a custom launch
+head is in effect — a custom server owns its whole command line. A model-level
+`backend.entrypoint` still wins over the runtime's for one-off cases.
+
+The model still gets the managed lifecycle: health checks, TTL, swapping and
+runtime version pinning all apply.
 
 For a vLLM model with `ttl > 0`, llama-swap automatically appends
 `--enable-sleep-mode` to the private launch arguments when it is not already
@@ -647,6 +717,45 @@ Claude Code signal and Anthropic-shaped fields, so ordinary Anthropic SDK
 requests are left byte-for-byte unchanged. `audit` stores redacted raw
 conversations for 30 days/5 GiB by default and exposes usage, cache counters,
 and estimated (not billed) pricing through the control API.
+
+### Audit storage
+
+Conversation audit lives in its own database with its own connection, beside
+the operational one:
+
+```
+data/
+  db.sqlite            activity rows, keys, pricing, power, …
+  audit/
+    audit.db           conversation rows, block index, session totals
+    segments/*.seg     zstd-compressed body blocks, one day per file
+```
+
+Bodies are stored compressed and content-addressed, and conversation requests
+are split at message boundaries before hashing. A session that re-sends its
+whole history every turn therefore pays only for the new messages — the
+accumulated context keeps a single stored copy:
+
+```yaml
+audit:
+  enabled: true
+  retention: 720h          # conversation retention
+  maxBytes: 5368709120     # compressed on-disk budget for the audit store
+  storeMedia: true         # inline media file content in the capture
+  activityRetention: 0s    # 0 keeps request rows forever; e.g. 2160h for 90 days
+```
+
+`maxBytes` counts the compressed bytes the audit store actually occupies, so
+the budget matches the directory's size. Retention drops whole expired day
+segments and compacts the rest; a conversation's detail view reports its
+session's accumulated requests, tokens, stored bytes and the context bytes the
+deduplication avoided.
+
+Existing installations are migrated once at startup: conversations written
+before the split are copied into the audit store (compressed and deduplicated)
+in the background while new requests already write to the new store. The copy
+resumes after a restart and drops the legacy table when it completes; the freed
+pages are reclaimed by an offline `VACUUM` at the operator's convenience.
 
 ## Advanced control with `cmd`
 

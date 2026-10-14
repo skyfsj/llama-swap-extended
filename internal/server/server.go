@@ -27,6 +27,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/perf"
 	"github.com/mostlygeek/llama-swap/internal/pricing"
 	"github.com/mostlygeek/llama-swap/internal/process"
+	protocolrelaykit "github.com/mostlygeek/llama-swap/internal/protocol/relaykit"
 	resourcePlanner "github.com/mostlygeek/llama-swap/internal/resource"
 	"github.com/mostlygeek/llama-swap/internal/route"
 	"github.com/mostlygeek/llama-swap/internal/router"
@@ -550,6 +551,7 @@ var (
 		// stripVersionPrefix removes /v before forwarding upstream.
 		"/v/completions", "/v/messages", "/v/messages/count_tokens",
 		"/v/embeddings", "/v/rerank", "/v/reranking",
+		"/v1beta/models/{geminiPath...}",
 	)
 	modelPostFormRoutes = appendRoutePaths(
 		routeModelPaths(http.MethodPost, route.BodyForm, "form"),
@@ -602,6 +604,9 @@ func appendRoutePaths(paths []string, extras ...string) []string {
 // isMetricsRecordPath reports whether path is one of the model-dispatched
 // endpoints that the metrics middleware records in the activity log.
 func isMetricsRecordPath(path string) bool {
+	if route, ok := protocolrelaykit.RouteForRequest(http.MethodPost, path); ok && route.Format == protocolrelaykit.Gemini {
+		return true
+	}
 	for _, p := range modelPostJSONRoutes {
 		if p == path {
 			return true
@@ -1028,8 +1033,8 @@ func (s *Server) localPeerHandler(w http.ResponseWriter, r *http.Request) {
 // the old handler boundary therefore keep their parsing/selection semantics
 // while a concurrent reconciliation atomically publishes the next handler.
 func (s *Server) localPeerHandlerWithConfig(w http.ResponseWriter, r *http.Request, cfg config.Config) {
-	restoreResponsesPath := rewriteResponsesChatBackendPath(r)
-	defer restoreResponsesPath()
+	restoreProtocolPath := rewriteProtocolBackendPath(r)
+	defer restoreProtocolPath()
 	stripVersionPrefix(r)
 	stripAudioAPIPrefix(r)
 
@@ -1349,7 +1354,7 @@ func (s *Server) routes() {
 	modelMiddlewares = append(modelMiddlewares,
 		CreateBackendCapabilityMiddleware(cfg),
 		CreateAnthropicCacheMiddleware(cfg),
-		CreateResponsesAdapterMiddleware(cfg, s.store),
+		CreateProtocolAdapterMiddleware(cfg, s.store),
 		CreateResponseAffinityMiddleware(cfg, s.store),
 	)
 	if cfg.Extensions.Enabled && extensionManager != nil {
@@ -1400,7 +1405,11 @@ func (s *Server) routes() {
 	s.modelChainHandler = modelChain.Then(dispatch)
 
 	for _, path := range modelPostJSONRoutes {
-		mux.Handle("POST "+path, modelChain.Then(dispatch))
+		handler := modelChain.Then(dispatch)
+		if path == "/v1beta/models/{geminiPath...}" {
+			handler = prepareGeminiRoute(handler)
+		}
+		mux.Handle("POST "+path, handler)
 	}
 	for _, path := range modelPostFormRoutes {
 		mux.Handle("POST "+path, modelChain.Then(dispatch))
@@ -1409,9 +1418,8 @@ func (s *Server) routes() {
 		mux.Handle("GET "+path, modelChain.Then(dispatch))
 	}
 	// Responses retrieval/cancellation carry the response id in the path, so
-	// they cannot use the model-in-body dispatcher.  The affinity record
-	// supplies the model for a native backend and lets the chat adapter serve a
-	// stored response after a restart.
+	// they cannot use the model-in-body dispatcher. The affinity record supplies
+	// the model and lets the stored response remain available after a restart.
 	mux.Handle("GET /v1/responses/{response_id}", inferenceAPI.ThenFunc(s.handleAPIResponseGet))
 	mux.Handle("POST /v1/responses/{response_id}/cancel", inferenceAPI.ThenFunc(s.handleAPIResponseCancel))
 	mux.Handle("GET /v/responses/{response_id}", inferenceAPI.ThenFunc(s.handleAPIResponseGet))
@@ -1815,6 +1823,7 @@ func (s *Server) runAuditMaintenance() {
 	if s == nil || s.store == nil || s.shutdownCtx == nil {
 		return
 	}
+	go s.migrateLegacyAudit()
 	s.maintainAudit()
 	ticker := time.NewTicker(auditMaintenanceInterval)
 	defer ticker.Stop()
@@ -1853,6 +1862,52 @@ func (s *Server) runKeyTouchFlusher() {
 	}
 }
 
+// migrateLegacyAudit copies the pre-split audit table into the dedicated audit
+// store once. It runs in the background: new requests are already written to the
+// audit store, so the copy only has to catch up with history, and a restart
+// resumes from the watermark instead of starting over.
+func (s *Server) migrateLegacyAudit() {
+	if s == nil || s.store == nil || s.shutdownCtx == nil {
+		return
+	}
+	ctx := s.shutdownCtx
+	if !s.store.LegacyAuditPending(ctx) {
+		return
+	}
+	if s.proxylog != nil {
+		s.proxylog.Infof("audit storage: migrating existing conversations into the dedicated audit store")
+	}
+	lastLog := time.Now()
+	progress, err := s.store.MigrateLegacyAudit(ctx, func(p store.AuditMigrationProgress) {
+		if s.proxylog == nil || time.Since(lastLog) < 10*time.Second {
+			return
+		}
+		lastLog = time.Now()
+		s.proxylog.Infof("audit storage: migrated %d/%d conversation(s)", p.Migrated, p.Total)
+	})
+	if err != nil {
+		if s.proxylog != nil {
+			s.proxylog.Warnf("audit storage migration failed after %d conversation(s); it resumes on the next restart: %v", progress.Migrated, err)
+		}
+		return
+	}
+	if s.proxylog != nil {
+		s.proxylog.Infof("audit storage: migration complete (%d conversation(s), %d byte(s) stored compressed)", progress.Migrated, progress.Bytes)
+	}
+	// The legacy blob files are unlinked only after the copy succeeded; the
+	// audit store is the sole remaining copy from here on.
+	if removed, err := s.store.PurgeLegacyBlobs(); err != nil {
+		if s.proxylog != nil {
+			s.proxylog.Warnf("audit storage: legacy blob cleanup failed: %v", err)
+		}
+	} else if removed > 0 && s.proxylog != nil {
+		s.proxylog.Infof("audit storage: removed %d legacy blob file(s)", removed)
+	}
+	if s.proxylog != nil {
+		s.proxylog.Infof("audit storage: the operational database still holds the freed pages; VACUUM reclaims them offline")
+	}
+}
+
 // maintainAudit runs one maintenance pass under the configured audit
 // retention and byte budget. Each step is best-effort with a warn log:
 // maintenance must never fail a request, and a missed pass is retried by the
@@ -1884,6 +1939,13 @@ func (s *Server) maintainAudit() {
 			s.proxylog.Warnf("audit retention cleanup failed: %v", err)
 		}
 	}
+	if policy.ActivityRetention > 0 {
+		if deleted, err := s.store.PurgeActivityBefore(ctx, time.Now().Add(-policy.ActivityRetention)); err != nil && s.proxylog != nil {
+			s.proxylog.Warnf("activity retention cleanup failed: %v", err)
+		} else if deleted > 0 && s.proxylog != nil {
+			s.proxylog.Infof("activity retention cleanup removed %d record(s)", deleted)
+		}
+	}
 	if policy.MaxBytes > 0 {
 		total, err := s.store.AuditTotalBytes(ctx)
 		if err != nil {
@@ -1912,12 +1974,38 @@ func (s *Server) gcAuditBlobs(ctx context.Context) {
 		return
 	}
 	s.auditLastGC = time.Now()
+	if s.store.AuditExternal() {
+		// The dedicated audit store keeps bodies in compressed segments:
+		// reclaiming space means unlinking expired day segments and rewriting
+		// the rest without the blocks no conversation references anymore.
+		reclaimed, dropped, err := s.store.MaintainAudit(ctx, time.Now().Add(-s.auditRetention()))
+		if err != nil {
+			if s.proxylog != nil {
+				s.proxylog.Warnf("audit segment compaction failed: %v", err)
+			}
+			return
+		}
+		if reclaimed > 0 && s.proxylog != nil {
+			s.proxylog.Infof("audit storage reclaimed %d byte(s) and dropped %d unreferenced block(s)", reclaimed, dropped)
+		}
+		return
+	}
 	deleted, err := s.store.GCUnusedBlobs(ctx)
 	if err != nil && s.proxylog != nil {
 		s.proxylog.Warnf("audit blob garbage collection failed: %v", err)
 	} else if deleted > 0 && s.proxylog != nil {
 		s.proxylog.Infof("audit blob garbage collection removed %d unreferenced file(s)", deleted)
 	}
+}
+
+// auditRetention reports the configured conversation retention, used as the
+// expiry horizon for whole day segments.
+func (s *Server) auditRetention() time.Duration {
+	policy := s.currentConfig().EffectiveAudit()
+	if policy.Retention > 0 {
+		return policy.Retention
+	}
+	return 24 * time.Hour
 }
 
 // CloseStreams cancels long-lived response streams (Server-Sent Events) so a

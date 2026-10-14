@@ -798,6 +798,14 @@ func (s *Store) RotateAPIKey(ctx context.Context, oldID string, replacement APIK
 }
 
 func (s *Store) InsertAuditConversation(ctx context.Context, record AuditConversation) error {
+	// The dedicated audit store owns bodies as compressed segments; only an
+	// in-memory store (no durable audit database) keeps the legacy path.
+	if audit := s.auditExternal(); audit != nil {
+		if _, err := audit.Insert(normalizeContext(ctx), auditRecord(record)); err != nil {
+			return err
+		}
+		return nil
+	}
 	ctx = normalizeContext(ctx)
 	if err := s.ensureDB(); err != nil {
 		return err
@@ -981,6 +989,23 @@ func normalizeAuditQuery(q AuditQuery) AuditQuery {
 }
 
 func (s *Store) ListAuditConversationsPage(ctx context.Context, q AuditQuery) (AuditConversationPage, error) {
+	if audit := s.auditExternal(); audit != nil {
+		page, err := audit.List(normalizeContext(ctx), auditQuery(q))
+		if err != nil {
+			return AuditConversationPage{}, err
+		}
+		records := make([]AuditConversation, 0, len(page.Data))
+		for _, record := range page.Data {
+			conversation := auditConversation(record)
+			if err := s.attachActivityPhases(normalizeContext(ctx), &conversation); err != nil {
+				return AuditConversationPage{}, err
+			}
+			records = append(records, conversation)
+		}
+		return AuditConversationPage{
+			Data: records, Page: page.Page, Limit: page.Limit, Total: page.Total, TotalPages: page.TotalPages,
+		}, nil
+	}
 	ctx = normalizeContext(ctx)
 	if err := s.ensureDB(); err != nil {
 		return AuditConversationPage{}, err
@@ -1041,6 +1066,17 @@ func (s *Store) ListAuditConversationsPage(ctx context.Context, q AuditQuery) (A
 // control plane uses this before destructive operations so model-scoped keys
 // cannot delete a conversation belonging to another model.
 func (s *Store) GetAuditConversation(ctx context.Context, id string) (AuditConversation, bool, error) {
+	if audit := s.auditExternal(); audit != nil {
+		record, found, err := audit.Get(normalizeContext(ctx), id)
+		if err != nil || !found {
+			return AuditConversation{}, found, err
+		}
+		conversation := auditConversation(record)
+		if err := s.attachActivityPhases(normalizeContext(ctx), &conversation); err != nil {
+			return AuditConversation{}, false, err
+		}
+		return conversation, true, nil
+	}
 	ctx = normalizeContext(ctx)
 	if s == nil || s.db == nil {
 		return AuditConversation{}, false, errors.New("store is unavailable")
@@ -1078,6 +1114,17 @@ func (s *Store) GetAuditConversation(ctx context.Context, id string) (AuditConve
 // request-record UI. Activity IDs are stable integers, so the detail view does
 // not need to know or expose the audit table's internal string key.
 func (s *Store) GetAuditConversationByActivityID(ctx context.Context, activityID int) (AuditConversation, bool, error) {
+	if audit := s.auditExternal(); audit != nil {
+		record, found, err := audit.GetByActivityID(normalizeContext(ctx), activityID)
+		if err != nil || !found {
+			return AuditConversation{}, found, err
+		}
+		conversation := auditConversation(record)
+		if err := s.attachActivityPhases(normalizeContext(ctx), &conversation); err != nil {
+			return AuditConversation{}, false, err
+		}
+		return conversation, true, nil
+	}
 	ctx = normalizeContext(ctx)
 	if s == nil || s.db == nil {
 		return AuditConversation{}, false, errors.New("store is unavailable")
@@ -1141,6 +1188,9 @@ func normalizeLimitOffset(limit, offset int) (int, int) {
 }
 
 func (s *Store) DeleteAuditConversation(ctx context.Context, id string) error {
+	if audit := s.auditExternal(); audit != nil {
+		return audit.Delete(normalizeContext(ctx), id)
+	}
 	ctx = normalizeContext(ctx)
 	if err := s.ensureDB(); err != nil {
 		return err
@@ -1154,6 +1204,9 @@ func (s *Store) DeleteAuditConversation(ctx context.Context, id string) error {
 // is ahead of the application host, which is required for the control-plane
 // "clear now" action to be deterministic.
 func (s *Store) ClearAuditConversations(ctx context.Context) error {
+	if audit := s.auditExternal(); audit != nil {
+		return audit.Clear(normalizeContext(ctx))
+	}
 	ctx = normalizeContext(ctx)
 	if s == nil || s.db == nil {
 		return errors.New("store is unavailable")
@@ -1163,6 +1216,12 @@ func (s *Store) ClearAuditConversations(ctx context.Context) error {
 }
 
 func (s *Store) PurgeAuditBefore(ctx context.Context, before time.Time) error {
+	if audit := s.auditExternal(); audit != nil {
+		if _, err := audit.PurgeBefore(normalizeContext(ctx), before); err != nil {
+			return err
+		}
+		return nil
+	}
 	ctx = normalizeContext(ctx)
 	if err := s.ensureDB(); err != nil {
 		return err
@@ -1175,6 +1234,11 @@ func (s *Store) PurgeAuditBefore(ctx context.Context, before time.Time) error {
 // size_bytes is maintained at write time, so the aggregate is a single column
 // pass that never materializes conversation bodies.
 func (s *Store) AuditTotalBytes(ctx context.Context) (int64, error) {
+	if audit := s.auditExternal(); audit != nil {
+		// The budget measures compressed bytes on disk, so the cap matches what
+		// the audit directory actually occupies.
+		return audit.StoredBytes(normalizeContext(ctx))
+	}
 	ctx = normalizeContext(ctx)
 	if s == nil || s.db == nil {
 		return 0, errors.New("store is unavailable")
@@ -1196,6 +1260,10 @@ func (s *Store) AuditTotalBytes(ctx context.Context) (int64, error) {
 // only connection for as long as the cascade ran and could starve unrelated
 // readers.
 func (s *Store) PurgeAuditOverBudget(ctx context.Context, maxBytes int64) (int64, error) {
+	if audit := s.auditExternal(); audit != nil {
+		deleted, err := audit.PurgeOverBudget(normalizeContext(ctx), maxBytes)
+		return int64(deleted), err
+	}
 	ctx = normalizeContext(ctx)
 	if maxBytes <= 0 {
 		return 0, nil
@@ -1231,6 +1299,13 @@ func (s *Store) PurgeAuditOverBudget(ctx context.Context, maxBytes int64) (int64
 // returns the number of files removed; the server rates it through the
 // background maintenance task.
 func (s *Store) GCUnusedBlobs(ctx context.Context) (int, error) {
+	if audit := s.auditExternal(); audit != nil {
+		// Space reclamation for the dedicated store: expired day segments are
+		// unlinked and the rest compacted, which is what the legacy blob GC
+		// achieved file by file.
+		_, dropped, err := audit.CompactSegments(normalizeContext(ctx))
+		return dropped, err
+	}
 	ctx = normalizeContext(ctx)
 	if s == nil || s.db == nil || s.blobs == nil {
 		return 0, nil

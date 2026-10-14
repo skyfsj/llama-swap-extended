@@ -29,10 +29,9 @@ const backendTransformBodyLimit = 64 << 20
 // responses continue through untouched so adapter plumbing cannot break token
 // streaming or the Realtime bridge.
 //
-// Responses↔Chat conversion is deliberately kept in
-// CreateResponsesAdapterMiddleware. This middleware is the generic seam for a
-// backend-specific adapter and does not infer protocol semantics from a model
-// name or proxy URL.
+// Text protocol conversion is handled by CreateProtocolAdapterMiddleware. This
+// middleware is the generic seam for backend-specific transforms and does not
+// infer protocol semantics from a model name or proxy URL.
 func CreateBackendAdapterMiddleware(cfg config.Config, adapters map[string]backend.BackendAdapter) chain.Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -66,7 +65,7 @@ func CreateBackendAdapterMiddleware(cfg config.Config, adapters map[string]backe
 			}
 			streaming := backendRequestStreams(r, body)
 			request := backend.RequestTransform{Body: body, Header: cloneHeader(r.Header)}
-			transformed, err := adapter.TransformRequest(r.Context(), r.URL.Path, request)
+			transformed, err := adapter.TransformRequest(r.Context(), backendAdapterPath(r), request)
 			if err != nil {
 				status := http.StatusBadGateway
 				if errors.Is(err, backend.ErrUnsupported) {
@@ -101,6 +100,16 @@ func CreateBackendAdapterMiddleware(cfg config.Config, adapters map[string]backe
 			}
 		})
 	}
+}
+
+func backendAdapterPath(r *http.Request) string {
+	if r != nil {
+		if target, ok := r.Context().Value(protocolBackendPathKey{}).(protocolBackendPath); ok && target.Path != "" {
+			return target.Path
+		}
+		return r.URL.Path
+	}
+	return ""
 }
 
 func readBackendTransformRequestBody(r *http.Request) ([]byte, bool, error) {
@@ -138,6 +147,9 @@ func cloneHeader(header http.Header) http.Header {
 
 func backendRequestStreams(r *http.Request, body []byte) bool {
 	if r == nil {
+		return true
+	}
+	if target, ok := r.Context().Value(protocolBackendPathKey{}).(protocolBackendPath); ok && target.Stream {
 		return true
 	}
 	if strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("stream")), "true") {
@@ -251,7 +263,7 @@ func (w *backendTransformResponseWriter) finish(r *http.Request, adapter backend
 	transformed := body
 	changed := false
 	if w.status >= 200 && w.status < 300 && isJSONResponse(w.header) {
-		value, err := adapter.TransformResponse(r.Context(), r.URL.Path, body, w.header.Clone())
+		value, err := adapter.TransformResponse(r.Context(), backendAdapterPath(r), body, w.header.Clone())
 		if err != nil {
 			return fmt.Errorf("backend response transform: %w", err)
 		}

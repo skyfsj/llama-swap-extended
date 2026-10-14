@@ -98,8 +98,8 @@ func (p *ProcessCommand) warmupVLLM(ctx context.Context, upstream http.Handler) 
 	names := make([]string, 0, 3+len(p.config.Aliases))
 	names = append(names, strings.TrimSpace(p.config.UseModelName))
 	names = append(names, p.config.Aliases...)
-	if p.config.Backend.Launch != nil {
-		names = append(names, strings.TrimSpace(p.config.Backend.Launch.ServedModelName))
+	if served := servedModelNameFromArguments(p.config.Backend.Arguments); served != "" {
+		names = append(names, served)
 	}
 	names = append(names, p.id)
 	unique := make([]string, 0, len(names))
@@ -187,6 +187,25 @@ func (p *ProcessCommand) warmupVLLMModel(ctx context.Context, upstream http.Hand
 // looksLikeUnknownModel recognizes the vLLM and llama.cpp "model does not
 // exist" errors so the warmup can try the next accepted name instead of
 // treating a name misconfiguration as a generic upstream failure.
+// servedModelNameFromArguments reads --served-model-name out of a managed
+// model's argument list. The structured launch block that used to carry it is
+// folded into args at config load, so the flag is the only remaining source.
+func servedModelNameFromArguments(args []string) string {
+	for index := 0; index < len(args); index++ {
+		token := strings.TrimSpace(args[index])
+		if token == "--served-model-name" {
+			if index+1 < len(args) {
+				return strings.TrimSpace(args[index+1])
+			}
+			return ""
+		}
+		if strings.HasPrefix(token, "--served-model-name=") {
+			return strings.TrimSpace(strings.TrimPrefix(token, "--served-model-name="))
+		}
+	}
+	return ""
+}
+
 func looksLikeUnknownModel(status int, body []byte) bool {
 	if status != http.StatusNotFound && status != http.StatusBadRequest {
 		return false

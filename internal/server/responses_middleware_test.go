@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/config"
+	protocolrelaykit "github.com/mostlygeek/llama-swap/internal/protocol/relaykit"
 	"github.com/mostlygeek/llama-swap/internal/store"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
@@ -83,7 +84,7 @@ data: [DONE]
 	}
 }
 
-func TestResponseAffinityNativeGetForwardsUpstream(t *testing.T) {
+func TestResponseAffinityChatOnlyGetServesStoredResponse(t *testing.T) {
 	local := newStubRouter([]string{"m"}, `{"id":"resp_1","model":"m","status":"completed"}`)
 	s := newTestServer(local, newStubRouter(nil, ""))
 	s.cfg = config.Config{Models: map[string]config.ModelConfig{"m": {Backend: config.BackendConfig{Type: "vllm", Protocol: config.AdapterProtocolNative}}}}
@@ -104,11 +105,8 @@ func TestResponseAffinityNativeGetForwardsUpstream(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
 		t.Fatal(err)
 	}
-	if response["output"] != nil {
-		t.Fatalf("native GET served stored chat chain: %s", w.Body.String())
-	}
-	if !strings.Contains(w.Body.String(), `"id":"resp_1"`) {
-		t.Fatalf("upstream response missing: %s", w.Body.String())
+	if response["output"] == nil {
+		t.Fatalf("Chat-backed GET did not serve stored Responses output: %s", w.Body.String())
 	}
 }
 
@@ -166,7 +164,7 @@ func TestResponsesAdapterStreamsChatSSEAndPersistsAffinity(t *testing.T) {
 		_, _ = w.Write([]byte(`data: {"choices":[{"delta":{"content":"llo","tool_calls":[{"index":0,"function":{"arguments":"1}"}}]}}],"usage":{"prompt_tokens":2,"completion_tokens":3}}` + "\n\n"))
 		_, _ = w.Write([]byte("data: [DONE]\n\n"))
 	})
-	handler := CreateResponsesAdapterMiddleware(cfg, st)(next)
+	handler := CreateProtocolAdapterMiddleware(cfg, st)(next)
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"m","input":"hi","stream":true}`))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -247,7 +245,7 @@ func TestServer_ResponsesChatAdapterEndToEnd(t *testing.T) {
 	_ = s.Shutdown(time.Second)
 }
 
-func TestRewriteResponsesChatBackendPathRestoresPublicPath(t *testing.T) {
+func TestRewriteProtocolBackendPathRestoresPublicPath(t *testing.T) {
 	for _, test := range []struct {
 		publicPath string
 		chatPath   string
@@ -257,8 +255,12 @@ func TestRewriteResponsesChatBackendPathRestoresPublicPath(t *testing.T) {
 	} {
 		req := httptest.NewRequest(http.MethodPost, test.publicPath+"?trace=1", strings.NewReader(`{"model":"m"}`))
 		originalURI := req.RequestURI
-		req = markResponsesChatRequest(req)
-		restore := rewriteResponsesChatBackendPath(req)
+		backendPath, err := protocolrelaykit.TargetPathForRequest(protocolrelaykit.OpenAIChat, "m", false, test.publicPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req = markProtocolBackendRequest(req, protocolrelaykit.OpenAIResponses, protocolrelaykit.OpenAIChat, backendPath, false)
+		restore := rewriteProtocolBackendPath(req)
 		if req.URL.Path != test.chatPath {
 			t.Fatalf("public %s backend path=%q, want %q", test.publicPath, req.URL.Path, test.chatPath)
 		}
@@ -315,43 +317,17 @@ func TestServer_ResponsesChatAdapterStreamingEndToEnd(t *testing.T) {
 	_ = s.Shutdown(time.Second)
 }
 
-func TestServer_NativeResponsesAffinityGetCancelEndToEnd(t *testing.T) {
+func TestServer_ChatOnlyResponsesAffinityGetCancelEndToEnd(t *testing.T) {
 	local := newStubRouter([]string{"m"}, "")
-	var postIDs []string
+	posts := 0
 	local.serveHTTP = func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost && r.URL.Path == "/v1/responses" {
-			body, err := io.ReadAll(r.Body)
-			if err != nil {
-				t.Fatalf("read native request: %v", err)
-			}
-			var request map[string]any
-			if err := json.Unmarshal(body, &request); err != nil {
-				t.Fatalf("decode native request: %v", err)
-			}
-			id := "native-store"
-			if stored, ok := request["store"].(bool); ok && !stored {
-				id = "native-no-store"
-			}
-			postIDs = append(postIDs, id)
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(w, fmt.Sprintf(`{"id":%q,"object":"response","model":"m","status":"completed","output":[]}`, id))
-			return
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/chat/completions" {
+			t.Fatalf("unexpected backend request: %s %s", r.Method, r.URL.Path)
 		}
+		posts++
+		id := fmt.Sprintf("chat-%d", posts)
 		w.Header().Set("Content-Type", "application/json")
-		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/responses/native-store":
-			if got := r.URL.Query().Get("model"); got != "m" {
-				t.Errorf("native GET model query = %q, want m", got)
-			}
-			_, _ = io.WriteString(w, `{"id":"native-store","object":"response","model":"m","status":"completed","output":[]}`)
-		case r.Method == http.MethodPost && r.URL.Path == "/v1/responses/native-store/cancel":
-			if got := r.URL.Query().Get("model"); got != "m" {
-				t.Errorf("native cancel model query = %q, want m", got)
-			}
-			_, _ = io.WriteString(w, `{"id":"native-store","object":"response","model":"m","status":"cancelled","output":[]}`)
-		default:
-			http.Error(w, "unexpected native route", http.StatusNotFound)
-		}
+		_, _ = io.WriteString(w, fmt.Sprintf(`{"id":%q,"object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}`, id))
 	}
 	s := newTestServer(local, newStubRouter(nil, ""))
 	s.cfg = config.Config{Models: map[string]config.ModelConfig{
@@ -359,49 +335,50 @@ func TestServer_NativeResponsesAffinityGetCancelEndToEnd(t *testing.T) {
 	}}
 	s.routes()
 
-	post := func(storeValue bool) *httptest.ResponseRecorder {
+	post := func(storeValue bool, wantID string) *httptest.ResponseRecorder {
 		body := fmt.Sprintf(`{"model":"m","input":"hello","store":%t}`, storeValue)
 		recorder := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		s.ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"id":"`+wantID+`"`) {
+			t.Fatalf("Responses POST = %d %s", recorder.Code, recorder.Body.String())
+		}
 		return recorder
 	}
-	if recorder := post(true); recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"native-store"`) {
-		t.Fatalf("native POST = %d %s", recorder.Code, recorder.Body.String())
+	post(true, "resp_chat-1")
+	post(false, "resp_chat-2")
+	if posts != 2 {
+		t.Fatalf("Chat upstream posts = %d, want 2", posts)
 	}
-	if recorder := post(false); recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"native-no-store"`) {
-		t.Fatalf("native store:false POST = %d %s", recorder.Code, recorder.Body.String())
+	if _, found, err := s.store.GetResponseAffinity(context.Background(), "resp_chat-1", time.Now()); err != nil || !found {
+		t.Fatalf("stored affinity found=%v err=%v", found, err)
 	}
-	if len(postIDs) != 2 || postIDs[0] != "native-store" || postIDs[1] != "native-no-store" {
-		t.Fatalf("native POST ids = %#v", postIDs)
-	}
-	if _, found, err := s.store.GetResponseAffinity(context.Background(), "native-store", time.Now()); err != nil || !found {
-		t.Fatalf("stored native affinity found=%v err=%v", found, err)
-	}
-	if _, found, err := s.store.GetResponseAffinity(context.Background(), "native-no-store", time.Now()); err != nil || found {
-		t.Fatalf("store:false native affinity found=%v err=%v", found, err)
+	if _, found, err := s.store.GetResponseAffinity(context.Background(), "resp_chat-2", time.Now()); err != nil || found {
+		t.Fatalf("store:false affinity found=%v err=%v", found, err)
 	}
 
 	get := httptest.NewRecorder()
-	s.ServeHTTP(get, httptest.NewRequest(http.MethodGet, "/v1/responses/native-store", nil))
-	if get.Code != http.StatusOK || !strings.Contains(get.Body.String(), `"native-store"`) {
-		t.Fatalf("native GET = %d %s", get.Code, get.Body.String())
+	s.ServeHTTP(get, httptest.NewRequest(http.MethodGet, "/v1/responses/resp_chat-1", nil))
+	if get.Code != http.StatusOK || !strings.Contains(get.Body.String(), `"id":"resp_chat-1"`) {
+		t.Fatalf("Responses GET = %d %s", get.Code, get.Body.String())
 	}
 	cancel := httptest.NewRecorder()
-	s.ServeHTTP(cancel, httptest.NewRequest(http.MethodPost, "/v1/responses/native-store/cancel", nil))
-	if cancel.Code != http.StatusOK || !strings.Contains(cancel.Body.String(), `"cancelled"`) {
-		t.Fatalf("native cancel = %d %s", cancel.Code, cancel.Body.String())
+	s.ServeHTTP(cancel, httptest.NewRequest(http.MethodPost, "/v1/responses/resp_chat-1/cancel", nil))
+	if cancel.Code != http.StatusOK || !strings.Contains(cancel.Body.String(), `"status":"cancelled"`) {
+		t.Fatalf("Responses cancel = %d %s", cancel.Code, cancel.Body.String())
 	}
 	_ = s.Shutdown(time.Second)
 }
 
-func TestServer_NativeResponsesStreamingPersistsAffinityWithoutRewriting(t *testing.T) {
+func TestServer_ResponsesChatOnlyStreamingPersistsAffinity(t *testing.T) {
 	local := newStubRouter([]string{"m"}, "")
-	local.serveHTTP = func(w http.ResponseWriter, _ *http.Request) {
+	upstreamPath := ""
+	local.serveHTTP = func(w http.ResponseWriter, r *http.Request) {
+		upstreamPath = r.URL.Path
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"native-stream\",\"model\":\"m\",\"status\":\"in_progress\"}}\n\n")
-		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"native-stream\",\"model\":\"m\",\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"call-1\",\"name\":\"lookup\",\"arguments\":\"{}\"}],\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n")
+		_, _ = io.WriteString(w, `data: {"id":"chat-native-stream","model":"m","created":1,"choices":[{"index":0,"delta":{"content":"hello"}}]}`+"\n\n")
+		_, _ = io.WriteString(w, `data: {"id":"chat-native-stream","model":"m","created":1,"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`+"\n\n")
 		_, _ = io.WriteString(w, "data: [DONE]\n\n")
 	}
 	s := newTestServer(local, newStubRouter(nil, ""))
@@ -414,20 +391,23 @@ func TestServer_NativeResponsesStreamingPersistsAffinityWithoutRewriting(t *test
 	recorder := httptest.NewRecorder()
 	s.ServeHTTP(recorder, req)
 	if recorder.Code != http.StatusOK {
-		t.Fatalf("native stream status=%d body=%s", recorder.Code, recorder.Body.String())
+		t.Fatalf("Responses stream status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if upstreamPath != "/v1/chat/completions" {
+		t.Fatalf("Chat-only upstream path=%q", upstreamPath)
 	}
 	if got := recorder.Header().Get("Content-Type"); !strings.Contains(got, "text/event-stream") {
-		t.Fatalf("native stream content type=%q", got)
+		t.Fatalf("Responses stream content type=%q", got)
 	}
-	if !strings.Contains(recorder.Body.String(), "response.completed") || !strings.Contains(recorder.Body.String(), "[DONE]") {
-		t.Fatalf("native stream was rewritten or truncated: %s", recorder.Body.String())
+	if !strings.Contains(recorder.Body.String(), "response.completed") || !strings.Contains(recorder.Body.String(), `"text":"hello"`) || strings.Contains(recorder.Body.String(), "[DONE]") {
+		t.Fatalf("Responses stream was not converted: %s", recorder.Body.String())
 	}
-	affinity, found, err := s.store.GetResponseAffinity(context.Background(), "native-stream", time.Now())
+	affinity, found, err := s.store.GetResponseAffinity(context.Background(), "resp_chat-native-stream", time.Now())
 	if err != nil || !found {
-		t.Fatalf("native stream affinity found=%v err=%v", found, err)
+		t.Fatalf("Responses stream affinity found=%v err=%v", found, err)
 	}
-	if affinity.Status != "completed" || !strings.Contains(string(affinity.Response), `"call_id":"call-1"`) || !strings.Contains(string(affinity.Response), `"input_tokens":3`) {
-		t.Fatalf("native stream affinity=%+v", affinity)
+	if affinity.Status != "completed" || !strings.Contains(string(affinity.Response), `"text":"hello"`) || !strings.Contains(string(affinity.Response), `"input_tokens":3`) {
+		t.Fatalf("Responses stream affinity=%+v", affinity)
 	}
 	_ = s.Shutdown(time.Second)
 }
@@ -748,7 +728,7 @@ func TestResponsesAdapterRejectsPreviousResponseFromAnotherModel(t *testing.T) {
 		"target": {Backend: config.BackendConfig{Type: "vllm", Protocol: config.AdapterProtocolResponsesToChat}},
 	}}
 	called := false
-	handler := CreateResponsesAdapterMiddleware(cfg, st)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called = true }))
+	handler := CreateProtocolAdapterMiddleware(cfg, st)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called = true }))
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"target","input":"continue","previous_response_id":"resp-other"}`))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -766,7 +746,7 @@ func TestResponsesAdapterRejectsOversizedRequestBeforeConversion(t *testing.T) {
 		"m": {Backend: config.BackendConfig{Type: "vllm", Protocol: config.AdapterProtocolResponsesToChat}},
 	}}
 	called := false
-	handler := CreateResponsesAdapterMiddleware(cfg, nil)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+	handler := CreateProtocolAdapterMiddleware(cfg, nil)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		called = true
 	}))
 	body := bytes.Repeat([]byte{'x'}, backendTransformBodyLimit+1)

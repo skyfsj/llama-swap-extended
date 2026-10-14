@@ -60,6 +60,10 @@ func resolveModelGPUs(cfg config.Config, hardware *hw.HardwareSnapshot, modelID 
 	}
 
 	var selections []string
+	// CUDA_VISIBLE_DEVICES in the model environment is the single persisted GPU
+	// selection; a legacy launch block is folded into it at config load. Accept
+	// the block directly too, for configs built in memory without the loader.
+	selections = append(selections, config.CUDAVisibleDevicesFromEnvironment(modelConfig.Env)...)
 	if launch := modelConfig.Backend.Launch; launch != nil {
 		selections = append(selections, launch.GPUs...)
 	}
@@ -365,8 +369,8 @@ func (s *Server) flushPowerSamples(ctx context.Context, cursors *powerCursors) {
 // powerCursors holds the last-integrated timestamp per source key ("node" or
 // a GPU stat key).
 type powerCursors struct {
-	mu      sync.Mutex
-	byKey   map[string]time.Time
+	mu       sync.Mutex
+	byKey    map[string]time.Time
 	defaults map[string]time.Time
 }
 

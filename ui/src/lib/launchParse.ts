@@ -400,3 +400,23 @@ export function adoptLaunchFields(kind: string, value: string, launch: ModelLaun
   }
   return next;
 }
+
+// launchPinnedFromArguments reports which launch fields the command text
+// already pins. The model editor uses it to hydrate the derived view: pinned
+// fields come from args, unpinned ones fall back to the runtime's metadata.
+export function launchPinnedFromArguments(kind: string, argumentsText: string): Record<string, boolean> {
+  const pinned: Record<string, boolean> = {};
+  try {
+    const parsed = parseLaunchCommand(kind, argumentsText);
+    if (parsed.warnings.length > 0) return pinned;
+    if (parsed.model !== "") pinned.model = true;
+    if (parsed.servedModelName !== "") pinned.servedModelName = true;
+    if (parsed.contextPerRequest > 0) pinned.contextPerRequest = true;
+    if (parsed.maxConcurrency > 0) pinned.maxConcurrency = true;
+    if (parsed.tensorParallelSize > 0) pinned.tensorParallelSize = true;
+    if (parsed.gpuMemoryUtilization != null) pinned.gpuMemoryUtilization = true;
+  } catch {
+    // best effort: the text keeps working
+  }
+  return pinned;
+}

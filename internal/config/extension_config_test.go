@@ -374,12 +374,8 @@ func TestLoadConfigAppliesManagedRuntimeUpdateDefaults(t *testing.T) {
 	}
 }
 
-// TestBackendConfig_EffectiveProtocol pins the default that routes Responses
-// requests through the adapter. Most inference backends implement the Responses
-// API only partially, so a native pass-through hands the client whatever gaps the
-// backend has (tool-call shapes Codex cannot follow, dropped reasoning fields,
-// streams that never terminate) — while configuring nothing should not be a way
-// to end up there. AdapterProtocolNative stays an explicit opt-out.
+// TestBackendConfig_EffectiveProtocol pins the Chat-only upstream format while
+// keeping the legacy protocol values valid in configuration.
 func TestBackendConfig_EffectiveProtocol(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -388,8 +384,8 @@ func TestBackendConfig_EffectiveProtocol(t *testing.T) {
 	}{
 		{"unset converts", "", AdapterProtocolResponsesToChat},
 		{"whitespace converts", "   ", AdapterProtocolResponsesToChat},
-		{"explicit native passes through", AdapterProtocolNative, AdapterProtocolNative},
-		{"explicit native with padding", " native ", AdapterProtocolNative},
+		{"legacy native is normalized to chat", AdapterProtocolNative, AdapterProtocolResponsesToChat},
+		{"padded legacy native is normalized to chat", " native ", AdapterProtocolResponsesToChat},
 		{"explicit conversion", AdapterProtocolResponsesToChat, AdapterProtocolResponsesToChat},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -398,5 +394,28 @@ func TestBackendConfig_EffectiveProtocol(t *testing.T) {
 				t.Fatalf("EffectiveProtocol(%q) = %q, want %q", tc.declared, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestBackendConfig_AdaptsResponses(t *testing.T) {
+	for _, tc := range []struct {
+		protocol string
+		want     bool
+	}{
+		{"", true},
+		{AdapterProtocolResponsesToChat, true},
+		{AdapterProtocolNative, true},
+	} {
+		if got := (BackendConfig{Protocol: tc.protocol}).AdaptsResponses(); got != tc.want {
+			t.Errorf("AdaptsResponses(%q) = %t, want %t", tc.protocol, got, tc.want)
+		}
+	}
+}
+
+func TestBackendConfigRejectsProtocolTargetsOtherThanChat(t *testing.T) {
+	for _, protocol := range []string{"openaiChat", "openaiResponses", "anthropicMessages", "gemini"} {
+		if err := (BackendConfig{Protocol: protocol}).Validate("model"); err == nil {
+			t.Errorf("backend.protocol %q must not select a non-Chat upstream", protocol)
+		}
 	}
 }

@@ -48,7 +48,7 @@
         "rolling_back": "回復中",
         "apply_failed": "套用失敗",
         "removing": "移除中",
-        "unloading": "排空解除安裝中"
+        "unloading": "排空卸載中"
       }
     },
     "request": {
@@ -65,11 +65,11 @@
   },
   "common": {
     "load": "載入",
-    "unload": "解除安裝",
+    "unload": "卸載",
     "cancel": "取消",
     "stopStart": "停止啟動",
     "loadModel": "載入模型",
-    "unloadModel": "解除安裝模型",
+    "unloadModel": "卸載模型",
     "sleepModel": "讓模型休眠",
     "wakeModel": "喚醒模型",
     "close": "關閉",
@@ -131,6 +131,30 @@
   },
   "activity": {
     "empty": "暫無活動記錄",
+    "tabs": {
+      "overview": "綜合總覽",
+      "requests": "請求審計",
+      "speed": "推理性能",
+      "models": "模型用量",
+      "energy": "能耗監控",
+      "all": "全部平鋪"
+    },
+    "viewAllModels": "查看全部模型",
+    "liveSync": "即時同步",
+    "inFlightCount": "{count} 進行中",
+    "activeModels": "活躍模型",
+    "costEstimated": "預估成本",
+    "costNotConfigured": "未設定計費",
+    "totalTokens": "Token 吞吐量",
+    "inputTokens": "輸入",
+    "outputTokens": "輸出",
+    "reasoningTokens": "思考",
+    "cacheSaved": "讀取 {tokens} 快取 Token",
+    "cacheWritten": "寫入 {tokens} ({ratio}%)",
+    "speedDistribution": "推理速度分佈直方圖",
+    "speedDistributionSubtitle": "Prefill 提示詞處理與 Decode Token 生成 TPS 分佈",
+    "overviewSubtitle": "即時指標、模型用量與請求審計追蹤",
+    "totalSummary": "總計",
     "stats": {
       "showHistograms": "顯示直方圖",
       "hideHistograms": "隱藏直方圖",
@@ -237,7 +261,7 @@
         "cacheCreationRatio": "快取寫入 Token 佔快取相關輸入總量的比例"
       },
       "phases": {
-        "waiting": "等待進程就緒",
+        "waiting": "等待行程就緒",
         "prefill": "Prefill",
         "decode": "Decode",
         "unknown": "未知"
@@ -411,7 +435,7 @@
     "visibleCount": "（{total} 個中的 {visible} 個）",
     "readyCount": "{count} 個就緒",
     "configModified": "設定已修改",
-    "unloadAll": "全部解除安裝",
+    "unloadAll": "全部卸載",
     "profiles": "設定檔",
     "active": "目前",
     "mapping": "對映",
@@ -469,7 +493,7 @@
     "delete": "刪除檔案",
     "deleteTitle": "刪除模型檔案",
     "deleteConfirm": "確定要刪除「{name}」嗎？此操作無法復原。",
-    "deleteBlockedInUse": "目前正在使用，請先解除安裝模型。",
+    "deleteBlockedInUse": "目前正在使用，請先卸載模型。",
     "deleteBlockedRegistered": "已註冊至模型設定，請先移除引用。",
     "registered": "已註冊",
     "inUse": "使用中",
@@ -536,7 +560,7 @@
       "retryAt": "預計 {time} 重試",
       "retrySoon": "即將重試",
       "cancel": "取消下載",
-      "cancelTitle": "確認取消下載",
+      "cancelTitle": "確認取消下載？",
       "cancelConfirm": "確定取消「{name}」嗎？已下載的暫存檔會保留以便稍後續傳。",
       "delete": "刪除工作",
       "deleteTitle": "刪除下載工作",
@@ -576,7 +600,7 @@
     "forceRestartFailed": "強制重新啟動模型失敗：{message}",
     "configUpdateFailed": "模型設定未能套用，請查看伺服器日誌了解詳情。",
     "configUpdateExitStatus": "後端啟動時退出（退出狀態 {status}）。請開啟模型日誌或故障歸檔查看完整輸出。",
-    "retryRestart": "重試重新啟動",
+    "retryRestart": "重新嘗試啟動",
     "oldRequests": "舊請求：{count}",
     "waitingRequests": "等待中：{count}",
     "configStatus": {
@@ -587,7 +611,7 @@
       "rolling_back": "正在回復舊設定",
       "apply_failed": "設定套用失敗",
       "removing": "正在移除模型",
-      "unloading": "正在排空解除安裝"
+      "unloading": "正在排空卸載"
     }
   },
   "settings": {
@@ -1036,8 +1060,8 @@
       "pinState": "執行環境鎖定",
       "pinned": "已鎖定",
       "notPinned": "未鎖定",
-      "safetyTitle": "回滾保護",
-      "rollbackAlways": "LMCache 新服務健康檢查失敗時一律自動回滾。",
+      "safetyTitle": "回復保護",
+      "rollbackAlways": "LMCache 新服務健康檢查失敗時一律自動回復。",
       "saving": "儲存中…",
       "poolMaxBytes": "記憶體池大小",
       "chunkSizeAuto": "自動",
@@ -1052,7 +1076,7 @@
     "lmcacheDisableConfirm": "停用 LMCache？將停止 server 並移除已啟動 vLLM 執行環境的 connector。",
     "lmcacheNoActiveRuntime": "暫無已啟動的 vLLM 執行環境；使用 LMCache 的模型首次啟動時會向該執行環境自動安裝 connector。",
     "lmcacheModels": "使用中的模型：{models}",
-    "lmcacheServerHint": "ZMQ {host}:{port} · 前端 {httpHost}:{httpPort} · {evictionPolicy} · 块 {chunkSize}",
+    "lmcacheServerHint": "ZMQ {host}:{port} · 前端 {httpHost}:{httpPort} · {evictionPolicy} · 區塊 {chunkSize}",
     "lmcacheServerRunning": "伺服器運行中（PID {pid}）",
     "lmcacheServerStopped": "伺服器已停止",
     "lmcacheServerStart": "啟動服務",
@@ -1060,7 +1084,7 @@
     "lmcacheState": {
       "NOT_INSTALLED": "未安裝",
       "STOPPED": "已停止",
-      "STARTING": "启動中",
+      "STARTING": "啟動中",
       "RUNNING": "運行中",
       "STOPPING": "停止中",
       "ERROR": "錯誤",
@@ -1068,13 +1092,13 @@
     },
     "lmcacheInUse": "當前有 {count} 個運行中的模型依賻 LMCache",
     "lmcachePendingRestart": "待重啟",
-    "lmcachePendingRestartHint": "服務器配置有待懎用的變更，重啟服務器以懎用。",
-    "lmcacheServerRestart": "重啟服務器",
-    "lmcacheRestartConfirm": "重啟 LMCache 服務器？將丢張內存中的 KV 編存。",
-    "lmcacheStartedAt": "启動於 {time}",
+    "lmcachePendingRestartHint": "伺服器設定有待套用的變更，重新啟動伺服器以套用。",
+    "lmcacheServerRestart": "重新啟動伺服器",
+    "lmcacheRestartConfirm": "重新啟動 LMCache 伺服器？將丟棄記憶體中的 KV 快取。",
+    "lmcacheStartedAt": "啟動於 {time}",
     "lmcacheVenv": "venv",
     "lmcacheTierGpu": "GPU {size} GB",
-    "lmcacheTierRam": "內存",
+    "lmcacheTierRam": "記憶體",
     "lmcacheTierDisk": "磁盤",
     "lmcacheTierLimit": "上限 {size}",
     "lmcacheTierUsed": "已用 {size}",
@@ -1083,9 +1107,9 @@
     "lmcacheUpdate": "更新：",
     "lmcacheUpdateStage": "暫存 {version}",
     "lmcacheUpdateActivate": "激活 {version}",
-    "lmcacheUpdateRollback": "回滚到 {version}",
-    "lmcacheActivateConfirm": "將 LMCache 服務器切換到版本 {version}？",
-    "lmcacheRollbackConfirm": "將 LMCache 服務器回滚到上一版本？",
+    "lmcacheUpdateRollback": "回復到 {version}",
+    "lmcacheActivateConfirm": "將 LMCache 伺服器切換到版本 {version}？",
+    "lmcacheRollbackConfirm": "將 LMCache 伺服器回復到上一版本？",
     "lmcacheLifecycleTitle": "版本生命週期",
     "lmcacheCurrentVersion": "目前版本",
     "lmcachePreviousVersion": "上一版本",
@@ -1111,7 +1135,7 @@
     "lmcacheUnpin": "解鎖 LMCache",
     "lmcacheUnpinConfirm": "解鎖 LMCache 並恢復背景生命週期管理？",
     "lmcacheUnlock": "解鎖 {version}",
-    "lmcachePinnedHint": "背景生命週期管理已鎖定到 {version}；手動升級和回滾仍可用。",
+    "lmcachePinnedHint": "背景生命週期管理已鎖定到 {version}；手動升級和回復仍可用。",
     "lmcacheAdvancedActions": "進階操作：",
     "lmcacheNever": "從未",
     "lmcacheNotConfigured": "未設定",
@@ -1128,7 +1152,7 @@
       "ACTIVATING": "啟用中",
       "HEALTH_CHECK": "健康檢查中",
       "ACTIVE": "已生效",
-      "ROLLBACK": "回滾中",
+      "ROLLBACK": "回復中",
       "DEGRADED": "降級",
       "UNKNOWN": "未知"
     },
@@ -1184,12 +1208,12 @@
     "runtimePinConfirm": "確定將 {name} 鎖定在版本 {version} 嗎？",
     "runtimeRollbackConfirm": "確定將 {name} 復原到版本 {version} 嗎？",
     "runtimeCenter": {
-      "eyebrow": "執行時",
-      "title": "執行時",
+      "eyebrow": "執行環境",
+      "title": "執行環境",
       "description": "管理模型推論環境、版本與共享 KV 快取。",
       "actions": {
-        "create": "新增執行時",
-        "clone": "複製執行時",
+        "create": "新增執行環境",
+        "clone": "複製執行環境",
         "cloneFor": "複製 {name}",
         "details": "詳細資料",
         "detailsFor": "開啟 {name} 的詳細資料",
@@ -1217,7 +1241,7 @@
         "rollback": "復原"
       },
       "list": {
-        "runtime": "執行時",
+        "runtime": "執行環境",
         "modelsPolicy": "模型 / 策略",
         "actions": "操作",
         "environments": "推論環境",
@@ -1255,7 +1279,7 @@
         "pip": "PyPI"
       },
       "runtimeErrors": {
-        "noVenv": "執行時環境尚未安裝。",
+        "noVenv": "執行環境尚未安裝。",
         "previousAvailable": "上一版本 {version} 可用於復原。",
         "noPrevious": "目前沒有保留上一版本。",
         "noRetainedVersion": "沒有可用於自動復原的保留版本。"
@@ -1267,16 +1291,16 @@
         "pinned": "已固定"
       },
       "summary": {
-        "label": "執行時控制摘要",
-        "runtimes": "執行時",
+        "label": "執行環境控制摘要",
+        "runtimes": "執行環境",
         "blocked": "被阻擋的啟用",
         "budget": "資源預算",
         "route": "操作",
         "routeValue": "檢查 · 暫存 · 啟用"
       },
       "empty": {
-        "title": "尚無託管執行時",
-        "description": "從外部來源建立執行時。模型繫結請在模型設定頁完成。"
+        "title": "尚無託管執行環境",
+        "description": "從外部來源建立執行環境。模型繫結請在模型設定頁完成。"
       },
       "readiness": {
         "title": "就緒檢查",
@@ -1287,7 +1311,7 @@
         "loadError": "無法載入就緒狀態：{message}"
       },
       "checks": {
-        "runtime-not-configured": "執行時未設定",
+        "runtime-not-configured": "執行環境未設定",
         "version-unavailable": "未選擇版本",
         "candidate-not-staged": "候選版本未暫存",
         "version-selected": "所選版本可用",
@@ -1296,30 +1320,30 @@
         "global-idle-required": "需要全域閒置",
         "global-idle": "全域閒置條件已滿足",
         "budget-unconfigured": "資源預算未啟用",
-        "budget-vram-exceeded": "宣告的顯存佔用超出預算",
+        "budget-vram-exceeded": "宣告的視訊記憶體佔用超出預算",
         "budget-ram-exceeded": "宣告的記憶體佔用超出預算",
         "hardware-unknown": "硬體遙測資訊不完整",
         "rollback-available": "已保留可復原版本",
         "rollback-unavailable": "沒有可用的復原版本"
       },
       "checkDetails": {
-        "runtime-not-configured": "請先新增執行時定義，再選擇版本。",
+        "runtime-not-configured": "請先新增執行環境定義，再選擇版本。",
         "version-unavailable": "請檢查來源，或先暫存具體版本。",
         "candidate-not-staged": "版本 {version} 必須先暫存才能啟用。",
         "version-selected": "{version}",
         "model-incompatible": "不相容的模型：{models}",
-        "model-footprint-unknown": "有 {count} 個關聯模型未宣告顯存/記憶體佔用，無法推斷容量。",
+        "model-footprint-unknown": "有 {count} 個關聯模型未宣告視訊記憶體/記憶體佔用，無法推斷容量。",
         "global-idle-required": "仍有推理、生命週期或控制操作正在進行，請等待完成。",
         "global-idle": "沒有推理、生命週期或控制操作阻擋此檢查。",
-        "budget-unconfigured": "請設定顯存或記憶體預算，以啟用准入統計。",
+        "budget-unconfigured": "請設定視訊記憶體或記憶體預算，以啟用准入統計。",
         "budget-vram-exceeded": "已使用 {used} MiB，預算為 {budget} MiB。",
         "budget-ram-exceeded": "已使用 {used} MiB，預算為 {budget} MiB。",
-        "hardware-unknown": "偵測到的硬體僅供參考，無法證明執行時容量。",
+        "hardware-unknown": "偵測到的硬體僅供參考，無法證明執行環境容量。",
         "rollback-available": "已保留上一版本 {version}，可用於復原。",
         "rollback-unavailable": "本次啟用沒有保留上一版本，無法自動復原。"
       },
       "route": {
-        "label": "執行時操作",
+        "label": "執行環境操作",
         "check": "檢查",
         "stage": "暫存",
         "staged": "候選已暫存",
@@ -1338,7 +1362,7 @@
         "description": "檢視生命週期事實、模型影響、容量和專家設定。",
         "facts": "生命週期事實",
         "recentOperations": "最近操作",
-        "noOperations": "目前尚未記錄執行時操作。",
+        "noOperations": "目前尚未記錄執行環境操作。",
         "loadError": "無法載入執行環境詳情：{message}"
       },
       "tabs": {
@@ -1359,17 +1383,17 @@
       },
       "models": {
         "title": "關聯模型影響",
-        "description": "檢視正在使用此執行時的模型。模型繫結請在模型設定頁修改；切換版本可能重啟跟隨目前版本的模型。",
+        "description": "檢視正在使用此執行環境的模型。模型繫結請在模型設定頁修改；切換版本可能重新啟動跟隨目前版本的模型。",
         "loaded": "已載入",
         "restarts": "將重啟",
         "compatible": "相容",
         "incompatible": "不相容",
         "notRunning": "未執行",
-        "empty": "沒有模型關聯到此執行時。"
+        "empty": "沒有模型關聯到此執行環境。"
       },
       "capacity": {
         "title": "容量與策略",
-        "description": "硬體是偵測到的證據，預算是准入上限，footprint 是維運者宣告的佔用。",
+        "description": "硬體是偵測到的設備依據，預算是准入上限，footprint 是維運者宣告的資源佔用。",
         "hardware": "偵測到的硬體",
         "unknown": "未偵測到",
         "referenceOnly": "僅供參考，不能據此判斷容量",
@@ -1383,18 +1407,18 @@
         "title": "專家設定",
         "description": "建置、來源、容器、環境變數和檢查欄位仍可在此檢視與編輯。",
         "edit": "編輯設定",
-        "ariaLabel": "執行時設定 JSON",
+        "ariaLabel": "執行環境設定 JSON",
         "transactionHint": "變更會經過設定預覽、ETag 保護、提交和稽核後才會生效。"
       },
       "logs": {
-        "title": "執行時記錄",
+        "title": "執行環境記錄",
         "description": "即時操作輸出。",
         "empty": "尚無即時輸出。",
         "lmcacheTitle": "LMCache 服務日誌",
         "truncated": "日誌過長，僅顯示末尾部分。"
       },
       "versionDialog": {
-        "title": "暫存執行時版本",
+        "title": "暫存執行環境版本",
         "description": "從 {name} 的來源目錄選擇版本。暫存不會自動啟用。",
         "select": "版本",
         "loading": "正在載入版本目錄…",
@@ -1429,16 +1453,16 @@
           "description": "使用結構化映像策略執行相容 vLLM 的容器。"
         },
         "clone": {
-          "label": "複製現有執行時",
+          "label": "複製現有執行環境",
           "description": "從現有定義開始，再選擇新名稱。"
         }
       },
       "wizard": {
-        "createTitle": "新增託管執行時",
-        "cloneTitle": "複製託管執行時",
-        "editTitle": "編輯託管執行時",
-        "description": "設定執行時來源和更新策略。模型繫結請在模型設定頁完成。",
-        "stepsLabel": "執行時精靈步驟",
+        "createTitle": "新增託管執行環境",
+        "cloneTitle": "複製託管執行環境",
+        "editTitle": "編輯託管執行環境",
+        "description": "設定執行環境來源和更新策略。模型繫結請在模型設定頁完成。",
+        "stepsLabel": "執行環境精靈步驟",
         "steps": {
           "template": "範本",
           "definition": "定義",
@@ -1449,8 +1473,8 @@
         "customLegend": "自訂來源",
         "template": "範本",
         "existingTemplate": "現有定義",
-        "nameLockedHint": "現有執行時的名稱不可修改；如需新名稱請改用「複製現有執行時」。",
-        "name": "執行時名稱",
+        "nameLockedHint": "現有執行環境的名稱不可修改；如需新名稱請改用「複製現有執行環境」。",
+        "name": "執行環境名稱",
         "kind": "後端類型",
         "mode": "執行模式",
         "native": "原生環境",
@@ -1481,29 +1505,29 @@
         "keepVersions": "保留的復原版本數",
         "rollback": "健康檢查失敗時自動復原",
         "expertSummary": "專家設定",
-        "expertHint": "使用有效 JSON 設定建置參數、掛載、環境變數和檢查欄位。服務端仍會驗證最終設定。",
+        "expertHint": "使用有效 JSON 設定建置參數、掛載、環境變數和檢查欄位。伺服端仍會驗證最終設定。",
         "modelsLegend": "繫結相容模型",
-        "modelsHint": "舊式 cmd 繫結和後端類型不符會被停用。不選模型即可建立未繫結執行時。",
+        "modelsHint": "舊式 cmd 繫結和後端類型不符會被停用。不選模型即可建立未繫結執行環境。",
         "unbound": "未繫結",
-        "bindingPreview": "將有 {count} 個模型跟隨此執行時",
+        "bindingPreview": "將有 {count} 個模型跟隨此執行環境",
         "noModels": "沒有可用的已設定模型。",
         "previewTitle": "提交前確認",
-        "previewHint": "請在儲存前確認執行時定義。模型繫結請在模型設定頁單獨修改。",
+        "previewHint": "請在儲存前確認執行環境定義。模型繫結請在模型設定頁單獨修改。",
         "boundModels": "選取的模型繫結",
         "modelBinding": "模型繫結",
         "modelBindingHint": "請在模型設定頁設定。",
         "sourceBoundary": "無法跨來源安全提交",
         "boundaryReasons": {
-          "differentSources": "執行時設定分散在不同的設定來源中。",
-          "readOnly": "執行時設定屬於唯讀設定來源。",
-          "unresolved": "無法解析執行時設定對應的可寫入來源。",
+          "differentSources": "執行環境設定分散在不同的設定來源中。",
+          "readOnly": "執行環境設定屬於唯讀設定來源。",
+          "unresolved": "無法解析執行環境設定對應的可寫入來源。",
           "unavailable": "設定快照不可用。"
         },
-        "atomicHint": "本次只修改執行時定義；提交前服務端仍會重新檢查 ETag。",
+        "atomicHint": "本次只修改執行環境定義；提交前伺服端仍會重新檢查 ETag。",
         "previewChanges": "設定預覽",
         "previewSources": "目標來源：{sources}",
         "previewDiff": "{count} 個生效變更",
-        "settingsUnavailable": "設定快照不可用，請重新載入後再編輯執行時。",
+        "settingsUnavailable": "設定快照不可用，請重新載入後再編輯執行環境。",
         "previewInvalid": "設定預覽遭拒。",
         "diagnostics": {
           "repository": "儲存庫位址必須是 HTTPS 或 git@，且不能包含認證資訊。",
@@ -1512,9 +1536,9 @@
           "objectRequired": "專家設定必須是 JSON 物件。"
         },
         "validation": {
-          "name-required": "請輸入執行時名稱。",
-          "name-invalid": "執行時名稱只能包含字母、數字、點、底線或連字號。",
-          "name-duplicate": "此執行時名稱已存在。",
+          "name-required": "請輸入執行環境名稱。",
+          "name-invalid": "執行環境名稱只能包含字母、數字、點、底線或連字號。",
+          "name-duplicate": "此執行環境名稱已存在。",
           "kind-invalid": "請選擇支援的後端類型。",
           "mode-invalid": "請選擇原生或容器模式。",
           "source-type-required": "請選擇來源類型。",
@@ -1529,7 +1553,11 @@
         },
         "back": "返回",
         "next": "繼續",
-        "commit": "提交交易"
+        "commit": "確認提交",
+        "metadataLegend": "啟動中繼資料",
+        "metadataHint": "此執行環境下所有模型繼承這些值；模型自己的啟動進入點命令或 args 中的同名參數優先。",
+        "metadataEntryPoint": "啟動進入點命令",
+        "metadataEntryPointHint": "原樣執行，後接模型的 args。留空則使用引擎的預設啟動命令。"
       },
       "cache": {
         "description": "在相容模型間共享 KV 快取，減少重複計算。",
@@ -1626,6 +1654,31 @@
     "auditEventCharacters": "{count} 個字元",
     "deleteAuditConfirm": "確定要刪除稽核記錄 {id} 嗎？其中保存的請求與回覆也會被刪除。",
     "clearAllConfirm": "確定要清除所有對話稽核記錄嗎？此操作無法復原。",
+    "auditTabTranscript": "對話內容",
+    "auditTabPayload": "報文資料",
+    "auditTabPerformance": "效能分析",
+    "auditTabHeaders": "標頭與事件",
+    "auditViewSplit": "並排檢視",
+    "auditViewRequest": "僅請求",
+    "auditViewResponse": "僅回應",
+    "auditFormatPretty": "格式化",
+    "auditFormatRaw": "原始文字",
+    "auditRenderMarkdown": "渲染 Markdown",
+    "auditFilterAll": "全部",
+    "auditExpandAll": "全部展開",
+    "auditCollapseAll": "全部收起",
+    "auditCopy": "複製",
+    "auditCopied": "已複製",
+    "auditNoHeaders": "此記錄未擷取到標頭資訊。",
+    "auditNoEvents": "此記錄未擷取到串流事件。",
+    "auditCopyPath": "複製路徑",
+    "auditCopyId": "複製 ID",
+    "auditTotalTokens": "總 Token 數",
+    "auditAvgTps": "平均速率",
+    "auditPeakTps": "峰值速率",
+    "auditDuration": "總耗時",
+    "auditTtft": "首字耗時",
+    "auditDecode": "解碼耗時",
     "authSignIn": "登入",
     "authSignOut": "登出",
     "authSignOutConfirm": "確定要登出目前的管理工作階段嗎？",
@@ -1659,7 +1712,7 @@
     "modelUnlisted": "從模型清單隱藏",
     "modelBackendType": "後端類型",
     "modelRuntime": "託管執行環境",
-    "modelRuntimeVersion": "執行時版本",
+    "modelRuntimeVersion": "執行環境版本",
     "modelRuntimeVersionFollow": "跟隨啟用版本",
     "modelRuntimeVersionNone": "暫無已安裝版本",
     "modelRuntimeVersionCurrent": "目前",
@@ -1672,7 +1725,7 @@
     "modelAPIs": "API 範圍覆寫",
     "modelLifecycle": "生命週期模式",
     "modelSleepLevel": "休眠層級",
-    "modelVRAM": "顯存預算（MiB）",
+    "modelVRAM": "視訊記憶體預算（MiB）",
     "modelRAM": "記憶體預算（MiB）",
     "modelGPUAffinity": "GPU 親和性（逗號分隔）",
     "modelPriority": "優先級",
@@ -1698,12 +1751,12 @@
     "launchMaxConcurrency": "最大並行序列",
     "launchTensorParallelSize": "張量並行數",
     "launchTensorParallelSizePlaceholder": "自動",
-    "launchGPUMemoryUtilization": "GPU 顯存使用上限",
+    "launchGPUMemoryUtilization": "GPU 視訊記憶體使用上限",
     "launchGPUs": "GPU",
     "launchGPUSelectAll": "全選",
     "launchGPUClear": "清空",
     "launchGPUsEmpty": "未偵測到 NVIDIA GPU",
-    "launchGPUMemoryTotal": "已選 GPU 顯存合計：{total} GB",
+    "launchGPUMemoryTotal": "已選 GPU 視訊記憶體合計：{total} GB",
     "launchPasteCommand": "貼上命令並解析",
     "launchCommandPreview": "查看完整啟動命令",
     "launchParseTitle": "匯入啟動命令",
@@ -1763,21 +1816,21 @@
     "modelLmcache": "使用 LMCache",
     "modelLmcacheNotInstalled": "LMCache 未安裝或未啟用，無法啟用。請先在「設定 → LMCache」中啟用該模組。",
     "modelLmcacheMode": "部署模式",
-    "modelLmcacheModeMp": "獨立服務（多進程）",
-    "modelLmcacheModeInProcess": "非獨立（進程內）",
+    "modelLmcacheModeMp": "獨立服務（多行程）",
+    "modelLmcacheModeInProcess": "非獨立（行程內）",
     "modelLmcacheModeMpHint": "模型透過 ZMQ 連線到獨立的 LMCache 服務，多個模型可共享同一份 KV 快取。需要先安裝並啟動 LMCache 服務。",
-    "modelLmcacheModeInProcessHint": "LMCache 函式庫直接運行在該模型的 vLLM 進程內，不依賴獨立服務；首次啟動時會向該模型的執行時自動安裝 connector。",
+    "modelLmcacheModeInProcessHint": "LMCache 函式庫直接運作於該模型的 vLLM 行程內，不依賴獨立服務；首次啟動時會向該模型的執行環境自動安裝 connector。",
     "modelLmcacheRole": "KV 角色",
-    "modelLmcacheRoleBoth": "生产者 + 消费者（預設）",
-    "modelLmcacheRoleProducer": "仅生产（写入）",
-    "modelLmcacheRoleConsumer": "仅消费（读取）",
-    "modelLmcacheHost": "服务主机",
+    "modelLmcacheRoleBoth": "生產者 + 消費者（預設）",
+    "modelLmcacheRoleProducer": "僅生產（寫入）",
+    "modelLmcacheRoleConsumer": "僅消費（讀取）",
+    "modelLmcacheHost": "服務主機",
     "modelLmcacheHostPlaceholder": "localhost",
-    "modelLmcachePort": "服务端口",
+    "modelLmcachePort": "服務連接埠",
     "modelLmcachePortPlaceholder": "5555",
-    "modelLmcacheChunkSize": "区块大小（tokens）",
-    "modelLmcacheChunkSizePlaceholder": "自动（函式库默认）",
-    "modelLmcacheChunkSizeHint": "0 表示使用函式库默认值。",
+    "modelLmcacheChunkSize": "區塊大小（tokens）",
+    "modelLmcacheChunkSizePlaceholder": "自動（函式庫預設）",
+    "modelLmcacheChunkSizeHint": "0 表示使用函式庫預設值。",
     "modelNoChanges": "模型欄位沒有變更。",
     "modelDelete": "刪除模型設定",
     "modelDeleteTitle": "刪除模型設定",
@@ -1789,7 +1842,7 @@
     "modelDeleteFilesLoading": "正在檢查關聯模型檔案…",
     "modelDeleteFilesUnavailable": "無法檢查關聯檔案；仍可只刪除模型設定。",
     "modelDeleteNoFiles": "找不到與此模型關聯的受管理模型檔案。",
-    "modelDeleteFilesInUse": "部分關聯檔案正在使用，請先解除安裝模型再刪除。",
+    "modelDeleteFilesInUse": "部分關聯檔案正在使用，請先卸載模型再刪除。",
     "modelDeleteFilesShared": "部分關聯檔案由其他模型共用，無法刪除。",
     "modelDeleteConflict": "為安全起見無法刪除模型設定，檔案正在使用或已共用：{models}",
     "modelDeleteFailed": "刪除模型設定失敗：{message}",
@@ -1876,7 +1929,7 @@
     "domainRuntimes": "命名執行環境",
     "domainRuntimesDescription": "版本化的本機或容器執行環境定義。",
     "domainResourceBudget": "資源預算",
-    "domainResourceBudgetDescription": "全域顯存、記憶體限制和載入排隊策略。",
+    "domainResourceBudgetDescription": "全域視訊記憶體、記憶體限制和載入佇列策略。",
     "domainModelFiles": "模型檔案",
     "domainModelFilesDescription": "模型目錄來源和持久化下載設定。",
     "domainPeers": "遠端節點",
@@ -1910,7 +1963,7 @@
       "sourceAllowlist": "允許的原始碼位址",
       "containerRegistries": "允許的容器倉庫",
       "operationTimeout": "操作逾時",
-      "vramMiB": "顯存預算（MiB）",
+      "vramMiB": "視訊記憶體預算（MiB）",
       "ramMiB": "記憶體預算（MiB）",
       "autoEvict": "自動驅逐閒置模型",
       "queueLoads": "排隊等待載入",
@@ -1969,7 +2022,7 @@
       "minIdle": "最短閒置時間",
       "activateOnlyWhenIdle": "僅在閒置時啟用",
       "keepVersions": "保留版本數",
-      "rollbackOnFailure": "失敗時回退",
+      "rollbackOnFailure": "失敗時回復",
       "verify": "安裝驗證",
       "sha256": "SHA-256",
       "healthPath": "健康檢查路徑",
@@ -2033,7 +2086,7 @@
       "refreshEvery": "重新整理間隔"
     },
     "configWriteStatus": "寫入權限",
-    "configApplyStatus": "執行階段狀態",
+    "configApplyStatus": "執行環境狀態",
     "configWritable": "可寫入",
     "configReadOnly": "唯讀",
     "configApplied": "已套用",
@@ -2068,7 +2121,7 @@
     "ccswitchDefaultKey": "llama-swap（預設佔位金鑰）",
     "ccswitchNoKey": "不匯入金鑰",
     "ccswitchOpen": "開啟 CC Switch",
-    "modelManagedModelRequired": "託管執行時需要選擇模型檔案，或在啟動參數中包含 --model",
+    "modelManagedModelRequired": "託管執行環境需要選擇模型檔案，或在啟動參數中包含 --model",
     "auditMediaImage": "圖像",
     "auditMediaFile": "檔案",
     "auditMediaDownload": "下載",
@@ -2082,9 +2135,9 @@
     "schemaGroups": "模型群組",
     "schemaGpus": "GPU 卡",
     "modelSelectors": "模型選擇器",
-    "schemaProfiles": "執行時設定檔",
+    "schemaProfiles": "執行環境設定檔",
     "modelDeleteRoutingTitle": "將同步調整路由",
-    "modelDeleteRoutingHint": "該模型被這些路由塊參照，刪除時會一併移除相應條目：{locations}。",
+    "modelDeleteRoutingHint": "該模型被這些路由區塊參照，刪除時會一併移除相應條目：{locations}。",
     "matrixVars": "模型變數",
     "matrixEvictCosts": "驅逐成本",
     "matrixSets": "並行模型集合",
@@ -2095,7 +2148,7 @@
     "matrixAddModel": "新增模型",
     "matrixSetName": "集合名稱",
     "modelCmdHint": "完整啟動命令。點擊下方標籤可插入 ${PORT}（自動分配的埠號）或模型 ID。",
-    "modelEnvHint": "每行一个 KEY=VALUE，作用於模型程序。",
+    "modelEnvHint": "每行一個 KEY=VALUE，作用於模型程序。",
     "modelDisabled": "維護模式（停用）",
     "modelDisabledHint": "停用後保留設定但不再對外服務：不出現在 /v1/models、請求直接回傳 503、不會被預先載入或手動啟動。隨時可以重新啟用，無需刪除重建。",
     "serviceRollbackOnFailure": "啟動失敗時自動回復配置",
@@ -2108,7 +2161,7 @@
     "keyManagementEmpty": "暫無管理金鑰",
     "keyManagementEmptyHint": "先建立管理金鑰用於登入，再在其下新增存取金鑰供用戶端呼叫模型。",
     "keyAccessTitle": "存取金鑰",
-    "keyAccessDescription": "存取金鑰承载模型呼叫限制：允許 IP、可用模型、併發數、使用分組與終止時間。",
+    "keyAccessDescription": "存取金鑰承載模型呼叫限制：允許 IP、可用模型、並行數、使用分組與終止時間。",
     "keyAccessEmpty": "該管理金鑰下暫無存取金鑰",
     "keyAccessEmptyHint": "新增存取金鑰後，用戶端即可帶著這些限制呼叫模型。",
     "keyAddAccess": "新增存取金鑰",
@@ -2136,7 +2189,18 @@
     "phaseTtft": "排隊 + 預填充",
     "phaseDecode": "解碼",
     "phaseOther": "其他",
-    "phaseTotal": "總耗時"
+    "phaseTotal": "總耗時",
+    "auditMediaAudio": "音訊",
+    "auditReasoning": "思考過程",
+    "modelEntryPoint": "啟動進入點命令",
+    "modelEntryPointPlaceholder": "python3 /scripts/server.py",
+    "modelEntryPointHint": "託管執行環境的自訂啟動進入點命令（選填）。它會以執行環境的環境原樣執行，後接上面的參數；此後整條命令由你掌控：不再注入任何引擎參數、host 或 port。",
+    "launchInheritedFromRuntime": "繼承自執行環境",
+    "auditSessionAccumulated": "工作階段累計",
+    "auditSessionRequests": "請求數",
+    "auditSessionTokens": "輸入 → 輸出 Token",
+    "auditSessionStored": "已儲存",
+    "auditSessionShared": "共用上下文"
   },
   "settingsCenter": {
     "navigation": {
@@ -2153,8 +2217,8 @@
         "description": "掃描、下載器與模型來源。"
       },
       "runtimes": {
-        "label": "執行階段管理",
-        "description": "執行階段來源、更新與資源預算。"
+        "label": "執行環境管理",
+        "description": "執行環境來源、更新與資源預算。"
       },
       "security": {
         "label": "安全與存取",
@@ -2200,11 +2264,11 @@
     "groups": {
       "service": {
         "title": "服務基礎",
-        "description": "設定服務執行階段的基礎行為與日誌輸出。"
+        "description": "設定服務執行環境的基礎行為與日誌輸出。"
       },
       "lifecycle": {
         "title": "連接埠與生命週期",
-        "description": "控制連接埠分配與模型閒置、解除安裝的預設行為。"
+        "description": "控制連接埠分配與模型閒置、卸載的預設行為。"
       },
       "sessions": {
         "title": "工作階段識別",
@@ -2247,16 +2311,16 @@
         "description": "設定 Hugging Face、ModelScope 位址與憑證環境變數。"
       },
       "runtimeManager": {
-        "title": "執行階段管理器",
-        "description": "設定執行階段安裝根目錄、來源白名單與更新策略。"
+        "title": "執行環境管理器",
+        "description": "設定執行環境安裝根目錄、來源白名單與更新策略。"
       },
       "resourceBudget": {
         "title": "資源預算",
-        "description": "為模型載入設定顯存、記憶體與佇列策略。"
+        "description": "為模型載入設定視訊記憶體、記憶體與佇列策略。"
       },
       "runtimeDefinitions": {
-        "title": "執行階段列表",
-        "description": "管理可用執行階段及其建置來源。"
+        "title": "執行環境列表",
+        "description": "管理可用執行環境及其建置來源。"
       },
       "security": {
         "title": "API Key 策略",
@@ -2276,7 +2340,7 @@
       },
       "selectors": {
         "title": "選取器",
-        "description": "定義路由策略、目標模型與回退規則。"
+        "description": "定義路由策略、目標模型與備援規則。"
       },
       "routing": {
         "title": "優先順序與比對",
@@ -2374,7 +2438,7 @@
       "empty": "沒有可用的已設定模型。"
     },
     "entity": {
-      "runtime": "執行階段",
+      "runtime": "執行環境",
       "peer": "節點",
       "profile": "設定檔",
       "selector": "模型選取器",
@@ -2401,7 +2465,7 @@
       "add": "新增模型",
       "searchLabel": "搜尋已設定模型",
       "searchPlaceholder": "搜尋模型 ID 或名稱",
-      "endpoint": "端點 / 執行階段",
+      "endpoint": "端點 / 執行環境",
       "listStatus": "可見性",
       "unnamed": "未命名",
       "noEndpoint": "未設定",
@@ -2432,7 +2496,7 @@
       "aliasPlaceholder": "新增別名",
       "unlistedHint": "從公開模型列表隱藏此模型，但仍可透過請求使用。",
       "environmentEmpty": "此模型尚未設定環境變數。",
-      "runtimePlaceholder": "選擇執行階段",
+      "runtimePlaceholder": "選擇執行環境",
       "backToOverview": "返回總覽",
       "applyHint": "變更會先套用到草稿，點擊頁面頂部「儲存」後統一提交。",
       "tabBasic": "基本資訊",
@@ -2462,7 +2526,7 @@
       "macroInsert": "插入巨集",
       "backendSection": "結構化後端",
       "backendType": "後端類型",
-      "backendRuntime": "執行時",
+      "backendRuntime": "執行環境",
       "backendProtocol": "協定",
       "backendApis": "API 介面",
       "backendArgs": "後端參數",
@@ -2502,7 +2566,7 @@
       "timeoutTLSHandshake": "TLS 握手",
       "timeoutExpectContinue": "Expect continue",
       "timeoutIdleConn": "閒置連線",
-      "stripParams": "剥离參數",
+      "stripParams": "剝離參數",
       "stripParamsHint": "從傳入的補全請求中移除這些參數。",
       "setParams": "設定參數",
       "setParamsByID": "按模型變體設定（setParamsByID）",
@@ -2675,7 +2739,22 @@
       "tab": "設定",
       "empty": "此腳本沒有宣告任何設定項。在入口檔案用 export const settings = { ... } 宣告，即可在此以表單方式設定。",
       "modalHint": "直接修改擴充聲明的設定項，無需進入完整編輯器，儲存後生效。",
-      "none": "此擴充未宣告設定項，可直接編輯原始設定。"
+      "none": "此擴充未宣告設定項，可直接編輯原始設定。",
+      "title": "擴充設定",
+      "subtitle": "配置擴充參數、模型適用範圍、權限沙箱與資源配額。",
+      "rawJson": "原始 JSON",
+      "form": "表單模式",
+      "formatJson": "格式化 JSON",
+      "validJson": "JSON 格式正確",
+      "openInEditor": "進入程式碼編輯",
+      "revert": "重設修改",
+      "tabs": {
+        "basic": "基本資訊",
+        "matching": "適用範圍",
+        "config": "擴充設定",
+        "limits": "執行限制",
+        "permissions": "權限沙箱"
+      }
     },
     "console": "主控台",
     "check": "檢查程式碼",
@@ -2757,12 +2836,42 @@
       "discard": "放棄變更",
       "fromPreset": "從預設新增",
       "details": "更多資訊",
-      "quickSettings": "設定"
+      "quickSettings": "設定",
+      "viewMode": "檢視模式",
+      "grid": "網格",
+      "table": "列表",
+      "sortBy": "排序方式",
+      "sortByName": "依名稱",
+      "sortByPriority": "依優先級",
+      "sortByStatus": "依狀態",
+      "batchEnable": "全部啟用",
+      "batchDisable": "全部停用",
+      "copyId": "複製標識",
+      "copied": "已複製",
+      "viewDocs": "開發文件",
+      "presetsMarketplace": "預設商店",
+      "totalKpi": "全部擴充",
+      "enabledKpi": "執行中",
+      "disabledKpi": "已停用",
+      "issuesKpi": "需關注",
+      "activeBadge": "執行中",
+      "customEndpoints": "自訂接口",
+      "storageMode": "儲存模式",
+      "storageEphemeral": "臨時儲存（記憶體）",
+      "storagePersistent": "持久化儲存（資料庫）",
+      "storageNone": "禁止儲存"
     },
     "dev": {
       "code": "程式碼",
       "debug": "請求除錯",
       "benchmark": "效能測試",
+      "codeMode": "程式碼編輯",
+      "settingsMode": "擴充設定",
+      "debugMode": "請求除錯",
+      "runShortcut": "執行測試",
+      "saveShortcut": "儲存修改",
+      "toggleSidebar": "摺疊檔案樹",
+      "quickInspector": "屬性配置",
       "scope": "執行已儲存擴充的 onRequest 鉤子與工具注入。測試不呼叫模型推理，並停用網路請求和檔案操作。",
       "export": "匯出結果",
       "stop": "停止",
@@ -2898,7 +3007,7 @@
     "description": "檢視和分析您的 API 使用歷史",
     "totalRequests": "總請求數",
     "totalTokens": "總 Token",
-    "tokenBreakdown": "輸入: {input} / 輸出: {output} / 快取: {cache}",
+    "tokenBreakdown": "輸入：{input} / 輸出：{output} / 快取：{cache}",
     "totalCost": "總消費",
     "standardCost": "標準 ${standard}",
     "averageDuration": "平均耗時",
@@ -2949,7 +3058,7 @@
     "trendCacheHitRate": "快取命中率",
     "loadMore": "載入更多",
     "showingRows": "已顯示 {count} / {total} 筆記錄",
-    "noKey": "無密鑰"
+    "noKey": "無金鑰"
   },
   "toast": {
     "region": "通知"
@@ -2972,15 +3081,15 @@
       "proxy": "代理",
       "priority": "優先級",
       "weight": "權重",
-      "sticky": "會話黏滯",
+      "sticky": "工作階段保持",
       "disabled": "停用",
-      "bareNamePolicy": "裸名仲裁",
+      "bareNamePolicy": "無前綴模型仲裁",
       "localFirst": "本地模型優先",
       "providerFirst": "供應商優先",
       "maxRetries": "最大重試",
       "apiKeys": "API 金鑰",
       "keyValueOrEnv": "金鑰值或 env:變數名",
-      "maxConcurrent": "並發上限",
+      "maxConcurrent": "並行上限",
       "models": "模型",
       "modelLocal": "本地模型 ID",
       "modelRemote": "上游模型名"

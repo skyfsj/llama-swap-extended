@@ -160,6 +160,24 @@ export interface ActivityLogEntry {
   metadata?: Record<string, string>;
 }
 
+// AuditSessionSummary is the accumulated view of one conversation session: its
+// requests share context, so the totals describe what the session cost rather
+// than what a single turn cost. sharedBlockBytes is the context the segment
+// store did not have to keep twice.
+export interface AuditSessionSummary {
+  sessionId: string;
+  requestCount: number;
+  inputTokens: number;
+  outputTokens: number;
+  storedBytes: number;
+  requestBytes: number;
+  sharedBlockBytes: number;
+  firstTimestamp: string;
+  lastTimestamp: string;
+  firstActivityId: number;
+  lastActivityId: number;
+}
+
 export interface AuditConversation {
   id: string;
   activityId?: number;
@@ -167,6 +185,9 @@ export interface AuditConversation {
   keyId?: string;
   model: string;
   sessionId?: string;
+  // Present when the conversation belongs to a session the audit store has
+  // accumulated.
+  session?: AuditSessionSummary;
   reqPath: string;
   timestamp: string;
   requestHeaders?: string | number[];

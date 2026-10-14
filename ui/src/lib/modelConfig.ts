@@ -24,6 +24,22 @@ export function emptyLaunchDraft(): ModelLaunchDraft {
   };
 }
 
+// launchPinnedFromLaunchBlock reports which fields a legacy backend.launch
+// block carried. Those were explicit model configuration, so they stay pinned
+// and materialize into backend.args when the model is saved.
+function launchPinnedFromLaunchBlock(backend: Record<string, unknown>): Record<string, boolean> {
+  const launch = record(property(backend, "launch"));
+  const pinned: Record<string, boolean> = {};
+  if (!launch) return pinned;
+  if (text(property(launch, "model")) !== "") pinned.model = true;
+  if (text(property(launch, "servedModelName")) !== "") pinned.servedModelName = true;
+  if (Number(numberText(property(launch, "contextPerRequest"))) > 0) pinned.contextPerRequest = true;
+  if (Number(numberText(property(launch, "maxConcurrency"))) > 0) pinned.maxConcurrency = true;
+  if (Number(numberText(property(launch, "tensorParallelSize"))) > 0) pinned.tensorParallelSize = true;
+  if (property(launch, "gpuMemoryUtilization") !== undefined) pinned.gpuMemoryUtilization = true;
+  return pinned;
+}
+
 // launchFromBackend reads the structured backend.launch block into the draft.
 // Zero values stay empty so the inputs show their placeholders instead.
 function launchFromBackend(backend: Record<string, unknown>): ModelLaunchDraft {
@@ -117,11 +133,18 @@ export interface ModelConfigDraft {
   backendType: string;
   backendRuntime: string;
   backendRuntimeVersion: string;
+  // EntryPoint is a custom launch head for a native managed runtime: it runs
+  // verbatim (under the runtime's environment) followed by backend.args.
+  backendEntryPoint: string;
   backendProtocol: string;
   backendAPIs: string[];
   backendDiscover: "" | "true" | "false";
   backendArguments: string;
   launch: ModelLaunchDraft;
+  // launchPinned marks the launch fields this model itself pins. Unpinned
+  // fields are inherited from the runtime's metadata and are never written
+  // into backend.args; only pinned fields materialize as flags on save.
+  launchPinned: Record<string, boolean>;
   backendContainer: Record<string, unknown>;
   lmcacheEnabled: boolean;
   lmcacheMode: "mp" | "inProcess";
@@ -166,6 +189,7 @@ export interface ConfigChange {
 
 export interface RuntimeOption {
   name: string;
+  metadata: RuntimeLaunchMetadata;
   kind: string;
   mode: string;
 }
@@ -320,11 +344,13 @@ export function emptyModelDraft(id = ""): ModelConfigDraft {
     backendType: "",
     backendRuntime: "",
     backendRuntimeVersion: "",
+    backendEntryPoint: "",
     backendProtocol: "",
     backendAPIs: [],
     backendDiscover: "",
     backendArguments: "",
     launch: emptyLaunchDraft(),
+    launchPinned: {},
     backendContainer: {},
     lmcacheEnabled: false,
     lmcacheMode: "mp",
@@ -408,18 +434,54 @@ export function managedLaunchKind(kind: string, mode: string): string {
   return normalizedKind;
 }
 
+// pinnedLaunchView returns the launch draft restricted to the fields the model
+// itself pins. Inherited runtime defaults stay out of backend.args: the server
+// applies them at launch, and materializing them here would silently freeze the
+// runtime's defaults into every model.
+export function pinnedLaunchView(draft: ModelConfigDraft): ModelLaunchDraft {
+  const pinned = draft.launchPinned ?? {};
+  const view = emptyLaunchDraft();
+  view.gpus = draft.launch.gpus;
+  for (const field of ["model", "servedModelName", "contextPerRequest", "maxConcurrency", "tensorParallelSize", "gpuMemoryUtilization"] as const) {
+    if (pinned[field]) (view as unknown as Record<string, unknown>)[field] = draft.launch[field];
+  }
+  return view;
+}
+
 export function runtimeOptions(config: unknown): RuntimeOption[] {
   const runtimes = record(property(record(config), "runtimes"));
   return Object.keys(runtimes)
     .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
     .map((name) => {
       const definition = record(runtimes[name]);
+      const metadata = record(property(definition, "metadata"));
       return {
         name,
         kind: text(property(definition, "kind")).trim().toLowerCase(),
         mode: runtimeMode(definition),
+        metadata: {
+          entryPoint: text(property(metadata, "entrypoint")).trim(),
+          contextPerRequest: text(property(metadata, "contextPerRequest")),
+          maxConcurrency: text(property(metadata, "maxConcurrency")),
+          tensorParallelSize: text(property(metadata, "tensorParallelSize")),
+          gpuMemoryUtilization: text(property(metadata, "gpuMemoryUtilization")),
+        },
       };
     });
+}
+
+// RuntimeLaunchMetadata is the launch metadata a runtime publishes for its
+// models: the launch head and the quick-config defaults they inherit.
+export interface RuntimeLaunchMetadata {
+  entryPoint: string;
+  contextPerRequest: string;
+  maxConcurrency: string;
+  tensorParallelSize: string;
+  gpuMemoryUtilization: string;
+}
+
+export function emptyRuntimeLaunchMetadata(): RuntimeLaunchMetadata {
+  return { entryPoint: "", contextPerRequest: "", maxConcurrency: "", tensorParallelSize: "", gpuMemoryUtilization: "" };
 }
 
 export function managedRuntimeEntrypoint(kind: string): string {
@@ -785,6 +847,74 @@ function dropOwnedFlagTokens(tokens: string[], index: number): string[] {
 // nvidiaGPUs is the number of selected cards the server can actually hand to
 // a CUDA runtime; callers without a hardware catalog pass the full selection
 // count, which is the legacy behavior.
+// materializePinnedLaunchArguments writes the model's pinned launch fields into
+// the command text without ever removing a flag. Args are the source of truth:
+// a flag already in the text stays even when the derived view does not carry it
+// (it may have been written by hand or inherited as a pinned runtime default).
+// Missing pinned flags are appended, and a pinned value that differs from the
+// text replaces it in place.
+export function materializePinnedLaunchArguments(value: string, kind: string, pinned: ModelLaunchDraft, nvidiaGPUs?: number): string {
+  if (kind !== "vllm" && kind !== "llamacpp") return value;
+  const owned = ownedLaunchFlagSet(kind);
+  const values = ownedLaunchFlagValues(kind, pinned, nvidiaGPUs ?? pinned.gpus.length);
+  if (Object.keys(values).length === 0) return value;
+  const kept: string[] = [];
+  const placed = new Set<string>();
+  for (const line of value.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed === "") {
+      kept.push(line);
+      continue;
+    }
+    const tokens = tokenizeArgLine(trimmed);
+    const first = tokens[0] ?? "";
+    if (owned.has(first)) {
+      const flag = OWNED_FLAG_ALIASES[first] ?? first;
+      if (flag in values) {
+        placed.add(flag);
+        if (compareOwnedFlagValue(flag, values[flag], tokens[1]) !== "different") {
+          kept.push(line);
+          continue;
+        }
+        kept.push(`${flag} ${serializeLaunchArgument(values[flag])}`);
+        continue;
+      }
+      // Not pinned by the model: the flag stays exactly as written.
+      kept.push(line);
+      continue;
+    }
+    const inline = tokens.findIndex((token) => {
+      const equals = token.indexOf("=");
+      return equals > 0 && owned.has(token.slice(0, equals));
+    });
+    if (inline >= 0) {
+      const token = tokens[inline];
+      const rawFlag = token.slice(0, token.indexOf("="));
+      const flag = OWNED_FLAG_ALIASES[rawFlag] ?? rawFlag;
+      const written = token.slice(token.indexOf("=") + 1);
+      if (flag in values) {
+        placed.add(flag);
+        if (compareOwnedFlagValue(flag, values[flag], written) !== "different") {
+          kept.push(line);
+          continue;
+        }
+        const replaced = [...tokens];
+        replaced[inline] = `${flag}=${values[flag]}`;
+        kept.push(replaced.map(serializeLaunchArgument).join(" "));
+        continue;
+      }
+      kept.push(line);
+      continue;
+    }
+    kept.push(line);
+  }
+  for (const [flag, argument] of Object.entries(values)) {
+    if (placed.has(flag)) continue;
+    kept.push(`${flag} ${serializeLaunchArgument(argument)}`);
+  }
+  return kept.join("\n");
+}
+
 export function syncLaunchOwnedArguments(value: string, kind: string, launch: ModelLaunchDraft, nvidiaGPUs?: number): string {
   if (kind !== "vllm" && kind !== "llamacpp") return value;
   const owned = ownedLaunchFlagSet(kind);
@@ -1038,11 +1168,15 @@ export function draftFromModel(id: string, value: unknown): ModelConfigDraft {
     backendType: text(property(backend, "type")),
     backendRuntime: runtime,
     backendRuntimeVersion: text(property(backend, "runtimeVersion")),
+    backendEntryPoint: text(property(backend, "entrypoint")),
     backendProtocol: text(property(backend, "protocol")),
     backendAPIs: listText(property(backend, "apis")),
     backendDiscover: boolText(property(backend, "discover")),
     backendArguments: args.join("\n"),
     launch: launchFromBackend(backend),
+    // A legacy launch block was explicit model configuration, so its fields
+    // count as pinned: they materialize into args on the next save.
+    launchPinned: launchPinnedFromLaunchBlock(backend),
     backendContainer: cloneRecord(property(backend, "container")),
     lmcacheEnabled: lmcache["enabled"] === true,
     lmcacheMode: text(lmcache["mode"]) === "inProcess" ? "inProcess" : "mp",
@@ -1149,16 +1283,26 @@ export function buildModelValue(draft: ModelConfigDraft, current: unknown = {}):
       delete backend.container;
     }
   } else {
-    const backendArgs = args(draft.backendArguments);
+    // The command text is the single source of truth: the structured launch
+    // fields are a derived view, so any value shown in them is materialized
+    // into the args before saving and the launch block itself is dropped.
+    let backendArgsText = draft.backendArguments;
+    const entryPoint = trimmedText(draft.backendEntryPoint);
+    const launchKind = managedLaunchKind(draft.backendType, "");
+    if (launchKind !== "") {
+      backendArgsText = materializePinnedLaunchArguments(backendArgsText, launchKind, pinnedLaunchView(draft), draft.launch.gpus.length);
+    }
+    const backendArgs = args(backendArgsText);
     const container = cloneRecord(draft.backendContainer);
-    if (backendArgs.length === 0 && !trimmedText(property(container, "image"))) {
-      throw new Error("backend.args or backend.container.image is required for backend mode");
+    if (backendArgs.length === 0 && entryPoint === "" && !trimmedText(property(container, "image"))) {
+      throw new Error("backend.args, backend.entrypoint or backend.container.image is required for backend mode");
     }
     delete model.cmd;
     delete model.cmdStop;
     setOptional(backend, "runtime", trimmedText(draft.backendRuntime));
     setOptional(backend, "runtimeVersion", trimmedText(draft.backendRuntimeVersion));
-    setOptional(backend, "launch", launchToBackend(draft));
+    setOptional(backend, "entrypoint", entryPoint);
+    delete backend.launch;
     setOptional(backend, "args", backendArgs);
     setOptional(backend, "container", Object.keys(container).length > 0 ? container : undefined);
   }

@@ -14,12 +14,14 @@ import (
 // readBlob streams a stored body the way the HTTP body endpoint does.
 func readBlob(t *testing.T, st *Store, ref string) []byte {
 	t.Helper()
-	file, size, err := st.OpenBlob(ref)
+	body, size, _, err := st.OpenBody(ref)
 	if err != nil {
-		t.Fatalf("OpenBlob(%s): %v", ref, err)
+		t.Fatalf("OpenBody(%s): %v", ref, err)
 	}
-	defer file.Close()
-	data, err := io.ReadAll(file)
+	if closer, ok := body.(io.Closer); ok {
+		defer closer.Close()
+	}
+	data, err := io.ReadAll(body)
 	if err != nil {
 		t.Fatalf("read blob %s: %v", ref, err)
 	}
@@ -44,27 +46,6 @@ func newFileBackedStore(t *testing.T) (*Store, string) {
 	return st, dir
 }
 
-func countBlobFiles(t *testing.T, dir string) int {
-	t.Helper()
-	n := 0
-	err := filepath.WalkDir(filepath.Join(dir, "blobs"), func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			if os.IsNotExist(err) {
-				return nil
-			}
-			return err
-		}
-		if !d.IsDir() {
-			n++
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("walk blob directory: %v", err)
-	}
-	return n
-}
-
 // A file-backed store externalizes non-empty bodies into the blob store: the
 // database row keeps only the hash reference, the file holds the bytes, and the
 // detail view publishes that reference plus the logical size so a client can
@@ -80,15 +61,19 @@ func TestStore_Blob_RoundTrip(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	var reqInline, respInline int
-	if err := st.db.QueryRow(`SELECT length(req_body), length(resp_body) FROM audit_conversations WHERE id='blob-rt'`).Scan(&reqInline, &respInline); err != nil {
+	// Bodies live in the compressed segments, not inline in a row.
+	stats, err := st.AuditStats(context.Background())
+	if err != nil {
 		t.Fatal(err)
 	}
-	if reqInline != 0 || respInline != 0 {
-		t.Fatalf("bodies stored inline req=%d resp=%d, want externalized to files", reqInline, respInline)
+	if stats.SegmentBytes == 0 {
+		t.Fatal("no segment bytes were written for the stored bodies")
 	}
-	if got := countBlobFiles(t, dir); got != 2 {
-		t.Fatalf("blob files=%d, want 2", got)
+	if stats.StoredBytes >= stats.LogicalBytes {
+		t.Fatalf("stored %d byte(s) of %d logical; expected compression", stats.StoredBytes, stats.LogicalBytes)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "audit", "audit.db")); err != nil {
+		t.Fatalf("dedicated audit database missing: %v", err)
 	}
 	full, found, err := st.GetAuditConversation(context.Background(), "blob-rt")
 	if err != nil || !found {
@@ -128,21 +113,38 @@ func TestStore_Blob_RoundTrip(t *testing.T) {
 	}
 }
 
-// Identical bodies share one blob file: retries, batch replays and repeated
-// media do not duplicate bytes on disk.
+// Identical bodies share one stored copy: retries, batch replays and repeated
+// media do not duplicate bytes on disk, and the second write stores nothing.
 func TestStore_Blob_Dedup(t *testing.T) {
-	st, dir := newFileBackedStore(t)
+	st, _ := newFileBackedStore(t)
 	now := time.Now().Truncate(time.Second)
 	body := bytes.Repeat([]byte("shared-media"), 512)
+	var stored int64
 	for _, id := range []string{"dup-1", "dup-2"} {
+		before, err := st.AuditStats(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
 		if err := st.InsertAuditConversation(context.Background(), AuditConversation{
 			ID: id, Model: "m", Timestamp: now, RequestBody: body,
 		}); err != nil {
 			t.Fatal(err)
 		}
+		after, err := st.AuditStats(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		stored += after.StoredBytes - before.StoredBytes
 	}
-	if got := countBlobFiles(t, dir); got != 1 {
-		t.Fatalf("blob files=%d, want 1 (deduplicated)", got)
+	stats, err := st.AuditStats(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Bodies != 1 {
+		t.Fatalf("bodies=%d, want 1 (deduplicated)", stats.Bodies)
+	}
+	if stored >= int64(len(body)) {
+		t.Fatalf("two identical bodies stored %d byte(s) of a %d byte payload; want one copy", stored, len(body))
 	}
 }
 
@@ -166,11 +168,11 @@ func TestStore_Blob_InMemoryStaysInline(t *testing.T) {
 	}
 }
 
-// Deleting the referencing row and clearing unreferenced files leaves only
-// the blobs that still have a live conversation; orphan files with no row at
-// all are reclaimed too.
+// Reclaiming space follows the reference counts: a conversation that is gone
+// releases its blocks, and compaction rewrites the segments without them while
+// the surviving conversation keeps reading its own body.
 func TestStore_Blob_GC(t *testing.T) {
-	st, dir := newFileBackedStore(t)
+	st, _ := newFileBackedStore(t)
 	now := time.Now().Truncate(time.Second)
 	keep := bytes.Repeat([]byte("keep-me"), 64)
 	drop := bytes.Repeat([]byte("drop-me"), 64)
@@ -182,89 +184,81 @@ func TestStore_Blob_GC(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// A blob with no referencing row, as if the row was deleted out-of-band.
-	orphanHash, err := st.blobs.Put([]byte("orphan"))
+	before, err := st.AuditStats(context.Background())
 	if err != nil {
 		t.Fatal(err)
-	}
-	// A fresh blob whose referencing row has not committed yet: GC must skip
-	// it (the audit writer stores the blob before the INSERT commits).
-	freshHash, err := st.blobs.Put([]byte("fresh-uncommitted"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Backdate the true orphan past the grace period so it is collectable.
-	orphanPath, err := st.blobs.pathFor(orphanHash)
-	if err != nil {
-		t.Fatal(err)
-	}
-	stale := time.Now().Add(-2 * time.Hour)
-	if err := os.Chtimes(orphanPath, stale, stale); err != nil {
-		t.Fatal(err)
-	}
-	if got := countBlobFiles(t, dir); got != 4 {
-		t.Fatalf("blob files before GC=%d, want 4", got)
 	}
 	if err := st.DeleteAuditConversation(context.Background(), "gone"); err != nil {
 		t.Fatal(err)
 	}
-	deleted, err := st.GCUnusedBlobs(context.Background())
+	reclaimed, dropped, err := st.MaintainAudit(context.Background(), time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if deleted != 1 {
-		t.Fatalf("GC deleted=%d, want 1 (backdated orphan); fresh blob must survive the grace period", deleted)
+	if dropped == 0 || reclaimed == 0 {
+		t.Fatalf("compaction reclaimed %d byte(s) and dropped %d block(s); want both non-zero", reclaimed, dropped)
 	}
-	if got := countBlobFiles(t, dir); got != 3 {
-		t.Fatalf("blob files after GC=%d, want 3", got)
-	}
-	freshPath, err := st.blobs.pathFor(freshHash)
+	after, err := st.AuditStats(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(freshPath); err != nil {
-		t.Fatalf("fresh blob was collected despite the grace period: %v", err)
+	if after.SegmentBytes >= before.SegmentBytes {
+		t.Fatalf("segment bytes %d -> %d, want a smaller file", before.SegmentBytes, after.SegmentBytes)
 	}
 	full, found, err := st.GetAuditConversation(context.Background(), "kept")
 	if err != nil || !found {
-		t.Fatalf("kept row after GC found=%v err=%v", found, err)
+		t.Fatalf("kept row after compaction found=%v err=%v", found, err)
 	}
 	if streamed := readBlob(t, st, full.RequestBodyRef); !bytes.Equal(streamed, keep) {
 		t.Fatalf("kept row body len=%d, want %d sentinel bytes", len(streamed), len(keep))
 	}
 }
 
-// A lost blob file must not fail the detail view: the reference is still
+// A lost segment file must not fail the detail view: the reference is still
 // published (so the metadata stays usable) while streaming that body reports
-// the blob as missing instead of pretending it is empty.
+// the bytes as missing instead of pretending they are empty.
 func TestStore_Blob_MissingFileDegradesToEmptyBody(t *testing.T) {
 	st, dir := newFileBackedStore(t)
 	if err := st.InsertAuditConversation(context.Background(), AuditConversation{
-		ID: "fragile", Model: "m", Timestamp: time.Now().Truncate(time.Second), RequestBody: []byte("fragile-media"),
+		ID: "fragile", Model: "m", Timestamp: time.Now().Truncate(time.Second),
+		RequestBody: bytes.Repeat([]byte("fragile-media"), 64),
 	}); err != nil {
-		t.Fatal(err)
-	}
-	var ref string
-	if err := st.db.QueryRow(`SELECT req_blob FROM audit_conversations WHERE id='fragile'`).Scan(&ref); err != nil {
-		t.Fatal(err)
-	}
-	if ref == "" {
-		t.Fatal("row did not externalize its body")
-	}
-	if err := os.Remove(filepath.Join(dir, "blobs", ref[:2], ref)); err != nil {
 		t.Fatal(err)
 	}
 	full, found, err := st.GetAuditConversation(context.Background(), "fragile")
 	if err != nil || !found {
-		t.Fatalf("GetAuditConversation found=%v err=%v, want usable row", found, err)
+		t.Fatalf("GetAuditConversation found=%v err=%v", found, err)
 	}
-	if len(full.RequestBody) != 0 {
-		t.Fatalf("lost blob returned an inline body (len=%d), want none", len(full.RequestBody))
+	if full.RequestBodyRef == "" {
+		t.Fatal("row did not store its body")
 	}
-	if full.RequestBodyRef != ref {
-		t.Fatalf("detail view ref=%q, want %q (metadata must stay usable)", full.RequestBodyRef, ref)
+	// Lose the segment that carries the body, as a pruned or damaged file
+	// would. The row must stay usable and only the body becomes unavailable.
+	segments, err := os.ReadDir(filepath.Join(dir, "audit", "segments"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, _, err := st.OpenBlob(ref); !errors.Is(err, ErrBlobNotFound) {
-		t.Fatalf("OpenBlob(lost blob) err=%v, want ErrBlobNotFound", err)
+	removed := 0
+	for _, entry := range segments {
+		if entry.IsDir() {
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, "audit", "segments", entry.Name())); err != nil {
+			t.Fatal(err)
+		}
+		removed++
+	}
+	if removed == 0 {
+		t.Fatal("no segment file was written")
+	}
+	full, found, err = st.GetAuditConversation(context.Background(), "fragile")
+	if err != nil || !found {
+		t.Fatalf("GetAuditConversation after loss found=%v err=%v, want usable row", found, err)
+	}
+	if full.RequestBodyRef == "" {
+		t.Fatal("lost body dropped its reference; metadata must stay usable")
+	}
+	if _, _, _, err := st.OpenBody(full.RequestBodyRef); !errors.Is(err, ErrBlobNotFound) {
+		t.Fatalf("OpenBody(lost segment) err=%v, want ErrBlobNotFound", err)
 	}
 }

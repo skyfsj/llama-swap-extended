@@ -12,6 +12,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/mostlygeek/llama-swap/internal/launchspec"
 	"gopkg.in/yaml.v3"
 )
 
@@ -20,23 +21,13 @@ const (
 	AdapterProtocolResponsesToChat = "responsesToChat"
 )
 
-// EffectiveProtocol resolves which adapter serves a Responses request for this
-// backend.
-//
-// Conversion is the default because for most inference backends the Responses
-// API is only partially implemented: a native pass-through hands the client
-// whatever gaps the backend has — tool-call shapes that Codex cannot follow,
-// reasoning fields dropped, terminals that never close the stream — while the
-// adapter normalises all of them on the way through. AdapterProtocolNative stays
-// available as an explicit opt-out for a backend whose Responses support is
-// complete, where the round trip through the Chat protocol would only lose
-// native-only features.
-func (b BackendConfig) EffectiveProtocol() string {
-	if strings.TrimSpace(b.Protocol) == AdapterProtocolNative {
-		return AdapterProtocolNative
-	}
+// EffectiveProtocol resolves the upstream text format. Protocol is retained
+// for existing configurations, but inference backends receive Chat requests.
+func (BackendConfig) EffectiveProtocol() string {
 	return AdapterProtocolResponsesToChat
 }
+
+func (BackendConfig) AdaptsResponses() bool { return true }
 
 // BackendConfig describes a managed backend without changing the legacy
 // command-based model contract. An empty backend block keeps the existing
@@ -44,6 +35,16 @@ func (b BackendConfig) EffectiveProtocol() string {
 type BackendConfig struct {
 	Type    string `yaml:"type" json:"type"`
 	Runtime string `yaml:"runtime" json:"runtime"`
+	// EntryPoint is an optional custom launch head for a native managed
+	// runtime: instead of the runtime kind's canonical entrypoint
+	// (`vllm serve` / `llama-server`), the process runs exactly these tokens
+	// followed by backend.args. It exists for custom servers that must run
+	// under a managed runtime's environment (for example a Python ASR server
+	// started with the runtime's interpreter). The runtime still supplies the
+	// PATH, library paths and version management; the operator supplies the
+	// command head. Ports are written explicitly as ${PORT} in the entrypoint
+	// or args because no engine-specific flags are injected for it.
+	EntryPoint string `yaml:"entrypoint" json:"entrypoint,omitempty"`
 	// RuntimeVersion pins the model to one installed version of its managed
 	// runtime (backend.runtime). Empty follows the runtime's current pointer.
 	// The pinned version must stay installed: deletion of a pinned version is
@@ -893,6 +894,109 @@ type RuntimeConfig struct {
 	Container RuntimeContainerConfig `yaml:"container" json:"container"`
 	Update    RuntimeUpdateConfig    `yaml:"update" json:"update"`
 	Verify    RuntimeVerifyConfig    `yaml:"verify" json:"verify"`
+	// Metadata is the runtime-level launch metadata every model on this
+	// runtime inherits: the launch head for runtimes that front a custom
+	// server, and the quick-config engine defaults. A model overrides any of
+	// them — its own entrypoint wins, and a flag written in its args always
+	// beats the corresponding default.
+	Metadata RuntimeMetadataConfig `yaml:"metadata" json:"metadata"`
+}
+
+// Validate checks the runtime's launch metadata: the entrypoint only makes
+// sense for a native runtime, and the quick-config defaults must be sane.
+func (m RuntimeMetadataConfig) Validate(runtimeName, mode string) error {
+	if strings.ContainsRune(m.EntryPoint, '\x00') {
+		return fmt.Errorf("runtime %s: metadata.entrypoint contains NUL", runtimeName)
+	}
+	if strings.TrimSpace(m.EntryPoint) != "" && mode == "container" {
+		return fmt.Errorf("runtime %s: metadata.entrypoint requires mode native", runtimeName)
+	}
+	if m.ContextPerRequest < 0 {
+		return fmt.Errorf("runtime %s: metadata.contextPerRequest must be >= 0", runtimeName)
+	}
+	if m.MaxConcurrency < 0 {
+		return fmt.Errorf("runtime %s: metadata.maxConcurrency must be >= 0", runtimeName)
+	}
+	if m.TensorParallelSize < 0 {
+		return fmt.Errorf("runtime %s: metadata.tensorParallelSize must be >= 0", runtimeName)
+	}
+	if m.GPUMemoryUtilization != nil && (*m.GPUMemoryUtilization <= 0 || *m.GPUMemoryUtilization > 1) {
+		return fmt.Errorf("runtime %s: metadata.gpuMemoryUtilization must be within (0, 1]", runtimeName)
+	}
+	return nil
+}
+
+// EffectiveLaunchMetadata resolves the launch head and quick-config defaults a
+// model inherits from its runtime. The model's own entrypoint wins over the
+// runtime's. Defaults are rendered as engine flags and are empty when a custom
+// head is in effect (a custom server has no engine grammar to inject into) or
+// when the model already pins the flag in its args.
+func EffectiveLaunchMetadata(model ModelConfig, runtime RuntimeConfig, kind string) (string, []string) {
+	entrypoint := strings.TrimSpace(model.Backend.EntryPoint)
+	if entrypoint == "" {
+		entrypoint = strings.TrimSpace(runtime.Metadata.EntryPoint)
+	}
+	if entrypoint != "" || runtime.Metadata.Empty() {
+		return entrypoint, nil
+	}
+	spec := launchspec.Spec{
+		ServedModelName:      "",
+		ContextPerRequest:    runtime.Metadata.ContextPerRequest,
+		MaxConcurrency:       runtime.Metadata.MaxConcurrency,
+		GPUMemoryUtilization: runtime.Metadata.GPUMemoryUtilization,
+		TensorParallelSize:   runtime.Metadata.TensorParallelSize,
+	}
+	rendered := spec.BuildArgs(kind, false)
+	if len(rendered) == 0 {
+		return entrypoint, nil
+	}
+	present := make(map[string]bool, len(model.Backend.Arguments))
+	for _, token := range SplitManagedLaunchTokens(model.Backend.Arguments) {
+		if name := flagName(token); name != "" {
+			present[name] = true
+		}
+	}
+	defaults := make([]string, 0, len(rendered))
+	for index := 0; index < len(rendered); index++ {
+		token := rendered[index]
+		name := flagName(token)
+		if name == "" || present[name] {
+			continue
+		}
+		if strings.Contains(token, "=") {
+			defaults = append(defaults, token)
+			continue
+		}
+		if index+1 < len(rendered) {
+			defaults = append(defaults, token, rendered[index+1])
+			index++
+			continue
+		}
+		defaults = append(defaults, token)
+	}
+	return entrypoint, defaults
+}
+
+// RuntimeMetadataConfig is a runtime's launch metadata.
+type RuntimeMetadataConfig struct {
+	// EntryPoint is the launch head for models on this runtime, for example
+	// "python3 /scripts/server.py". Empty keeps the runtime kind's canonical
+	// entrypoint (`vllm serve` / `llama-server`). When set, the quick-config
+	// defaults below are not rendered: a custom head owns its whole command
+	// line, so engine flags would not apply.
+	EntryPoint string `yaml:"entrypoint" json:"entrypoint,omitempty"`
+	// The quick-config defaults, rendered as engine flags for every model on
+	// this runtime that does not pin the flag in its own args.
+	ContextPerRequest    int      `yaml:"contextPerRequest" json:"contextPerRequest,omitempty"`
+	MaxConcurrency       int      `yaml:"maxConcurrency" json:"maxConcurrency,omitempty"`
+	TensorParallelSize   int      `yaml:"tensorParallelSize" json:"tensorParallelSize,omitempty"`
+	GPUMemoryUtilization *float64 `yaml:"gpuMemoryUtilization" json:"gpuMemoryUtilization,omitempty"`
+}
+
+// Empty reports a metadata block that would add nothing.
+func (m RuntimeMetadataConfig) Empty() bool {
+	return strings.TrimSpace(m.EntryPoint) == "" && m.ContextPerRequest == 0 &&
+		m.MaxConcurrency == 0 && m.TensorParallelSize == 0 && m.GPUMemoryUtilization == nil
 }
 
 type RuntimeSource struct {
@@ -1213,6 +1317,12 @@ type AuditConfig struct {
 	MaxBytes      int64         `yaml:"maxBytes" json:"maxBytes"`
 	StoreMedia    bool          `yaml:"storeMedia" json:"storeMedia"`
 	RedactHeaders bool          `yaml:"redactHeaders" json:"redactHeaders"`
+	// ActivityRetention bounds the operational activity rows (the per-request
+	// metrics behind the dashboards). It is independent of the audit
+	// retention: a deployment can keep conversations for a month while
+	// trimming the metric rows that stop being interesting much sooner. Zero
+	// keeps them indefinitely, matching the historical behavior.
+	ActivityRetention time.Duration `yaml:"activityRetention" json:"activityRetention"`
 }
 
 type PricingConfig struct {
@@ -1295,8 +1405,8 @@ func (c Config) ValidateExtensionConfig() error {
 	if err := c.Anthropic.CacheFix.Validate(); err != nil {
 		return err
 	}
-	if c.Audit.Retention < 0 || c.Audit.MaxBytes < 0 {
-		return fmt.Errorf("audit retention and maxBytes must be >= 0")
+	if c.Audit.Retention < 0 || c.Audit.MaxBytes < 0 || c.Audit.ActivityRetention < 0 {
+		return fmt.Errorf("audit retention, activityRetention and maxBytes must be >= 0")
 	}
 	if c.Pricing.ModelsDev.URL != "" {
 		u, err := url.Parse(c.Pricing.ModelsDev.URL)
@@ -1321,10 +1431,9 @@ func (c Config) ValidateExtensionConfig() error {
 	// Migrate once, before the validation loop: the migration mutates the
 	// shared Models map, so running it inside the loop validated a mix of
 	// pre- and post-migration model copies and re-ran the whole scan per
-	// model (O(n²)). Legacy args-only managed models upgrade to the
-	// structured launch block when the migration is provably lossless;
-	// ambiguous text stays as written and keeps working through the legacy
-	// path.
+	// model (O(n²)). A legacy structured launch block is folded into
+	// backend.args here, making the command text the single source of truth
+	// for the rest of the pipeline.
 	c.MigrateLaunchBlocks()
 	for name, model := range c.Models {
 		if err := model.Backend.Validate(name); err != nil {
@@ -1386,43 +1495,18 @@ func (c Config) validateManagedRuntimeReference(modelName string, model ModelCon
 	if strings.TrimSpace(model.Backend.Container.Image) != "" {
 		return fmt.Errorf("model %s: native backend.runtime %q cannot use backend.container", modelName, runtimeName)
 	}
-	if len(model.Backend.Arguments) == 0 && model.Backend.Launch == nil {
-		return fmt.Errorf("model %s: native backend.runtime %q requires backend.args or backend.launch", modelName, runtimeName)
+	if len(model.Backend.Arguments) == 0 && strings.TrimSpace(model.Backend.EntryPoint) == "" {
+		return fmt.Errorf("model %s: native backend.runtime %q requires backend.args", modelName, runtimeName)
 	}
-	// The launch binding ignores operator-written argv[0] and always executes
-	// the runtime-owned entrypoint, so the args may start anywhere; what the
-	// config must provide is a model target — from the structured launch
-	// block or from the args text itself.
-	if model.Backend.Launch != nil && strings.TrimSpace(model.Backend.Launch.Model) != "" {
-		if err := validateLaunchExtraArguments(modelName, runtimeKind, model.Backend.Arguments); err != nil {
-			return err
-		}
+	// A custom launch head owns its whole command line: the flags a kind would
+	// inject do not apply, so only the token list is validated.
+	if strings.TrimSpace(model.Backend.EntryPoint) != "" {
 		return nil
 	}
+	// Engine flags are owned by backend.args; the builder only needs a model
+	// target, which may appear anywhere in the operator's argument list.
 	if _, err := RebuildManagedLaunchArguments(model.Backend.Arguments, runtimeKind, model.Proxy); err != nil {
 		return fmt.Errorf("model %s: native backend.runtime %q: %w", modelName, runtimeName, err)
-	}
-	return nil
-}
-
-// validateLaunchExtraArguments rejects engine arguments that a structured
-// launch block already owns: the basic fields have exclusive control over
-// their flags, and a duplicate in the extras would silently win or lose.
-func validateLaunchExtraArguments(modelName, kind string, args []string) error {
-	tokens := SplitManagedLaunchTokens(args)
-	reserved := launchspecReservedFlags(kind)
-	for index := 0; index < len(tokens); index++ {
-		token := tokens[index]
-		name := token
-		if equals := strings.Index(token, "="); equals > 0 {
-			name = token[:equals]
-		}
-		if reserved[name] {
-			return fmt.Errorf("model %s: backend.args %s is managed by backend.launch; remove it from the extra arguments", modelName, name)
-		}
-		if name == "--host" || name == "-hp" || name == "--port" {
-			index++
-		}
 	}
 	return nil
 }
@@ -1514,6 +1598,9 @@ func (r RuntimeConfig) Validate(name string) error {
 		return err
 	}
 	if err := validateRuntimeContainer(name, r.Container); err != nil {
+		return err
+	}
+	if err := r.Metadata.Validate(name, mode); err != nil {
 		return err
 	}
 	if r.Update.Policy != "" && r.Update.Policy != "disabled" && r.Update.Policy != "manual" && r.Update.Policy != "automatic" && r.Update.Policy != "pinned" {
@@ -1902,7 +1989,7 @@ func (b BackendConfig) Validate(model string) error {
 	if b.Type != "" && b.Type != "llamacpp" && b.Type != "vllm" && b.Type != "generic" {
 		return fmt.Errorf("model %s: backend.type is invalid", model)
 	}
-	if b.Protocol != "" && b.Protocol != "native" && b.Protocol != "responsesToChat" {
+	if b.Protocol != "" && b.Protocol != AdapterProtocolNative && b.Protocol != AdapterProtocolResponsesToChat {
 		return fmt.Errorf("model %s: backend.protocol is invalid", model)
 	}
 	if runtimeName := strings.TrimSpace(b.Runtime); runtimeName != "" && !safeRuntimeToken(runtimeName) {

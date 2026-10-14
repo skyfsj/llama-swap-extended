@@ -445,12 +445,12 @@ models:
 			t.Fatalf("Failed to load config: %v", err)
 		}
 		assert.Equal(t, "http://127.0.0.1:6200", config.Models["model1"].Proxy)
-		// The hand-written args migrate into the structured launch block.
-		launch := config.Models["model1"].Backend.Launch
-		if launch == nil || launch.Model != "/models/qwen" {
-			t.Fatalf("expected a migrated launch block, got %+v", launch)
+		// The command text stays the single source of truth: no structured
+		// launch block is synthesized and the args round-trip verbatim.
+		if launch := config.Models["model1"].Backend.Launch; launch != nil {
+			t.Fatalf("unexpected migrated launch block: %+v", launch)
 		}
-		assert.Equal(t, []string{}, config.Models["model1"].Backend.Arguments)
+		assert.Equal(t, []string{"--model", "/models/qwen"}, config.Models["model1"].Backend.Arguments)
 	})
 }
 

@@ -178,6 +178,7 @@ func DefaultDescriptors() []RouteDescriptor {
 		{Method: http.MethodGet, Pattern: "/v1/audio/voices", APIFamily: "openai", Body: BodyQuery, ModelField: "model", ModelLocation: "query", Capability: "speech", Permission: inference},
 		{Method: http.MethodPost, Pattern: "/v1/messages", APIFamily: "anthropic", Body: BodyJSON, ModelField: "model", ModelLocation: "body", Capability: "anthropic", Permission: inference},
 		{Method: http.MethodPost, Pattern: "/v1/messages/count_tokens", APIFamily: "anthropic", Body: BodyJSON, ModelField: "model", ModelLocation: "body", Capability: "anthropic", Permission: inference},
+		{Method: http.MethodPost, Pattern: "/v1beta/models/{geminiPath...}", APIFamily: "gemini", Body: BodyJSON, ModelField: "model", ModelLocation: "path", Capability: "gemini", Streaming: "sse", Permission: inference},
 		{Method: http.MethodPost, Pattern: "/v/messages", APIFamily: "anthropic", Body: BodyJSON, ModelField: "model", ModelLocation: "body", Capability: "anthropic", Permission: inference},
 		{Method: http.MethodPost, Pattern: "/v/messages/count_tokens", APIFamily: "anthropic", Body: BodyJSON, ModelField: "model", ModelLocation: "body", Capability: "anthropic", Permission: inference},
 		{Method: http.MethodPost, Pattern: "/v2/embed", Body: BodyJSON, ModelField: "model", ModelLocation: "body", Capability: "embed", Permission: inference},

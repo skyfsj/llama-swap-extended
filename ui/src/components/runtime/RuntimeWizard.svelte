@@ -151,6 +151,34 @@
     updateConfig({ ...runtimeConfig, update: { ...asRecord(runtimeConfig.update), [key]: value } });
   }
 
+  // Launch metadata is runtime-scoped: every model on this runtime inherits the
+  // launch head and the quick-config defaults unless it overrides them.
+  function metadataValue(key: string): unknown {
+    return asRecord(runtimeConfig.metadata)[key];
+  }
+
+  function updateMetadataValue(key: string, value: unknown): void {
+    const metadata = { ...asRecord(runtimeConfig.metadata) };
+    if (value === "" || value === undefined) delete metadata[key];
+    else metadata[key] = value;
+    if (Object.keys(metadata).length === 0) {
+      const { metadata: _dropped, ...rest } = runtimeConfig;
+      updateConfig(rest);
+      return;
+    }
+    updateConfig({ ...runtimeConfig, metadata });
+  }
+
+  function updateMetadataNumber(key: string, raw: string): void {
+    const trimmed = raw.trim();
+    if (trimmed === "") {
+      updateMetadataValue(key, "");
+      return;
+    }
+    const parsed = Number(trimmed);
+    updateMetadataValue(key, Number.isFinite(parsed) ? parsed : "");
+  }
+
   function policyValue(key: string): unknown {
     return asRecord(runtimeConfig.update)[key];
   }
@@ -295,6 +323,19 @@
           {#if ["release", "channel"].includes(sourceValue("type"))}<label class="grid gap-1 text-sm"><span class="font-medium">{$translate("controlPlane.runtimeCenter.wizard.sourceURL")}</span><input class="h-9 rounded-lg border border-input bg-background px-3 font-mono text-xs outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50" value={sourceValue("url")} oninput={(event) => setSourceValue("url", event.currentTarget.value)} placeholder="https://example.com/llama.cpp.tar.gz" /></label>{/if}
           {#if sourceValue("type") === "local"}<label class="grid gap-1 text-sm"><span class="font-medium">{$translate("controlPlane.runtimeCenter.wizard.sourcePath")}</span><input class="h-9 rounded-lg border border-input bg-background px-3 font-mono text-xs outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50" value={sourceValue("path")} oninput={(event) => setSourceValue("path", event.currentTarget.value)} placeholder="/opt/runtime-sources/llama.cpp" /></label>{/if}
           {#if String(runtimeConfig.mode ?? "native") === "container" || sourceValue("type") === "image"}<div class="grid gap-2 sm:grid-cols-2"><label class="grid gap-1 text-sm sm:col-span-2"><span class="font-medium">{$translate("controlPlane.runtimeCenter.wizard.image")}</span><input class="h-9 rounded-lg border border-input bg-background px-3 font-mono text-xs outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50" value={sourceValue("image")} oninput={(event) => setSourceValue("image", event.currentTarget.value)} placeholder="registry.example/vllm:stable" /></label></div>{/if}
+          {#if String(runtimeConfig.mode ?? "native") === "native"}
+            <fieldset class="grid gap-2 rounded-lg border p-3">
+              <legend class="px-1 text-sm font-semibold">{$translate("controlPlane.runtimeCenter.wizard.metadataLegend")}</legend>
+              <p class="text-muted-foreground text-xs">{$translate("controlPlane.runtimeCenter.wizard.metadataHint")}</p>
+              <label class="grid gap-1 text-sm"><span class="font-medium">{$translate("controlPlane.runtimeCenter.wizard.metadataEntryPoint")}</span><input class="h-9 rounded-lg border border-input bg-background px-3 font-mono text-xs outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50" value={String(metadataValue("entrypoint") ?? "")} oninput={(event) => updateMetadataValue("entrypoint", event.currentTarget.value)} placeholder="python3 /var/lib/llama-swap/scripts/qwen-asr-server.py" /><span class="text-muted-foreground text-xs">{$translate("controlPlane.runtimeCenter.wizard.metadataEntryPointHint")}</span></label>
+              <div class="grid gap-2 sm:grid-cols-2">
+                <label class="grid gap-1 text-sm"><span class="font-medium">{$translate("controlPlane.launchContextPerRequest")}</span><input class="h-9 rounded-lg border border-input bg-background px-3 text-sm" type="number" min="0" value={String(metadataValue("contextPerRequest") ?? "")} oninput={(event) => updateMetadataNumber("contextPerRequest", event.currentTarget.value)} placeholder="262144" /></label>
+                <label class="grid gap-1 text-sm"><span class="font-medium">{$translate("controlPlane.launchMaxConcurrency")}</span><input class="h-9 rounded-lg border border-input bg-background px-3 text-sm" type="number" min="0" value={String(metadataValue("maxConcurrency") ?? "")} oninput={(event) => updateMetadataNumber("maxConcurrency", event.currentTarget.value)} placeholder="2" /></label>
+                <label class="grid gap-1 text-sm"><span class="font-medium">{$translate("controlPlane.launchTensorParallelSize")}</span><input class="h-9 rounded-lg border border-input bg-background px-3 text-sm" type="number" min="0" value={String(metadataValue("tensorParallelSize") ?? "")} oninput={(event) => updateMetadataNumber("tensorParallelSize", event.currentTarget.value)} placeholder="4" /></label>
+                <label class="grid gap-1 text-sm"><span class="font-medium">{$translate("controlPlane.launchGPUMemoryUtilization")}</span><input class="h-9 rounded-lg border border-input bg-background px-3 text-sm" type="number" min="0" max="100" value={metadataValue("gpuMemoryUtilization") === undefined ? "" : String(Number(metadataValue("gpuMemoryUtilization")) * 100)} oninput={(event) => { const raw = event.currentTarget.value.trim(); updateMetadataValue("gpuMemoryUtilization", raw === "" ? "" : Number(raw) / 100); }} placeholder="90" /></label>
+              </div>
+            </fieldset>
+          {/if}
           <fieldset class="grid gap-2 rounded-lg border p-3"><legend class="px-1 text-sm font-semibold">{$translate("controlPlane.runtimeCenter.wizard.policyLegend")}</legend><div class="grid gap-2 sm:grid-cols-2"><label class="grid gap-1 text-sm"><span class="font-medium">{$translate("controlPlane.runtimeCenter.wizard.policy")}</span><select class="h-9 rounded-lg border border-input bg-background px-3 text-sm" value={String(policyValue("policy") ?? "automatic")} onchange={(event) => updatePolicyValue("policy", event.currentTarget.value)}><option value="automatic">{$translate("controlPlane.runtimeCenter.policy.automatic")}</option><option value="manual">{$translate("controlPlane.runtimeCenter.policy.manual")}</option><option value="disabled">{$translate("controlPlane.runtimeCenter.policy.disabled")}</option><option value="pinned">{$translate("controlPlane.runtimeCenter.policy.pinned")}</option></select></label><label class="flex items-center gap-2 pt-5 text-sm"><input type="checkbox" checked={policyValue("activateOnlyWhenIdle") !== false} onchange={(event) => updatePolicyValue("activateOnlyWhenIdle", event.currentTarget.checked)} />{$translate("controlPlane.runtimeCenter.wizard.idleGate")}</label></div><div class="grid gap-2 sm:grid-cols-2"><label class="grid gap-1 text-sm"><span class="font-medium">{$translate("controlPlane.runtimeCenter.wizard.keepVersions")}</span><input class="h-9 rounded-lg border border-input bg-background px-3 text-sm" type="number" min="0" max="20" value={Number(policyValue("keepVersions") ?? 2)} oninput={(event) => updatePolicyValue("keepVersions", Number(event.currentTarget.value))} /></label><label class="flex items-center gap-2 pt-5 text-sm"><input type="checkbox" checked={policyValue("rollbackOnFailure") !== false} onchange={(event) => updatePolicyValue("rollbackOnFailure", event.currentTarget.checked)} />{$translate("controlPlane.runtimeCenter.wizard.rollback")}</label></div></fieldset>
           {#if mode === "edit"}<details class="rounded-lg border px-3 py-2"><summary class="cursor-pointer text-sm font-medium">{$translate("controlPlane.runtimeCenter.wizard.expertSummary")}</summary><div class="mt-2 grid gap-2"><p class="text-xs text-muted-foreground">{$translate("controlPlane.runtimeCenter.wizard.expertHint")}</p><textarea class="min-h-48 w-full rounded-lg border border-input bg-background p-3 font-mono text-xs leading-5 outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50" bind:value={expertJSON} oninput={syncExpert} aria-label={$translate("controlPlane.runtimeCenter.expert.ariaLabel")}></textarea>{#if expertError}<p class="text-xs text-destructive" role="alert">{expertError}</p>{/if}</div></details>{/if}
         </div>

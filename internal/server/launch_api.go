@@ -52,10 +52,10 @@ func (s *Server) handleAPILaunchParse(w http.ResponseWriter, r *http.Request) {
 // command line. The draft uses the same shape as the public model config.
 func (s *Server) handleAPILaunchPreview(w http.ResponseWriter, r *http.Request) {
 	var request struct {
-		Kind   string                    `json:"kind"`
-		Proxy  string                    `json:"proxy"`
-		Args   []string                  `json:"args"`
-		Launch *config.ModelLaunchConfig `json:"launch"`
+		Kind       string   `json:"kind"`
+		Proxy      string   `json:"proxy"`
+		Args       []string `json:"args"`
+		EntryPoint string   `json:"entrypoint"`
 	}
 	if err := decodeJSONBody(w, r, &request, 256<<10); err != nil {
 		swaputil.SendResponse(w, r, http.StatusBadRequest, err.Error())
@@ -66,15 +66,7 @@ func (s *Server) handleAPILaunchPreview(w http.ResponseWriter, r *http.Request) 
 		swaputil.SendResponse(w, r, http.StatusBadRequest, "kind must be vllm or llamacpp")
 		return
 	}
-	launch := request.Launch
-	if launch != nil && len(launch.GPUs) > 0 {
-		// Same vendor rule as the real launch: only NVIDIA selections reach
-		// CUDA_VISIBLE_DEVICES, so the preview mirrors the bound argv/env.
-		boundLaunch := *launch
-		boundLaunch.GPUs = nvidiaLaunchDevices(s.hardware, launch.GPUs)
-		launch = &boundLaunch
-	}
-	argv, env, err := config.BuildManagedLaunchArguments(request.Args, launch, kind, request.Proxy)
+	argv, env, err := config.BuildManagedLaunchArguments(request.Args, request.EntryPoint, kind, request.Proxy)
 	if err != nil {
 		swaputil.SendResponse(w, r, http.StatusBadRequest, err.Error())
 		return

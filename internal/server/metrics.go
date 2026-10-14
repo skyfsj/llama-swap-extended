@@ -6,12 +6,14 @@ import (
 	"compress/flate"
 	"compress/gzip"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"math"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"sync"
@@ -489,9 +491,16 @@ func (mp *metricsMonitor) persistAudit(metric ActivityLogEntry, r *http.Request,
 	// Media persistence is explicit because multipart/audio bodies can be very
 	// large. The default is true, matching the product's raw-audit contract.
 	// Non-media endpoints are retained regardless of whether a client used
-	// JSON or SSE. StoreMedia only controls large binary/media routes.
-	storeBody := mp.audit.StoreMedia || !isMediaRequestPath(r.URL.Path)
-	if !storeBody {
+	// JSON or SSE. StoreMedia only controls large binary/media routes. A
+	// multipart form is re-encoded into structured JSON either way so the
+	// transcript can render its fields and file metadata readably; only the
+	// inline file contents follow StoreMedia.
+	storeMedia := mp.audit.StoreMedia
+	structured, isForm := structuredFormCapture(r, reqBody, storeMedia)
+	storeBody := storeMedia || !isMediaRequestPath(r.URL.Path) || isForm
+	if storeBody {
+		reqBody = structured
+	} else {
 		reqBody = nil
 		respBody = nil
 	}
@@ -545,6 +554,84 @@ func (mp *metricsMonitor) persistAudit(metric ActivityLogEntry, r *http.Request,
 
 func isMediaRequestPath(path string) bool {
 	return strings.Contains(path, "/audio/") || strings.Contains(path, "/images/") || strings.HasPrefix(path, "/sdapi/")
+}
+
+// formAuditFileMaxBytes caps how much of one uploaded file's content is
+// inlined into a structured form capture when StoreMedia is enabled. The
+// cap keeps a single large upload from dominating the audit byte budget
+// while small audio clips stay fully replayable.
+const formAuditFileMaxBytes = 8 << 20
+
+// structuredFormCapture converts a multipart/form-data request body into a
+// JSON document the audit transcript can render: text fields become named
+// values and every uploaded file becomes metadata (name, MIME type, size)
+// plus inline content when small enough and media storage is enabled. The
+// second return value reports whether the body was a multipart form — true
+// means the capture is self-describing JSON and stays persisted even on
+// media paths where raw bytes would follow StoreMedia. Bodies in any other
+// encoding pass through unchanged; the audit view already renders JSON and
+// urlencoded forms readably.
+func structuredFormCapture(r *http.Request, reqBody []byte, storeMedia bool) ([]byte, bool) {
+	if len(reqBody) == 0 || !strings.Contains(strings.ToLower(r.Header.Get("Content-Type")), "multipart/form-data") {
+		return reqBody, false
+	}
+	// Parse from a fresh reader so the caller's copy of the body is untouched.
+	boundaryReader := httptest.NewRequest(http.MethodPost, r.URL.String(), bytes.NewReader(reqBody))
+	boundaryReader.Header.Set("Content-Type", r.Header.Get("Content-Type"))
+	if err := boundaryReader.ParseMultipartForm(swaputil.MaxMultiPartSize); err != nil {
+		return reqBody, false
+	}
+	defer boundaryReader.MultipartForm.RemoveAll()
+
+	capture := map[string]any{
+		"format": "multipart-form",
+		"fields": map[string]string{},
+		"files":  []map[string]any{},
+	}
+	fields := capture["fields"].(map[string]string)
+	files := capture["files"].([]map[string]any)
+	for key, values := range boundaryReader.MultipartForm.Value {
+		if len(values) > 0 {
+			fields[key] = values[0]
+		}
+	}
+	for key, headers := range boundaryReader.MultipartForm.File {
+		for _, header := range headers {
+			file, err := header.Open()
+			if err != nil {
+				continue
+			}
+			content, err := io.ReadAll(io.LimitReader(file, formAuditFileMaxBytes+1))
+			file.Close()
+			if err != nil {
+				continue
+			}
+			entry := map[string]any{
+				"field":    key,
+				"filename": header.Filename,
+				"mimeType": header.Header.Get("Content-Type"),
+				"size":     header.Size,
+			}
+			if len(content) <= formAuditFileMaxBytes {
+				entry["content"] = base64.StdEncoding.EncodeToString(content)
+				if int64(len(content)) < header.Size {
+					entry["truncated"] = true
+				}
+			} else {
+				entry["truncated"] = true
+			}
+			if !storeMedia {
+				delete(entry, "content")
+			}
+			files = append(files, entry)
+		}
+	}
+	capture["files"] = files
+	encoded, err := json.Marshal(capture)
+	if err != nil {
+		return reqBody, false
+	}
+	return encoded, true
 }
 
 // decodeResponseBody returns the buffered response body, decompressing it when

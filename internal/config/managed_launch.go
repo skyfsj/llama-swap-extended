@@ -177,105 +177,38 @@ func RebuildManagedLaunchArguments(args []string, kind, proxy string) ([]string,
 	return append(rebuilt, extras...), nil
 }
 
-// BuildManagedLaunchArguments renders the final managed argv for a model,
-// merging the structured launch block with the operator's extra arguments.
-// The first return value is the argv; the second carries the environment the
-// structured block owns (CUDA_VISIBLE_DEVICES from the GPU selection). A nil
-// launch block falls back to the legacy args-only rebuild.
-func BuildManagedLaunchArguments(args []string, launch *ModelLaunchConfig, kind, proxy string) ([]string, []string, error) {
-	if launch == nil || (launch.Model == "" && launch.ServedModelName == "" &&
-		launch.ContextPerRequest == 0 && launch.MaxConcurrency == 0 &&
-		launch.GPUMemoryUtilization == nil && launch.TensorParallelSize == 0 &&
-		len(launch.GPUs) == 0) {
-		rebuilt, err := RebuildManagedLaunchArguments(args, kind, proxy)
-		return rebuilt, nil, err
-	}
-
-	tokens := SplitManagedLaunchTokens(args)
-	parsed, err := launchspec.ParseTokens(kind, tokens)
-	if err != nil {
-		return nil, nil, fmt.Errorf("parse backend.args: %w", err)
-	}
-
-	spec := launch.Spec()
-	// Existing configurations can contain both backend.launch and the old
-	// whole-line backend.args representation. Fill only missing structured
-	// fields from the parsed args so that those values are not left behind as
-	// positional tokens (the exact failure seen with vLLM's TP value).
-	if strings.TrimSpace(spec.Model) == "" {
-		spec.Model = parsed.Model
-	}
-	if spec.ServedModelName == "" {
-		spec.ServedModelName = parsed.ServedModelName
-	}
-	if spec.ContextPerRequest == 0 {
-		spec.ContextPerRequest = parsed.ContextPerRequest
-	}
-	if spec.MaxConcurrency == 0 {
-		spec.MaxConcurrency = parsed.MaxConcurrency
-	}
-	if spec.GPUMemoryUtilization == nil {
-		spec.GPUMemoryUtilization = parsed.GPUMemoryUtilization
-	}
-	if spec.TensorParallelSize == 0 {
-		spec.TensorParallelSize = parsed.TensorParallelSize
-	}
-	if len(spec.CUDAVisibleDevices) == 0 {
-		spec.CUDAVisibleDevices = parsed.CUDAVisibleDevices
-	}
-
-	model := strings.TrimSpace(spec.Model)
-	if model == "" {
-		model = strings.TrimSpace(parsed.Model)
-	}
-	if model == "" {
-		return nil, nil, errors.New("backend.launch must set a model target")
-	}
-
-	host, port := "", ""
-	if trimmed := strings.TrimSpace(proxy); trimmed != "" {
-		parsed := trimmed
-		if !strings.Contains(parsed, "://") {
-			parsed = "http://" + parsed
+// BuildManagedLaunchArguments renders the final managed argv for a model.
+// backend.args is the single source of truth for engine flags: the structured
+// launch block is folded into it at config load (see MigrateLaunchBlocks), so
+// this builder only owns the launch head and the system-injected bind address.
+//
+// Two shapes are supported:
+//
+//   - Default head (backend.entrypoint empty): the runtime kind owns the
+//     entrypoint. The model target comes from args, and the bind host/port are
+//     injected from the model's resolved proxy.
+//   - Custom head (backend.entrypoint set): the operator's head runs verbatim,
+//     followed by args. No engine-specific flags are injected — ports are
+//     written explicitly as ${PORT} — so a custom server can run under the
+//     managed runtime's environment without pretending to be vLLM or llama.cpp.
+func BuildManagedLaunchArguments(args []string, entrypoint, kind, proxy string) ([]string, []string, error) {
+	if trimmed := strings.TrimSpace(entrypoint); trimmed != "" {
+		// The head is a shell-like command line, so it is tokenized with the
+		// same lexer the operator's argument text uses — never executed.
+		head := launchspec.Tokenize(trimmed)
+		if len(head) == 0 {
+			return nil, nil, errors.New("backend.entrypoint is empty")
 		}
-		if target, err := url.Parse(parsed); err == nil {
-			host = target.Hostname()
-			port = target.Port()
-		}
-		// A previewed draft may still carry the unresolved ${PORT} macro
-		// (allocation happens at config load). Keep it verbatim so the echoed
-		// command shows where the port will be injected.
-		if port == "" && strings.Contains(trimmed, "${PORT}") {
-			port = "${PORT}"
-		}
+		// The args are appended verbatim: a custom head has no engine grammar to
+		// inject into, so the operator owns the whole line — including the
+		// --port that carries the allocated ${PORT}. Only the token split is
+		// normalized (whole-line entries become pairs).
+		rest := SplitManagedLaunchTokens(args)
+		rebuilt := make([]string, 0, len(head)+len(rest))
+		rebuilt = append(rebuilt, head...)
+		rebuilt = append(rebuilt, rest...)
+		return rebuilt, nil, nil
 	}
-	if host == "" {
-		host = "127.0.0.1"
-	}
-
-	// The canonical prefix already carries --model; the structured build
-	// only adds the remaining managed flags.
-	spec.Model = ""
-	if kind == "vllm" && spec.TensorParallelSize == 0 && len(spec.CUDAVisibleDevices) > 1 {
-		// Auto parallel strategy: one shard per selected GPU unless the
-		// operator pinned an explicit tensor-parallel-size.
-		spec.TensorParallelSize = len(spec.CUDAVisibleDevices)
-	}
-
-	var rebuilt []string
-	if kind == "vllm" {
-		rebuilt = []string{"vllm", "serve", "--model", model, "--host", host}
-	} else {
-		rebuilt = []string{"llama-server", "--model", model, "--host", host}
-	}
-	if port != "" {
-		rebuilt = append(rebuilt, "--port", port)
-	}
-	rebuilt = append(rebuilt, spec.BuildArgs(kind, false)...)
-	// ParseTokens has already consumed every managed pair as a unit. This is
-	// important for list entries such as "--tensor-parallel-size 4": the
-	// value must never be emitted as a bare positional argument after the
-	// canonical launch prefix.
-	rebuilt = append(rebuilt, parsed.ExtraArgs...)
-	return rebuilt, spec.BuildEnv(), nil
+	rebuilt, err := RebuildManagedLaunchArguments(args, kind, proxy)
+	return rebuilt, nil, err
 }

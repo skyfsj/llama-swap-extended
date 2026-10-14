@@ -39,6 +39,9 @@ func CreateBackendCapabilityMiddleware(cfg config.Config) chain.Middleware {
 				return
 			}
 			modelConfig, exists := cfg.Models[data.ModelID]
+			if exists {
+				capability = backendProtocolCapability(modelConfig.Backend.Protocol, r.Method, r.URL.Path, capability)
+			}
 			if !exists || len(modelConfig.Backend.APIs) == 0 || backendAPIAllowed(modelConfig.Backend.APIs, capability) {
 				next.ServeHTTP(w, r)
 				return
@@ -46,6 +49,24 @@ func CreateBackendCapabilityMiddleware(cfg config.Config) chain.Middleware {
 			swaputil.SendResponse(w, r, http.StatusNotImplemented, "backend capability "+capability+" is not enabled for model "+data.ModelID)
 		})
 	}
+}
+
+func backendProtocolCapability(_ string, method, path, requestCapability string) string {
+	if requestCapability == "" {
+		return requestCapability
+	}
+	supported := false
+	switch path {
+	case "/v1/chat/completions", "/v/chat/completions", "/v1/responses", "/v/responses", "/v1/messages", "/v/messages":
+		supported = method == http.MethodPost
+	default:
+		supported = method == http.MethodPost && strings.HasPrefix(path, "/v1beta/models/") &&
+			(strings.HasSuffix(path, ":generateContent") || strings.HasSuffix(path, ":streamGenerateContent"))
+	}
+	if !supported || path == "/v1/messages/count_tokens" || path == "/v/messages/count_tokens" {
+		return requestCapability
+	}
+	return "chat"
 }
 
 func backendAPIAllowed(apis []string, capability string) bool {

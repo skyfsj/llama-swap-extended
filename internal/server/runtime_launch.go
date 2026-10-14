@@ -94,13 +94,26 @@ func bindManagedRuntimeLaunchConfigForVersions(cfg config.Config, versions map[s
 		if strings.TrimSpace(model.Backend.Container.Image) != "" {
 			return config.Config{}, fmt.Errorf("model %q uses native backend.runtime %q with backend.container; use either native backend.args or a container runtime", modelID, runtimeName)
 		}
-		// The configuration contract (ValidateExtensionConfig) accepts a
-		// launch-only managed model whose args are empty, and
-		// MigrateLaunchBlocks produces exactly that shape from legacy
-		// args-only configs. Rejecting it here would fail configs that the
-		// loader itself validated and migrated.
-		if len(model.Backend.Arguments) == 0 && !model.Backend.Launch.LaunchManagedModel() {
-			return config.Config{}, fmt.Errorf("model %q uses native backend.runtime %q without backend.args or a launch block", modelID, runtimeName)
+		// A managed model always carries its engine flags in backend.args. A
+		// legacy structured launch block is folded in here as well as at load,
+		// so programmatically constructed configs (embedders, tests) normalize
+		// exactly like loaded ones.
+		// A launch block reaches here only for programmatically built configs;
+		// loaded ones were already normalized. Its GPU selection is filtered to
+		// NVIDIA cards before any CUDA variable is written, exactly like a
+		// selection the operator wrote into model.env.
+		selections := config.NormalizeModelLaunchFlags(&model, kind)
+		if len(selections) == 0 {
+			selections = config.CUDAVisibleDevicesFromEnvironment(model.Env)
+		}
+		devices := nvidiaLaunchDevices(hardware, selections)
+		// Tensor parallelism keeps its historical convenience: a multi-GPU
+		// selection materializes an explicit flag when none was pinned.
+		if kind == "vllm" && !config.HasTensorParallelFlag(model.Backend.Arguments) && len(devices) > 1 {
+			model.Backend.Arguments = append(model.Backend.Arguments, "--tensor-parallel-size", strconv.Itoa(len(devices)))
+		}
+		if len(model.Backend.Arguments) == 0 && strings.TrimSpace(model.Backend.EntryPoint) == "" {
+			return config.Config{}, fmt.Errorf("model %q uses native backend.runtime %q without backend.args", modelID, runtimeName)
 		}
 
 		// The launch binding always resolves the kind's canonical entrypoint,
@@ -124,31 +137,28 @@ func bindManagedRuntimeLaunchConfigForVersions(cfg config.Config, versions map[s
 		if err != nil {
 			return config.Config{}, fmt.Errorf("model %q managed runtime %q: %w", modelID, runtimeName, err)
 		}
-		launch := model.Backend.Launch
-		if launch != nil {
-			// CUDA_VISIBLE_DEVICES is the sole persisted GPU selection. Copy it
-			// into this short-lived launch plan only so the managed builder can
-			// derive tensor parallelism and normalize the process environment.
-			selections := launch.GPUs
-			if len(selections) == 0 {
-				selections = config.CUDAVisibleDevicesFromEnvironment(model.Env)
-			}
-			if len(selections) > 0 {
-				// CUDA_VISIBLE_DEVICES only reaches a CUDA runtime: the launch
-				// binding keeps the selections it can resolve to an NVIDIA card,
-				// so on Apple or AMD hosts the selection stays affinity metadata
-				// without leaking CUDA variables into the environment.
-				boundLaunch := *launch
-				boundLaunch.GPUs = nvidiaLaunchDevices(hardware, selections)
-				launch = &boundLaunch
-			}
+		// CUDA_VISIBLE_DEVICES only reaches a CUDA runtime: the selection is
+		// filtered to NVIDIA cards, so on Apple or AMD hosts it stays affinity
+		// metadata without leaking CUDA variables into the environment.
+		launchEnv := []string(nil)
+		if len(devices) > 0 {
+			launchEnv = append(launchEnv, "CUDA_DEVICE_ORDER=PCI_BUS_ID", "CUDA_VISIBLE_DEVICES="+strings.Join(devices, ","))
 		}
-		rebuilt, launchEnv, err := config.BuildManagedLaunchArguments(model.Backend.Arguments, launch, kind, model.Proxy)
+		// The runtime's launch metadata supplies the head and the quick-config
+		// defaults the model inherits; a model-level entrypoint or an explicit
+		// flag in its args always wins.
+		entrypoint, defaults := config.EffectiveLaunchMetadata(model, runtimeConfig, kind)
+		model.Backend.Arguments = append(append([]string(nil), defaults...), model.Backend.Arguments...)
+		rebuilt, entryEnv, err := config.BuildManagedLaunchArguments(model.Backend.Arguments, entrypoint, kind, model.Proxy)
 		if err != nil {
 			return config.Config{}, fmt.Errorf("model %q managed runtime %q: %w", modelID, runtimeName, err)
 		}
-		rebuilt = config.EnsureVLLMSleepModeArgument(rebuilt, model.Backend.Type, model.UnloadAfter)
-		rebuilt[0] = binding.Executable
+		launchEnv = append(launchEnv, entryEnv...)
+		if strings.TrimSpace(entrypoint) == "" {
+			// Sleep mode is a vLLM flag; a custom launch head owns its own argv.
+			rebuilt = config.EnsureVLLMSleepModeArgument(rebuilt, model.Backend.Type, model.UnloadAfter)
+			rebuilt[0] = binding.Executable
+		}
 		bound := model
 		bound.Backend = model.Backend
 		bound.Backend.Arguments = rebuilt

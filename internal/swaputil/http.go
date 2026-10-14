@@ -21,6 +21,7 @@ import (
 
 	"github.com/mostlygeek/llama-swap/internal/auth"
 	"github.com/mostlygeek/llama-swap/internal/config"
+	protocolrelaykit "github.com/mostlygeek/llama-swap/internal/protocol/relaykit"
 	"github.com/mostlygeek/llama-swap/internal/route"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -389,6 +390,20 @@ func ReplaceRequestModel(r *http.Request, model, replacement string) (*http.Requ
 	if current != model {
 		return r, nil
 	}
+	if geminiRoute, ok := protocolrelaykit.RouteForRequest(r.Method, r.URL.Path); ok && geminiRoute.Format == protocolrelaykit.Gemini {
+		if strings.TrimSpace(replacement) == "" {
+			return r, fmt.Errorf("gemini model replacement is required")
+		}
+		rewrittenPath := "/v1beta/models/" + strings.Trim(replacement, "/") + ":" + geminiRoute.Action
+		r.URL.Path = rewrittenPath
+		r.URL.RawPath = ""
+		r.SetPathValue("model", strings.Trim(replacement, "/"))
+		r.SetPathValue("geminiPath", strings.Trim(replacement, "/")+":"+geminiRoute.Action)
+		if r.RequestURI != "" {
+			r.RequestURI = r.URL.RequestURI()
+		}
+		return invalidateRequestContext(r), nil
+	}
 
 	if r.Method == http.MethodGet {
 		query := r.URL.Query()
@@ -660,6 +675,7 @@ func SetReqData(ctx context.Context, key, value string) error {
 func extractContext(r *http.Request) (ReqContextData, error) {
 
 	apiKey := ExtractAPIKey(r)
+	pathModel := strings.TrimSpace(r.PathValue("model"))
 
 	if r.Method == http.MethodGet {
 		q := r.URL.Query()
@@ -695,9 +711,13 @@ func extractContext(r *http.Request) (ReqContextData, error) {
 	contentType := strings.ToLower(r.Header.Get("Content-Type"))
 
 	if strings.Contains(contentType, "application/json") {
+		streaming := gjson.GetBytes(bodyBytes, "stream").Bool()
+		if geminiRoute, ok := protocolrelaykit.RouteForRequest(r.Method, r.URL.Path); ok && geminiRoute.Format == protocolrelaykit.Gemini {
+			streaming = geminiRoute.Stream
+		}
 		return ReqContextData{
-			Model:     gjson.GetBytes(bodyBytes, "model").String(),
-			Streaming: gjson.GetBytes(bodyBytes, "stream").Bool(),
+			Model:     firstNonEmpty(pathModel, gjson.GetBytes(bodyBytes, "model").String()),
+			Streaming: streaming,
 			ApiKey:    apiKey,
 			Metadata:  make(map[string]string),
 		}, nil
@@ -723,6 +743,15 @@ func extractContext(r *http.Request) (ReqContextData, error) {
 		ApiKey:    apiKey,
 		Metadata:  make(map[string]string),
 	}, nil
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 // extractAPIKey pulls a candidate API key from the request, preferring Basic,
@@ -755,6 +784,8 @@ func ExtractAPIKey(r *http.Request) string {
 		return bearerKey
 	case strings.TrimSpace(r.Header.Get("x-api-key")) != "":
 		return strings.TrimSpace(r.Header.Get("x-api-key"))
+	case strings.TrimSpace(r.Header.Get("x-goog-api-key")) != "":
+		return strings.TrimSpace(r.Header.Get("x-goog-api-key"))
 	}
 	// Browsers cannot attach a custom Authorization header to EventSource.
 	// The control plane therefore accepts the short-lived, same-origin session

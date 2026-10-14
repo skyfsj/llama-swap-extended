@@ -9,7 +9,7 @@
   import ModelSelector from "./ModelSelector.svelte";
   import ExpandableTextarea from "./ExpandableTextarea.svelte";
   import EmptyState from "../EmptyState.svelte";
-  import { Settings, Paperclip, Send, Maximize2, MessagesSquare } from "@lucide/svelte";
+  import { Paperclip, Send, Maximize2, MessagesSquare, SlidersHorizontal, Plus, Square } from "@lucide/svelte";
   import { Button } from "$lib/components/ui/button/index.js";
   import { Input } from "$lib/components/ui/input/index.js";
   import { Textarea } from "$lib/components/ui/textarea/index.js";
@@ -17,7 +17,7 @@
   import * as Select from "$lib/components/ui/select/index.js";
   import * as Dialog from "$lib/components/ui/dialog/index.js";
   import { X } from "@lucide/svelte";
-  import { t, translate } from "../../lib/i18n";
+  import { locale, t, translate } from "../../lib/i18n";
 
   const selectedModelStore = persistentStore<string>("playground-selected-model", "");
   const systemPromptStore = persistentStore<string>("playground-system-prompt", "");
@@ -324,18 +324,143 @@
     attachedImages = attachedImages.filter((_, i) => i !== idx);
     imageError = null;
   }
+
+  const starterPrompts = $derived.by(() => {
+    const isZh = $locale.startsWith("zh");
+    if (isZh) {
+      return [
+        {
+          icon: "💡",
+          title: "原理解析",
+          content: "深入解释大语言模型中自注意力机制与 KV Cache 的计算与优化原理",
+        },
+        {
+          icon: "💻",
+          title: "代码编写",
+          content: "用 Go 语言编写一个高并发、支持超时控制与优雅退出的 HTTP 反向代理",
+        },
+        {
+          icon: "🔍",
+          title: "代码审查",
+          content: "审查代码中的并发竞态条件、内存逃逸与 Goroutine 泄漏风险并给出建议",
+        },
+        {
+          icon: "⚡",
+          title: "架构设计",
+          content: "对比分析 gRPC、RESTful 与 WebSocket 在低延迟分布式微服务中的选型考量",
+        },
+      ];
+    }
+    return [
+      {
+        icon: "💡",
+        title: "Deep Dive",
+        content: "Explain the self-attention mechanism and KV Cache optimization in LLMs",
+      },
+      {
+        icon: "💻",
+        title: "Write Code",
+        content: "Write a high-performance HTTP reverse proxy in Go with graceful shutdown",
+      },
+      {
+        icon: "🔍",
+        title: "Code Review",
+        content: "Review this code for concurrency race conditions and goroutine leaks",
+      },
+      {
+        icon: "⚡",
+        title: "Architecture",
+        content: "Compare gRPC, RESTful, and WebSockets for low-latency distributed microservices",
+      },
+    ];
+  });
+
+  function applyStarterPrompt(text: string) {
+    userInput = text;
+    inputRef?.focus();
+  }
+
+  function handlePaste(event: ClipboardEvent) {
+    const items = event.clipboardData?.items;
+    if (!items) return;
+    const files: File[] = [];
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (item.kind === "file" && item.type.startsWith("image/")) {
+        const file = item.getAsFile();
+        if (file) files.push(file);
+      }
+    }
+    if (files.length > 0) {
+      event.preventDefault();
+      void processImageFiles(files);
+    }
+  }
 </script>
 
 <div class="flex flex-col h-full">
   <!-- Model selector and controls -->
   <div class="shrink-0 flex flex-wrap items-center gap-2 mb-3">
     <ModelSelector bind:value={$selectedModelStore} disabled={isStreaming} category="chat" />
+
+    {#if $selectedModelStore}
+      <div class="hidden sm:flex items-center gap-1.5 flex-wrap">
+        <button
+          type="button"
+          class="pg-chip font-mono hover:bg-muted/80 cursor-pointer transition-colors"
+          onclick={() => (showSettings = true)}
+          title={$translate("playground.chat.endpoint")}
+        >
+          /{$endpointStore}
+        </button>
+        <button
+          type="button"
+          class="pg-chip hover:bg-muted/80 cursor-pointer transition-colors"
+          onclick={() => (showSettings = true)}
+          title={$translate("playground.chat.temperature")}
+        >
+          T: {$temperatureStore.toFixed(2)}
+        </button>
+        <button
+          type="button"
+          class="pg-chip hover:bg-muted/80 cursor-pointer transition-colors"
+          onclick={() => (showSettings = true)}
+          title={$translate("playground.chat.maxTokens")}
+        >
+          {$maxTokensStore} max
+        </button>
+        {#if $systemPromptStore.trim()}
+          <button
+            type="button"
+            class="pg-chip border border-primary/30 text-primary bg-primary/5 hover:bg-primary/10 cursor-pointer transition-colors"
+            onclick={() => (showSettings = true)}
+            title={$translate("playground.chat.systemPrompt")}
+          >
+            <span class="size-1.5 rounded-full bg-primary inline-block"></span>
+            {$translate("playground.chat.systemPrompt")}
+          </button>
+        {/if}
+      </div>
+    {/if}
+
     <div class="flex items-center gap-1.5 ml-auto">
-      <Button variant="ghost" size="icon" class="pg-tool" onclick={() => (showSettings = true)} title={$translate("common.settings")}>
-        <Settings />
+      <Button
+        variant="outline"
+        size="icon"
+        class="pg-control"
+        onclick={() => (showSettings = true)}
+        title={$translate("common.settings")}
+      >
+        <SlidersHorizontal class="size-3.5" />
       </Button>
-      <Button variant="outline" class="pg-control" onclick={newChat} disabled={messages.length === 0 && !isStreaming}>
-        {$translate("playground.chat.newChat")}
+      <Button
+        variant="outline"
+        class="pg-control gap-1"
+        onclick={newChat}
+        disabled={messages.length === 0 && !isStreaming}
+      >
+        <Plus class="size-3.5" />
+        <span class="hidden sm:inline">{$translate("playground.chat.newChat")}</span>
       </Button>
     </div>
   </div>
@@ -417,11 +542,46 @@
       onscroll={handleMessagesScroll}
     >
       {#if messages.length === 0}
-        <div class="flex h-full flex-col items-center justify-center gap-3 text-center">
-          <div class="pg-inset flex size-11 items-center justify-center" style="border-radius: 99px">
-            <MessagesSquare class="size-5" style="color: var(--pg-ink-3)" />
+        <div class="flex h-full flex-col items-center justify-center gap-6 px-4 py-8 text-center max-w-xl mx-auto">
+          <div class="flex flex-col items-center gap-2">
+            <div class="pg-inset flex size-12 items-center justify-center rounded-2xl shadow-inner border border-primary/10 bg-primary/5">
+              <MessagesSquare class="size-6 text-primary" />
+            </div>
+            <h3 class="text-base font-semibold tracking-tight">{$translate("playground.tabs.chat")}</h3>
+            <p class="pg-hint max-w-sm text-xs leading-relaxed">
+              {$translate("playground.chat.emptyConversation")}
+            </p>
           </div>
-          <p class="pg-hint max-w-xs leading-relaxed">{$translate("playground.chat.emptyConversation")}</p>
+
+          <div class="grid w-full grid-cols-1 sm:grid-cols-2 gap-2 text-left">
+            {#each starterPrompts as prompt}
+              <button
+                type="button"
+                class="group relative flex flex-col gap-1 rounded-xl border border-border/60 bg-card/60 p-3 text-xs shadow-xs transition-all hover:border-primary/40 hover:bg-muted/40 hover:shadow-sm cursor-pointer"
+                onclick={() => applyStarterPrompt(prompt.content)}
+              >
+                <span class="font-medium text-foreground group-hover:text-primary transition-colors flex items-center gap-1.5">
+                  <span>{prompt.icon}</span>
+                  {prompt.title}
+                </span>
+                <span class="pg-hint line-clamp-2 text-[11px] leading-relaxed">
+                  {prompt.content}
+                </span>
+              </button>
+            {/each}
+          </div>
+
+          <div class="flex items-center gap-2 text-[11px] text-muted-foreground">
+            <span class="inline-flex items-center gap-1">
+              <kbd class="rounded border bg-muted px-1.5 py-0.5 font-mono text-[10px]">Enter</kbd>
+              {$translate("playground.chat.send")}
+            </span>
+            <span>·</span>
+            <span class="inline-flex items-center gap-1">
+              <kbd class="rounded border bg-muted px-1.5 py-0.5 font-mono text-[10px]">Shift+Enter</kbd>
+              {$translate("playground.expandable.editText")}
+            </span>
+          </div>
         </div>
       {:else}
         {#each messages as message, idx (idx)}
@@ -474,7 +634,7 @@
         </div>
       {/if}
 
-      <div class="pg-composer flex flex-col gap-1 p-1.5">
+      <div class="pg-composer flex flex-col gap-1 p-1.5" onpaste={handlePaste}>
         <!-- Hidden file input -->
         <input
           type="file"
@@ -520,21 +680,26 @@
                 {$selectedModelStore}
               </span>
             {/if}
+            {#if userInput.trim().length > 0}
+              <span class="pg-chip ml-1 hidden sm:inline-flex text-[11px]">
+                {userInput.length} {$translate("playground.chat.characters")}
+              </span>
+            {/if}
             <div class="ml-auto flex items-center gap-1.5">
               {#if isStreaming}
-                <Button variant="outline" class="pg-control pg-control--danger" onclick={cancelStreaming}>
-                  <X />
-                  {$translate("common.cancel")}
+                <Button variant="outline" class="pg-control pg-control--danger gap-1.5" onclick={cancelStreaming}>
+                  <Square class="size-3.5 fill-current" />
+                  <span>{$translate("common.cancel")}</span>
                 </Button>
               {:else}
                 <Button
-                  class="pg-action"
+                  class="pg-action gap-1.5"
                   onclick={sendMessage}
                   disabled={(!userInput.trim() && attachedImages.length === 0) || !$selectedModelStore}
                   title={$translate("playground.chat.send")}
                 >
-                  <Send />
-                  {$translate("playground.chat.send")}
+                  <Send class="size-3.5" />
+                  <span>{$translate("playground.chat.send")}</span>
                 </Button>
               {/if}
             </div>

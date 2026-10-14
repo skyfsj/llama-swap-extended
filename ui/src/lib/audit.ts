@@ -26,10 +26,12 @@ export interface AuditToolField {
 
 export type AuditTranscriptItem =
   | { kind: "message"; role: "system" | "user" | "assistant"; text: string }
+  | { kind: "reasoning"; text: string }
   | { kind: "tool_call"; id: string; name: string; fields: AuditToolField[] }
   | { kind: "tool_result"; id: string; name: string; text: string }
   | { kind: "image"; label: string; dataUrl: string; sizeBytes: number }
-  | { kind: "file"; label: string; dataUrl: string; sizeBytes: number };
+  | { kind: "file"; label: string; dataUrl: string; sizeBytes: number }
+  | { kind: "audio"; label: string; dataUrl: string; sizeBytes: number };
 
 // formatBytes renders an approximate byte size for media labels.
 export function formatBytes(size: number): string {
@@ -457,6 +459,20 @@ function messageText(value: Record<string, unknown>): string {
     || nonEmptyString(value.output_text);
 }
 
+// messageReasoning extracts the chain of thought from one chat message.
+// vLLM's qwen3 parser puts it in reasoning_content; some backends use
+// reasoning, or a <think> block folded into a string content field.
+function messageReasoning(value: Record<string, unknown>): string {
+  const direct = nonEmptyString(value.reasoning_content) || nonEmptyString(value.reasoning);
+  if (direct) return direct;
+  const content = value.content;
+  if (typeof content === "string") {
+    const match = /<think>([\s\S]*?)<\/think>/.exec(content);
+    if (match) return match[1].trim();
+  }
+  return "";
+}
+
 function appendContentTools(items: AuditTranscriptItem[], content: unknown): void {
   if (!Array.isArray(content)) return;
   for (const part of content) {
@@ -498,6 +514,10 @@ function appendMessage(items: AuditTranscriptItem[], value: unknown): void {
       : roleValue === "user"
         ? "user"
         : "";
+  // A chat-completions assistant message carries its chain of thought in
+  // reasoning_content (vLLM/qwen3 style); render it before the answer.
+  const reasoning = messageReasoning(item);
+  if (role === "assistant" && reasoning) items.push({ kind: "reasoning", text: reasoning });
   const text = messageText(item).trim();
   if (role && text) items.push({ kind: "message", role, text });
 
@@ -525,6 +545,11 @@ export function auditRequestTranscript(value: AuditBytes): AuditTranscriptItem[]
   const root = record(parsed);
   if (!root) return [];
 
+  // Structured multipart captures (audio transcriptions/translations, image
+  // edits) render as a user turn: the text fields become the message and each
+  // uploaded file becomes a playable/downloadable media item.
+  if (nonEmptyString(root.format) === "multipart-form") return formCaptureTranscript(root);
+
   const items: AuditTranscriptItem[] = [];
   const system = contentPartsText(root.system) || nonEmptyString(root.system) || contentPartsText(root.instructions) || nonEmptyString(root.instructions);
   if (system) items.push({ kind: "message", role: "system", text: system });
@@ -534,8 +559,45 @@ export function auditRequestTranscript(value: AuditBytes): AuditTranscriptItem[]
   return items;
 }
 
+// formCaptureTranscript renders one structured multipart-form capture. The
+// request's text fields join into a single user message (model first, then
+// the rest in capture order) and every file becomes a media item — audio
+// inline-playable, anything else a download.
+function formCaptureTranscript(root: Record<string, unknown>): AuditTranscriptItem[] {
+  const items: AuditTranscriptItem[] = [];
+  const fields = record(root.fields);
+  const parts: string[] = [];
+  if (fields) {
+    for (const [key, value] of Object.entries(fields)) {
+      const text = nonEmptyString(value);
+      if (text) parts.push(`${key}: ${text}`);
+    }
+  }
+  if (parts.length) items.push({ kind: "message", role: "user", text: parts.join("\n") });
+
+  const files = Array.isArray(root.files) ? root.files : [];
+  for (const entry of files) {
+    const file = record(entry);
+    if (!file) continue;
+    const content = nonEmptyString(file.content);
+    if (!content) continue;
+    const mime = nonEmptyString(file.mimeType) || "application/octet-stream";
+    const filename = nonEmptyString(file.filename) || nonEmptyString(file.field) || "upload";
+    const dataUrl = `data:${mime};base64,${content}`;
+    const sizeBytes = typeof file.size === "number" ? file.size : base64ByteSize(content);
+    if (mime.startsWith("audio/")) {
+      items.push({ kind: "audio", label: filename, dataUrl, sizeBytes });
+    } else if (mime.startsWith("image/")) {
+      items.push({ kind: "image", label: filename, dataUrl, sizeBytes });
+    } else {
+      items.push({ kind: "file", label: filename, dataUrl, sizeBytes });
+    }
+  }
+  return items;
+}
+
 function toolIdentity(item: AuditTranscriptItem): string {
-  if (item.kind === "message" || item.kind === "image" || item.kind === "file") return "";
+  if (item.kind === "message" || item.kind === "image" || item.kind === "file" || item.kind === "audio" || item.kind === "reasoning") return "";
   return item.kind === "tool_call"
     ? `call:${item.id}:${item.name}:${item.fields.map((field) => `${field.name}=${field.value}`).join("|")}`
     : `result:${item.id}:${item.name}:${item.text}`;
@@ -592,9 +654,46 @@ function collectToolItems(value: unknown, items: AuditTranscriptItem[], seen: Se
 
 // auditResponseTranscript coalesces streamed assistant deltas into one message
 // and lists structured tool calls/results as separate, readable entries.
+// Reasoning deltas (chat reasoning_content, Responses API reasoning summary)
+// are folded into a separate collapsible thinking block.
 export function auditResponseTranscript(value: AuditBytes): AuditTranscriptItem[] {
   const view = formatAuditBody(value);
   const items: AuditTranscriptItem[] = [];
+
+  const reasoningParts: string[] = [];
+  const collectReasoning = (value: unknown): void => {
+    const node = record(value);
+    if (!node) return;
+    // Chat-completions deltas nest under choices[].delta; Responses API and
+    // some adapters put reasoning fields on the frame itself.
+    const deltas: Record<string, unknown>[] = [];
+    if (Array.isArray(node.choices)) {
+      for (const choice of node.choices) {
+        const delta = record(record(choice)?.delta);
+        if (delta) deltas.push(delta);
+      }
+    }
+    const directDelta = record(node.delta);
+    if (directDelta) deltas.push(directDelta);
+    for (const delta of deltas) {
+      const text = nonEmptyString(delta.reasoning_content) || nonEmptyString(delta.reasoning);
+      if (text) reasoningParts.push(text);
+    }
+    const direct = nonEmptyString(node.reasoning_content);
+    if (direct) reasoningParts.push(direct);
+    // Responses API: {type:"reasoning", summary:[{type:"summary_text",text}]}
+    if (nonEmptyString(node.type) === "reasoning" && Array.isArray(node.summary)) {
+      for (const part of node.summary) {
+        const text = nonEmptyString(record(part)?.text);
+        if (text) reasoningParts.push(text);
+      }
+    }
+  };
+  collectReasoning(parseJSON(view.raw));
+  for (const event of view.events) collectReasoning(event.data);
+  const reasoning = reasoningParts.join("").trim();
+  if (reasoning) items.push({ kind: "reasoning", text: reasoning });
+
   if (view.text.trim()) items.push({ kind: "message", role: "assistant", text: view.text });
 
   const tools: AuditTranscriptItem[] = [];

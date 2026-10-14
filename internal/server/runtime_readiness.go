@@ -502,8 +502,8 @@ func runtimeModelCompatible(runtimeCfg config.RuntimeConfig, model config.ModelC
 	if strings.TrimSpace(model.Backend.Container.Image) != "" {
 		return false, "native runtime cannot use a backend container image"
 	}
-	if len(model.Backend.Arguments) == 0 && model.Backend.Launch == nil {
-		return false, "native runtime requires backend args or a structured launch block"
+	if len(model.Backend.Arguments) == 0 && strings.TrimSpace(model.Backend.EntryPoint) == "" {
+		return false, "native runtime requires backend args"
 	}
 	return true, "native backend and runtime are compatible"
 }

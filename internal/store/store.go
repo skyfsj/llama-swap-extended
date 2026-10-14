@@ -13,8 +13,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mostlygeek/llama-swap/internal/store/auditstore"
 	"github.com/pressly/goose/v3"
 	_ "modernc.org/sqlite"
+	"path/filepath"
 )
 
 //go:embed migrations/*.sql
@@ -169,10 +171,14 @@ type HistogramData struct {
 type Store struct {
 	db       *sql.DB
 	inMemory bool
-	// blobs is the content-addressed file store for audit bodies. It is nil
-	// for in-memory stores, where bodies stay inline (nothing is persisted
-	// anyway) and no blob directory is created.
+	// blobs is the legacy content-addressed file store for audit bodies. New
+	// writes go to the dedicated audit store; this remains only to serve the
+	// pre-split data until the one-time migration has copied it.
 	blobs *BlobStore
+	// audit is the dedicated audit database and its compressed body segments.
+	// It is nil for in-memory stores, whose audit rows stay in the
+	// operational database (nothing is durable there anyway).
+	audit *auditstore.Store
 }
 
 // normalizeContext keeps the store boundary safe for callers that do not
@@ -238,6 +244,14 @@ func New(path string) (*Store, error) {
 	st := &Store{db: db, inMemory: !diskFile}
 	if diskFile {
 		st.blobs = newBlobStore(dsn)
+		// The audit trail lives in its own database next to the operational
+		// one: it is the only unbounded-growth table, and keeping it separate
+		// means retention sweeps cannot stall the request path.
+		audit, err := auditstore.Open(filepath.Join(filepath.Dir(dsn), "audit"))
+		if err != nil {
+			return nil, fmt.Errorf("open audit store: %w", err)
+		}
+		st.audit = audit
 	}
 	return st, nil
 }
@@ -261,7 +275,39 @@ func (s *Store) Close() error {
 	if s == nil || s.db == nil {
 		return nil
 	}
-	return s.db.Close()
+	var err error
+	if s.audit != nil {
+		if closeErr := s.audit.Close(); closeErr != nil {
+			err = closeErr
+		}
+	}
+	if closeErr := s.db.Close(); err == nil {
+		err = closeErr
+	}
+	return err
+}
+
+// PurgeActivityBefore deletes activity rows older than the cutoff. The rows
+// are small but unbounded: a busy proxy accumulates one per request forever.
+// Audit conversations are purged independently, and the detail view tolerates a
+// missing activity row (the phase fields fall back to their sentinels).
+func (s *Store) PurgeActivityBefore(ctx context.Context, before time.Time) (int64, error) {
+	ctx = normalizeContext(ctx)
+	if err := s.ensureDB(); err != nil {
+		return 0, err
+	}
+	if before.IsZero() {
+		return 0, nil
+	}
+	result, err := s.db.ExecContext(ctx, `DELETE FROM activity WHERE ts_created < ?`, before.Unix())
+	if err != nil {
+		return 0, fmt.Errorf("purge activity rows: %w", err)
+	}
+	deleted, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("purge activity rows: %w", err)
+	}
+	return deleted, nil
 }
 
 func (s *Store) InsertActivity(ctx context.Context, entry ActivityLogEntry) (ActivityLogEntry, error) {
@@ -365,7 +411,7 @@ func (s *Store) ListActivity(ctx context.Context, query ActivityQuery) (Activity
 			cache_creation_tokens, reasoning_tokens, estimated_cost, cost_estimated,
 			cache_hit_ratio, cache_creation_ratio, repair_applied, prefix_hash, client_ip,
 			decode_ms, speed_timeline,
-			EXISTS (SELECT 1 FROM audit_conversations AS audit WHERE audit.activity_id = activity.id)
+			`+s.hasAuditColumn()+`
 		FROM activity`+where+activityOrderBy(query)+`
 		LIMIT ? OFFSET ?`,
 		append(args, query.Limit, offset)...,
@@ -385,6 +431,9 @@ func (s *Store) ListActivity(ctx context.Context, query ActivityQuery) (Activity
 	}
 	if err := rows.Err(); err != nil {
 		return ActivityPage{}, fmt.Errorf("list activity rows: %w", err)
+	}
+	if err := s.probeAuditPresence(ctx, entries); err != nil {
+		return ActivityPage{}, err
 	}
 
 	return ActivityPage{

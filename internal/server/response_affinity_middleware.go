@@ -29,9 +29,9 @@ func affinityWriteContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), affinityWriteTimeout)
 }
 
-// CreateResponseAffinityMiddleware records native Responses ids without
-// buffering the response seen by the client. The chat adapter owns its own
-// recorder, so this middleware skips that protocol to avoid duplicate rows.
+// CreateResponseAffinityMiddleware retains affinity data for responses that
+// bypass the protocol adapter. Adapted Responses calls are persisted by the
+// protocol middleware, so this middleware skips them to avoid duplicate rows.
 func CreateResponseAffinityMiddleware(cfg config.Config, st *store.Store) chain.Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -45,7 +45,7 @@ func CreateResponseAffinityMiddleware(cfg config.Config, st *store.Store) chain.
 				return
 			}
 			modelConfig, ok := cfg.Models[data.ModelID]
-			if ok && modelConfig.Backend.EffectiveProtocol() == config.AdapterProtocolResponsesToChat {
+			if ok && modelConfig.Backend.AdaptsResponses() {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -79,7 +79,7 @@ func CreateResponseAffinityMiddleware(cfg config.Config, st *store.Store) chain.
 }
 
 // readRequestBodyForAffinity peeks at a bounded request while preserving the
-// complete stream for the downstream native Responses handler. The boolean is
+// complete stream for the downstream Responses handler. The boolean is
 // false when the body was not safely inspectable (for example a known body
 // larger than the bound or a read error); callers must then avoid persisting
 // affinity because store:false cannot be ruled out.
@@ -88,7 +88,7 @@ func readRequestBodyForAffinity(r *http.Request) ([]byte, bool) {
 		return nil, true
 	}
 	// Affinity only peeks at the request to honor store:false. Do not consume
-	// an oversized known body just to inspect that flag: the downstream native
+	// an oversized known body just to inspect that flag: the downstream
 	// Responses handler must still receive the original stream. Unknown-length
 	// bodies are read up to a hard bound and then replayed below, so small
 	// chunked requests still get correct store:false semantics.
@@ -138,8 +138,8 @@ func (r *replayReadCloser) Close() error {
 }
 
 func persistNativeResponseAffinity(_ context.Context, st *store.Store, model, backend string, body []byte, headers http.Header, status int) {
-	// Native Responses ids are useful for routing subsequent GET/cancel calls
-	// even when the initial request failed (for example a provider may return a
+	// Responses ids are useful for routing subsequent GET/cancel calls even
+	// when the initial request failed (for example an upstream may return a
 	// response.failed SSE lifecycle with HTTP 200, or an error response with a
 	// stable id and HTTP 5xx). Keep the bounded canonical body and mark its
 	// state below instead of dropping every non-2xx response.
@@ -169,9 +169,7 @@ func persistNativeResponseAffinity(_ context.Context, st *store.Store, model, ba
 }
 
 // responseAffinityState prefers the protocol-level Responses status when one
-// is present, falling back to the HTTP status for native error envelopes.
-// Keeping this normalization in one place makes native and Chat-adapted
-// persistence agree on completed/failed/cancelled/incomplete states.
+// is present, falling back to the HTTP status for error envelopes.
 func responseAffinityState(response map[string]any, httpStatus int) string {
 	if response != nil {
 		if state, ok := response["status"].(string); ok && strings.TrimSpace(state) != "" {

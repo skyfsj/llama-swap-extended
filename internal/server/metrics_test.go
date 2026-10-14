@@ -3,8 +3,11 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"io"
 	"math"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1141,5 +1144,116 @@ func TestMetrics_FailedErrorMessageTruncatesOnRuneBoundary(t *testing.T) {
 	}
 	if !strings.HasSuffix(msg, "...") {
 		t.Fatalf("message = %q, want a truncation suffix", msg)
+	}
+}
+
+// A multipart/form-data capture (audio transcriptions/translations, image
+// edits) must persist as structured JSON the audit transcript can render:
+// text fields readable, file contents gated by StoreMedia, metadata always.
+func TestMetricsMonitor_FormCapturePersistsStructuredJSON(t *testing.T) {
+	mm := newTestMetricsMonitor(t, logmon.NewWriter(io.Discard), 10)
+	mm.configureAudit(config.AuditConfig{Enabled: true, StoreMedia: false})
+
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	mw.WriteField("model", "Qwen/Qwen3-ASR-1.7B")
+	mw.WriteField("language", "ja")
+	fileWriter, err := mw.CreateFormFile("file", "song.mp3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fileWriter.Write([]byte("ID3-FAKE-MP3-BYTES")); err != nil {
+		t.Fatal(err)
+	}
+	mw.Close()
+
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"text":"テスト"}`))
+	})
+	handler := CreateMetricsMiddleware(mm, config.Config{Models: map[string]config.ModelConfig{"Qwen/Qwen3-ASR-1.7B": {}}})(upstream)
+	req := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", &buf)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+
+	rows, err := mm.store.ListAuditConversations(context.Background(), store.AuditQuery{Limit: 10})
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("audit rows = %+v, err=%v", rows, err)
+	}
+	conversation, found, err := mm.store.GetAuditConversation(context.Background(), rows[0].ID)
+	if err != nil || !found {
+		t.Fatalf("audit conversation found=%v err=%v", found, err)
+	}
+
+	var capture struct {
+		Format string            `json:"format"`
+		Fields map[string]string `json:"fields"`
+		Files  []struct {
+			Field    string `json:"field"`
+			Filename string `json:"filename"`
+			MimeType string `json:"mimeType"`
+			Size     int64  `json:"size"`
+			Content  string `json:"content"`
+		} `json:"files"`
+	}
+	if err := json.Unmarshal(conversation.RequestBody, &capture); err != nil {
+		t.Fatalf("request body is not structured JSON: %v (body=%q)", err, conversation.RequestBody)
+	}
+	if capture.Format != "multipart-form" {
+		t.Errorf("format = %q", capture.Format)
+	}
+	if capture.Fields["model"] != "Qwen/Qwen3-ASR-1.7B" || capture.Fields["language"] != "ja" {
+		t.Errorf("fields = %+v", capture.Fields)
+	}
+	if len(capture.Files) != 1 {
+		t.Fatalf("files = %+v", capture.Files)
+	}
+	file := capture.Files[0]
+	if file.Filename != "song.mp3" || file.Size != int64(len("ID3-FAKE-MP3-BYTES")) {
+		t.Errorf("file metadata = %+v", file)
+	}
+	// StoreMedia is off, so the audio content must not be inlined.
+	if file.Content != "" {
+		t.Errorf("file content stored despite StoreMedia=false (%d bytes)", len(file.Content))
+	}
+}
+
+// With StoreMedia enabled the structured capture inlines the uploaded file's
+// content so the audit transcript can play or download it.
+func TestMetricsMonitor_FormCaptureInlinesFileWithStoreMedia(t *testing.T) {
+	mm := newTestMetricsMonitor(t, logmon.NewWriter(io.Discard), 10)
+	mm.configureAudit(config.AuditConfig{Enabled: true, StoreMedia: true})
+
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	mw.WriteField("model", "Qwen/Qwen3-ASR-1.7B")
+	fileWriter, err := mw.CreateFormFile("file", "clip.wav")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fileWriter.Write([]byte("RIFF-WAVE")); err != nil {
+		t.Fatal(err)
+	}
+	mw.Close()
+
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"text":""}`))
+	})
+	handler := CreateMetricsMiddleware(mm, config.Config{Models: map[string]config.ModelConfig{"Qwen/Qwen3-ASR-1.7B": {}}})(upstream)
+	req := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", &buf)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+
+	rows, err := mm.store.ListAuditConversations(context.Background(), store.AuditQuery{Limit: 10})
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("audit rows = %+v, err=%v", rows, err)
+	}
+	conversation, found, err := mm.store.GetAuditConversation(context.Background(), rows[0].ID)
+	if err != nil || !found {
+		t.Fatalf("audit conversation found=%v err=%v", found, err)
+	}
+	encoded := base64.StdEncoding.EncodeToString([]byte("RIFF-WAVE"))
+	if !strings.Contains(string(conversation.RequestBody), encoded) {
+		t.Errorf("inlined file content missing from capture: %q", conversation.RequestBody)
 	}
 }

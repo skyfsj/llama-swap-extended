@@ -42,10 +42,13 @@
     type ConfigChange,
     type LaunchMode,
     type ModelConfigDraft,
+    type DraftNumberValue,
     type ModelLaunchDraft,
-    tokenizeLaunchArguments,
+    type RuntimeLaunchMetadata,
+    emptyRuntimeLaunchMetadata,
+    pinnedLaunchView,
   } from "../../lib/modelConfig";
-  import { adoptLaunchFields, parseLaunchCommand, stripOwnedLaunchArguments, type ParsedLaunch } from "../../lib/launchParse";
+  import { adoptLaunchFields, launchPinnedFromArguments, parseLaunchCommand, stripOwnedLaunchArguments, type ParsedLaunch } from "../../lib/launchParse";
   import LaunchArgsCodeEditor from "./LaunchArgsCodeEditor.svelte";
 
   interface ConfigSource {
@@ -190,18 +193,24 @@
     // tokens (entrypoint, bind host and port) are dropped and the operator's
     // own lines are preserved verbatim, so a hand-edited config round-trips.
     if (kind !== "") next.backendArguments = rebuildManagedArguments(next.backendArguments, kind, "");
+    // A legacy structured launch block is history: its values are folded into
+    // the command text on load so the editor shows (and later stores) exactly
+    // what the engine will run. The block is never written back.
+    if (kind !== "" && !launchViewEmpty(next.launch)) {
+      next.backendArguments = syncLaunchOwnedArguments(next.backendArguments, kind, next.launch, next.launch.gpus.length);
+    }
     draft = next;
     argsText = extraLaunchArguments(next.backendArguments, kind);
     hydrateGPUSelectionFromEnv = true;
     cudaEnvSyncState.visible = { managed: "", stashed: "" };
     cudaEnvSyncState.order = { managed: "", stashed: "" };
-    // A legacy args-only config surfaces in the structured fields too: the Go
-    // parser classifies the text once and the editor mirrors the result. The
-    // file itself is only rewritten when the user saves.
+    // The structured fields are a derived view of the command text: they are
+    // read from it on load and written back to it on edit, but never stored
+    // as their own YAML block.
     const migrationKey = `${selectedModel}:${snapshot.etag}`;
     if (kind !== "" && launchViewEmpty(next.launch) && next.backendArguments.trim() !== "" && lastLaunchMigration !== migrationKey) {
       lastLaunchMigration = migrationKey;
-      migrateLaunchView(next.backendArguments, kind);
+      deriveLaunchView(argsText, kind);
     }
   });
 
@@ -264,7 +273,7 @@
       if (gpu.vendor.toUpperCase() === "NVIDIA") devices.add(String(gpu.index));
     }
     const deviceList = [...devices];
-    const nextArgs = syncLaunchOwnedArguments(argsText, kind, draft.launch, deviceList.length);
+    const nextArgs = syncLaunchOwnedArguments(argsText, kind, pinnedLaunchView(draft), deviceList.length);
     if (nextArgs !== argsText) {
       argsText = nextArgs;
       draft.backendArguments = rebuildManagedArguments(nextArgs, kind, "");
@@ -274,6 +283,29 @@
     if (nextEnv !== draft.env) draft.env = nextEnv;
   });
 
+  // Runtime metadata is the inheritance source for the derived view: a model
+  // that does not pin a field shows (and uses) the runtime's default.
+  let runtimeMetadata = $state<RuntimeLaunchMetadata>(emptyRuntimeLaunchMetadata());
+  $effect(() => {
+    const option = runtimes.find((candidate) => candidate.name === draft.backendRuntime);
+    runtimeMetadata = option?.metadata ?? emptyRuntimeLaunchMetadata();
+  });
+
+  function launchFieldInherited(field: keyof ModelLaunchDraft): boolean {
+    return !draft.launchPinned[field] && String(draft.launch[field] ?? "") !== "";
+  }
+
+  // setLaunchField pins or unpins one launch field. Clearing the input hands
+  // the field back to the runtime default instead of writing an empty flag.
+  function setLaunchField(field: keyof ModelLaunchDraft, value: DraftNumberValue): void {
+    (draft.launch as unknown as Record<string, unknown>)[field] = value;
+    const text = String(value ?? "").trim();
+    const pinned = { ...draft.launchPinned };
+    if (text === "") delete pinned[field];
+    else pinned[field] = true;
+    draft.launchPinned = pinned;
+  }
+
   function launchViewEmpty(launch: ModelLaunchDraft): boolean {
     return trimmedText(launch.model) === "" && trimmedText(launch.servedModelName) === "" &&
       trimmedText(launch.contextPerRequest) === "" && trimmedText(launch.maxConcurrency) === "" &&
@@ -281,23 +313,33 @@
       launch.gpus.length === 0 && trimmedText(launch.gpuMemoryUtilization) === "";
   }
 
-  function migrateLaunchView(argumentsText: string, kind: string): void {
+  // deriveLaunchView reads the structured fields out of the command text.
+  // The args are the source of truth now, so this only fills the view: it
+  // never rewrites, reorders or removes a flag.
+  function deriveLaunchView(argumentsText: string, kind: string): void {
     try {
       const parsed = parseLaunchCommand(kind, argumentsText);
       if (parsed.warnings.length > 0) return;
+      const pinned = launchPinnedFromArguments(kind, argumentsText);
       if (parsed.model !== "") draft.launch.model = parsed.model;
+      if (parsed.servedModelName !== "") draft.launch.servedModelName = parsed.servedModelName;
       if (parsed.contextPerRequest > 0) draft.launch.contextPerRequest = String(parsed.contextPerRequest);
       if (parsed.maxConcurrency > 0) draft.launch.maxConcurrency = String(parsed.maxConcurrency);
       if (parsed.tensorParallelSize > 0) draft.launch.tensorParallelSize = String(parsed.tensorParallelSize);
       if (parsed.gpuMemoryUtilization != null) draft.launch.gpuMemoryUtilization = String(parsed.gpuMemoryUtilization * 100);
       if (parsed.cudaVisibleDevices.length > 0) draft.launch.gpus = mapDeviceSelections(parsed.cudaVisibleDevices);
-      const extras = parsed.extraArgs;
-      if (extras.length !== tokenizeLaunchArguments(argumentsText).length) {
-        argsText = renderExtraArgs(extras);
-        draft.backendArguments = rebuildManagedArguments(argsText, kind, "");
+      // Unpinned fields fall back to the runtime's metadata defaults so the
+      // editor shows the effective configuration.
+      const defaults = runtimeMetadata;
+      if (!pinned.contextPerRequest && defaults.contextPerRequest !== "") draft.launch.contextPerRequest = defaults.contextPerRequest;
+      if (!pinned.maxConcurrency && defaults.maxConcurrency !== "") draft.launch.maxConcurrency = defaults.maxConcurrency;
+      if (!pinned.tensorParallelSize && defaults.tensorParallelSize !== "") draft.launch.tensorParallelSize = defaults.tensorParallelSize;
+      if (!pinned.gpuMemoryUtilization && defaults.gpuMemoryUtilization !== "") {
+        draft.launch.gpuMemoryUtilization = String(Number(defaults.gpuMemoryUtilization) * 100);
       }
+      draft.launchPinned = pinned;
     } catch {
-      // the migration view is best effort; the legacy text keeps working
+      // the derived view is best effort; the text keeps working
     }
   }
 
@@ -955,11 +997,27 @@
                           {:else if !modelFilesLoading && managedTargets.length === 0}<p class="text-muted-foreground text-xs">{$translate("modelFiles.empty")}</p>{/if}
                         </div>
                         <label class="grid gap-1 text-sm"><span class="font-medium">{$translate("controlPlane.launchServedModelName")}</span><Input class={inputClass} readonly bind:value={draft.launch.servedModelName} /></label>
-                        <label class="grid gap-1 text-sm"><span class="font-medium">{$translate("controlPlane.launchContextPerRequest")}</span><Input class={inputClass} type="number" min="1" bind:value={draft.launch.contextPerRequest} placeholder="262144" /></label>
-                        <label class="grid gap-1 text-sm"><span class="font-medium">{$translate("controlPlane.launchMaxConcurrency")}</span><Input class={inputClass} type="number" min="1" bind:value={draft.launch.maxConcurrency} placeholder="2" /></label>
+                        <label class="grid gap-1 text-sm">
+                          <span class="font-medium">{$translate("controlPlane.launchContextPerRequest")}</span>
+                          <Input class={inputClass} type="number" min="1" value={draft.launch.contextPerRequest} oninput={(event) => setLaunchField("contextPerRequest", event.currentTarget.value)} placeholder="262144" />
+                          {#if launchFieldInherited("contextPerRequest")}<span class="text-muted-foreground text-xs">{$translate("controlPlane.launchInheritedFromRuntime")}</span>{/if}
+                        </label>
+                        <label class="grid gap-1 text-sm">
+                          <span class="font-medium">{$translate("controlPlane.launchMaxConcurrency")}</span>
+                          <Input class={inputClass} type="number" min="1" value={draft.launch.maxConcurrency} oninput={(event) => setLaunchField("maxConcurrency", event.currentTarget.value)} placeholder="2" />
+                          {#if launchFieldInherited("maxConcurrency")}<span class="text-muted-foreground text-xs">{$translate("controlPlane.launchInheritedFromRuntime")}</span>{/if}
+                        </label>
                         {#if effectiveManagedKind === "vllm"}
-                          <label class="grid gap-1 text-sm"><span class="font-medium">{$translate("controlPlane.launchTensorParallelSize")}</span><Input class={inputClass} type="number" min="1" bind:value={draft.launch.tensorParallelSize} placeholder={$translate("controlPlane.launchTensorParallelSizePlaceholder")} /></label>
-                          <label class="grid gap-1 text-sm sm:col-span-2"><span class="font-medium">{$translate("controlPlane.launchGPUMemoryUtilization")}</span><div class="flex max-w-56 items-center gap-1"><Input class={inputClass} type="number" min="1" max="100" bind:value={draft.launch.gpuMemoryUtilization} placeholder="90" /><span class="text-muted-foreground text-sm">%</span></div></label>
+                          <label class="grid gap-1 text-sm">
+                            <span class="font-medium">{$translate("controlPlane.launchTensorParallelSize")}</span>
+                            <Input class={inputClass} type="number" min="1" value={draft.launch.tensorParallelSize} oninput={(event) => setLaunchField("tensorParallelSize", event.currentTarget.value)} placeholder={$translate("controlPlane.launchTensorParallelSizePlaceholder")} />
+                            {#if launchFieldInherited("tensorParallelSize")}<span class="text-muted-foreground text-xs">{$translate("controlPlane.launchInheritedFromRuntime")}</span>{/if}
+                          </label>
+                          <label class="grid gap-1 text-sm sm:col-span-2">
+                            <span class="font-medium">{$translate("controlPlane.launchGPUMemoryUtilization")}</span>
+                            <div class="flex max-w-56 items-center gap-1"><Input class={inputClass} type="number" min="1" max="100" value={draft.launch.gpuMemoryUtilization} oninput={(event) => setLaunchField("gpuMemoryUtilization", event.currentTarget.value)} placeholder="90" /><span class="text-muted-foreground text-sm">%</span></div>
+                            {#if launchFieldInherited("gpuMemoryUtilization")}<span class="text-muted-foreground text-xs">{$translate("controlPlane.launchInheritedFromRuntime")}</span>{/if}
+                          </label>
                         {/if}
                       </div>
                       <div class="mb-1 grid gap-1.5 text-sm">
@@ -986,6 +1044,11 @@
                         {/if}
                       </div>
                     {/if}
+                    <label class="grid gap-1 text-sm" for="model-overview-entrypoint">
+                      <span class="font-medium">{$translate("controlPlane.modelEntryPoint")}</span>
+                      <Input id="model-overview-entrypoint" class={inputClass} bind:value={draft.backendEntryPoint} placeholder={$translate("controlPlane.modelEntryPointPlaceholder")} />
+                      <span class="text-muted-foreground text-xs">{$translate("controlPlane.modelEntryPointHint")}</span>
+                    </label>
                     <span class="font-medium">{selectedRuntime ? $translate("controlPlane.modelRuntimeArguments") : $translate("controlPlane.modelArguments")}</span>
                     <LaunchArgsCodeEditor compact ariaLabel={selectedRuntime ? $translate("controlPlane.modelRuntimeArguments") : $translate("controlPlane.modelArguments")} bind:value={argsText} onChange={(value) => updateBackendArguments(value)} placeholder={effectiveManagedKind === "llamacpp" ? "--flash-attn auto" : "--trust-remote-code"} />
                     {#if parseNote}<span class="text-destructive text-xs" role="status">{parseNote}</span>{/if}

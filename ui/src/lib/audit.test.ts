@@ -254,3 +254,78 @@ describe("streamed transcript bodies", () => {
     }
   });
 });
+
+describe("audit reasoning and form captures", () => {
+  it("renders reasoning_content from a chat assistant message", () => {
+    const transcript = auditRequestTranscript(JSON.stringify({
+      messages: [
+        { role: "user", content: "hi" },
+        { role: "assistant", content: "answer", reasoning_content: "step by step thought" },
+      ],
+    }));
+    const reasoning = transcript.find((item) => item.kind === "reasoning");
+    expect(reasoning).toMatchObject({ kind: "reasoning", text: "step by step thought" });
+  });
+
+  it("folds streamed reasoning deltas into one thinking block", () => {
+    const body = [
+      "event: message",
+      'data: {"choices":[{"delta":{"reasoning_content":"think "}}]}',
+      "",
+      "event: message",
+      'data: {"choices":[{"delta":{"reasoning_content":"hard"}}]}',
+      "",
+      "event: message",
+      'data: {"choices":[{"delta":{"content":"answer"}}]}',
+      "",
+      "data: [DONE]",
+      "",
+    ].join("\n");
+    const transcript = auditResponseTranscript(body);
+    const reasoning = transcript.find((item) => item.kind === "reasoning");
+    expect(reasoning).toMatchObject({ kind: "reasoning", text: "think hard" });
+    const answer = transcript.find((item) => item.kind === "message");
+    expect(answer).toMatchObject({ role: "assistant", text: "answer" });
+  });
+
+  it("renders a structured multipart-form capture as user turn plus audio", () => {
+    const capture = {
+      format: "multipart-form",
+      fields: { model: "Qwen/Qwen3-ASR-1.7B", language: "ja" },
+      files: [{
+        field: "file",
+        filename: "song.mp3",
+        mimeType: "audio/mpeg",
+        size: 4,
+        content: btoa("ID3x"),
+      }],
+    };
+    const transcript = auditRequestTranscript(JSON.stringify(capture));
+    const message = transcript.find((item) => item.kind === "message");
+    expect(message).toMatchObject({ role: "user" });
+    expect((message as { text: string }).text).toContain("model: Qwen/Qwen3-ASR-1.7B");
+    const audio = transcript.find((item) => item.kind === "audio");
+    expect(audio).toMatchObject({ kind: "audio", label: "song.mp3", sizeBytes: 4 });
+    expect((audio as { dataUrl: string }).dataUrl).toContain("data:audio/mpeg;base64,");
+  });
+
+  it("renders a form capture without stored content as text only", () => {
+    const capture = {
+      format: "multipart-form",
+      fields: { model: "m" },
+      files: [{ field: "file", filename: "a.mp3", mimeType: "audio/mpeg", size: 9 }],
+    };
+    const transcript = auditRequestTranscript(JSON.stringify(capture));
+    expect(transcript.find((item) => item.kind === "audio")).toBeUndefined();
+    expect(transcript.find((item) => item.kind === "message")).toBeDefined();
+  });
+
+  it("collapses long base64 data URLs cleanly in collapseDataUrls", () => {
+    const hugeBase64 = "A".repeat(300);
+    const input = `{"image": "data:image/png;base64,${hugeBase64}"}`;
+    const result = collapseDataUrls(input);
+    expect(result).toContain("data:image/png;base64,[");
+    expect(result).not.toContain(hugeBase64);
+  });
+});
+

@@ -6,14 +6,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
 // handleAPIResponseGet resolves a Responses response id through the durable
-// affinity table. Chat-adapted responses are served from the stored canonical
-// Responses JSON; native backends are dispatched upstream with the model
-// restored as a query parameter.
+// affinity table. Responses results are served from the stored canonical JSON;
+// the selected Chat backend is used only when no local result is available.
 func (s *Server) handleAPIResponseGet(w http.ResponseWriter, r *http.Request) {
 	cfg := s.currentConfig()
 	affinity, found, err := s.store.GetResponseAffinity(r.Context(), strings.TrimSpace(r.PathValue("response_id")), time.Now())
@@ -37,11 +35,8 @@ func (s *Server) handleAPIResponseGet(w http.ResponseWriter, r *http.Request) {
 	s.handleResponseForward(w, r, affinity.Model)
 }
 
-// handleAPIResponseCancel forwards native cancellation to the selected
-// backend. For a chat-adapted response there is no backend response id to
-// cancel after completion, so the stored response is returned with an
-// explicit cancelled status rather than pretending a remote cancellation
-// happened.
+// handleAPIResponseCancel updates the stored result because the Chat backend
+// has no Responses response id to cancel after completion.
 func (s *Server) handleAPIResponseCancel(w http.ResponseWriter, r *http.Request) {
 	cfg := s.currentConfig()
 	id := strings.TrimSpace(r.PathValue("response_id"))
@@ -85,18 +80,14 @@ func (s *Server) handleAPIResponseCancel(w http.ResponseWriter, r *http.Request)
 	s.handleResponseForward(w, r, affinity.Model)
 }
 
-// responseUsesChatAdapter is deliberately resolved from the current model
-// configuration instead of using the presence of response_json as a proxy for
-// protocol mode. Native Responses responses are also persisted for audit and
-// restart correlation, but GET/cancel must still reach the upstream native
-// endpoint; only the Chat adapter can satisfy those operations from its local
-// response chain.
+// responseUsesChatAdapter keeps response lookup behavior tied to the selected
+// model configuration rather than inferring protocol mode from stored data.
 func (s *Server) responseUsesChatAdapter(model string) bool {
 	if s == nil {
 		return false
 	}
 	modelConfig, ok := s.currentConfig().Models[model]
-	return ok && modelConfig.Backend.EffectiveProtocol() == config.AdapterProtocolResponsesToChat
+	return ok && modelConfig.Backend.AdaptsResponses()
 }
 
 func (s *Server) handleResponseForward(w http.ResponseWriter, r *http.Request, model string) {
@@ -105,6 +96,6 @@ func (s *Server) handleResponseForward(w http.ResponseWriter, r *http.Request, m
 	r.URL.RawQuery = query.Encode()
 	// The regular model dispatcher accepts GET query-model requests only for
 	// registered model routes. Calling the selected local/peer handler directly
-	// keeps the original response path intact for native backends.
+	// keeps the original Responses path intact when no local result is stored.
 	s.localPeerHandler(w, r)
 }

@@ -28,16 +28,24 @@ import type { ModelConfigDraft } from "./modelConfig";
 
 describe("modelConfig", () => {
   it("derives managed runtime entrypoints from runtime definitions", () => {
+    const noMetadata = { entryPoint: "", contextPerRequest: "", maxConcurrency: "", tensorParallelSize: "", gpuMemoryUtilization: "" };
     expect(runtimeOptions({ runtimes: {
       "vllm-main": { kind: "vLLM" },
       "llama-cuda": { kind: "llamacpp" },
     } })).toEqual([
-      { name: "llama-cuda", kind: "llamacpp", mode: "native" },
-      { name: "vllm-main", kind: "vllm", mode: "native" },
+      { name: "llama-cuda", kind: "llamacpp", mode: "native", metadata: noMetadata },
+      { name: "vllm-main", kind: "vllm", mode: "native", metadata: noMetadata },
     ]);
+    // Runtime metadata publishes the launch head and quick-config defaults.
+    expect(runtimeOptions({ runtimes: {
+      "vllm-meta": { kind: "vllm", metadata: { entrypoint: "python3 /s.py", contextPerRequest: 32768 } },
+    } })[0].metadata).toEqual({
+      entryPoint: "python3 /s.py", contextPerRequest: "32768", maxConcurrency: "", tensorParallelSize: "", gpuMemoryUtilization: "",
+    });
     expect(managedRuntimeEntrypoint("vllm")).toBe("vllm");
     expect(managedRuntimeEntrypoint("llamacpp")).toBe("llama-server");
   });
+
 
   it("derives the runtime mode like the server: explicit mode, then images, then native", () => {
     expect(runtimeMode({ kind: "vllm" })).toBe("native");
@@ -98,26 +106,31 @@ describe("modelConfig", () => {
   it("serializes numbers emitted by native number inputs", () => {
     const draft = emptyModelDraft("numeric-input");
     draft.launchMode = "backend";
+    draft.backendType = "vllm";
     draft.backendArguments = "/models/qwen";
     draft.launch.contextPerRequest = 262144;
     draft.launch.maxConcurrency = 4;
     draft.launch.tensorParallelSize = 4;
     draft.launch.gpuMemoryUtilization = 80;
+    draft.launchPinned = { contextPerRequest: true, maxConcurrency: true, tensorParallelSize: true, gpuMemoryUtilization: true };
     draft.ttl = 60;
     draft.capabilitiesContext = 262144;
     draft.timeoutConnect = 10;
 
     expect(hasModelCapabilityOverrides(draft)).toBe(true);
+    // The structured fields are a view: saving materializes them as flags in
+    // the command text and never writes a launch block.
     expect(buildModelValue(draft)).toEqual({
       ttl: 60,
       backend: {
-        args: ["/models/qwen"],
-        launch: {
-          contextPerRequest: 262144,
-          maxConcurrency: 4,
-          tensorParallelSize: 4,
-          gpuMemoryUtilization: 0.8,
-        },
+        type: "vllm",
+        args: [
+          "/models/qwen",
+          "--max-model-len 262144",
+          "--max-num-seqs 4",
+          "--tensor-parallel-size 4",
+          "--gpu-memory-utilization 0.8",
+        ],
       },
       capabilities: { context: 262144 },
       timeouts: { connect: 10 },
@@ -142,7 +155,16 @@ describe("modelConfig", () => {
 
     expect(draft.launch.tensorParallelSize).toBe("4");
     const backend = buildModelValue(draft).backend as Record<string, unknown>;
-    expect((backend.launch as Record<string, unknown>).tensorParallelSize).toBe(4);
+    expect(backend.launch).toBeUndefined();
+    expect(backend.args).toEqual([
+      "--model /models/qwen",
+      "--tensor-parallel-size 4",
+      "--dtype float16",
+      "--served-model-name qwen",
+      "--max-model-len 262144",
+      "--max-num-seqs 2",
+      "--gpu-memory-utilization 0.8",
+    ]);
   });
 
   it("builds a new command model without materializing empty optional fields", () => {
@@ -437,7 +459,10 @@ describe("modelConfig", () => {
   it("requires a local launch definition", () => {
     const draft = emptyModelDraft("broken");
     draft.launchMode = "backend";
-    expect(() => buildModelValue(draft)).toThrow("backend.args or backend.container.image");
+    expect(() => buildModelValue(draft)).toThrow("backend.args, backend.entrypoint or backend.container.image");
+    // A custom launch head is a complete definition on its own.
+    draft.backendEntryPoint = "python3 /scripts/server.py";
+    expect((buildModelValue(draft).backend as Record<string, unknown>).entrypoint).toBe("python3 /scripts/server.py");
   });
 
   it("summarizes nested changes as leaf fields", () => {
@@ -789,5 +814,36 @@ describe("autoServedModelName", () => {
 
   it("trims surrounding whitespace from both inputs", () => {
     expect(autoServedModelName("  upstream-name  ", " qwen38 ")).toBe("upstream-name");
+  });
+});
+
+describe("runtime launch metadata inheritance", () => {
+  it("does not materialize inherited defaults into backend.args", () => {
+    const draft = emptyModelDraft("inherited");
+    draft.launchMode = "backend";
+    draft.backendType = "vllm";
+    draft.backendArguments = "--model /models/qwen";
+    // The view shows the runtime default, but the model does not pin it.
+    draft.launch.contextPerRequest = 32768;
+    draft.launchPinned = {};
+
+    const backend = buildModelValue(draft).backend as Record<string, unknown>;
+    expect(backend.args).toEqual(["--model /models/qwen"]);
+  });
+
+  it("materializes a field the model pins and keeps hand-written flags", () => {
+    const draft = emptyModelDraft("pinned");
+    draft.launchMode = "backend";
+    draft.backendType = "vllm";
+    draft.backendArguments = "--model /models/qwen\n--tensor-parallel-size 4";
+    draft.launch.contextPerRequest = 32768;
+    draft.launchPinned = { contextPerRequest: true };
+
+    const backend = buildModelValue(draft).backend as Record<string, unknown>;
+    expect(backend.args).toEqual([
+      "--model /models/qwen",
+      "--tensor-parallel-size 4",
+      "--max-model-len 32768",
+    ]);
   });
 });
