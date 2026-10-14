@@ -2,7 +2,7 @@
 @import "tw-animate-css";
 
 @custom-variant dark (&:is(.dark *));
-@custom-variant data-active (&:is([data-state="active"]));
+@custom-variant data-active (&:is([data-state="active"], [data-active="true"]));
 @custom-variant data-checked (&:is([data-state="checked"]));
 @custom-variant data-unchecked (&:is([data-state="unchecked"]));
 @custom-variant data-open (&:is([data-state="open"]));
