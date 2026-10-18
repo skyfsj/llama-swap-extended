@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { basicSetup, EditorView } from "codemirror";
   import { Compartment, EditorState, type Extension } from "@codemirror/state";
+  import { codeMirrorChromeTheme } from "../../lib/codemirrorChrome";
   import { HighlightStyle, syntaxHighlighting } from "@codemirror/language";
   import { tags } from "@lezer/highlight";
   import { yaml } from "@codemirror/lang-yaml";
@@ -53,21 +54,6 @@
       color: "var(--muted-foreground)",
     },
     ".cm-gutterElement": { padding: "0 0.625rem" },
-    ".cm-activeLine": { backgroundColor: "color-mix(in oklab, var(--primary) 8%, transparent)" },
-    ".cm-activeLineGutter": { backgroundColor: "color-mix(in oklab, var(--primary) 12%, transparent)" },
-    ".cm-selectionBackground, &.cm-focused .cm-selectionBackground, ::selection": {
-      backgroundColor: "color-mix(in oklab, var(--primary) 28%, transparent) !important",
-    },
-    ".cm-cursor, .cm-dropCursor": { borderLeftColor: "var(--foreground)" },
-    ".cm-matchingBracket": {
-      backgroundColor: "color-mix(in oklab, var(--primary) 18%, transparent)",
-      outline: "1px solid color-mix(in oklab, var(--primary) 55%, transparent)",
-    },
-    ".cm-foldPlaceholder": {
-      border: "1px solid var(--border)",
-      backgroundColor: "var(--muted)",
-      color: "var(--muted-foreground)",
-    },
     "&.cm-focused": { outline: "2px solid var(--ring)", outlineOffset: "-2px" },
   });
 
@@ -123,6 +109,7 @@
         doc: value ?? "",
         extensions: [
           basicSetup,
+          codeMirrorChromeTheme,
           yaml(),
           yamlHighlighting,
           editorTheme,

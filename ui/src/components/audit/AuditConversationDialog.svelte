@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { tick } from "svelte";
+  import { tick, untrack } from "svelte";
   import { Button } from "$lib/components/ui/button/index.js";
   import * as Dialog from "$lib/components/ui/dialog/index.js";
   import * as Tabs from "$lib/components/ui/tabs/index.js";
@@ -116,20 +116,20 @@
     if (status >= 200 && status < 300) {
       return {
         label: `${status} OK`,
-        badgeClass: "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/20",
+        badgeClass: "bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border-emerald-500/30",
         icon: CheckCircle2,
       };
     }
     if (status >= 400 && status < 500) {
       return {
         label: `${status} Error`,
-        badgeClass: "bg-amber-500/10 text-amber-600 dark:text-amber-400 border-amber-500/20",
+        badgeClass: "bg-amber-500/15 text-amber-700 dark:text-amber-300 border-amber-500/30",
         icon: AlertCircle,
       };
     }
     return {
       label: `${status} Fail`,
-      badgeClass: "bg-destructive/10 text-destructive border-destructive/20",
+      badgeClass: "bg-destructive/15 text-destructive border-destructive/30",
       icon: XCircle,
     };
   }
@@ -148,8 +148,13 @@
 
   $effect(() => {
     const item = conversation;
-    streamedBodies = {};
-    bodiesError = "";
+    // The reset writes streamedBodies/bodiesError; reading them in the same
+    // effect would retrigger it on every run. The reads below are taken from a
+    // snapshot so the effect depends only on the conversation being opened.
+    untrack(() => {
+      streamedBodies = {};
+      bodiesError = "";
+    });
     if (!open || !item) {
       bodiesLoading = false;
       return;
@@ -166,12 +171,14 @@
     const jobs: Promise<void>[] = [];
     if (wantRequest) {
       jobs.push(fetchAuditConversationBody(id, "request").then((bytes) => {
-        if (!cancelled) streamedBodies = { ...streamedBodies, request: bytes };
+        if (cancelled) return;
+        untrack(() => { streamedBodies = { ...streamedBodies, request: bytes }; });
       }));
     }
     if (wantResponse) {
       jobs.push(fetchAuditConversationBody(id, "response").then((bytes) => {
-        if (!cancelled) streamedBodies = { ...streamedBodies, response: bytes };
+        if (cancelled) return;
+        untrack(() => { streamedBodies = { ...streamedBodies, response: bytes }; });
       }));
     }
     void Promise.all(jobs)
@@ -199,7 +206,10 @@
     if (!value) onclose();
   }}
 >
-  <Dialog.Content class="flex h-[90vh] max-h-[92vh] w-[95vw] max-w-6xl flex-col gap-0 p-0 overflow-hidden shadow-2xl border-border">
+  <Dialog.Content
+    showCloseButton={false}
+    class="flex h-[88vh] max-h-[92vh] w-[96vw] sm:max-w-[96vw] md:max-w-[94vw] lg:max-w-[1400px] xl:max-w-[1560px] flex-col gap-0 p-0 overflow-hidden shadow-2xl border border-border bg-background"
+  >
     {#if loading}
       <Dialog.Header class="border-b px-5 py-4">
         <Dialog.Title>{$translate("controlPlane.auditTitle")}</Dialog.Title>
@@ -218,26 +228,27 @@
       </div>
     {:else if conversation}
       {@const statusInfo = statusVariant(conversation.responseStatus)}
-      <!-- Enhanced Header -->
-      <Dialog.Header class="border-b bg-card/60 px-5 py-3.5 backdrop-blur-xs">
+      <!-- Header -->
+      <Dialog.Header class="border-b bg-card/60 px-5 py-3 backdrop-blur-xs">
         <div class="flex items-center justify-between gap-4">
-          <div class="min-w-0 flex-1">
+          <div class="min-w-0 flex-1 space-y-1">
+            <!-- Line 1: Title, Status, Model, ID -->
             <div class="flex flex-wrap items-center gap-2">
               <span class="text-base font-bold tracking-tight text-foreground">
                 {$translate("controlPlane.auditTitle")}
               </span>
 
+              <!-- Status badge -->
+              <span class="inline-flex items-center gap-1 rounded-md border px-2 py-0.5 font-mono text-xs font-semibold {statusInfo.badgeClass}">
+                <statusInfo.icon class="size-3.5" aria-hidden="true" />
+                <span>{statusInfo.label}</span>
+              </span>
+
               <!-- Model badge -->
               <Badge variant="secondary" class="inline-flex items-center gap-1 font-mono text-xs font-medium">
                 <Cpu class="size-3 text-primary" aria-hidden="true" />
-                <span class="max-w-48 truncate">{conversation.model}</span>
+                <span class="max-w-56 truncate">{conversation.model}</span>
               </Badge>
-
-              <!-- Status badge -->
-              <span class="inline-flex items-center gap-1 rounded-md border px-2 py-0.5 font-mono text-xs font-semibold {statusInfo.badgeClass}">
-                <statusInfo.icon class="size-3" aria-hidden="true" />
-                <span>{statusInfo.label}</span>
-              </span>
 
               <!-- ID badge with copy -->
               <div class="inline-flex items-center gap-1 rounded-md border bg-muted/40 px-1.5 py-0.5 text-xs text-muted-foreground font-mono">
@@ -246,9 +257,9 @@
               </div>
             </div>
 
-            <!-- Path and timestamp -->
-            <div class="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
-              <span class="inline-flex items-center gap-1 font-mono text-foreground/80">
+            <!-- Line 2: Path, timestamp, Key, Session -->
+            <div class="flex flex-wrap items-center gap-x-2.5 gap-y-1 text-xs text-muted-foreground">
+              <span class="inline-flex items-center gap-1 font-mono text-foreground/80 font-medium">
                 <span>{conversation.reqPath}</span>
                 <AuditCopyButton text={conversation.reqPath} title={$translate("controlPlane.auditCopyPath")} />
               </span>
@@ -259,22 +270,23 @@
               </span>
               {#if conversation.keyId}
                 <span>·</span>
-                <span class="font-mono">{$translate("activity.filters.key")}: {conversation.keyId}</span>
+                <span class="font-mono">Key: {conversation.keyId}</span>
               {/if}
               {#if conversation.sessionId}
                 <span>·</span>
                 <span class="inline-flex items-center gap-1 font-mono">
-                  <span>{$translate("controlPlane.auditSession")}: {conversation.sessionId.slice(0, 16)}</span>
+                  <span>Session: {conversation.sessionId.slice(0, 16)}</span>
                   <AuditCopyButton text={conversation.sessionId} />
                 </span>
               {/if}
             </div>
           </div>
 
+          <!-- Single Close Button -->
           <Button
             variant="ghost"
             size="icon"
-            class="size-8 shrink-0 rounded-full text-muted-foreground hover:text-foreground"
+            class="size-8 shrink-0 rounded-full text-muted-foreground hover:bg-muted hover:text-foreground"
             onclick={onclose}
             aria-label={$translate("common.close")}
           >
@@ -283,89 +295,51 @@
         </div>
       </Dialog.Header>
 
-      <!-- KPI Overview Bar -->
-      <div class="grid grid-cols-2 gap-2 border-b bg-muted/20 px-5 py-2.5 sm:grid-cols-4 lg:grid-cols-5 text-xs">
+      <!-- Compact Metrics Ribbon (Clean, space-efficient, no awkward truncation) -->
+      <div class="flex flex-wrap items-center gap-2 border-b bg-muted/20 px-5 py-2 text-xs">
         <!-- Duration & TTFT -->
-        <div class="rounded-lg border bg-background/80 p-2.5 shadow-2xs">
-          <div class="text-muted-foreground flex items-center justify-between">
-            <span>{$translate("controlPlane.auditDuration")}</span>
-            <Clock class="size-3.5 text-muted-foreground" />
-          </div>
-          <div class="mt-1 font-mono text-sm font-semibold text-foreground">
-            {formatMs(conversation.durationMs ?? 0)}
-          </div>
-          <div class="mt-0.5 text-muted-foreground text-xs">
-            {$translate("controlPlane.auditTtft")}: {conversation.firstTokenMs !== undefined && conversation.firstTokenMs >= 0 ? formatMs(conversation.firstTokenMs) : "—"}
-          </div>
+        <div class="flex items-center gap-1.5 rounded-md border bg-background/90 px-2.5 py-1 shadow-2xs">
+          <Clock class="size-3.5 text-muted-foreground" aria-hidden="true" />
+          <span class="text-muted-foreground">{$translate("controlPlane.auditDuration")}:</span>
+          <span class="font-mono font-semibold text-foreground">{formatMs(conversation.durationMs ?? 0)}</span>
+          {#if conversation.firstTokenMs !== undefined && conversation.firstTokenMs >= 0}
+            <span class="text-muted-foreground font-mono">({$translate("controlPlane.auditTtft")}: {formatMs(conversation.firstTokenMs)})</span>
+          {/if}
         </div>
 
         <!-- Tokens -->
-        <div class="rounded-lg border bg-background/80 p-2.5 shadow-2xs">
-          <div class="text-muted-foreground flex items-center justify-between">
-            <span>{$translate("controlPlane.auditTokens")}</span>
-            <Zap class="size-3.5 text-amber-500" />
-          </div>
-          <div class="mt-1 font-mono text-sm font-semibold text-foreground">
-            {totalTokens(conversation)}
-          </div>
-          <div class="mt-0.5 text-muted-foreground text-xs truncate">
-            {conversation.inputTokens} ↑ · {conversation.outputTokens} ↓
-            {#if conversation.reasoningTokens}
-              · {conversation.reasoningTokens} 💡
-            {/if}
-          </div>
+        <div class="flex items-center gap-1.5 rounded-md border bg-background/90 px-2.5 py-1 shadow-2xs">
+          <Zap class="size-3.5 text-amber-500" aria-hidden="true" />
+          <span class="text-muted-foreground">{$translate("controlPlane.auditTokens")}:</span>
+          <span class="font-mono font-semibold text-foreground">{totalTokens(conversation)}</span>
+          <span class="text-muted-foreground font-mono">({conversation.inputTokens}↑ · {conversation.outputTokens}↓{#if conversation.reasoningTokens} · {conversation.reasoningTokens}💡{/if})</span>
         </div>
 
         <!-- Cache Hit -->
-        <div class="rounded-lg border bg-background/80 p-2.5 shadow-2xs">
-          <div class="text-muted-foreground flex items-center justify-between">
-            <span>{$translate("controlPlane.cacheHitRatio")}</span>
-            <Database class="size-3.5 text-sky-500" />
-          </div>
-          <div class="mt-1 font-mono text-sm font-semibold text-foreground">
-            {percent(conversation.cacheHitRatio)}
-          </div>
-          <div class="mt-0.5 text-muted-foreground text-xs truncate">
-            {conversation.cachedTokens ?? 0} cached
-          </div>
+        <div class="flex items-center gap-1.5 rounded-md border bg-background/90 px-2.5 py-1 shadow-2xs">
+          <Database class="size-3.5 text-sky-500" aria-hidden="true" />
+          <span class="text-muted-foreground">{$translate("controlPlane.cacheHitRatio")}:</span>
+          <span class="font-mono font-semibold text-foreground">{percent(conversation.cacheHitRatio)}</span>
+          {#if conversation.cachedTokens}
+            <span class="text-muted-foreground font-mono">({conversation.cachedTokens})</span>
+          {/if}
         </div>
 
         <!-- Estimated Cost -->
-        <div class="rounded-lg border bg-background/80 p-2.5 shadow-2xs">
-          <div class="text-muted-foreground flex items-center justify-between">
-            <span>{$translate("controlPlane.auditCost")}</span>
-            <DollarSign class="size-3.5 text-emerald-500" />
-          </div>
-          <div class="mt-1 font-mono text-sm font-semibold text-foreground">
-            ${conversation.estimatedCost.toFixed(6)}
-          </div>
-          <div class="mt-0.5 text-muted-foreground text-xs">
-            {conversation.complete ? "Complete" : "Inflight"}
-          </div>
+        <div class="flex items-center gap-1.5 rounded-md border bg-background/90 px-2.5 py-1 shadow-2xs">
+          <DollarSign class="size-3.5 text-emerald-500" aria-hidden="true" />
+          <span class="text-muted-foreground">{$translate("controlPlane.auditCost")}:</span>
+          <span class="font-mono font-semibold text-foreground">${conversation.estimatedCost.toFixed(6)}</span>
         </div>
 
-        <!-- Session Status (if applicable) -->
-        <div class="col-span-2 sm:col-span-4 lg:col-span-1 rounded-lg border bg-background/80 p-2.5 shadow-2xs">
-          <div class="text-muted-foreground flex items-center justify-between">
-            <span>{$translate("controlPlane.auditSession")}</span>
-            <Layers class="size-3.5 text-primary" />
+        <!-- Session status if multi-turn -->
+        {#if conversation.session && conversation.session.requestCount > 1}
+          <div class="flex items-center gap-1.5 rounded-md border bg-background/90 px-2.5 py-1 shadow-2xs">
+            <Layers class="size-3.5 text-primary" aria-hidden="true" />
+            <span class="text-muted-foreground">{$translate("controlPlane.auditSession")}:</span>
+            <span class="font-mono font-semibold text-foreground">Req #{conversation.session.requestCount}</span>
           </div>
-          {#if conversation.session && conversation.session.requestCount > 1}
-            <div class="mt-1 font-mono text-sm font-semibold text-foreground">
-              Req #{conversation.session.requestCount}
-            </div>
-            <div class="mt-0.5 text-muted-foreground text-xs truncate">
-              {conversation.session.inputTokens} → {conversation.session.outputTokens} tok
-            </div>
-          {:else}
-            <div class="mt-1 font-mono text-sm font-medium text-muted-foreground truncate">
-              {conversation.sessionId ? conversation.sessionId.slice(0, 10) : "1 turn"}
-            </div>
-            <div class="mt-0.5 text-muted-foreground text-xs">
-              Single request
-            </div>
-          {/if}
-        </div>
+        {/if}
       </div>
 
       <!-- Main Tabs Structure -->
@@ -424,7 +398,7 @@
 
         <!-- TAB 1: TRANSCRIPT -->
         <Tabs.Content value="transcript" class="m-0 min-h-0 flex-1 overflow-y-auto p-4 sm:p-5">
-          <div bind:this={transcriptScroller} class="max-w-4xl mx-auto space-y-4">
+          <div bind:this={transcriptScroller} class="w-full space-y-4">
             {#if bodiesLoading}
               <div class="rounded-lg border border-dashed p-8 text-center text-sm text-muted-foreground">
                 <div class="inline-block animate-spin mr-2">⌛</div>
@@ -497,7 +471,7 @@
           <div class="grid min-h-0 flex-1 gap-4 {payloadViewMode === 'split' ? 'lg:grid-cols-2' : 'grid-cols-1'}">
             <!-- Request Payload -->
             {#if payloadViewMode === 'split' || payloadViewMode === 'request'}
-              {@const reqStr = payloadFormat === 'pretty' ? bodyPretty(conversation.requestBody) : bodyText(conversation.requestBody)}
+              {@const reqStr = payloadFormat === 'pretty' ? bodyPretty(requestBody) : bodyText(requestBody)}
               <div class="flex min-h-0 flex-col rounded-lg border bg-card shadow-2xs overflow-hidden">
                 <div class="flex items-center justify-between border-b bg-muted/40 px-3.5 py-2 text-xs">
                   <div class="flex items-center gap-2 font-medium text-foreground">
@@ -517,7 +491,7 @@
 
             <!-- Response Payload -->
             {#if payloadViewMode === 'split' || payloadViewMode === 'response'}
-              {@const respStr = payloadFormat === 'pretty' ? bodyPretty(conversation.responseBody) : bodyText(conversation.responseBody)}
+              {@const respStr = payloadFormat === 'pretty' ? bodyPretty(responseBody) : bodyText(responseBody)}
               <div class="flex min-h-0 flex-col rounded-lg border bg-card shadow-2xs overflow-hidden">
                 <div class="flex items-center justify-between border-b bg-muted/40 px-3.5 py-2 text-xs">
                   <div class="flex items-center gap-2 font-medium text-foreground">
@@ -539,7 +513,7 @@
 
         <!-- TAB 3: PERFORMANCE -->
         <Tabs.Content value="performance" class="m-0 min-h-0 flex-1 overflow-y-auto p-4 sm:p-5">
-          <div class="max-w-4xl mx-auto space-y-6">
+          <div class="w-full space-y-6">
             <!-- Phase Timing Section -->
             <section class="rounded-xl border bg-card p-4 shadow-2xs space-y-3" aria-labelledby="timing-title">
               <div class="flex items-center justify-between border-b pb-2.5">
@@ -610,7 +584,7 @@
 
         <!-- TAB 4: HEADERS & EVENTS -->
         <Tabs.Content value="headers" class="m-0 min-h-0 flex-1 overflow-y-auto p-4 sm:p-5">
-          <div class="max-w-4xl mx-auto space-y-6">
+          <div class="w-full space-y-6">
             <!-- Headers Section -->
             <div class="grid gap-4 md:grid-cols-2">
               <!-- Request Headers -->
@@ -691,7 +665,7 @@
       </Tabs.Root>
 
       <!-- Footer -->
-      <Dialog.Footer class="mx-0 mb-0 shrink-0 border-t bg-card/60 px-5 py-3 flex items-center justify-between">
+      <Dialog.Footer class="mx-0 mb-0 shrink-0 border-t bg-card/60 px-5 py-2.5 flex items-center justify-between">
         <div class="flex items-center gap-3 text-xs text-muted-foreground">
           <span>{$translate("controlPlane.auditTokens")}: <strong class="text-foreground font-mono">{totalTokens(conversation)}</strong></span>
           <span>·</span>

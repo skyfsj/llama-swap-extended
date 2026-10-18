@@ -21,6 +21,13 @@
   );
 </script>
 
-<div class="flex items-center" title={tooltipText}>
-  <span class="inline-block w-3 h-3 rounded-full {eventStatusColor} mr-2"></span>
+<div class="flex items-center justify-center" title={tooltipText} aria-label={tooltipText}>
+  <span class="relative flex size-2.5">
+    {#if $connectionState === "connecting"}
+      <span class="absolute inline-flex size-full animate-ping rounded-full bg-amber-400 opacity-75"></span>
+    {:else if $connectionState === "connected"}
+      <span class="absolute inline-flex size-full rounded-full bg-emerald-400/20 ring-2 ring-emerald-500/30"></span>
+    {/if}
+    <span class="relative inline-flex size-2.5 rounded-full {eventStatusColor} shadow-xs"></span>
+  </span>
 </div>

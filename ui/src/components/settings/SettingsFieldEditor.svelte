@@ -5,8 +5,9 @@
   import { Input } from "$lib/components/ui/input/index.js";
   import SettingsListEditor from "./SettingsListEditor.svelte";
   import SettingsMapEditor from "./SettingsMapEditor.svelte";
+  import SettingsSensitiveListEditor from "./SettingsSensitiveListEditor.svelte";
   import ModelMultiSelect from "../ModelMultiSelect.svelte";
-  import type { SettingsField, SettingsOption } from "../../lib/settingsApi";
+  import type { SettingsChange, SettingsField, SettingsOption } from "../../lib/settingsApi";
   import { fieldEditorVariant } from "../../lib/settingsFieldVariant";
   import { translate } from "../../lib/i18n";
 
@@ -17,9 +18,12 @@
     loading?: boolean;
     error?: string;
     onChange: (value: unknown) => void;
+    // Lists whose entries are stored secrets (apiKeys) report the exact
+    // operations their rows changed, so untouched secrets are never rewritten.
+    onListChange?: (value: unknown[], changes: SettingsChange[]) => void;
   }
 
-  let { field, value, options = [], loading = false, error = "", onChange }: Props = $props();
+  let { field, value, options = [], loading = false, error = "", onChange, onListChange }: Props = $props();
   // A key the file does not define renders the catalogue default so the user
   // sees the effective value. The default stays out of the draft until the
   // user actually types, so saving an untouched field never materializes it.
@@ -42,18 +46,15 @@
   // unmarshal !!str into []string").
   let variant = $derived(fieldEditorVariant(field));
 
-  // Sensitive values reach the editor as "[REDACTED]" placeholders. While the
-  // field is untouched, show a fixed-length mask so a value is visible without
-  // being read. Typing replaces the draft value; the server keeps the old
-  // secret when the sentinel is submitted unchanged and writes new values.
+  // Sensitive values reach the editor as a "[REDACTED]" sentinel. A stored
+  // secret is shown as a fixed-length mask in the placeholder, never as the
+  // field value: typing into a value that already holds the mask saved
+  // "••••••••••••<typed>". Leaving the field alone submits nothing, so the
+  // stored secret stays as it is.
   const REDACTED_MASK = "••••••••••••";
-  let sensitiveTouched = $state(false);
+  let sensitiveStored = $derived(typeof value === "string" && value.includes("[REDACTED]"));
   let sensitiveDisplay = $derived(
-    !sensitiveTouched && typeof value === "string" && value.includes("[REDACTED]")
-      ? REDACTED_MASK
-      : value === undefined || value === null
-        ? ""
-        : String(value)
+    sensitiveStored ? "" : value === undefined || value === null ? "" : String(value)
   );
 
   function updateText(raw: string): void {
@@ -72,7 +73,6 @@
   }
 
   function updateSensitive(raw: string): void {
-    sensitiveTouched = true;
     onChange(raw);
   }
 </script>
@@ -89,8 +89,15 @@
       id={`settings-${field.path}`}
       type="password"
       value={sensitiveDisplay}
+      placeholder={sensitiveStored ? REDACTED_MASK : ""}
       oninput={(event) => updateSensitive(event.currentTarget.value)}
       aria-invalid={error ? "true" : "false"}
+    />
+  {:else if variant === "sensitive-list"}
+    <SettingsSensitiveListEditor
+      path={field.path}
+      value={value}
+      onChange={(next, changes) => onListChange?.(next, changes)}
     />
   {:else if variant === "sensitive-status"}
     <div class="settings-sensitive-value text-muted-foreground flex items-center border px-3 text-sm" role="status">

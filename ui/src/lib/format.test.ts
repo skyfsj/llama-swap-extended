@@ -7,6 +7,7 @@ import {
   formatCapacity,
   formatRelativeTime,
   formatAbsoluteTime,
+  formatProviderLabel,
 } from "./format";
 
 describe("formatDuration", () => {
@@ -108,5 +109,33 @@ describe("formatAbsoluteTime", () => {
     expect(formatAbsoluteTime(new Date(2026, 11, 31, 23, 59, 59).toISOString())).toBe(
       "2026-12-31 23:59:59"
     );
+  });
+});
+
+describe("formatProviderLabel", () => {
+  it("reads a row served here as the local model label", () => {
+    expect(formatProviderLabel({ provider_local: true }, "Local")).toBe("Local");
+    expect(formatProviderLabel({ provider: "   ", provider_local: true }, "本地")).toBe("本地");
+  });
+
+  it("shows an unattributed provider request as unknown instead of local", () => {
+    // A provider request that failed before any upstream answered has no
+    // provider either; claiming it ran here would be wrong.
+    expect(formatProviderLabel({}, "Local")).toBe("—");
+    expect(formatProviderLabel({ provider: "" }, "Local")).toBe("—");
+    expect(formatProviderLabel({ provider_local: false }, "Local")).toBe("—");
+  });
+
+  it("appends the adapter only when the provider has one", () => {
+    expect(formatProviderLabel({ provider: "opencode-go" }, "Local")).toBe("opencode-go");
+    expect(formatProviderLabel({ provider: "opencode-go", provider_adapter: "Claude" }, "Local")).toBe(
+      "opencode-go / Claude"
+    );
+  });
+
+  it("trims surrounding whitespace so the in-flight and record rows match", () => {
+    expect(
+      formatProviderLabel({ provider: " CPA ", provider_adapter: " OpenAI " }, "Local")
+    ).toBe("CPA / OpenAI");
   });
 });

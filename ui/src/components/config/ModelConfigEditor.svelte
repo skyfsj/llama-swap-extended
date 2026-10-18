@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import { AlertTriangle, Check, ChevronRight, Filter, Link2, LoaderCircle, RefreshCw, RotateCcw, Save, Server, SlidersHorizontal, Terminal } from "@lucide/svelte";
   import * as Dialog from "$lib/components/ui/dialog/index.js";
   import * as Tabs from "$lib/components/ui/tabs/index.js";
@@ -21,6 +21,7 @@
     draftFromModel,
     emptyModelDraft,
     extraLaunchArguments,
+    isCustomLaunchHead,
     hasModelCapabilityOverrides,
     managedLaunchKind,
     managedRuntimeEntrypoint,
@@ -31,7 +32,6 @@
     rebuildManagedArguments,
     record,
     runtimeOptions,
-    serializeLaunchArgument,
     summarizeChanges,
     syncCudaEnvLines,
     syncLaunchOwnedArguments,
@@ -47,8 +47,10 @@
     type RuntimeLaunchMetadata,
     emptyRuntimeLaunchMetadata,
     pinnedLaunchView,
+    shouldDeriveLaunchView,
+    removeOwnedLaunchFlag,
   } from "../../lib/modelConfig";
-  import { adoptLaunchFields, launchPinnedFromArguments, parseLaunchCommand, stripOwnedLaunchArguments, type ParsedLaunch } from "../../lib/launchParse";
+  import { adoptLaunchFields, launchPinnedFromArguments, parseLaunchCommand, type ParsedLaunch } from "../../lib/launchParse";
   import LaunchArgsCodeEditor from "./LaunchArgsCodeEditor.svelte";
 
   interface ConfigSource {
@@ -192,38 +194,50 @@
     // Managed launch text is normalized as soon as it is loaded: system-owned
     // tokens (entrypoint, bind host and port) are dropped and the operator's
     // own lines are preserved verbatim, so a hand-edited config round-trips.
-    if (kind !== "") next.backendArguments = rebuildManagedArguments(next.backendArguments, kind, "");
+    // A custom launch head owns the whole line, so its text is left alone.
+    const nextCustomHead = isCustomLaunchHead(
+      next.backendEntryPoint,
+      trimmedText(runtimes.find((candidate) => candidate.name === next.backendRuntime)?.metadata?.entryPoint ?? ""),
+    );
+    if (kind !== "" && !nextCustomHead) next.backendArguments = rebuildManagedArguments(next.backendArguments, kind, "");
     // A legacy structured launch block is history: its values are folded into
     // the command text on load so the editor shows (and later stores) exactly
     // what the engine will run. The block is never written back.
-    if (kind !== "" && !launchViewEmpty(next.launch)) {
+    if (kind !== "" && !nextCustomHead && !launchViewEmpty(next.launch)) {
       next.backendArguments = syncLaunchOwnedArguments(next.backendArguments, kind, next.launch, next.launch.gpus.length);
     }
     draft = next;
-    argsText = extraLaunchArguments(next.backendArguments, kind);
+    // The text this load produced is used directly below instead of reading
+    // `argsText` back: an effect that reads the state it also writes re-runs on
+    // the operator's own edits, and every keystroke in the arguments editor
+    // would be reverted to the config's value a moment later.
+    const loadedArgsText = extraLaunchArguments(next.backendArguments, kind, nextCustomHead);
+    argsText = loadedArgsText;
     hydrateGPUSelectionFromEnv = true;
     cudaEnvSyncState.visible = { managed: "", stashed: "" };
     cudaEnvSyncState.order = { managed: "", stashed: "" };
     // The structured fields are a derived view of the command text: they are
     // read from it on load and written back to it on edit, but never stored
     // as their own YAML block.
-    const migrationKey = `${selectedModel}:${snapshot.etag}`;
-    if (kind !== "" && launchViewEmpty(next.launch) && next.backendArguments.trim() !== "" && lastLaunchMigration !== migrationKey) {
-      lastLaunchMigration = migrationKey;
-      deriveLaunchView(argsText, kind);
+    //
+    // Untracked: filling the view writes properties of `draft`, and a property
+    // write reads `draft` itself, so tracking it would make this effect depend
+    // on the state it assigns two lines above — the effect would invalidate
+    // itself and spin until Svelte gives up with effect_update_depth_exceeded.
+    // A custom head has no engine flags to read the structured view from.
+    if (!nextCustomHead && shouldDeriveLaunchView(kind, loadedArgsText)) {
+      untrack(() => deriveLaunchView(loadedArgsText, kind));
     }
   });
-
-  let lastLaunchMigration = "";
 
   // The engine must serve under the name llama-swap sends upstream
   // (useModelName, or the model id when unset), so a managed launch owns
   // its served model name: the draft mirrors the derived value and the
   // field is display-only.
   $effect(() => {
-    if (effectiveManagedKind === "") return;
+    if (effectiveManagedKind === "" || customLaunchHead) return;
     const derived = autoServedModelName(draft.useModelName, draft.id);
-    if (draft.launch.servedModelName !== derived) draft.launch.servedModelName = derived;
+    if (draft.launch.servedModelName !== derived) setLaunchField("servedModelName", derived);
   });
 
   // The structured launch fields are the source of truth for the engine flags
@@ -283,6 +297,14 @@
     if (nextEnv !== draft.env) draft.env = nextEnv;
   });
 
+  // A custom launch head runs its own command line: the structured engine
+  // fields do not apply to it, so they are neither shown nor materialized into
+  // its args. The head comes from the model (backend.entrypoint) or, when the
+  // model leaves it empty, from the runtime's launch metadata — the same
+  // precedence the server applies when it builds the command.
+  let runtimeLaunchHead = $derived(trimmedText(selectedRuntime?.metadata?.entryPoint ?? ""));
+  let customLaunchHead = $derived(isCustomLaunchHead(draft.backendEntryPoint, runtimeLaunchHead));
+
   // Runtime metadata is the inheritance source for the derived view: a model
   // that does not pin a field shows (and uses) the runtime's default.
   let runtimeMetadata = $state<RuntimeLaunchMetadata>(emptyRuntimeLaunchMetadata());
@@ -295,14 +317,23 @@
     return !draft.launchPinned[field] && String(draft.launch[field] ?? "") !== "";
   }
 
-  // setLaunchField pins or unpins one launch field. Clearing the input hands
-  // the field back to the runtime default instead of writing an empty flag.
+  // setLaunchField pins or unpins one launch field. Clearing the input is an
+  // explicit removal: the field falls back to the runtime default and its flag
+  // is deleted from the command text — and only that flag, because the
+  // structured sync never removes anything on its own.
   function setLaunchField(field: keyof ModelLaunchDraft, value: DraftNumberValue): void {
     (draft.launch as unknown as Record<string, unknown>)[field] = value;
     const text = String(value ?? "").trim();
     const pinned = { ...draft.launchPinned };
-    if (text === "") delete pinned[field];
-    else pinned[field] = true;
+    if (text === "") {
+      delete pinned[field];
+      if (effectiveManagedKind !== "") {
+        argsText = removeOwnedLaunchFlag(argsText, effectiveManagedKind, field);
+        draft.backendArguments = rebuildManagedArguments(argsText, effectiveManagedKind, "");
+      }
+    } else {
+      pinned[field] = true;
+    }
     draft.launchPinned = pinned;
   }
 
@@ -429,7 +460,7 @@
     }
     if (!runtime) return;
     draft.backendType = runtime.kind;
-    argsText = managed === "" ? draft.backendArguments : extraLaunchArguments(draft.backendArguments, managed);
+    argsText = managed === "" ? draft.backendArguments : extraLaunchArguments(draft.backendArguments, managed, customLaunchHead);
     // LMCache only attaches to a native vLLM runtime: switching the runtime
     // away from vLLM turns the model's LMCache usage off so the draft cannot
     // carry a configuration the server would reject.
@@ -438,7 +469,7 @@
 
   function updateBackendArguments(value: string): void {
     argsText = value;
-    draft.backendArguments = rebuildManagedArguments(value, effectiveManagedKind, "");
+    draft.backendArguments = rebuildManagedArguments(value, effectiveManagedKind, "", customLaunchHead);
     error = "";
     validation = null;
     // A full command pasted into the box is parsed into the structured fields
@@ -463,8 +494,8 @@
 
   function selectManagedModel(path: string): void {
     if (effectiveManagedKind === "" || !path) return;
-    draft.launch.model = path;
-    draft.backendArguments = rebuildManagedArguments(draft.backendArguments, effectiveManagedKind, path);
+    setLaunchField("model", path);
+    draft.backendArguments = rebuildManagedArguments(draft.backendArguments, effectiveManagedKind, path, customLaunchHead);
     argsText = draft.backendArguments;
   }
 
@@ -585,24 +616,6 @@
   // this is its port so pasting needs no round-trip.
   let parseNote = $state("");
 
-  // renderExtraArgs writes the surviving engine arguments back into the editor
-  // as one "flag value" line each. Values are re-quoted so a JSON payload (or
-  // any token with spaces/quotes) round-trips losslessly through the
-  // tokenizer on the next save.
-  function renderExtraArgs(tokens: string[]): string {
-    const lines: string[] = [];
-    for (let index = 0; index < tokens.length; index += 1) {
-      const token = tokens[index];
-      if (token.startsWith("-") && index + 1 < tokens.length && !tokens[index + 1].startsWith("-")) {
-        lines.push(`${token} ${serializeLaunchArgument(tokens[index + 1])}`);
-        index += 1;
-        continue;
-      }
-      lines.push(serializeLaunchArgument(token));
-    }
-    return lines.join("\n");
-  }
-
   // A first line that starts like a launch command (an engine entrypoint, a
   // python -m module, or a leading NAME=VALUE assignment) rather than a bare
   // engine flag is parsed instead of kept verbatim.
@@ -625,15 +638,20 @@
     });
   }
 
+  // applyParsedLaunch mirrors a pasted command into the derived view. The
+  // command text stays the source of truth — every flag keeps its line — and
+  // the fields the parse found are pinned, so the save writes them back exactly
+  // where they came from instead of dropping them from the text.
   function applyParsedLaunch(parsed: ParsedLaunch): void {
-    if (parsed.model) draft.launch.model = parsed.model;
-    if (parsed.contextPerRequest > 0) draft.launch.contextPerRequest = String(parsed.contextPerRequest);
-    if (parsed.maxConcurrency > 0) draft.launch.maxConcurrency = String(parsed.maxConcurrency);
-    if (parsed.tensorParallelSize > 0) draft.launch.tensorParallelSize = String(parsed.tensorParallelSize);
-    if (parsed.gpuMemoryUtilization != null) draft.launch.gpuMemoryUtilization = String(parsed.gpuMemoryUtilization * 100);
+    const pinned = { ...draft.launchPinned };
+    if (parsed.model) { draft.launch.model = parsed.model; pinned.model = true; }
+    if (parsed.servedModelName) { draft.launch.servedModelName = parsed.servedModelName; pinned.servedModelName = true; }
+    if (parsed.contextPerRequest > 0) { draft.launch.contextPerRequest = String(parsed.contextPerRequest); pinned.contextPerRequest = true; }
+    if (parsed.maxConcurrency > 0) { draft.launch.maxConcurrency = String(parsed.maxConcurrency); pinned.maxConcurrency = true; }
+    if (parsed.tensorParallelSize > 0) { draft.launch.tensorParallelSize = String(parsed.tensorParallelSize); pinned.tensorParallelSize = true; }
+    if (parsed.gpuMemoryUtilization != null) { draft.launch.gpuMemoryUtilization = String(parsed.gpuMemoryUtilization * 100); pinned.gpuMemoryUtilization = true; }
     if (parsed.cudaVisibleDevices.length > 0) draft.launch.gpus = mapDeviceSelections(parsed.cudaVisibleDevices);
-    argsText = renderExtraArgs(parsed.extraArgs);
-    draft.backendArguments = rebuildManagedArguments(argsText, effectiveManagedKind, "");
+    draft.launchPinned = pinned;
     parseNote = parsed.warnings.join(" ");
   }
 
@@ -690,7 +708,7 @@
     const current = modelEntries(snapshot.config)[selectedModel];
     if (current !== undefined) {
       draft = draftFromModel(selectedModel, current);
-      argsText = extraLaunchArguments(draft.backendArguments, effectiveManagedKind);
+      argsText = extraLaunchArguments(draft.backendArguments, effectiveManagedKind, customLaunchHead);
     }
   }
 
@@ -771,19 +789,14 @@
       return;
     }
     try {
-      // Once the structured launch block carries the model target it owns the
-      // reserved engine flags: the server's launch validator rejects a save
-      // whose backend.args still repeat them ("backend.args --model is managed
-      // by backend.launch"). Store only the surviving extras — the editor text
-      // keeps rendering the canonical flag lines from the structured fields.
-      if (
-        draft.launchMode === "backend" &&
-        (effectiveManagedKind === "vllm" || effectiveManagedKind === "llamacpp") &&
-        trimmedText(draft.launch.model) !== ""
-      ) {
-        draft.backendArguments = stripOwnedLaunchArguments(effectiveManagedKind, draft.backendArguments);
-      }
-      const patch = buildModelPatch(snapshot.config, draft, editing);
+      // backend.args is the single source of truth for the command line, so
+      // nothing is stripped here: the save materializes the fields the model
+      // pins (including the model target) in place, and every other flag the
+      // operator wrote stays exactly as it is.
+      // A custom launch head stores its args verbatim: there is no engine
+      // grammar to materialize and nothing the server injects, so the save
+      // must not rewrite (or drop) any of its flags.
+      const patch = buildModelPatch(snapshot.config, draft, editing, customLaunchHead);
       const operation = patch[0] as { path?: string; value?: unknown };
       const value = operation.path === "/models"
         ? (operation.value as Record<string, unknown> | undefined)?.[trimmedText(draft.id)]
@@ -983,7 +996,9 @@
                   {/if}
                   <div class="grid gap-1.5 text-sm sm:col-span-2">
                     <span class="font-medium">{$translate("controlPlane.modelParameters")}</span>
-                    {#if effectiveManagedKind !== ""}
+                    {#if customLaunchHead}
+                      <p class="text-muted-foreground rounded-md border border-dashed p-3 text-xs">{$translate("controlPlane.modelCustomHeadHint")}</p>
+                    {:else if effectiveManagedKind !== ""}
                       <div class="mb-1 grid gap-2.5 sm:grid-cols-2">
                         <div class="grid gap-1 text-sm">
                           <div class="flex items-center justify-between gap-2"><span class="font-medium">{$translate("controlPlane.launchModel")}</span><Button type="button" variant="ghost" size="icon-sm" onclick={() => void loadModelFileCatalog()} disabled={modelFilesLoading} aria-label={$translate("modelFiles.refresh")} title={$translate("modelFiles.refresh")}><RefreshCw class={`size-4 ${modelFilesLoading ? "animate-spin" : ""}`} aria-hidden="true" /></Button></div>

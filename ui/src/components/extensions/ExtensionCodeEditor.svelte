@@ -8,6 +8,7 @@
   import { linter, type Diagnostic } from "@codemirror/lint";
   import { extensionCompletionSource, packageJsonCompletions } from "../../lib/extensionCompletions";
   import type { ExtensionDiagnostic } from "../../lib/extensionsApi";
+  import { codeMirrorChromeTheme } from "../../lib/codemirrorChrome";
 
   interface Props {
     value: string;
@@ -86,6 +87,7 @@
         doc: value,
         extensions: [
           basicSetup,
+          codeMirrorChromeTheme,
           language === "json" ? json() : javascript(),
           autocompletion({
             override: [language === "json" ? jsonCompletionSource : completionSourceFor()],
@@ -110,8 +112,7 @@
             ".cm-content": { padding: "0.5rem" },
             "&.cm-focused": { outline: "none" },
             ".cm-gutters": { backgroundColor: "var(--background)", color: "var(--muted-foreground)", borderRight: "1px solid var(--border)" },
-            ".cm-tooltip": { backgroundColor: "var(--popover)", color: "var(--popover-foreground)", border: "1px solid var(--border)" },
-            ".cm-tooltip-autocomplete ul li[aria-selected]": { backgroundColor: "var(--accent)", color: "var(--accent-foreground)" },
+
           }),
         ],
       }),

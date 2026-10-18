@@ -61,7 +61,7 @@
       <Dialog.Title>{$translate("controlPlane.authSignOut")}</Dialog.Title>
       <Dialog.Description>{$translate("controlPlane.authSignOutConfirm")}</Dialog.Description>
     </Dialog.Header>
-    {#if error}<div class="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm" role="alert">{error}</div>{/if}
+    {#if error}<div class="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm break-words whitespace-pre-wrap max-h-40 overflow-y-auto" role="alert">{error}</div>{/if}
     <Dialog.Footer>
       <Button variant="outline" onclick={() => { confirmOpen = false; }} disabled={submitting}>{$translate("common.cancel")}</Button>
       <Button variant="destructive" onclick={() => void endSession()} disabled={submitting}>

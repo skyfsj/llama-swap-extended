@@ -81,6 +81,7 @@
     "error": "错误",
     "loading": "加载中...",
     "view": "查看",
+    "edit": "编辑",
     "save": "保存",
     "remove": "移除",
     "settings": "设置",
@@ -145,6 +146,7 @@
     "activeModels": "活跃模型",
     "costEstimated": "预估成本",
     "costNotConfigured": "未配置计费",
+    "pricingBased": "基于模型定价核算",
     "totalTokens": "Token 吞吐量",
     "inputTokens": "输入",
     "outputTokens": "输出",
@@ -212,6 +214,7 @@
         "id": "ID",
         "time": "时间",
         "model": "模型",
+        "provider": "供应商",
         "path": "路径",
         "status": "状态",
         "contentType": "Content-Type",
@@ -234,6 +237,7 @@
         "elapsed": "已用时",
         "phase": "输出阶段",
         "model": "模型",
+        "provider": "供应商",
         "request": "请求",
         "address": "地址",
         "userAgent": "User Agent",
@@ -270,6 +274,9 @@
         "applied": "已应用",
         "noOutput": "暂无输出",
         "waitingForTelemetry": "等待上游计数"
+      },
+      "provider": {
+        "local": "本地"
       }
     },
     "filters": {
@@ -319,6 +326,7 @@
       "curveTitle": "推理速度曲线",
       "contextTitle": "按上下文长度的吞吐",
       "contextTable": "按上下文长度的性能",
+      "contextTableHidden": "已隐藏 {count} 行没有吞吐数据的样本",
       "series": {
         "prefill": "Prefill 吞吐 (tok/s)",
         "decode": "Decode 吞吐 (tok/s)",
@@ -612,7 +620,11 @@
       "apply_failed": "配置应用失败",
       "removing": "正在移除模型",
       "unloading": "正在排空卸载"
-    }
+    },
+    "providerTitle": "{id} 由供应商提供",
+    "providerHint": "该模型通过网关转发到上游供应商，没有本地启动配置可以在这里编辑。",
+    "providerServedBy": "由这些供应商提供",
+    "providerLink": "打开供应商页面"
   },
   "settings": {
     "title": "设置",
@@ -743,6 +755,7 @@
       "matchingCapabilities": "匹配的能力",
       "selectors": "选择器",
       "local": "本地",
+      "provider": "供应商",
       "groupTranslation": "翻译模型",
       "groupChat": "语言模型",
       "groupImage": "图像模型",
@@ -1601,6 +1614,7 @@
     "keyScopes": "权限范围（逗号分隔）",
     "keyModels": "模型访问",
     "keyModelAll": "全部模型",
+    "keyAllowedIPsAll": "不限制地址",
     "keyModelSelected": "已选择 {count} 个模型",
     "keyModelEmpty": "暂无可用模型",
     "keyExpires": "过期时间",
@@ -1612,7 +1626,12 @@
     "keyAccess": "访问权限",
     "keyManagementLoginEnabled": "管理面板",
     "keyAPIOnly": "仅 API",
+    "keyAPIOnlyHint": "此密钥是仅 API 的管理密钥。勾选后它也允许登录控制面板。",
     "keyLastUsed": "最后使用",
+    "keyFromIP": "来自 {ip}",
+    "keyLastIPHint": "使用该密钥的最近一次请求的来源地址。",
+    "keyLastIPBlockedHint": "该地址不在密钥的允许 IP 列表中。",
+    "keyAllowedIPsMatchedHint": "密钥最近一次请求来自该条目。",
     "keyUsage": "用量",
     "keyRequests": "请求",
     "createKey": "创建密钥",
@@ -2083,7 +2102,8 @@
       "storeMedia": "保存媒体内容",
       "redactHeaders": "请求头脱敏",
       "modelsDev": "Models.dev 数据源",
-      "refreshEvery": "刷新间隔"
+      "refreshEvery": "刷新间隔",
+      "maxContinuationMiB": "工具续接轮次上限（MiB）"
     },
     "configWriteStatus": "写入权限",
     "configApplyStatus": "运行时状态",
@@ -2119,8 +2139,13 @@
     "ccswitchAutoKey": "自动创建推理密钥",
     "ccswitchCurrentKey": "当前会话密钥",
     "ccswitchDefaultKey": "llama-swap（默认占位密钥）",
-    "ccswitchNoKey": "不导入密钥",
     "ccswitchOpen": "打开 CC Switch",
+    "ccswitchResolved": "将按 {endpoint}（{format}）写入 CC Switch。",
+    "ccswitchModelScope": "模型列表已按该密钥允许的模型过滤。",
+    "ccswitchFormat_anthropic": "Anthropic Messages",
+    "ccswitchFormat_openai_chat": "OpenAI Chat Completions",
+    "ccswitchFormat_openai_responses": "OpenAI Responses",
+    "ccswitchFormat_gemini_native": "Gemini generateContent",
     "modelManagedModelRequired": "托管运行时需要选择模型文件，或在启动参数中包含 --model",
     "auditMediaImage": "图像",
     "auditMediaFile": "文件",
@@ -2181,6 +2206,7 @@
     "keyCreateAccess": "创建访问密钥",
     "keyEditAccess": "编辑访问密钥",
     "keyUngrouped": "未分组",
+    "keyUnnamed": "未命名密钥",
     "keyCreateManagement": "创建管理密钥",
     "keyEditManagement": "编辑管理密钥",
     "keyLoginOnlyHint": "管理密钥用于登录与管理控制面板。",
@@ -2200,13 +2226,21 @@
     "auditSessionRequests": "请求数",
     "auditSessionTokens": "输入 → 输出 Token",
     "auditSessionStored": "已存储",
-    "auditSessionShared": "共用上下文"
+    "auditSessionShared": "共用上下文",
+    "modelCustomHeadHint": "该模型使用自定义启动头（backend.entrypoint）。结构化引擎字段不适用：启动头与下面的参数共同组成完整命令行。",
+    "keyManagedByConfig": "配置",
+    "keyManagedByConfigHint": "该密钥来自配置文件的 apiKeys：以配置文件为准，修改或删除请在设置中心（或直接编辑 YAML），保存后立即生效。",
+    "keyConfigLocked": "由配置文件管理"
   },
   "settingsCenter": {
     "navigation": {
       "general": {
         "label": "基础与服务",
         "description": "服务、端口和会话的基础行为。"
+      },
+      "network": {
+        "label": "网络、代理与安全",
+        "description": "出网代理、反向代理下的真实来源地址、HTTP 服务限制与认证限速。"
       },
       "observability": {
         "label": "监控与日志",
@@ -2369,6 +2403,10 @@
       "macros": {
         "title": "宏定义",
         "description": "可展开到模型命令与参数中的可复用值。"
+      },
+      "network": {
+        "title": "网络与边界防护",
+        "description": "控制出入站网络策略、对上游反代的信任边界与客户端来源判定。"
       }
     },
     "toolbar": {
@@ -2430,7 +2468,11 @@
       "value": "值",
       "removeItem": "删除条目",
       "addItem": "添加条目",
-      "default": "默认"
+      "default": "默认",
+      "structuredEntry": "结构化条目",
+      "secretValue": "密钥值",
+      "addSecret": "输入新密钥后回车添加",
+      "secretListHint": "已保存的密钥以掩码显示，只有被重新输入的条目会被写入。删掉一条并保存后，该密钥立即失效；在「API 密钥」页创建的密钥不受影响。"
     },
     "list": {
       "all": "全部模型",
@@ -2688,6 +2730,10 @@
     "providers": "提供方",
     "endpoints": "接口",
     "networkHosts": "允许访问的网络主机",
+    "networkHostsHint": "允许该扩展通过 fetch 或其他网络请求访问的主机，每行一个。留空表示允许任意公网主机；填写后只允许列出的主机，*.example.com 可匹配子域名。本地、私有与链路本地地址始终被拒绝。",
+    "proxyHint": "出网代理由全局设置控制",
+    "proxyHintBody": "扩展的网络请求、模型下载与运行时构建都走 设置中心 → 网络代理 里的策略；留空时跟随服务的 HTTP_PROXY / HTTPS_PROXY 环境变量。",
+    "proxyHintOpen": "打开网络代理设置",
     "readRoots": "可读取目录",
     "writeRoots": "可写入目录",
     "timeout": "超时时间",
@@ -2722,12 +2768,15 @@
       "installedNotice": "{id} 已安装",
       "credential": "凭据",
       "targetId": "扩展 ID",
+      "anyPublicHost": "任意公网主机",
       "category": {
         "search": "联网搜索",
         "documents": "文档解析",
         "knowledge": "知识检索",
         "memory": "记忆管理",
-        "other": "其他"
+        "other": "其他",
+        "media": "图像媒体",
+        "utilities": "实用工具"
       }
     },
     "deleted": "扩展已删除",
@@ -3038,6 +3087,7 @@
     "exportCSV": "导出 CSV",
     "colKey": "API 密钥",
     "colModel": "模型",
+    "colProvider": "供应商",
     "colEndpoint": "端点",
     "colIP": "IP",
     "colGroup": "分组",
@@ -3072,7 +3122,12 @@
       "addKey": "添加密钥",
       "addModel": "添加模型",
       "pull": "从上游拉取",
-      "test": "测试"
+      "test": "测试",
+      "addAdapter": "添加适配器",
+      "addFromTemplate": "从模板添加",
+      "pullDistribute": "拉取并分发",
+      "enable": "启用",
+      "disable": "停用"
     },
     "fields": {
       "name": "名称",
@@ -3092,7 +3147,48 @@
       "maxConcurrent": "并发上限",
       "models": "模型",
       "modelLocal": "本地模型 ID",
-      "modelRemote": "上游模型名"
+      "modelRemote": "上游模型名",
+      "sessionHeaders": "会话请求头",
+      "sessionHeadersHint": "转发到上游时写入会话 ID 的请求头。下游携带会话 ID 时透传原值，否则按前缀缓存派生。",
+      "adapters": "适配器",
+      "adaptersHint": "每个适配器对应一个上游 API 表面（方言 + 端点 + 模型）。订阅同时提供多种 API 时添加多个适配器。",
+      "adapterName": "名称",
+      "adapterNamePlaceholder": "可选标签",
+      "adapterAdvanced": "高级",
+      "pathMap": "路径改写",
+      "pathMapHint": "逗号分隔的 from=to 路径前缀，转发前应用（如 /v1beta/models/=/v1/models/）。",
+      "modelMatch": "模型匹配",
+      "modelMatchHint": "拉取模型时用于分发到该适配器的 glob 规则。",
+      "adapterDefault": "作为拉取模型的兜底适配器",
+      "modelProxy": "代理（继承）",
+      "adapterProxy": "适配器代理",
+      "proxyHint": "该层级的出网代理：http/https/socks5/socks5h 地址，或 direct 表示绕过所有代理。留空继承上一级（模型 > 适配器 > 密钥 > 供应商 > 全局）。",
+      "modelPrefix": "模型名前缀",
+      "modelPrefixPlaceholder": "留空（裸模型名）",
+      "modelPrefixHint": "加在该供应商每个对外模型名前（/v1/models 与路由都用它）。旧的 供应商ID/模型ID 形式仍可调用。",
+      "cooldownPolicy": "冷却策略",
+      "cooldownInherit": "继承网关设置",
+      "cooldownEnabled": "启用冷却",
+      "cooldownDisabled": "禁用冷却",
+      "cooldownHint": "禁用后该供应商的密钥失败也不进入冷却（错误仍会记录，请求仍会失败转移）。",
+      "modelAliases": "别名（逗号分隔）",
+      "modelKind": "模型类型",
+      "modelAliasesPlaceholder": "可选。首个名字作为模型列表里的显示名，其余为别名；留空则用上游模型名",
+      "typeOpenAI": "OpenAI Completions API",
+      "typeOpenAIResponses": "OpenAI Responses API",
+      "typeAnthropic": "Anthropic API",
+      "typeGemini": "Gemini API",
+      "typeGeminiInteractions": "Gemini 交互",
+      "exposeUpstreamName": "上游名可调用",
+      "exposeUpstreamNameHint": "客户端可以用别名或上游模型名访问；关掉后只发布本供应商声明的名字。"
+    },
+    "modelKind": {
+      "chat": "对话",
+      "vision": "视觉理解",
+      "image": "图像生成",
+      "speech": "语音合成",
+      "transcription": "语音转写",
+      "translation": "翻译"
     },
     "status": {
       "disabled": "已停用",
@@ -3108,14 +3204,19 @@
       "nameRequired": "必须填写供应商名称。",
       "endpointRequired": "必须填写服务地址。",
       "keysRequired": "至少需要一个 API 密钥。",
-      "modelsRequired": "至少需要一个模型。"
+      "modelsRequired": "至少需要一个模型。",
+      "duplicateModel": "适配器“{adapter}”里重复声明了模型 {model}。两个适配器可以同名（它们是同一模型的多个 API 表面），但一个适配器内不能重复。"
     },
     "toast": {
       "saved": "供应商 {id} 已保存。",
       "deleted": "供应商 {id} 已移除。",
       "noModels": "上游未返回任何模型。",
       "pulled": "已从上游拉取 {count} 个模型。",
-      "testOk": "连通正常（可见 {count} 个模型）。"
+      "testOk": "连通正常（可见 {count} 个模型）。",
+      "pullSkipped": "已跳过 {count} 个由其他适配器服务的模型。",
+      "distributed": "已把 {count} 个新模型分发到各适配器。",
+      "enabled": "供应商 {id} 已启用",
+      "disabled": "供应商 {id} 已停用"
     },
     "delete": {
       "title": "移除供应商",
@@ -3124,6 +3225,40 @@
     "deleteKey": {
       "title": "移除 API 密钥",
       "message": "从该供应商移除此 API 密钥？"
+    },
+    "quota": {
+      "title": "额度",
+      "subtitle": "上游按凭据返回的订阅用量窗口。",
+      "configTitle": "额度（订阅用量）",
+      "configHint": "从套餐用量接口读取每个密钥的额度并在列表上方以卡片展示；需要选择内置预设或填写端点映射。",
+      "preset": "预设",
+      "refreshInterval": "自动刷新",
+      "refreshIntervalPlaceholder": "留空=仅手动，如 5m",
+      "enforce": "额度用尽时停用该密钥",
+      "threshold": "阈值 %",
+      "refresh": "刷新",
+      "refreshAll": "刷新全部",
+      "updated": "更新于",
+      "never": "尚未刷新",
+      "remaining": "剩余 {percent}%",
+      "missing": "未返回",
+      "resets": "重置",
+      "enforced": "额度已满",
+      "noCredentials": "该供应商暂无已调度的密钥。",
+      "windows": {
+        "rolling": "5 小时",
+        "weekly": "每周",
+        "monthly": "每月"
+      }
+    },
+    "templates": {
+      "title": "从模板添加供应商",
+      "subtitle": "模板会创建带适配器、会话请求头与额度映射的供应商，并从上游拉取当前模型列表。",
+      "use": "使用模板",
+      "applied": "已从上游拉取 {count} 个模型。",
+      "repull": "重新拉取模型",
+      "repulled": "已重新拉取 {count} 个模型并重新分发。",
+      "invalid": "模板生成的供应商草稿无效。"
     }
   }
 }

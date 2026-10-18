@@ -81,6 +81,7 @@
     "error": "錯誤",
     "loading": "載入中...",
     "view": "檢視",
+    "edit": "編輯",
     "save": "儲存",
     "remove": "移除",
     "settings": "設定",
@@ -145,6 +146,7 @@
     "activeModels": "活躍模型",
     "costEstimated": "預估成本",
     "costNotConfigured": "未設定計費",
+    "pricingBased": "基於模型定價核算",
     "totalTokens": "Token 吞吐量",
     "inputTokens": "輸入",
     "outputTokens": "輸出",
@@ -212,6 +214,7 @@
         "id": "ID",
         "time": "時間",
         "model": "模型",
+        "provider": "供應商",
         "path": "路徑",
         "status": "狀態",
         "contentType": "Content-Type",
@@ -234,6 +237,7 @@
         "elapsed": "已用時",
         "phase": "輸出階段",
         "model": "模型",
+        "provider": "供應商",
         "request": "請求",
         "address": "地址",
         "userAgent": "User Agent",
@@ -270,6 +274,9 @@
         "applied": "已套用",
         "noOutput": "尚無輸出",
         "waitingForTelemetry": "等待上游計數"
+      },
+      "provider": {
+        "local": "本地"
       }
     },
     "filters": {
@@ -319,6 +326,7 @@
       "curveTitle": "推理速度曲線",
       "contextTitle": "按上下文長度的吞吐",
       "contextTable": "按上下文長度的效能",
+      "contextTableHidden": "已隱藏 {count} 行沒有吞吐資料的樣本",
       "series": {
         "prefill": "Prefill 吞吐 (tok/s)",
         "decode": "Decode 吞吐 (tok/s)",
@@ -612,7 +620,11 @@
       "apply_failed": "設定套用失敗",
       "removing": "正在移除模型",
       "unloading": "正在排空卸載"
-    }
+    },
+    "providerTitle": "{id} 由供應商提供",
+    "providerHint": "該模型透過閘道轉發到上游供應商，沒有本地啟動設定可以在這裡編輯。",
+    "providerServedBy": "由這些供應商提供",
+    "providerLink": "開啟供應商頁面"
   },
   "settings": {
     "title": "設定",
@@ -743,6 +755,7 @@
       "matchingCapabilities": "符合的能力",
       "selectors": "選取器",
       "local": "本地",
+      "provider": "供應商",
       "groupTranslation": "翻譯模型",
       "groupChat": "語言模型",
       "groupImage": "圖像模型",
@@ -1601,6 +1614,7 @@
     "keyScopes": "權限範圍（逗號分隔）",
     "keyModels": "模型存取",
     "keyModelAll": "所有模型",
+    "keyAllowedIPsAll": "不限制位址",
     "keyModelSelected": "已選擇 {count} 個模型",
     "keyModelEmpty": "沒有可用模型",
     "keyExpires": "到期時間",
@@ -1612,7 +1626,12 @@
     "keyAccess": "存取權限",
     "keyManagementLoginEnabled": "管理面板",
     "keyAPIOnly": "僅 API",
+    "keyAPIOnlyHint": "此金鑰是僅 API 的管理金鑰。勾選後它也允許登入控制台。",
     "keyLastUsed": "最後使用",
+    "keyFromIP": "來自 {ip}",
+    "keyLastIPHint": "使用該金鑰的最近一次請求的來源位址。",
+    "keyLastIPBlockedHint": "該位址不在金鑰的允許 IP 清單中。",
+    "keyAllowedIPsMatchedHint": "金鑰最近一次請求來自該條目。",
     "keyUsage": "用量",
     "keyRequests": "請求",
     "createKey": "建立金鑰",
@@ -2083,7 +2102,8 @@
       "storeMedia": "儲存媒體內容",
       "redactHeaders": "請求標頭脫敏",
       "modelsDev": "Models.dev 資料源",
-      "refreshEvery": "重新整理間隔"
+      "refreshEvery": "重新整理間隔",
+      "maxContinuationMiB": "工具續接輪次上限（MiB）"
     },
     "configWriteStatus": "寫入權限",
     "configApplyStatus": "執行環境狀態",
@@ -2119,8 +2139,13 @@
     "ccswitchAutoKey": "自動建立推理金鑰",
     "ccswitchCurrentKey": "目前工作階段金鑰",
     "ccswitchDefaultKey": "llama-swap（預設佔位金鑰）",
-    "ccswitchNoKey": "不匯入金鑰",
     "ccswitchOpen": "開啟 CC Switch",
+    "ccswitchResolved": "將以 {endpoint}（{format}）寫入 CC Switch。",
+    "ccswitchModelScope": "模型列表已依該金鑰允許的模型篩選。",
+    "ccswitchFormat_anthropic": "Anthropic Messages",
+    "ccswitchFormat_openai_chat": "OpenAI Chat Completions",
+    "ccswitchFormat_openai_responses": "OpenAI Responses",
+    "ccswitchFormat_gemini_native": "Gemini generateContent",
     "modelManagedModelRequired": "託管執行環境需要選擇模型檔案，或在啟動參數中包含 --model",
     "auditMediaImage": "圖像",
     "auditMediaFile": "檔案",
@@ -2181,6 +2206,7 @@
     "keyCreateAccess": "建立存取金鑰",
     "keyEditAccess": "編輯存取金鑰",
     "keyUngrouped": "未分組",
+    "keyUnnamed": "未命名金鑰",
     "keyCreateManagement": "建立管理金鑰",
     "keyEditManagement": "編輯管理金鑰",
     "keyLoginOnlyHint": "管理金鑰用於登入與管理控制面板。",
@@ -2200,13 +2226,21 @@
     "auditSessionRequests": "請求數",
     "auditSessionTokens": "輸入 → 輸出 Token",
     "auditSessionStored": "已儲存",
-    "auditSessionShared": "共用上下文"
+    "auditSessionShared": "共用上下文",
+    "modelCustomHeadHint": "該模型使用自訂啟動頭（backend.entrypoint）。結構化引擎欄位不適用：啟動頭與下面的參數共同組成完整命令列。",
+    "keyManagedByConfig": "設定",
+    "keyManagedByConfigHint": "此金鑰來自設定檔的 apiKeys：以設定檔為準，修改或刪除請在設定中心（或直接編輯 YAML），儲存後立即生效。",
+    "keyConfigLocked": "由設定檔管理"
   },
   "settingsCenter": {
     "navigation": {
       "general": {
         "label": "基礎與服務",
         "description": "服務、連接埠和工作階段的基礎行為。"
+      },
+      "network": {
+        "label": "網路、代理與安全",
+        "description": "出網代理、反向代理下的真實來源位址、HTTP 服務限制與認證限速。"
       },
       "observability": {
         "label": "監控與日誌",
@@ -2369,6 +2403,10 @@
       "macros": {
         "title": "巨集定義",
         "description": "可展開到模型命令與參數中的可重複使用值。"
+      },
+      "network": {
+        "title": "網路與邊界防護",
+        "description": "控制出入站網路策略、對上游反代的信任邊界與用戶端來源判定。"
       }
     },
     "toolbar": {
@@ -2430,7 +2468,11 @@
       "value": "值",
       "removeItem": "移除項目",
       "addItem": "新增項目",
-      "default": "預設"
+      "default": "預設",
+      "structuredEntry": "結構化條目",
+      "secretValue": "金鑰值",
+      "addSecret": "輸入新金鑰後按 Enter 新增",
+      "secretListHint": "已儲存的金鑰以遮罩顯示，只有被重新輸入的條目會寫入。刪除一條並儲存後，該金鑰立即失效；在「API 金鑰」頁面建立的金鑰不受影響。"
     },
     "list": {
       "all": "全部模型",
@@ -2688,6 +2730,10 @@
     "providers": "提供者",
     "endpoints": "介面",
     "networkHosts": "允許存取的網路主機",
+    "networkHostsHint": "允許此外掛透過 fetch 或其他網路請求存取的主機，每行一個。留空代表允許任意公網主機；填寫後只允許列出的主機，*.example.com 可比對子網域。本機、私有與連結本地位址一律拒絕。",
+    "proxyHint": "出網代理由全域設定控制",
+    "proxyHintBody": "擴充功能的網路請求、模型下載與執行時建置都走 設定中心 → 網路代理 的策略；留空時跟隨服務的 HTTP_PROXY / HTTPS_PROXY 環境變數。",
+    "proxyHintOpen": "開啟網路代理設定",
     "readRoots": "可讀取目錄",
     "writeRoots": "可寫入目錄",
     "timeout": "逾時時間",
@@ -2722,12 +2768,15 @@
       "installedNotice": "{id} 已安裝",
       "credential": "憑證",
       "targetId": "擴充 ID",
+      "anyPublicHost": "任意公網主機",
       "category": {
         "search": "聯網搜尋",
         "documents": "文件解析",
         "knowledge": "知識檢索",
         "memory": "記憶管理",
-        "other": "其他"
+        "other": "其他",
+        "media": "圖像媒體",
+        "utilities": "實用工具"
       }
     },
     "deleted": "擴充已刪除",
@@ -3038,6 +3087,7 @@
     "exportCSV": "匯出 CSV",
     "colKey": "API 金鑰",
     "colModel": "模型",
+    "colProvider": "供應商",
     "colEndpoint": "端點",
     "colIP": "IP",
     "colGroup": "分組",
@@ -3072,7 +3122,12 @@
       "addKey": "新增金鑰",
       "addModel": "新增模型",
       "pull": "從上游拉取",
-      "test": "測試"
+      "test": "測試",
+      "addAdapter": "新增適配器",
+      "addFromTemplate": "從範本新增",
+      "pullDistribute": "拉取並分派",
+      "enable": "啟用",
+      "disable": "停用"
     },
     "fields": {
       "name": "名稱",
@@ -3092,7 +3147,48 @@
       "maxConcurrent": "並行上限",
       "models": "模型",
       "modelLocal": "本地模型 ID",
-      "modelRemote": "上游模型名"
+      "modelRemote": "上游模型名",
+      "sessionHeaders": "工作階段請求標頭",
+      "sessionHeadersHint": "轉發到上游時寫入工作階段 ID 的請求標頭。下游攜帶工作階段 ID 時透傳原值，否則依前綴快取推導。",
+      "adapters": "適配器",
+      "adaptersHint": "每個適配器對應一個上游 API 表面（方言 + 端點 + 模型）。訂閱同時提供多種 API 時加入多個適配器。",
+      "adapterName": "名稱",
+      "adapterNamePlaceholder": "可選標籤",
+      "adapterAdvanced": "進階",
+      "pathMap": "路徑改寫",
+      "pathMapHint": "逗號分隔的 from=to 路徑前綴，轉發前套用（如 /v1beta/models/=/v1/models/）。",
+      "modelMatch": "模型比對",
+      "modelMatchHint": "拉取模型時用於分派到該適配器的 glob 規則。",
+      "adapterDefault": "作為拉取模型的兜底適配器",
+      "modelProxy": "代理（繼承）",
+      "adapterProxy": "適配器代理",
+      "proxyHint": "該層級的出網代理：http/https/socks5/socks5h 位址，或 direct 表示繞過所有代理。留空繼承上一級（模型 > 適配器 > 金鑰 > 供應商 > 全域）。",
+      "modelPrefix": "模型名前綴",
+      "modelPrefixPlaceholder": "留空（裸模型名）",
+      "modelPrefixHint": "加在該供應商每個對外模型名前（/v1/models 與路由都用它）。舊的 供應商ID/模型ID 形式仍可呼叫。",
+      "cooldownPolicy": "冷卻策略",
+      "cooldownInherit": "繼承閘道設定",
+      "cooldownEnabled": "啟用冷卻",
+      "cooldownDisabled": "停用冷卻",
+      "cooldownHint": "停用後該供應商的金鑰失敗也不進入冷卻（錯誤仍會記錄，請求仍會失敗轉移）。",
+      "modelAliases": "別名（逗號分隔）",
+      "modelKind": "模型類型",
+      "modelAliasesPlaceholder": "可選。首個名字作為模型列表裡的顯示名，其餘為別名；留空則用上游模型名",
+      "typeOpenAI": "OpenAI Completions API",
+      "typeOpenAIResponses": "OpenAI Responses API",
+      "typeAnthropic": "Anthropic API",
+      "typeGemini": "Gemini API",
+      "typeGeminiInteractions": "Gemini 互動",
+      "exposeUpstreamName": "上游名可調用",
+      "exposeUpstreamNameHint": "客戶端可以用別名或上游模型名存取；關掉後只發佈本供應商宣告的名字。"
+    },
+    "modelKind": {
+      "chat": "對話",
+      "vision": "視覺理解",
+      "image": "圖像生成",
+      "speech": "語音合成",
+      "transcription": "語音轉寫",
+      "translation": "翻譯"
     },
     "status": {
       "disabled": "已停用",
@@ -3108,14 +3204,19 @@
       "nameRequired": "必須填寫供應商名稱。",
       "endpointRequired": "必須填寫服務位址。",
       "keysRequired": "至少需要一個 API 金鑰。",
-      "modelsRequired": "至少需要一個模型。"
+      "modelsRequired": "至少需要一個模型。",
+      "duplicateModel": "適配器「{adapter}」裡重複宣告了模型 {model}。兩個適配器可以同名（它們是同一模型的多個 API 表面），但一個適配器內不能重複。"
     },
     "toast": {
       "saved": "供應商 {id} 已儲存。",
       "deleted": "供應商 {id} 已移除。",
       "noModels": "上游未回傳任何模型。",
       "pulled": "已從上游拉取 {count} 個模型。",
-      "testOk": "連通正常（可見 {count} 個模型）。"
+      "testOk": "連通正常（可見 {count} 個模型）。",
+      "pullSkipped": "已跳過 {count} 個由其他適配器服務的模型。",
+      "distributed": "已把 {count} 個新模型分派到各適配器。",
+      "enabled": "供應商 {id} 已啟用",
+      "disabled": "供應商 {id} 已停用"
     },
     "delete": {
       "title": "移除供應商",
@@ -3124,6 +3225,40 @@
     "deleteKey": {
       "title": "移除 API 金鑰",
       "message": "從該供應商移除此 API 金鑰？"
+    },
+    "quota": {
+      "title": "額度",
+      "subtitle": "上游依憑證回報的訂閱用量視窗。",
+      "configTitle": "額度（訂閱用量）",
+      "configHint": "從方案的用量端點讀取每個金鑰的額度，並以卡片顯示於列表上方；需要選擇內建預設或填寫端點對應。",
+      "preset": "預設",
+      "refreshInterval": "自動更新",
+      "refreshIntervalPlaceholder": "留空=僅手動，如 5m",
+      "enforce": "額度用盡時停用該金鑰",
+      "threshold": "門檻 %",
+      "refresh": "重新整理",
+      "refreshAll": "全部重新整理",
+      "updated": "更新於",
+      "never": "尚未更新",
+      "remaining": "剩餘 {percent}%",
+      "missing": "未回報",
+      "resets": "重設",
+      "enforced": "額度已滿",
+      "noCredentials": "此供應商尚無已排程的金鑰。",
+      "windows": {
+        "rolling": "5 小時",
+        "weekly": "每週",
+        "monthly": "每月"
+      }
+    },
+    "templates": {
+      "title": "從範本新增供應商",
+      "subtitle": "範本會建立含適配器、工作階段標頭與額度對應的供應商，並從上游拉取目前模型清單。",
+      "use": "使用範本",
+      "applied": "已從上游拉取 {count} 個模型。",
+      "repull": "重新拉取模型",
+      "repulled": "已重新拉取 {count} 個模型並重新分派。",
+      "invalid": "範本產生的供應商草稿無效。"
     }
   }
 }

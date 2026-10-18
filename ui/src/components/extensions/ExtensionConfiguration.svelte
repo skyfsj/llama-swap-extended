@@ -1,5 +1,6 @@
 <script lang="ts">
   import { translate } from "../../lib/i18n";
+  import { push } from "svelte-spa-router";
   import type { ExtensionDefinition } from "../../lib/extensionsApi";
   import ExtensionValueEditor from "./ExtensionValueEditor.svelte";
   import ExtensionSettingsForm from "./ExtensionSettingsForm.svelte";
@@ -268,7 +269,7 @@
     <!-- Full-featured Tabs Mode: Used in ExtensionSettings route and Quick Settings modal -->
     <Tabs.Root bind:value={activeTab} class="w-full">
       <div class="border-b border-border bg-muted/20 px-4 pt-2">
-        <Tabs.List class="h-10 bg-transparent p-0 gap-2">
+        <Tabs.List class="h-10 w-full justify-start gap-2 bg-transparent p-0">
           <Tabs.Trigger
             value="basic"
             class="flex items-center gap-1.5 rounded-none border-b-2 border-transparent px-3 py-2 text-xs font-medium text-muted-foreground data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:text-foreground data-[state=active]:shadow-none"
@@ -748,8 +749,19 @@
                   class="font-mono text-xs bg-background"
                 />
                 <p class="text-xs text-muted-foreground">
-                  允许通过 <code>fetch</code> 或网络请求访问的外部域名列表（每行一个）。留空表示完全禁止外部网络。
+                  {$translate("extensions.networkHostsHint")}
                 </p>
+                <div class="flex items-start gap-2 rounded-lg border border-border/60 bg-muted/40 p-3">
+                  <Info class="size-3.5 shrink-0 text-muted-foreground mt-0.5" />
+                  <div class="min-w-0 flex-1 space-y-2">
+                    <p class="text-xs text-muted-foreground">
+                      {$translate("extensions.proxyHintBody")}
+                    </p>
+                    <Button variant="outline" size="sm" onclick={() => push("/settings")}>
+                      {$translate("extensions.proxyHintOpen")}
+                    </Button>
+                  </div>
+                </div>
               </div>
 
               <div class="rounded-xl border border-border bg-card p-5 space-y-3">

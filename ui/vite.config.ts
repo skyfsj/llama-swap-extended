@@ -60,11 +60,15 @@ export default defineConfig({
     // yes very insecure but who's running this thing
     // on the public internet for dev?! haha.
     host: "0.0.0.0",
+    port: 5180,
     allowedHosts: true,
     proxy: Object.fromEntries(
       ["/api", "/logs", "/upstream", "/unload", "/v1", "/sdapi"].map((path) => [
         path,
-        process.env.LLAMA_SWAP_URL ?? "http://localhost:8080",
+        {
+          target: process.env.LLAMA_SWAP_URL ?? "http://localhost:8080",
+          changeOrigin: true,
+        },
       ]),
     ),
   },

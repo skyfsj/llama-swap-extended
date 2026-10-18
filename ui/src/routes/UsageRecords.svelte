@@ -153,6 +153,15 @@
     return keyName || keyId || $translate("usageRecords.noKey");
   }
 
+  // 供应商列的显示值：本地模型显示"本地"，多适配器供应商拼成"供应商 / 适配器"。
+  // 这与活动页、供应商页保持同一口径，避免三处各写一种。
+  function formatProvider(record: UsageRecord): string {
+    const provider = (record.provider ?? "").trim();
+    if (provider === "") return $translate("activity.table.provider.local");
+    const adapter = (record.providerAdapter ?? "").trim();
+    return adapter === "" ? provider : `${provider} / ${adapter}`;
+  }
+
   let totals = $derived(analytics?.totals);
   // The range card shows the active preset's label, so the card and the select
   // can never disagree about which window is selected.
@@ -386,6 +395,7 @@
           <tr>
             <th class="px-3 py-2 font-medium">{$translate("usageRecords.colKey")}</th>
             <th class="px-3 py-2 font-medium">{$translate("usageRecords.colModel")}</th>
+            <th class="px-3 py-2 font-medium">{$translate("usageRecords.colProvider")}</th>
             <th class="px-3 py-2 font-medium">{$translate("usageRecords.colEndpoint")}</th>
             <th class="px-3 py-2 font-medium">{$translate("usageRecords.colIP")}</th>
             <th class="px-3 py-2 font-medium">{$translate("usageRecords.colGroup")}</th>
@@ -398,19 +408,20 @@
         <tbody>
           {#if loading && records.length === 0}
             <tr>
-              <td colspan={9} class="text-muted-foreground py-8 text-center text-sm">
+              <td colspan={10} class="text-muted-foreground py-8 text-center text-sm">
                 <LoaderCircle class="mx-auto size-4 animate-spin" aria-hidden="true" />
               </td>
             </tr>
           {:else if records.length === 0}
             <tr>
-              <td colspan={9} class="text-muted-foreground py-8 text-center text-sm">{$translate("usageRecords.noData")}</td>
+              <td colspan={10} class="text-muted-foreground py-8 text-center text-sm">{$translate("usageRecords.noData")}</td>
             </tr>
           {:else}
             {#each records as record (record.id)}
               <tr class="border-t">
                 <td class="px-3 py-2 text-xs">{keyLabel(record.keyId, record.keyName)}</td>
                 <td class="px-3 py-2 text-xs">{record.model}</td>
+                <td class="max-w-[180px] truncate px-3 py-2 text-xs" title={record.provider ? `${record.provider}${record.providerAdapter ? " / " + record.providerAdapter : ""}` : ""}>{formatProvider(record)}</td>
                 <td class="max-w-[220px] truncate px-3 py-2 text-xs" title={record.endpoint}>{record.endpoint}</td>
                 <td class="px-3 py-2 font-mono text-xs">{record.clientIp || "—"}</td>
                 <td class="px-3 py-2 text-xs">{record.keyGroup || $translate("controlPlane.keyUngrouped")}</td>

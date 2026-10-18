@@ -22,10 +22,9 @@
   interface Props {
     stats: ActivityStatsData | null;
     inflightCount?: number;
-    onSelectTab?: (tab: string) => void;
   }
 
-  let { stats, inflightCount = 0, onSelectTab }: Props = $props();
+  let { stats, inflightCount = 0 }: Props = $props();
 
   let nf = $derived(new Intl.NumberFormat(localeToIntl($locale)));
   const histogramCollapsed = persistentStore<boolean>("activity-histogram-collapsed", false);
@@ -48,29 +47,28 @@
   <!-- Top 5 Key Metric Cards -->
   <div class="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
     <!-- Card 1: Requests -->
-    <Card.Root class="relative overflow-hidden p-4 transition-all duration-200 hover:shadow-sm">
-      <div class="flex items-center justify-between gap-2">
-        <span class="text-muted-foreground text-xs font-medium uppercase tracking-wider">
-          {$translate("activity.stats.requests")}
-        </span>
-        <div class="flex size-7 shrink-0 items-center justify-center rounded-lg bg-blue-500/10 text-blue-600 dark:text-blue-400">
-          <Activity class="size-4" />
+    <Card.Root class="flex flex-col justify-between p-4 transition-all duration-200 hover:shadow-sm">
+      <div>
+        <div class="flex items-center justify-between gap-2">
+          <span class="text-xs font-medium text-muted-foreground">
+            {$translate("activity.stats.requests")}
+          </span>
+          <div class="flex size-7 shrink-0 items-center justify-center rounded-lg bg-blue-500/10 text-blue-600 dark:text-blue-400">
+            <Activity class="size-4" />
+          </div>
+        </div>
+        <div class="mt-2 flex items-baseline gap-1.5">
+          <span
+            class="text-2xl font-bold tracking-tight text-foreground"
+            title={nf.format(stats?.total_requests ?? 0)}
+          >
+            {formatCompactNumber(stats?.total_requests ?? 0, $locale)}
+          </span>
         </div>
       </div>
-      <div class="mt-2 flex items-baseline gap-2">
-        <span
-          class="text-2xl font-bold tracking-tight text-foreground"
-          title={nf.format(stats?.total_requests ?? 0)}
-        >
-          {formatCompactNumber(stats?.total_requests ?? 0, $locale)}
-        </span>
-        <span class="text-muted-foreground text-xs">
-          {$translate("activity.stats.completed")}
-        </span>
-      </div>
-      <div class="mt-2.5 flex items-center gap-1.5 min-h-[1.25rem]">
+      <div class="mt-auto pt-2.5 text-xs text-muted-foreground min-h-[1.25rem]">
         {#if inflightCount > 0}
-          <span class="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/10 px-2 py-0.5 text-xs font-medium text-emerald-600 dark:text-emerald-400">
+          <span class="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/10 px-2 py-0.5 font-medium text-emerald-600 dark:text-emerald-400">
             <span class="relative flex size-2">
               <span class="absolute inline-flex size-full animate-ping rounded-full bg-emerald-400 opacity-75"></span>
               <span class="relative inline-flex size-2 rounded-full bg-emerald-500"></span>
@@ -78,7 +76,7 @@
             {$translate("activity.inFlightCount", { count: inflightCount })}
           </span>
         {:else}
-          <span class="text-muted-foreground/80 text-xs">
+          <span class="text-muted-foreground/80">
             {nf.format(stats?.total_requests ?? 0)} {$translate("activity.stats.completed")}
           </span>
         {/if}
@@ -86,25 +84,27 @@
     </Card.Root>
 
     <!-- Card 2: Total Tokens -->
-    <Card.Root class="relative overflow-hidden p-4 transition-all duration-200 hover:shadow-sm">
-      <div class="flex items-center justify-between gap-2">
-        <span class="text-muted-foreground text-xs font-medium uppercase tracking-wider">
-          {$translate("activity.totalTokens")}
-        </span>
-        <div class="flex size-7 shrink-0 items-center justify-center rounded-lg bg-purple-500/10 text-purple-600 dark:text-purple-400">
-          <Cpu class="size-4" />
+    <Card.Root class="flex flex-col justify-between p-4 transition-all duration-200 hover:shadow-sm">
+      <div>
+        <div class="flex items-center justify-between gap-2">
+          <span class="text-xs font-medium text-muted-foreground">
+            {$translate("activity.totalTokens")}
+          </span>
+          <div class="flex size-7 shrink-0 items-center justify-center rounded-lg bg-purple-500/10 text-purple-600 dark:text-purple-400">
+            <Cpu class="size-4" />
+          </div>
+        </div>
+        <div class="mt-2 flex items-baseline gap-1.5">
+          <span
+            class="text-2xl font-bold tracking-tight text-foreground"
+            title={nf.format(totalTokens)}
+          >
+            {formatCompactNumber(totalTokens, $locale)}
+          </span>
+          <span class="text-xs text-muted-foreground font-normal">Token</span>
         </div>
       </div>
-      <div class="mt-2 flex items-baseline gap-2">
-        <span
-          class="text-2xl font-bold tracking-tight text-foreground"
-          title={nf.format(totalTokens)}
-        >
-          {formatCompactNumber(totalTokens, $locale)}
-        </span>
-        <span class="text-muted-foreground text-xs">Token</span>
-      </div>
-      <div class="mt-2.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-muted-foreground min-h-[1.25rem]">
+      <div class="mt-auto pt-2.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-muted-foreground min-h-[1.25rem]">
         <span title={`${nf.format(stats?.total_input_tokens ?? 0)} Token`}>
           {$translate("activity.inputTokens")}: <strong class="font-medium text-foreground">{formatCompactNumber(stats?.total_input_tokens ?? 0, $locale)}</strong>
         </span>
@@ -122,55 +122,61 @@
     </Card.Root>
 
     <!-- Card 3: Cache Performance -->
-    <Card.Root class="relative overflow-hidden p-4 transition-all duration-200 hover:shadow-sm">
-      <div class="flex items-center justify-between gap-2">
-        <span class="text-muted-foreground text-xs font-medium uppercase tracking-wider">
-          {$translate("activity.stats.cacheHit")}
-        </span>
-        <div class="flex size-7 shrink-0 items-center justify-center rounded-lg bg-emerald-500/10 text-emerald-600 dark:text-emerald-400">
-          <Zap class="size-4" />
+    <Card.Root class="flex flex-col justify-between p-4 transition-all duration-200 hover:shadow-sm">
+      <div>
+        <div class="flex items-center justify-between gap-2">
+          <span class="text-xs font-medium text-muted-foreground">
+            {$translate("activity.stats.cacheHit")}
+          </span>
+          <div class="flex size-7 shrink-0 items-center justify-center rounded-lg bg-emerald-500/10 text-emerald-600 dark:text-emerald-400">
+            <Zap class="size-4" />
+          </div>
+        </div>
+        <div class="mt-2 flex items-baseline gap-1.5">
+          <span class="text-2xl font-bold tracking-tight text-emerald-600 dark:text-emerald-400">
+            {(cacheHitRatio * 100).toFixed(1)}%
+          </span>
         </div>
       </div>
-      <div class="mt-2 flex items-baseline gap-2">
-        <span class="text-2xl font-bold tracking-tight text-emerald-600 dark:text-emerald-400">
-          {nf.format(cacheHitRatio * 100)}%
-        </span>
-      </div>
-      <div class="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-muted/80">
-        <div
-          class="h-full rounded-full bg-emerald-500 transition-all duration-500"
-          style="width: {Math.min(100, Math.max(0, cacheHitRatio * 100))}%"
-        ></div>
-      </div>
-      <div class="mt-1.5 text-xs text-muted-foreground truncate" title={`${nf.format(stats?.total_cache_tokens ?? 0)} Token`}>
-        {$translate("activity.cacheSaved", { tokens: formatCompactNumber(stats?.total_cache_tokens ?? 0, $locale) })}
-        {#if hasCacheCreation}
-          · {$translate("activity.cacheWritten", {
-            tokens: formatCompactNumber(stats?.total_cache_creation_tokens ?? 0, $locale),
-            ratio: nf.format((stats?.cache_creation_ratio ?? 0) * 100)
-          })}
-        {/if}
+      <div class="mt-auto pt-2.5 space-y-1.5 min-h-[1.25rem]">
+        <div class="h-1.5 w-full overflow-hidden rounded-full bg-muted/80">
+          <div
+            class="h-full rounded-full bg-emerald-500 transition-all duration-500"
+            style="width: {Math.min(100, Math.max(0, cacheHitRatio * 100))}%"
+          ></div>
+        </div>
+        <div class="text-xs text-muted-foreground truncate" title={`${nf.format(stats?.total_cache_tokens ?? 0)} Token`}>
+          {$translate("activity.cacheSaved", { tokens: formatCompactNumber(stats?.total_cache_tokens ?? 0, $locale) })}
+          {#if hasCacheCreation}
+            · {$translate("activity.cacheWritten", {
+              tokens: formatCompactNumber(stats?.total_cache_creation_tokens ?? 0, $locale),
+              ratio: ((stats?.cache_creation_ratio ?? 0) * 100).toFixed(1)
+            })}
+          {/if}
+        </div>
       </div>
     </Card.Root>
 
     <!-- Card 4: Estimated Cost -->
-    <Card.Root class="relative overflow-hidden p-4 transition-all duration-200 hover:shadow-sm">
-      <div class="flex items-center justify-between gap-2">
-        <span class="text-muted-foreground text-xs font-medium uppercase tracking-wider">
-          {$translate("activity.costEstimated")}
-        </span>
-        <div class="flex size-7 shrink-0 items-center justify-center rounded-lg bg-amber-500/10 text-amber-600 dark:text-amber-400">
-          <Coins class="size-4" />
+    <Card.Root class="flex flex-col justify-between p-4 transition-all duration-200 hover:shadow-sm">
+      <div>
+        <div class="flex items-center justify-between gap-2">
+          <span class="text-xs font-medium text-muted-foreground">
+            {$translate("activity.costEstimated")}
+          </span>
+          <div class="flex size-7 shrink-0 items-center justify-center rounded-lg bg-amber-500/10 text-amber-600 dark:text-amber-400">
+            <Coins class="size-4" />
+          </div>
+        </div>
+        <div class="mt-2 flex items-baseline gap-1.5">
+          <span class="text-2xl font-bold tracking-tight text-foreground">
+            {formatCostVal(stats?.estimated_cost)}
+          </span>
         </div>
       </div>
-      <div class="mt-2 flex items-baseline gap-2">
-        <span class="text-2xl font-bold tracking-tight text-foreground">
-          {formatCostVal(stats?.estimated_cost)}
-        </span>
-      </div>
-      <div class="mt-2.5 text-xs text-muted-foreground truncate min-h-[1.25rem]">
+      <div class="mt-auto pt-2.5 text-xs text-muted-foreground truncate min-h-[1.25rem]">
         {#if stats?.cost_estimated}
-          <span>{$translate("activity.stats.byModel.columns.cost")}</span>
+          <span>{$translate("activity.pricingBased")}</span>
         {:else}
           <span class="text-muted-foreground/70">{$translate("activity.costNotConfigured")}</span>
         {/if}
@@ -178,42 +184,35 @@
     </Card.Root>
 
     <!-- Card 5: Active Models -->
-    <Card.Root class="relative overflow-hidden p-4 transition-all duration-200 hover:shadow-sm">
-      <div class="flex items-center justify-between gap-2">
-        <span class="text-muted-foreground text-xs font-medium uppercase tracking-wider">
-          {$translate("activity.activeModels")}
-        </span>
-        <a
-          href="/models"
-          use:link
-          class="flex size-7 shrink-0 items-center justify-center rounded-lg bg-cyan-500/10 text-cyan-600 transition-colors hover:bg-cyan-500/20 dark:text-cyan-400"
-          title={$translate("navigation.models")}
-        >
-          <Boxes class="size-4" />
-        </a>
+    <Card.Root class="flex flex-col justify-between p-4 transition-all duration-200 hover:shadow-sm">
+      <div>
+        <div class="flex items-center justify-between gap-2">
+          <span class="text-xs font-medium text-muted-foreground">
+            {$translate("activity.activeModels")}
+          </span>
+          <a
+            href="/models"
+            use:link
+            class="flex size-7 shrink-0 items-center justify-center rounded-lg bg-cyan-500/10 text-cyan-600 transition-colors hover:bg-cyan-500/20 dark:text-cyan-400"
+            title={$translate("navigation.models")}
+          >
+            <Boxes class="size-4" />
+          </a>
+        </div>
+        <div class="mt-2 flex items-baseline gap-1.5">
+          <span class="text-2xl font-bold tracking-tight text-foreground">
+            {readyModels}
+          </span>
+          <span class="text-xs text-muted-foreground font-normal">
+            / {totalModels} {$translate("activity.stats.byModel.columns.model")}
+          </span>
+        </div>
       </div>
-      <div class="mt-2 flex items-baseline gap-2">
-        <span class="text-2xl font-bold tracking-tight text-foreground">
-          {readyModels}
-        </span>
-        <span class="text-muted-foreground text-xs">
-          / {totalModels} {$translate("activity.stats.byModel.columns.model")}
-        </span>
-      </div>
-      <div class="mt-2.5 flex items-center justify-between text-xs text-muted-foreground min-h-[1.25rem]">
+      <div class="mt-auto pt-2.5 text-xs text-muted-foreground truncate min-h-[1.25rem]">
         <span>
           <span class="font-medium text-emerald-600 dark:text-emerald-400">{readyModels}</span> {$translate("status.model.ready")}
           · <span class="font-medium text-muted-foreground">{sleepingModels}</span> {$translate("status.model.sleeping")}
         </span>
-        {#if onSelectTab}
-          <button
-            type="button"
-            class="text-primary hover:underline flex items-center gap-0.5 text-xs font-medium"
-            onclick={() => onSelectTab("models")}
-          >
-            {$translate("activity.tabs.models")}
-          </button>
-        {/if}
       </div>
     </Card.Root>
   </div>

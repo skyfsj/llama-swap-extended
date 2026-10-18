@@ -23,6 +23,27 @@ export function formatSpeed(speed: number, unknownLabel = "unknown"): string {
   return speed < 0 ? unknownLabel : speed.toFixed(2) + " t/s";
 }
 
+/**
+ * Format the provider column shared by the activity records and the in-flight
+ * table. The adapter only has a value when the provider exposes more than one
+ * API surface, and is appended as "provider / adapter" so both tables read the
+ * same way.
+ *
+ * An empty provider only means "local" when the row says so (`provider_local`):
+ * a provider request that failed before any upstream produced an answer has no
+ * provider either, and reporting that as "local" would be a lie.
+ */
+export function formatProviderLabel(
+  row: { provider?: string; provider_adapter?: string; provider_local?: boolean },
+  localLabel: string,
+  unknownLabel = "—"
+): string {
+  const provider = (row.provider ?? "").trim();
+  if (provider === "") return row.provider_local ? localLabel : unknownLabel;
+  const adapter = (row.provider_adapter ?? "").trim();
+  return adapter === "" ? provider : `${provider} / ${adapter}`;
+}
+
 /** Format a count with locale-aware compact units such as 1.68万 or 1.05B. */
 export function formatCompactNumber(value: number, locale: Locale): string {
   const safeValue = Number.isFinite(value) ? value : 0;

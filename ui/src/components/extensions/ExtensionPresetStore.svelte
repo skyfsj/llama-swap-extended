@@ -28,6 +28,14 @@
     return custom || preset.id;
   }
 
+  // "*" is the widest grant on offer — every public host — so the card spells it
+  // out instead of showing a bare asterisk an operator has to decode.
+  function hostSummary(preset: ExtensionPreset): string {
+    return (preset.hosts ?? [])
+      .map((host) => (host === "*" ? $translate("extensions.presets.anyPublicHost") : host))
+      .join(", ");
+  }
+
   async function install(preset: ExtensionPreset): Promise<void> {
     busyId = preset.id;
     error = "";
@@ -86,8 +94,8 @@
               </p>
             {/if}
             {#if (preset.hosts ?? []).length > 0}
-              <p class="truncate font-mono text-[10px] text-muted-foreground" title={(preset.hosts ?? []).join(", ")}>
-                {(preset.hosts ?? []).join(", ")}
+              <p class="truncate font-mono text-[10px] text-muted-foreground" title={hostSummary(preset)}>
+                {hostSummary(preset)}
               </p>
             {/if}
             {#if settingSummary(preset)}

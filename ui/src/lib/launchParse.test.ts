@@ -1,3 +1,4 @@
+import { shouldDeriveLaunchView } from "./modelConfig";
 import { describe, expect, it } from "vitest";
 import { adoptLaunchFields, parseLaunchCommand, stripOwnedLaunchArguments } from "./launchParse";
 
@@ -303,5 +304,19 @@ describe("adoptLaunchFields", () => {
     const current = { ...launch(), gpus: ["uuid:GPU-1"] };
     const adopted = adoptLaunchFields("vllm", "--max-num-seqs 2", current);
     expect(adopted.gpus).toEqual(["uuid:GPU-1"]);
+  });
+});
+
+describe("shouldDeriveLaunchView", () => {
+  it("reads the fields whenever a managed model carries a command text", () => {
+    // The load effect runs more than once (the runtime catalog arrives later)
+    // and rebuilds the draft each time, so the fields must be re-read then.
+    expect(shouldDeriveLaunchView("vllm", "--max-num-seqs 8")).toBe(true);
+    expect(shouldDeriveLaunchView("llamacpp", "--ctx-size 32768")).toBe(true);
+  });
+
+  it("does nothing without a managed kind or a command text", () => {
+    expect(shouldDeriveLaunchView("", "--max-num-seqs 8")).toBe(false);
+    expect(shouldDeriveLaunchView("vllm", "   ")).toBe(false);
   });
 });

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { ChevronDown, ChevronRight, KeyRound, LoaderCircle, Plus, RotateCcw, Trash2 } from "@lucide/svelte";
+  import { ChevronDown, ChevronRight, KeyRound, LoaderCircle, Pencil, Plus, RotateCcw, Trash2 } from "@lucide/svelte";
   import * as Dialog from "$lib/components/ui/dialog/index.js";
   import * as Select from "$lib/components/ui/select/index.js";
   import { Button } from "$lib/components/ui/button/index.js";
@@ -8,6 +8,7 @@
   import { fetchPlaygroundModels, playgroundModels } from "../stores/api";
   import { translate } from "../lib/i18n";
   import ModelMultiSelect from "../components/ModelMultiSelect.svelte";
+  import { ipMatchesEntry } from "../lib/ipMatch";
   import {
     createAPIKey,
     fetchAPIKeys,
@@ -76,15 +77,29 @@
     return grouped;
   });
 
-  let modelOptions = $derived.by(() => {
-    const ids = new Set<string>();
-    for (const model of $playgroundModels) {
-      if (model.id) ids.add(model.id);
+  // Model groups for the allowlist picker: each model followed by the alias
+  // names that resolve to it, so an old name reads as one of the model's
+  // routing names instead of a model of its own.
+  let modelGroups = $derived.by(() => {
+    const seen = new Set<string>();
+    const groups: { model: string; aliases: string[] }[] = [];
+    const ordered = [...$playgroundModels].sort((a, b) =>
+      (a.id ?? "").localeCompare(b.id ?? "", undefined, { numeric: true })
+    );
+    for (const model of ordered) {
+      const id = (model.id ?? "").trim();
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      const aliases: string[] = [];
       for (const alias of model.aliases ?? []) {
-        if (alias) ids.add(alias);
+        const name = (alias ?? "").trim();
+        if (!name || seen.has(name)) continue;
+        seen.add(name);
+        aliases.push(name);
       }
+      groups.push({ model: id, aliases });
     }
-    return [...ids].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+    return groups;
   });
 
   // The access-key dialog shows the parent management key read-only: the
@@ -94,6 +109,23 @@
     const parentKey = managementKeys.find((key) => key.id === editing?.parentId);
     return parentKey?.name || parentKey?.id || editing.parentId;
   });
+
+  // A key the configuration file declares is re-asserted on every config
+  // change, so editing it here would be undone: the panel shows it read-only
+  // and points at where it is edited.
+  function configManaged(key: APIKey): boolean {
+    return key.source === "config";
+  }
+
+  // matchedAllowedIP finds the allowlist entry a recorded address falls under,
+  // so the table can show whether the key's last caller would still be allowed
+  // (an address outside every entry is the interesting case: it means the key
+  // was used before the allowlist tightened, or by a denied caller).
+  function matchedAllowedIP(key: APIKey): string {
+    const ip = key.lastIp ?? "";
+    if (ip === "" || key.allowedIps.length === 0) return "";
+    return key.allowedIps.find((entry) => ipMatchesEntry(entry, ip)) ?? "";
+  }
 
   function accessKeysFor(parentId: string): APIKey[] {
     return (accessKeysByParent.get(parentId) ?? []).filter((key) => !key.revokedAt);
@@ -130,10 +162,6 @@
       .filter((entry) => entry.length > 0);
   }
 
-  function modelLabel(models: string[]): string {
-    return models.length > 0 ? models.join(", ") : $translate("controlPlane.keyModelsAllModels");
-  }
-
   function concurrencyLabel(key: APIKey): string {
     if (key.maxConcurrency <= 0) return $translate("controlPlane.keyConcurrencyUnlimited");
     return `${key.maxConcurrency}`;
@@ -162,9 +190,10 @@
     if (saving) return;
     dialogKind = kind;
     editing = { ...emptyDraft(), parentId };
-    // A first managed key switches the installation from open mode to
-    // authenticated mode, so it must remain able to access the control panel.
-    editing.allowManagementLogin = kind === "management" && managementKeys.length === 0;
+    // Management keys are for signing in and administering the control plane,
+    // so the panel always creates them with panel access (an API-only
+    // management key can still be made through the API).
+    editing.allowManagementLogin = kind === "management";
     // Opening the nested list up front means the new access key is visible as
     // soon as the dialog closes.
     if (parentId) expanded[parentId] = true;
@@ -289,7 +318,10 @@
   });
 
   $effect(() => {
-    if (!editDialogOpen && editing && !saving) editing = null;
+    // Release the draft once no dialog is using it. The create dialog shares
+    // `editing` with the edit dialog, so testing only editDialogOpen threw the
+    // draft away the moment the create dialog opened and left it blank.
+    if (!createDialogOpen && !editDialogOpen && editing && !saving) editing = null;
   });
 
   onMount(() => {
@@ -334,161 +366,255 @@
       </Button>
     </div>
   {:else}
-    <div class="space-y-4">
-      <div>
-        <h4 class="mb-2 text-sm font-semibold">{$translate("controlPlane.keyManagementTitle")}</h4>
-        <p class="text-muted-foreground mb-3 text-xs">{$translate("controlPlane.keyManagementDescription")}</p>
-      </div>
-      {#each managementKeys as parent (parent.id)}
-        <div class="overflow-hidden rounded-xl border bg-card">
-          <table class="w-full min-w-[860px] text-sm">
-            <caption class="sr-only">{$translate("controlPlane.keyManagementTitle")}: {parent.name || parent.id}</caption>
-            <thead class="bg-muted/40 text-left">
-              <tr>
-                <th class="px-3 py-2.5">{$translate("controlPlane.keyName")}</th>
-                <th class="px-3 py-2.5">{$translate("controlPlane.keyAccess")}</th>
-                <th class="px-3 py-2.5">{$translate("controlPlane.keyLastUsed")}</th>
-                <th class="px-3 py-2.5">{$translate("controlPlane.keyAccessTitle")}</th>
-                <th class="px-3 py-2.5">{$translate("controlPlane.runtimeActions")}</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr class="align-top">
-                <td class="px-3 py-3">
-                  <div class="flex items-center gap-1.5">
-                    <button
-                      type="button"
-                      class="hover:bg-muted/60 rounded p-0.5"
-                      aria-expanded={expanded[parent.id] === true}
-                      aria-label={$translate("controlPlane.keyAccessTitle")}
-                      onclick={() => (expanded[parent.id] = !expanded[parent.id])}
-                    >
-                      {#if expanded[parent.id]}
-                        <ChevronDown class="size-4" aria-hidden="true" />
-                      {:else}
-                        <ChevronRight class="size-4" aria-hidden="true" />
+    <!-- One table for every management key. Rendering a table per key repeated
+         the header and the empty-access note once per parent and pushed the
+         row actions onto a second line. -->
+    <div class="overflow-hidden rounded-xl border bg-card">
+      <table class="keys-table w-full table-fixed text-sm">
+        <colgroup>
+          <col />
+          <col class="w-[13rem]" />
+          <col class="w-[5.5rem]" />
+          <col class="w-[9rem]" />
+        </colgroup>
+        <thead class="bg-muted/40 text-left">
+          <tr>
+            <th class="px-3 py-2.5">{$translate("controlPlane.keyName")}</th>
+            <th class="px-3 py-2.5 whitespace-nowrap">{$translate("controlPlane.keyLastUsed")}</th>
+            <th class="px-3 py-2.5 whitespace-nowrap">{$translate("controlPlane.keyAccessTitle")}</th>
+            <th class="px-3 py-2.5 text-right">{$translate("controlPlane.runtimeActions")}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {#each managementKeys as parent (parent.id)}
+            <tr class="border-t align-middle">
+              <td class="px-3 py-2.5">
+                <div class="flex items-start gap-1.5">
+                  <button
+                    type="button"
+                    class="hover:bg-muted/60 mt-0.5 rounded p-0.5"
+                    aria-expanded={expanded[parent.id] === true}
+                    aria-label={$translate("controlPlane.keyAccessTitle")}
+                    onclick={() => (expanded[parent.id] = !expanded[parent.id])}
+                  >
+                    {#if expanded[parent.id]}
+                      <ChevronDown class="size-4" aria-hidden="true" />
+                    {:else}
+                      <ChevronRight class="size-4" aria-hidden="true" />
+                    {/if}
+                  </button>
+                  <div class="min-w-0">
+                    <div class="flex items-center gap-1.5">
+                      <span class="truncate font-medium">{parent.name || $translate("controlPlane.keyUnnamed")}</span>
+                      {#if configManaged(parent)}
+                        <span
+                          class="rounded-sm border border-border px-1 py-px text-[10px] text-muted-foreground"
+                          title={$translate("controlPlane.keyManagedByConfigHint")}
+                        >{$translate("controlPlane.keyManagedByConfig")}</span>
                       {/if}
-                    </button>
-                    <div>
-                      <div class="font-medium">{parent.name || parent.id}</div>
-                      <div class="text-muted-foreground text-xs">{parent.id}</div>
-                      <div class="text-muted-foreground mt-1 text-xs">
-                        {parent.expiresAt
-                          ? `${$translate("controlPlane.keyExpires")}: ${formatDate(parent.expiresAt)}`
-                          : $translate("controlPlane.keyExpiryUnlimited")}
-                      </div>
+                    </div>
+                    <div class="text-muted-foreground truncate font-mono text-xs">{parent.id}</div>
+                    <div class="text-muted-foreground mt-0.5 text-xs">
+                      {parent.expiresAt
+                        ? `${$translate("controlPlane.keyExpires")}: ${formatDate(parent.expiresAt)}`
+                        : $translate("controlPlane.keyExpiryUnlimited")}
                     </div>
                   </div>
-                </td>
-                <td class="px-3 py-3 text-xs">
-                  {#if parent.allowManagementLogin}
-                    <span class="text-success">{$translate("controlPlane.keyManagementLoginEnabled")}</span>
+                </div>
+              </td>
+              <td class="px-3 py-2.5 text-xs">
+                <div class="whitespace-nowrap">{formatDate(parent.lastUsedAt ?? parent.createdAt)}</div>
+                {#if parent.lastIp}
+                  <div class="text-muted-foreground mt-0.5 font-mono text-[11px]" title={$translate("controlPlane.keyLastIPHint")}>
+                    {$translate("controlPlane.keyFromIP", { ip: parent.lastIp })}
+                  </div>
+                {/if}
+              </td>
+              <td class="w-px px-3 py-2.5 text-right text-xs tabular-nums">{accessKeysFor(parent.id).length}</td>
+              <td class="px-3 py-2.5">
+                <div class="keys-table__actions">
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    title={$translate("controlPlane.keyAddAccess")}
+                    aria-label={$translate("controlPlane.keyAddAccess")}
+                    onclick={() => openCreate("access", parent.id)}
+                    disabled={saving}
+                  >
+                    <Plus aria-hidden="true" />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    aria-label={$translate("controlPlane.editKey")}
+                    onclick={() => openEdit(parent)}
+                    disabled={saving || configManaged(parent)}
+                    title={configManaged(parent) ? $translate("controlPlane.keyManagedByConfigHint") : $translate("controlPlane.editKey")}
+                  >
+                    <Pencil aria-hidden="true" />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    aria-label={$translate("controlPlane.rotate")}
+                    onclick={() => requestAction("rotate", parent)}
+                    disabled={saving || configManaged(parent)}
+                    title={configManaged(parent) ? $translate("controlPlane.keyManagedByConfigHint") : $translate("controlPlane.rotate")}
+                  >
+                    <RotateCcw aria-hidden="true" />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    class="keys-table__danger"
+                    aria-label={$translate("controlPlane.deleteKey")}
+                    onclick={() => requestAction("delete", parent)}
+                    disabled={saving || configManaged(parent)}
+                    title={configManaged(parent) ? $translate("controlPlane.keyManagedByConfigHint") : $translate("controlPlane.deleteKey")}
+                  >
+                    <Trash2 aria-hidden="true" />
+                  </Button>
+                </div>
+              </td>
+            </tr>
+
+            {#if expanded[parent.id]}
+              {@const children = accessKeysFor(parent.id)}
+              <tr class="border-t bg-muted/20">
+                <td class="px-3 py-3" colspan="5">
+                  {#if children.length === 0}
+                    <div class="flex items-center gap-2">
+                      <span class="text-muted-foreground text-xs">{$translate("controlPlane.keyAccessEmpty")}</span>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        class="text-muted-foreground h-6 px-2 text-xs"
+                        onclick={() => openCreate("access", parent.id)}
+                        disabled={saving}
+                      >
+                        <Plus class="size-3" aria-hidden="true" />
+                        {$translate("controlPlane.keyAddAccess")}
+                      </Button>
+                    </div>
                   {:else}
-                    <span class="text-muted-foreground">{$translate("controlPlane.keyAPIOnly")}</span>
+                    <table class="keys-table w-full table-fixed text-sm">
+                      <caption class="sr-only">{$translate("controlPlane.keyAccessTitle")}: {parent.name || parent.id}</caption>
+                      <colgroup>
+                        <col />
+                        <col class="w-[11rem]" />
+                        <col class="w-[10rem]" />
+                        <col class="w-[7rem]" />
+                        <col class="w-[13rem]" />
+                        <col class="w-[8rem]" />
+                      </colgroup>
+                      <thead class="text-left">
+                        <tr>
+                          <th class="px-3 py-2">{$translate("controlPlane.keyName")}</th>
+                          <th class="px-3 py-2 whitespace-nowrap">{$translate("controlPlane.keyModels")}</th>
+                          <th class="px-3 py-2 whitespace-nowrap">{$translate("controlPlane.keyAllowedIPs")}</th>
+                          <th class="px-3 py-2 whitespace-nowrap">{$translate("controlPlane.keyMaxConcurrency")}</th>
+                          <th class="px-3 py-2 whitespace-nowrap">{$translate("controlPlane.keyLastUsed")}</th>
+                          <th class="px-3 py-2 text-right">{$translate("controlPlane.runtimeActions")}</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {#each children as child (child.id)}
+                          <tr class="border-t align-middle">
+                            <td class="px-3 py-2">
+                              <div class="truncate font-medium">{child.name || $translate("controlPlane.keyUnnamed")}</div>
+                              <div class="text-muted-foreground truncate font-mono text-xs">{child.id}</div>
+                              <div class="text-muted-foreground mt-0.5 text-xs">
+                                {child.group || $translate("controlPlane.keyUngrouped")}
+                                {#if child.expiresAt}
+                                  · {$translate("controlPlane.keyExpires")}: {formatDate(child.expiresAt)}
+                                {/if}
+                              </div>
+                            </td>
+                            <td class="px-3 py-2 text-xs break-words" title={child.models.length > 0 ? child.models.join(", ") : ""}>
+                              {#if child.models.length > 0}
+                                {child.models.join(", ")}
+                              {:else}
+                                <span class="text-muted-foreground">{$translate("controlPlane.keyModelsAllModels")}</span>
+                              {/if}
+                            </td>
+                            <td class="px-3 py-2 text-xs">
+                              {#if child.allowedIps.length > 0}
+                                {@const matched = matchedAllowedIP(child)}
+                                {#each child.allowedIps as entry (entry)}
+                                  <div
+                                    class={matched && entry === matched ? "break-words font-medium text-success" : "break-words text-muted-foreground"}
+                                    title={matched && entry === matched ? $translate("controlPlane.keyAllowedIPsMatchedHint") : ""}
+                                  >{entry}</div>
+                                {/each}
+                              {:else}
+                                <span class="text-muted-foreground">{$translate("controlPlane.keyAllowedIPsAll")}</span>
+                              {/if}
+                            </td>
+                            <td class="px-3 py-2 text-xs">
+                              {concurrencyLabel(child)}
+                              {#if child.maxConcurrency > 0 && (child.activeRequests ?? 0) > 0}
+                                <div class="text-muted-foreground">
+                                  {$translate("controlPlane.keyInFlight", { count: child.activeRequests ?? 0 })}
+                                </div>
+                              {/if}
+                            </td>
+                            <td class="px-3 py-2 text-xs">
+                              <div class="whitespace-nowrap">{formatDate(child.lastUsedAt ?? child.createdAt)}</div>
+                              {#if child.lastIp}
+                                <div
+                                  class={matchedAllowedIP(child) ? "text-muted-foreground mt-0.5 font-mono text-[11px]" : "text-destructive mt-0.5 font-mono text-[11px]"}
+                                  title={matchedAllowedIP(child) ? $translate("controlPlane.keyLastIPHint") : $translate("controlPlane.keyLastIPBlockedHint")}
+                                >
+                                  {$translate("controlPlane.keyFromIP", { ip: child.lastIp })}
+                                </div>
+                              {/if}
+                            </td>
+                            <td class="px-3 py-2">
+                              <div class="keys-table__actions">
+                                <Button
+                                  variant="ghost"
+                                  size="icon-sm"
+                                  title={$translate("controlPlane.editKey")}
+                                  aria-label={$translate("controlPlane.editKey")}
+                                  onclick={() => openEdit(child)}
+                                  disabled={saving}
+                                >
+                                  <Pencil aria-hidden="true" />
+                                </Button>
+                                <Button
+                                  variant="ghost"
+                                  size="icon-sm"
+                                  title={$translate("controlPlane.rotate")}
+                                  aria-label={$translate("controlPlane.rotate")}
+                                  onclick={() => requestAction("rotate", child)}
+                                  disabled={saving}
+                                >
+                                  <RotateCcw aria-hidden="true" />
+                                </Button>
+                                <Button
+                                  variant="ghost"
+                                  size="icon-sm"
+                                  class="keys-table__danger"
+                                  title={$translate("controlPlane.deleteKey")}
+                                  aria-label={$translate("controlPlane.deleteKey")}
+                                  onclick={() => requestAction("delete", child)}
+                                  disabled={saving}
+                                >
+                                  <Trash2 aria-hidden="true" />
+                                </Button>
+                              </div>
+                            </td>
+                          </tr>
+                        {/each}
+                      </tbody>
+                    </table>
                   {/if}
                 </td>
-                <td class="px-3 py-3 text-xs">{formatDate(parent.lastUsedAt ?? parent.createdAt)}</td>
-                <td class="px-3 py-3 text-xs">{accessKeysFor(parent.id).length}</td>
-                <td class="px-3 py-3">
-                  <div class="flex flex-wrap gap-2">
-                    <Button variant="outline" size="sm" onclick={() => openCreate("access", parent.id)} disabled={saving}>
-                      <Plus class="size-3.5" aria-hidden="true" />
-                      {$translate("controlPlane.keyAddAccess")}
-                    </Button>
-                    <Button variant="outline" size="sm" onclick={() => openEdit(parent)} disabled={saving}>
-                      {$translate("controlPlane.editKey")}
-                    </Button>
-                    <Button variant="outline" size="sm" onclick={() => requestAction("rotate", parent)} disabled={saving}>
-                      <RotateCcw class="size-3.5" aria-hidden="true" />
-                      {$translate("controlPlane.rotate")}
-                    </Button>
-                    <Button variant="destructive" size="sm" onclick={() => requestAction("delete", parent)} disabled={saving}>
-                      <Trash2 class="size-3.5" aria-hidden="true" />
-                      {$translate("controlPlane.deleteKey")}
-                    </Button>
-                  </div>
-                </td>
               </tr>
-            </tbody>
-          </table>
-
-          {#if expanded[parent.id]}
-            {@const children = accessKeysFor(parent.id)}
-            <div class="border-t bg-muted/20 px-3 py-3">
-              {#if children.length === 0}
-                <p class="text-muted-foreground text-xs">{$translate("controlPlane.keyAccessEmpty")}</p>
-                <p class="text-muted-foreground mt-1 text-xs">{$translate("controlPlane.keyAccessEmptyHint")}</p>
-              {:else}
-                <div class="overflow-x-auto rounded-lg border bg-card">
-                  <table class="w-full min-w-[900px] text-sm">
-                    <thead class="bg-muted/40 text-left">
-                      <tr>
-                        <th class="px-3 py-2">{$translate("controlPlane.keyName")}</th>
-                        <th class="px-3 py-2">{$translate("controlPlane.keyModels")}</th>
-                        <th class="px-3 py-2">{$translate("controlPlane.keyAllowedIPs")}</th>
-                        <th class="px-3 py-2">{$translate("controlPlane.keyMaxConcurrency")}</th>
-                        <th class="px-3 py-2">{$translate("controlPlane.keyGroup")}</th>
-                        <th class="px-3 py-2">{$translate("controlPlane.keyLastUsed")}</th>
-                        <th class="px-3 py-2">{$translate("controlPlane.runtimeActions")}</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {#each children as child (child.id)}
-                        <tr class="border-t align-top">
-                          <td class="px-3 py-3">
-                            <div class="font-medium">{child.name || child.id}</div>
-                            <div class="text-muted-foreground text-xs">{child.id}</div>
-                            <div class="text-muted-foreground mt-1 text-xs">
-                              {child.expiresAt
-                                ? `${$translate("controlPlane.keyExpires")}: ${formatDate(child.expiresAt)}`
-                                : $translate("controlPlane.keyExpiryUnlimited")}
-                            </div>
-                          </td>
-                          <td class="px-3 py-3 text-xs">{modelLabel(child.models)}</td>
-                          <td class="px-3 py-3 text-xs">
-                            {#if child.allowedIps.length > 0}
-                              {child.allowedIps.join(", ")}
-                            {:else}
-                              <span class="text-muted-foreground">{$translate("controlPlane.keyModelAll")}</span>
-                            {/if}
-                          </td>
-                          <td class="px-3 py-3 text-xs">
-                            {concurrencyLabel(child)}
-                            {#if child.maxConcurrency > 0 && (child.activeRequests ?? 0) > 0}
-                              <div class="text-muted-foreground">
-                                {$translate("controlPlane.keyInFlight", { count: child.activeRequests ?? 0 })}
-                              </div>
-                            {/if}
-                          </td>
-                          <td class="px-3 py-3 text-xs">
-                            {child.group || $translate("controlPlane.keyUngrouped")}
-                          </td>
-                          <td class="px-3 py-3 text-xs">{formatDate(child.lastUsedAt ?? child.createdAt)}</td>
-                          <td class="px-3 py-3">
-                            <div class="flex flex-wrap gap-2">
-                              <Button variant="outline" size="sm" onclick={() => openEdit(child)} disabled={saving}>
-                                {$translate("controlPlane.editKey")}
-                              </Button>
-                              <Button variant="outline" size="sm" onclick={() => requestAction("rotate", child)} disabled={saving}>
-                                <RotateCcw class="size-3.5" aria-hidden="true" />
-                                {$translate("controlPlane.rotate")}
-                              </Button>
-                              <Button variant="destructive" size="sm" onclick={() => requestAction("delete", child)} disabled={saving}>
-                                <Trash2 class="size-3.5" aria-hidden="true" />
-                                {$translate("controlPlane.deleteKey")}
-                              </Button>
-                            </div>
-                          </td>
-                        </tr>
-                      {/each}
-                    </tbody>
-                  </table>
-                </div>
-              {/if}
-            </div>
-          {/if}
-        </div>
-      {/each}
+            {/if}
+          {/each}
+        </tbody>
+      </table>
     </div>
   {/if}
 </section>
@@ -537,7 +663,7 @@
             <span class="font-medium">{$translate("controlPlane.keyModels")}</span>
             <ModelMultiSelect
               bind:value={editing.models}
-              options={modelOptions}
+              groups={modelGroups}
               ariaLabel={$translate("controlPlane.keyModels")}
               allLabel={$translate("controlPlane.keyModelAll")}
               selectedLabel={$translate("controlPlane.keyModelSelected", { count: editing.models.length })}
@@ -611,10 +737,6 @@
             {/if}
           </div>
           {#if dialogKind === "management"}
-            <label class="flex items-center gap-2 rounded-lg border border-transparent px-1 py-1.5 text-sm hover:bg-muted/50">
-              <input class="accent-primary mt-0.5 size-4 shrink-0" type="checkbox" bind:checked={editing.allowManagementLogin} />
-              <span class="font-medium">{$translate("controlPlane.keyAllowManagementLogin")}</span>
-            </label>
             <p class="text-muted-foreground text-xs">{$translate("controlPlane.keyLoginOnlyHint")}</p>
           {/if}
         </fieldset>
@@ -677,7 +799,7 @@
             <span class="font-medium">{$translate("controlPlane.keyModels")}</span>
             <ModelMultiSelect
               bind:value={editing.models}
-              options={modelOptions}
+              groups={modelGroups}
               ariaLabel={$translate("controlPlane.keyModels")}
               allLabel={$translate("controlPlane.keyModelAll")}
               selectedLabel={$translate("controlPlane.keyModelSelected", { count: editing.models.length })}
@@ -748,11 +870,12 @@
               />
             {/if}
           </div>
-          {#if dialogKind === "management"}
+          {#if dialogKind === "management" && !editing.allowManagementLogin}
             <label class="flex items-center gap-2 rounded-lg border border-transparent px-1 py-1.5 text-sm hover:bg-muted/50">
               <input class="accent-primary mt-0.5 size-4 shrink-0" type="checkbox" bind:checked={editing.allowManagementLogin} />
               <span class="font-medium">{$translate("controlPlane.keyAllowManagementLogin")}</span>
             </label>
+            <p class="text-muted-foreground text-xs">{$translate("controlPlane.keyAPIOnlyHint")}</p>
           {/if}
         </fieldset>
         {#if error}
@@ -808,3 +931,27 @@
     </Dialog.Footer>
   </Dialog.Content>
 </Dialog.Root>
+
+<style>
+  /* The action cells hold four icon buttons; without this the row wraps them
+     onto a second line and every management key grows two rows tall. */
+  .keys-table__actions {
+    display: flex;
+    flex-wrap: nowrap;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 0.125rem;
+    white-space: nowrap;
+  }
+
+  /* The class is passed to a Button component, so the compiler cannot see it
+     from the markup; the selector stays global for that, like the models page. */
+  :global(.keys-table__danger) {
+    color: var(--destructive);
+  }
+
+  :global(.keys-table__danger):hover:not(:disabled) {
+    color: var(--destructive);
+    background: color-mix(in oklab, var(--destructive) 12%, transparent);
+  }
+</style>

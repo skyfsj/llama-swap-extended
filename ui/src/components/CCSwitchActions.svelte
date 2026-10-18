@@ -1,15 +1,20 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import { ExternalLink, LoaderCircle } from "@lucide/svelte";
   import * as Dialog from "$lib/components/ui/dialog/index.js";
   import * as Select from "$lib/components/ui/select/index.js";
   import { Button } from "$lib/components/ui/button/index.js";
   import { translate } from "../lib/i18n";
   import { errorMessageFromPayload } from "../lib/apiError";
+  import { selectableModelNames } from "../lib/ccswitchModels";
   import { authSession } from "../stores/auth";
   import { currentRoute } from "../stores/route";
   import { fetchPlaygroundModels, playgroundModels } from "../stores/api";
 
-  type CCSwitchApp = "claude" | "codex";
+  // Applications CC Switch v4 imports provider links into. The order matches
+  // internal/ccswitch.Apps, which mirrors CC Switch's own parser.
+  const apps = ["claude", "codex", "gemini", "grokbuild", "opencode", "openclaw", "hermes", "pi"] as const;
+  type CCSwitchApp = (typeof apps)[number];
 
   interface APIKey {
     id: string;
@@ -20,14 +25,26 @@
   interface LinkPayload {
     link?: string;
     error?: string;
+    endpoint?: string;
+    apiFormat?: string;
   }
 
   const currentKeyValue = "__current__";
   const autoKeyValue = "__auto__";
   const defaultKeyValue = "__default__";
   const defaultAPIKey = "llama-swap";
-  const noKeyValue = "__none__";
   const mainModelValue = "__main__";
+
+  const appLabels: Record<CCSwitchApp, string> = {
+    claude: "Claude Code",
+    codex: "Codex",
+    gemini: "Gemini CLI",
+    grokbuild: "Grok Build",
+    opencode: "OpenCode",
+    openclaw: "OpenClaw",
+    hermes: "Hermes",
+    pi: "Pi",
+  };
 
   let dialogOpen = $state(false);
   let selectedApp = $state<CCSwitchApp>("claude");
@@ -43,35 +60,41 @@
   let keysLoading = $state(false);
   let generating = $state(false);
   let readyLink = $state("");
+  let resolvedEndpoint = $state("");
+  let resolvedFormat = $state("");
   let error = $state("");
   let generationRevision = 0;
   let generationTimer: ReturnType<typeof setTimeout> | undefined;
 
-  let modelOptions = $derived.by(() => {
-    const values = new Set<string>();
-    if (model) values.add(model);
-    for (const entry of $playgroundModels) {
-      if (entry.id) values.add(entry.id);
-      for (const alias of entry.aliases ?? []) {
-        if (alias) values.add(alias);
-      }
-    }
-    return [...values].sort((left, right) => left.localeCompare(right, undefined, { numeric: true }));
-  });
-
-  function appLabel(app: CCSwitchApp): string {
-    return app === "claude" ? "Claude" : "Codex";
+  /**
+   * The key whose model allowlist constrains this import, or null when the
+   * import is not tied to a stored key. An empty allowlist means the key may
+   * use every model.
+   */
+  function restrictingKey(): APIKey | null {
+    const selectedID = selectedKeyID();
+    if (selectedID) return keys.find((entry) => entry.id === selectedID) ?? null;
+    if (keySelection === currentKeyValue) return keys.find((entry) => entry.id === currentKeyID) ?? null;
+    return null;
   }
+
+  /**
+   * A model group is offerable when the selected key's allowlist names the
+   * model or one of its aliases: the server resolves every spelling of a group
+   * through the same allowlist entry, so all of its names are usable.
+   */
+  let modelOptions = $derived.by(() => selectableModelNames($playgroundModels, restrictingKey()?.models ?? []));
 
   function defaultModel(): string {
     if ($currentRoute.startsWith("/models/")) {
       try {
-        return decodeURIComponent($currentRoute.slice("/models/".length));
+        const candidate = decodeURIComponent($currentRoute.slice("/models/".length));
+        if (modelOptions.includes(candidate)) return candidate;
       } catch {
-        return $currentRoute.slice("/models/".length);
+        // Fall through to the first selectable model.
       }
     }
-    return $playgroundModels[0]?.id ?? "";
+    return modelOptions[0] ?? "";
   }
 
   function normalizeKey(value: unknown): APIKey | null {
@@ -106,8 +129,7 @@
   function openImport(): void {
     if (dialogOpen) return;
     selectedApp = "claude";
-    model = defaultModel();
-    providerName = model || "llama-swap";
+    providerName = "";
     nameFollowsModel = true;
     haikuModel = "";
     sonnetModel = "";
@@ -115,8 +137,12 @@
     keySelection = $authSession.authenticated ? currentKeyValue : defaultKeyValue;
     currentKeyID = "";
     readyLink = "";
+    resolvedEndpoint = "";
+    resolvedFormat = "";
     error = "";
     keys = [];
+    model = defaultModel();
+    providerName = model || "llama-swap";
     dialogOpen = true;
     void fetchPlaygroundModels();
     if ($authSession.authenticated) void loadKeys();
@@ -132,6 +158,8 @@
     generationTimer = undefined;
     generating = false;
     readyLink = "";
+    resolvedEndpoint = "";
+    resolvedFormat = "";
     error = "";
   }
 
@@ -139,13 +167,16 @@
     if (value === autoKeyValue) return $translate("controlPlane.ccswitchAutoKey");
     if (value === currentKeyValue) return $translate("controlPlane.ccswitchCurrentKey");
     if (value === defaultKeyValue) return $translate("controlPlane.ccswitchDefaultKey");
-    if (value === noKeyValue) return $translate("controlPlane.ccswitchNoKey");
     const key = keys.find((entry) => entry.id === value);
     return key ? (key.name ? `${key.name} (${key.id})` : key.id) : value;
   }
 
+  /** The stored key the import should carry, or "" when no stored key applies. */
   function selectedKeyID(): string {
-    return keySelection !== currentKeyValue && keySelection !== autoKeyValue && keySelection !== defaultKeyValue && keySelection !== noKeyValue ? keySelection : "";
+    if (keySelection === currentKeyValue || keySelection === autoKeyValue || keySelection === defaultKeyValue) {
+      return "";
+    }
+    return keySelection;
   }
 
   function selectedKey(): string {
@@ -180,7 +211,6 @@
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         app: selectedApp,
-        endpoint: `${window.location.origin}/v1`,
         name: providerName.trim(),
         model: model.trim(),
         haikuModel: haikuModel.trim(),
@@ -198,6 +228,8 @@
     if (typeof payload.link !== "string" || payload.link.trim() === "") {
       throw new Error($translate("controlPlane.ccswitchUnavailable"));
     }
+    resolvedEndpoint = payload.endpoint ?? "";
+    resolvedFormat = payload.apiFormat ?? "";
     return payload.link;
   }
 
@@ -255,14 +287,29 @@
     else clearGeneratedLink();
   });
 
+  // The model list is narrowed once the key options arrive. A selection that
+  // the chosen key cannot use would be rejected by the server, so replace it
+  // with a selectable model instead of offering a link that cannot be created.
   $effect(() => {
-    if (dialogOpen && model.trim() === "") {
-      const candidate = defaultModel();
-      if (candidate) {
-        model = candidate;
-        if (nameFollowsModel) providerName = candidate;
+    if (!dialogOpen) return;
+    const options = modelOptions;
+    if (options.length === 0) return;
+    // Only modelOptions is a dependency: the selections are read and written
+    // here, so they go through untrack to keep the effect from retriggering
+    // itself on its own writes.
+    untrack(() => {
+      if (!model.trim() || !options.includes(model)) {
+        const previous = model;
+        model = options[0];
+        if (nameFollowsModel || providerName.trim() === "" || providerName === previous) {
+          providerName = model;
+          nameFollowsModel = true;
+        }
       }
-    }
+      if (haikuModel && !options.includes(haikuModel)) haikuModel = "";
+      if (sonnetModel && !options.includes(sonnetModel)) sonnetModel = "";
+      if (opusModel && !options.includes(opusModel)) opusModel = "";
+    });
   });
 </script>
 
@@ -281,14 +328,18 @@
       <fieldset class="grid gap-2">
         <legend class="text-sm font-medium">{$translate("controlPlane.ccswitchApplication")}</legend>
         <div class="flex flex-wrap gap-x-5 gap-y-2">
-          {#each ["claude", "codex"] as app (app)}
-            {@const target = app as CCSwitchApp}
+          {#each apps as app (app)}
             <label class="flex items-center gap-2 text-sm">
-              <input type="radio" name="ccswitch-app" value={target} checked={selectedApp === target} onchange={() => { selectedApp = target; }} />
-              <span>{appLabel(target)}</span>
+              <input type="radio" name="ccswitch-app" value={app} checked={selectedApp === app} onchange={() => { selectedApp = app; }} />
+              <span>{appLabels[app]}</span>
             </label>
           {/each}
         </div>
+        {#if resolvedEndpoint}
+          <p class="text-muted-foreground text-xs">
+            {$translate("controlPlane.ccswitchResolved", { endpoint: resolvedEndpoint, format: $translate(`controlPlane.ccswitchFormat_${resolvedFormat}`) })}
+          </p>
+        {/if}
       </fieldset>
 
       <label class="grid gap-1.5 text-sm" for="ccswitch-name">
@@ -344,14 +395,16 @@
             {#each keys.filter((key) => key.id !== currentKeyID) as key (key.id)}
               <Select.Item value={key.id}>{key.name ? `${key.name} (${key.id})` : key.id}</Select.Item>
             {/each}
-            <Select.Item value={noKeyValue}>{$translate("controlPlane.ccswitchNoKey")}</Select.Item>
           </Select.Content>
         </Select.Root>
         {#if keysLoading}<span class="text-muted-foreground text-xs" role="status">{$translate("controlPlane.loading")}</span>{/if}
+        {#if restrictingKey() && (restrictingKey()?.models?.length ?? 0) > 0}
+          <span class="text-muted-foreground text-xs">{$translate("controlPlane.ccswitchModelScope")}</span>
+        {/if}
       </div>
 
       {#if error}
-        <div class="rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-sm" role="alert">{$translate("controlPlane.error", { message: error })}</div>
+        <div class="rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-sm break-words whitespace-pre-wrap max-h-40 overflow-y-auto" role="alert">{$translate("controlPlane.error", { message: error })}</div>
       {/if}
 
       <Dialog.Footer>

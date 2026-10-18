@@ -74,6 +74,10 @@ export interface UsageRecord {
   costEstimated: boolean;
   durationMs: number;
   firstTokenMs: number;
+  /** 实际应答的上游供应商；本地托管模型为空。 */
+  provider: string;
+  /** 供应商的 API 表面（多适配器供应商才有值）。 */
+  providerAdapter: string;
 }
 
 export interface UsageRecordPage {

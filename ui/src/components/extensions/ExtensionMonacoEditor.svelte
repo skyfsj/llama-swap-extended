@@ -333,8 +333,9 @@
     const muted = cssColorToHex(styles.getPropertyValue("--muted-foreground"));
     const border = cssColorToHex(styles.getPropertyValue("--border"));
     const accent = cssColorToHex(styles.getPropertyValue("--accent"));
+    const primary = cssColorToHex(styles.getPropertyValue("--primary"));
     const base = document.documentElement.classList.contains("dark") ? "vs-dark" : "vs";
-    if (!background || !foreground || !muted || !border || !accent) {
+    if (!background || !foreground || !muted || !border || !accent || !primary) {
       // Half of the palette is unreadable (unsupported color syntax or no
       // DOM): fall back to the stock theme rather than feeding Monaco a
       // partial definition.
@@ -351,16 +352,22 @@
         "editorLineNumber.foreground": muted,
         "editorLineNumber.activeForeground": foreground,
         "editorCursor.foreground": foreground,
-        "editor.selectionBackground": withAlpha(accent, 0.55),
-        "editor.inactiveSelectionBackground": withAlpha(accent, 0.3),
-        "editor.lineHighlightBackground": withAlpha(accent, 0.3),
+        // Selection and highlights use the brand color, not --accent: in the
+        // dark palette --accent is a near-background grey, so a selection
+        // painted with it is invisible on the editor surface.
+        "editor.selectionBackground": withAlpha(primary, 0.45),
+        "editor.inactiveSelectionBackground": withAlpha(primary, 0.22),
+        "editor.selectionHighlightBackground": withAlpha(primary, 0.22),
+        "editor.findMatchBackground": withAlpha(primary, 0.55),
+        "editor.findMatchHighlightBackground": withAlpha(primary, 0.28),
+        "editor.lineHighlightBackground": withAlpha(primary, 0.1),
         "editor.lineHighlightBorder": withAlpha(border, 0.6),
         "editorWidget.background": background,
         "editorWidget.foreground": foreground,
         "editorWidget.border": border,
         "editorSuggestWidget.background": background,
         "editorSuggestWidget.foreground": foreground,
-        "editorSuggestWidget.selectedBackground": withAlpha(accent, 0.55),
+        "editorSuggestWidget.selectedBackground": withAlpha(primary, 0.45),
         "editorHoverWidget.background": background,
         "editorHoverWidget.foreground": foreground,
         "editorHoverWidget.border": border,

@@ -6,14 +6,16 @@ import {
   draftFromModel,
   emptyLaunchDraft,
   emptyModelDraft,
+  effectiveLaunchHead,
   extraLaunchArguments,
+  isCustomLaunchHead,
   hasModelCapabilityOverrides,
-  launchToBackend,
   managedLaunchKind,  managedRuntimeEntrypoint,
   runtimeMode,
   managedModelPathFromArguments,
   managedModelTargets,
   rebuildManagedArguments,
+  removeOwnedLaunchFlag,
   runtimeOptions,
   serializeLaunchArgument,
   summarizeChanges,
@@ -522,6 +524,67 @@ describe("managed launch arguments", () => {
     expect(extraLaunchArguments("--prompt\nhello", "generic")).toBe("--prompt\nhello");
   });
 
+  it("keeps a custom launch head's whole command line", () => {
+    // A runtime whose metadata supplies a custom entrypoint appends the args
+    // verbatim and injects nothing, so --port ${PORT} is the only copy of the
+    // allocated port. Stripping it here (as the engine grammar does for a
+    // stock vllm head) left the ASR server without --port and it exited with
+    // an argparse usage error.
+    const asrArgs = "--port ${PORT}\n--model /models/Qwen/Qwen3-ASR-1.7B\n--aligner /models/Qwen/Qwen3-ForcedAligner-0.6B";
+
+    expect(isCustomLaunchHead("", "python3 /scripts/qwen-asr-server.py")).toBe(true);
+    expect(isCustomLaunchHead("/opt/custom/serve.sh", "")).toBe(true);
+    expect(isCustomLaunchHead("", "")).toBe(false);
+    // The model's own entrypoint wins over the runtime's, like the server.
+    expect(effectiveLaunchHead("/opt/custom/serve.sh", "vllm")).toBe("/opt/custom/serve.sh");
+
+    expect(extraLaunchArguments(asrArgs, "vllm", true)).toBe(asrArgs);
+    expect(rebuildManagedArguments(asrArgs, "vllm", "", true)).toBe(asrArgs);
+    // The model picker must not invent a --model line for a command line that
+    // may not take one, nor drop the operator's own target.
+    expect(withManagedModelTarget(asrArgs, "vllm", "/models/other", true)).toBe(asrArgs);
+    // Neither do the structured fields get materialized into it.
+    const pinned = { ...emptyLaunchDraft(), model: "/models/other", servedModelName: "Qwen/Qwen3-ASR-1.7B" };
+    expect(syncLaunchOwnedArguments(asrArgs, "vllm", pinned, 0, true)).toBe(asrArgs);
+  });
+
+  it("saves a custom launch head's args without rewriting them", () => {
+    // The runtime supplies the custom head (metadata.entrypoint), so the model
+    // itself has no backend.entrypoint: only the caller knows the line is the
+    // operator's own. The structured view must not materialize --served-model-name
+    // (a flag the ASR server's argparse rejects) into it.
+    const asrArgs = "--port ${PORT}\n--model /models/Qwen/Qwen3-ASR-1.7B\n--aligner /models/Qwen/Qwen3-ForcedAligner-0.6B";
+    const draft = emptyModelDraft("Qwen/Qwen3-ASR-1.7B");
+    draft.backendRuntime = "qwen-asr";
+    draft.backendType = "vllm";
+    draft.backendArguments = asrArgs;
+    draft.launch.servedModelName = "Qwen/Qwen3-ASR-1.7B";
+    draft.launchPinned.servedModelName = true;
+
+    const saved = buildModelValue(draft, {}, true) as { backend?: { args?: string[] } };
+    expect(saved.backend?.args).toEqual([
+      "--port ${PORT}",
+      "--model /models/Qwen/Qwen3-ASR-1.7B",
+      "--aligner /models/Qwen/Qwen3-ForcedAligner-0.6B",
+    ]);
+
+    // Without the flag the structured view re-enters the command line, which
+    // is what broke the production config: --served-model-name was appended.
+    const plain = emptyModelDraft("plain");
+    plain.backendType = "vllm";
+    plain.backendArguments = "--model /models/q";
+    plain.launch.servedModelName = "/models/q";
+    plain.launchPinned.servedModelName = true;
+    const plainSaved = buildModelValue(plain, {}, false) as { backend?: { args?: string[] } };
+    expect((plainSaved.backend?.args ?? []).join(" ")).toContain("--served-model-name");
+  });
+
+  it("still normalizes the same text for a stock engine head", () => {
+    const args = "--port ${PORT}\n--model /models/qwen\n--dtype float16";
+    expect(extraLaunchArguments(args, "vllm")).toBe("--model /models/qwen\n--dtype float16");
+    expect(rebuildManagedArguments(args, "vllm", "", false)).toBe("--model /models/qwen\n--dtype float16");
+  });
+
   it("rebuilds operator lines and replaces the model target on request", () => {
     expect(rebuildManagedArguments(
       "vllm serve /models/qwen --host 127.0.0.1 --port 8001 --dtype float16",
@@ -591,11 +654,14 @@ describe("syncLaunchOwnedArguments", () => {
     );
   });
 
-  it("drops a line whose structured field is unset (vllm)", () => {
+  // Args are the source of truth: a flag the operator wrote stays even when the
+  // derived view does not carry its field. Dropping it here silently removed
+  // engine flags from the config on the next save.
+  it("keeps a line whose structured field is unset (vllm)", () => {
     const launch = emptyLaunchDraft();
     launch.servedModelName = "m";
     expect(syncLaunchOwnedArguments("--max-num-seqs 4\n--max-model-len 9\n--dtype fp8", "vllm", launch))
-      .toBe("--dtype fp8\n--served-model-name m");
+      .toBe("--max-num-seqs 4\n--max-model-len 9\n--dtype fp8\n--served-model-name m");
   });
 
   it("is idempotent and keeps non-owned lines verbatim", () => {
@@ -616,11 +682,15 @@ describe("syncLaunchOwnedArguments", () => {
       .toBe("--ctx-size 32768\n--flash-attn auto\n--alias alias1\n--parallel 2");
   });
 
-  it("renders the inline --flag=value form", () => {
+  it("renders the inline --flag=value form and keeps an unset inline flag", () => {
     const launch = emptyLaunchDraft();
     launch.servedModelName = "m";
     expect(syncLaunchOwnedArguments("--max-num-seqs=4 --dtype fp8", "vllm", launch))
-      .toBe("--dtype fp8\n--served-model-name m");
+      .toBe("--max-num-seqs=4 --dtype fp8\n--served-model-name m");
+    // A pinned field replaces the inline value in place.
+    launch.maxConcurrency = "8";
+    expect(syncLaunchOwnedArguments("--max-num-seqs=4 --dtype fp8", "vllm", launch))
+      .toBe("--max-num-seqs=8 --dtype fp8\n--served-model-name m");
   });
 
   it("auto-sets tensor parallel only from NVIDIA selections", () => {
@@ -666,10 +736,10 @@ describe("syncLaunchOwnedArguments", () => {
       .toBe("--max-num-seqs 8\n--dtype fp8");
   });
 
-  it("drops only the valueless flag when a line mixes owned and extra tokens", () => {
+  it("keeps a valueless owned flag the view does not pin", () => {
     const launch = emptyLaunchDraft();
     expect(syncLaunchOwnedArguments("--max-num-seqs --dtype fp8", "vllm", launch))
-      .toBe("--dtype fp8");
+      .toBe("--max-num-seqs --dtype fp8");
   });
 });
 
@@ -711,14 +781,6 @@ describe("syncCudaEnvLines", () => {
   });
 });
 
-describe("launchToBackend GPU persistence", () => {
-  it("keeps card-picker selections out of the structured launch block", () => {
-    const draft = emptyModelDraft("qwen");
-    draft.launch.model = "/models/qwen";
-    draft.launch.gpus = ["1", "2", "3", "4"];
-    expect(launchToBackend(draft)).toEqual({ model: "/models/qwen" });
-  });
-});
 
 describe("cudaVisibleDevicesFromEnv", () => {
   it("reads numeric and UUID selections from the existing environment block", () => {
@@ -845,5 +907,104 @@ describe("runtime launch metadata inheritance", () => {
       "--tensor-parallel-size 4",
       "--max-model-len 32768",
     ]);
+  });
+});
+
+describe("managed model saves keep a model target", () => {
+  // The production shape: a legacy launch block without a model field, and the
+  // model target living in args. Selecting the model from the picker must pin
+  // it, and the save must keep --model in args.
+  const productionShape = {
+    backend: {
+      type: "vllm",
+      runtime: "vllm-1cat",
+      apis: ["chat"],
+      launch: { contextPerRequest: 327680, maxConcurrency: 1, tensorParallelSize: 4, gpuMemoryUtilization: 0.9 },
+      args: ["--model /models/Qwen", "--trust-remote-code", "--max-model-len 327680"],
+    },
+    env: ["CUDA_VISIBLE_DEVICES=1,2,3,4"],
+  };
+
+  it("keeps --model from args when a legacy launch block exists", () => {
+    const draft = draftFromModel("m", productionShape);
+    const backend = buildModelValue(draft).backend as Record<string, unknown>;
+    const args = backend.args as string[];
+    expect(args.some((line) => line.startsWith("--model "))).toBe(true);
+    expect(backend.launch).toBeUndefined();
+  });
+
+  it("writes the picked model target even when the field was not pinned", () => {
+    const draft = emptyModelDraft("picked");
+    draft.launchMode = "backend";
+    draft.backendType = "vllm";
+    // The editor strips the model target from args while the picker owns it;
+    // only the launch view carries it at save time.
+    draft.backendArguments = "--trust-remote-code";
+    draft.launch.model = "/models/Qwen3.8-27B-FP8";
+    draft.launchPinned = {};
+
+    const backend = buildModelValue(draft).backend as Record<string, unknown>;
+    // The target is prepended: it reads first in a command line.
+    expect(backend.args).toEqual(["--model /models/Qwen3.8-27B-FP8", "--trust-remote-code"]);
+  });
+
+  it("does not drop flags the operator wrote when the view pins others", () => {
+    const draft = draftFromModel("mixed", {
+      backend: {
+        type: "vllm",
+        runtime: "vllm-1cat",
+        args: ["--model /models/Qwen", "--speculative-config '{\"method\":\"dflash\"}'"],
+      },
+    });
+    // The operator pins the model only; a hand-written flag with quotes must
+    // survive the materialization untouched.
+    draft.launchPinned = { model: true };
+    draft.launch.model = "/models/Qwen";
+    const backend = buildModelValue(draft).backend as Record<string, unknown>;
+    const args = backend.args as string[];
+    expect(args).toContain("--speculative-config '{\"method\":\"dflash\"}'");
+    expect(args).toContain("--model /models/Qwen");
+  });
+});
+
+describe("explicit field clearing", () => {
+  // Clearing a field in the editor is an explicit removal: exactly that flag
+  // goes, and nothing else.
+  it("removes only the cleared field's flag", () => {
+    const args = "--model /models/qwen\n--max-num-seqs 4\n--max-model-len 32768\n--dtype float16";
+    expect(removeOwnedLaunchFlag(args, "vllm", "maxConcurrency"))
+      .toBe("--model /models/qwen\n--max-model-len 32768\n--dtype float16");
+    expect(removeOwnedLaunchFlag(args, "vllm", "contextPerRequest"))
+      .toBe("--model /models/qwen\n--max-num-seqs 4\n--dtype float16");
+  });
+
+  it("removes the inline and llama.cpp forms", () => {
+    expect(removeOwnedLaunchFlag("--max-num-seqs=4 --dtype fp8", "vllm", "maxConcurrency"))
+      .toBe("--dtype fp8");
+    expect(removeOwnedLaunchFlag("--alias m\n--ctx-size 8192\n--parallel 2", "llamacpp", "contextPerRequest"))
+      .toBe("--alias m\n--parallel 2");
+  });
+
+  it("leaves the args untouched for an unknown field", () => {
+    expect(removeOwnedLaunchFlag("--model /models/qwen", "vllm", "model")).toBe("--model /models/qwen");
+  });
+});
+
+describe("ambiguous command text", () => {
+  // A parse warning means the view cannot be derived. The save must not use
+  // that as a reason to drop the flags the operator wrote.
+  it("keeps every owned flag", () => {
+    const draft = draftFromModel("ambiguous", {
+      backend: {
+        type: "vllm",
+        runtime: "vllm-1cat",
+        args: ["--model /models/qwen", "--max-model-len 32768", "--max-num-seqs 2"],
+      },
+    });
+    // No derivation happened (as after a parse warning): the view is empty.
+    draft.launchPinned = {};
+    draft.launch.model = "";
+    const backend = buildModelValue(draft).backend as Record<string, unknown>;
+    expect(backend.args).toEqual(["--model /models/qwen", "--max-model-len 32768", "--max-num-seqs 2"]);
   });
 });

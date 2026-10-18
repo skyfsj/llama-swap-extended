@@ -301,7 +301,7 @@
         {$translate("common.loading")}
       </div>
     {:else if draft}
-      <div class="mx-auto max-w-5xl py-2 sm:py-4">
+      <div class="mx-auto w-full max-w-[1600px] px-4 py-3 sm:px-6 sm:py-4">
         <ExtensionConfiguration
           bind:draft
           bind:activeTab

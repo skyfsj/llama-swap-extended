@@ -2,7 +2,14 @@ export type ConnectionState = "connected" | "connecting" | "disconnected";
 
 export type ModelStatus = "ready" | "sleeping" | "starting" | "stopping" | "stopped" | "shutdown" | "unknown";
 export type ModelConfigStatus = "applied" | "modified" | "draining" | "restarting" | "rolling_back" | "apply_failed" | "removing" | "unloading";
-export type PlaygroundModelType = "model" | "peer" | "selector" | "profile";
+export type PlaygroundModelType =
+  | "model"
+  | "peer"
+  | "selector"
+  | "profile"
+  // A provider-routed model: served upstream through the gateway instead of a
+  // local backend process.
+  | "provider";
 
 export interface ModelCapabilities {
   vision?: boolean;
@@ -154,6 +161,19 @@ export interface ActivityLogEntry {
   duration_ms: number;
   /** Milliseconds from request admission to the first visible response token. */
   first_token_ms: number;
+  /**
+   * 上游供应商，以及它的 API 表面（适配器）。
+   * 同一个模型名可能同时挂在多个供应商上，一个供应商也可能有多个适配器，
+   * 只有这两个字段能说明这条请求实际走了哪条路。
+   *
+   * 供应商为空有两种含义：本地托管模型（provider_local 为 true），或者
+   * 上游一次都没答复过（供应商请求在产出答复前就失败了）——后者不该显示成
+   * “本地”。
+   */
+  provider?: string;
+  provider_adapter?: string;
+  /** 由本地托管模型服务时为 true。 */
+  provider_local?: boolean;
   /** Raw request/response audit details are available for this activity row. */
   has_audit: boolean;
   error_msg?: string;
@@ -247,6 +267,16 @@ export interface InflightRequestEntry {
   id: string;
   timestamp: string;
   model: string;
+  /**
+   * Upstream serving the request; empty for a locally hosted model.
+   * `provider_adapter` names the provider's API surface when it has more than
+   * one. `route_resolved` separates "no provider" (local) from "not decided
+   * yet", which matters because a provider request is attributed only once the
+   * gateway picks an upstream.
+   */
+  provider?: string;
+  provider_adapter?: string;
+  route_resolved?: boolean;
   req_path: string;
   method: string;
   phase?: string;

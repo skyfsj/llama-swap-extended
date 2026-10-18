@@ -327,5 +327,78 @@ describe("audit reasoning and form captures", () => {
     expect(result).toContain("data:image/png;base64,[");
     expect(result).not.toContain(hugeBase64);
   });
+
+  it("extracts reasoning_content from non-streaming response choices message", () => {
+    const payload = JSON.stringify({
+      choices: [{
+        message: {
+          role: "assistant",
+          content: "The final answer is 42.",
+          reasoning_content: "Let me calculate step by step...",
+        },
+      }],
+    });
+    const transcript = auditResponseTranscript(payload);
+    expect(transcript).toHaveLength(2);
+    expect(transcript[0]).toEqual({
+      kind: "reasoning",
+      text: "Let me calculate step by step...",
+    });
+    expect(transcript[1]).toEqual({
+      kind: "message",
+      role: "assistant",
+      text: "The final answer is 42.",
+    });
+  });
+
+  it("extracts reasoning from <think> tags in response content and strips it from answer", () => {
+    const payload = JSON.stringify({
+      choices: [{
+        message: {
+          role: "assistant",
+          content: "<think>\nAnalyzing the context...\n</think>\nHere is the translation.",
+        },
+      }],
+    });
+    const transcript = auditResponseTranscript(payload);
+    expect(transcript).toHaveLength(2);
+    expect(transcript[0]).toEqual({
+      kind: "reasoning",
+      text: "Analyzing the context...",
+    });
+    expect(transcript[1]).toEqual({
+      kind: "message",
+      role: "assistant",
+      text: "Here is the translation.",
+    });
+  });
+
+  it("extracts Anthropic thinking content parts", () => {
+    const payload = JSON.stringify({
+      content: [
+        { type: "thinking", thinking: "Deep thought from Claude" },
+        { type: "text", text: "Hello!" },
+      ],
+    });
+    const transcript = auditResponseTranscript(payload);
+    const reasoning = transcript.find((i) => i.kind === "reasoning");
+    expect(reasoning).toEqual({
+      kind: "reasoning",
+      text: "Deep thought from Claude",
+    });
+  });
 });
 
+
+
+describe("payload panels read the streamed bodies", () => {
+  // The detail response carries only body references; the bytes arrive from the
+  // body endpoint. Panels must render those bytes, not the (absent) inline
+  // fields, or every externalized conversation shows as empty.
+  it("formats a body provided as streamed bytes", () => {
+    const streamed = new TextEncoder().encode('{"model":"m","messages":[{"role":"user","content":"hi"}]}');
+    const view = formatAuditBody(streamed);
+    expect(view.structured).toBe(true);
+    expect(view.formatted).toContain('"content": "hi"');
+  });
+});

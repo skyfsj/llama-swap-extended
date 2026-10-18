@@ -39,6 +39,13 @@ describe("normalizeAPIKey", () => {
     expect(normalizeAPIKey(null)).toBeNull();
   });
 
+  // The keys page renders config-owned keys read-only, so the marker the
+  // server sends has to survive normalization.
+  it("carries the configuration-ownership marker", () => {
+    expect((normalizeAPIKey({ ...baseRecord, source: "config" }) as APIKey).source).toBe("config");
+    expect((normalizeAPIKey(baseRecord) as APIKey).source).toBe("");
+  });
+
   it("never surfaces a secret even if a proxy adds one", () => {
     const key = normalizeAPIKey({ ...baseRecord, key: "sk-should-not-appear" }) as APIKey;
     expect(Object.keys(key)).not.toContain("key");

@@ -50,7 +50,10 @@
   const hasModels = $derived(
     filterByCategory(
       $playgroundModels.filter(
-        (m) => m.playgroundType === "model" || m.playgroundType === "peer"
+        (m) =>
+          m.playgroundType === "model" ||
+          m.playgroundType === "peer" ||
+          m.playgroundType === "provider"
       ),
       "translation"
     ).length > 0

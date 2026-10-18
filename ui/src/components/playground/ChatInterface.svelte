@@ -9,15 +9,14 @@
   import ModelSelector from "./ModelSelector.svelte";
   import ExpandableTextarea from "./ExpandableTextarea.svelte";
   import EmptyState from "../EmptyState.svelte";
-  import { Paperclip, Send, Maximize2, MessagesSquare, SlidersHorizontal, Plus, Square } from "@lucide/svelte";
+  import { Paperclip, Send, Maximize2, MessagesSquare, SlidersHorizontal, Plus, Square, X } from "@lucide/svelte";
   import { Button } from "$lib/components/ui/button/index.js";
   import { Input } from "$lib/components/ui/input/index.js";
   import { Textarea } from "$lib/components/ui/textarea/index.js";
   import { Label } from "$lib/components/ui/label/index.js";
   import * as Select from "$lib/components/ui/select/index.js";
   import * as Dialog from "$lib/components/ui/dialog/index.js";
-  import { X } from "@lucide/svelte";
-  import { locale, t, translate } from "../../lib/i18n";
+  import { t, translate } from "../../lib/i18n";
 
   const selectedModelStore = persistentStore<string>("playground-selected-model", "");
   const systemPromptStore = persistentStore<string>("playground-system-prompt", "");
@@ -325,60 +324,7 @@
     imageError = null;
   }
 
-  const starterPrompts = $derived.by(() => {
-    const isZh = $locale.startsWith("zh");
-    if (isZh) {
-      return [
-        {
-          icon: "💡",
-          title: "原理解析",
-          content: "深入解释大语言模型中自注意力机制与 KV Cache 的计算与优化原理",
-        },
-        {
-          icon: "💻",
-          title: "代码编写",
-          content: "用 Go 语言编写一个高并发、支持超时控制与优雅退出的 HTTP 反向代理",
-        },
-        {
-          icon: "🔍",
-          title: "代码审查",
-          content: "审查代码中的并发竞态条件、内存逃逸与 Goroutine 泄漏风险并给出建议",
-        },
-        {
-          icon: "⚡",
-          title: "架构设计",
-          content: "对比分析 gRPC、RESTful 与 WebSocket 在低延迟分布式微服务中的选型考量",
-        },
-      ];
-    }
-    return [
-      {
-        icon: "💡",
-        title: "Deep Dive",
-        content: "Explain the self-attention mechanism and KV Cache optimization in LLMs",
-      },
-      {
-        icon: "💻",
-        title: "Write Code",
-        content: "Write a high-performance HTTP reverse proxy in Go with graceful shutdown",
-      },
-      {
-        icon: "🔍",
-        title: "Code Review",
-        content: "Review this code for concurrency race conditions and goroutine leaks",
-      },
-      {
-        icon: "⚡",
-        title: "Architecture",
-        content: "Compare gRPC, RESTful, and WebSockets for low-latency distributed microservices",
-      },
-    ];
-  });
 
-  function applyStarterPrompt(text: string) {
-    userInput = text;
-    inputRef?.focus();
-  }
 
   function handlePaste(event: ClipboardEvent) {
     const items = event.clipboardData?.items;
@@ -403,45 +349,7 @@
   <div class="shrink-0 flex flex-wrap items-center gap-2 mb-3">
     <ModelSelector bind:value={$selectedModelStore} disabled={isStreaming} category="chat" />
 
-    {#if $selectedModelStore}
-      <div class="hidden sm:flex items-center gap-1.5 flex-wrap">
-        <button
-          type="button"
-          class="pg-chip font-mono hover:bg-muted/80 cursor-pointer transition-colors"
-          onclick={() => (showSettings = true)}
-          title={$translate("playground.chat.endpoint")}
-        >
-          /{$endpointStore}
-        </button>
-        <button
-          type="button"
-          class="pg-chip hover:bg-muted/80 cursor-pointer transition-colors"
-          onclick={() => (showSettings = true)}
-          title={$translate("playground.chat.temperature")}
-        >
-          T: {$temperatureStore.toFixed(2)}
-        </button>
-        <button
-          type="button"
-          class="pg-chip hover:bg-muted/80 cursor-pointer transition-colors"
-          onclick={() => (showSettings = true)}
-          title={$translate("playground.chat.maxTokens")}
-        >
-          {$maxTokensStore} max
-        </button>
-        {#if $systemPromptStore.trim()}
-          <button
-            type="button"
-            class="pg-chip border border-primary/30 text-primary bg-primary/5 hover:bg-primary/10 cursor-pointer transition-colors"
-            onclick={() => (showSettings = true)}
-            title={$translate("playground.chat.systemPrompt")}
-          >
-            <span class="size-1.5 rounded-full bg-primary inline-block"></span>
-            {$translate("playground.chat.systemPrompt")}
-          </button>
-        {/if}
-      </div>
-    {/if}
+
 
     <div class="flex items-center gap-1.5 ml-auto">
       <Button
@@ -542,36 +450,15 @@
       onscroll={handleMessagesScroll}
     >
       {#if messages.length === 0}
-        <div class="flex h-full flex-col items-center justify-center gap-6 px-4 py-8 text-center max-w-xl mx-auto">
-          <div class="flex flex-col items-center gap-2">
-            <div class="pg-inset flex size-12 items-center justify-center rounded-2xl shadow-inner border border-primary/10 bg-primary/5">
-              <MessagesSquare class="size-6 text-primary" />
-            </div>
-            <h3 class="text-base font-semibold tracking-tight">{$translate("playground.tabs.chat")}</h3>
-            <p class="pg-hint max-w-sm text-xs leading-relaxed">
-              {$translate("playground.chat.emptyConversation")}
-            </p>
+        <div class="flex h-full flex-col items-center justify-center gap-3 text-center px-4 py-8">
+          <div class="pg-inset flex size-12 items-center justify-center rounded-2xl border border-border/50 bg-muted/20">
+            <MessagesSquare class="size-6 text-muted-foreground/60" />
           </div>
-
-          <div class="grid w-full grid-cols-1 sm:grid-cols-2 gap-2 text-left">
-            {#each starterPrompts as prompt}
-              <button
-                type="button"
-                class="group relative flex flex-col gap-1 rounded-xl border border-border/60 bg-card/60 p-3 text-xs shadow-xs transition-all hover:border-primary/40 hover:bg-muted/40 hover:shadow-sm cursor-pointer"
-                onclick={() => applyStarterPrompt(prompt.content)}
-              >
-                <span class="font-medium text-foreground group-hover:text-primary transition-colors flex items-center gap-1.5">
-                  <span>{prompt.icon}</span>
-                  {prompt.title}
-                </span>
-                <span class="pg-hint line-clamp-2 text-[11px] leading-relaxed">
-                  {prompt.content}
-                </span>
-              </button>
-            {/each}
-          </div>
-
-          <div class="flex items-center gap-2 text-[11px] text-muted-foreground">
+          <p class="text-sm font-medium text-foreground">{$translate("playground.tabs.chat")}</p>
+          <p class="pg-hint max-w-xs text-xs leading-relaxed">
+            {$translate("playground.chat.emptyConversation")}
+          </p>
+          <div class="flex items-center gap-2 text-[11px] text-muted-foreground pt-1">
             <span class="inline-flex items-center gap-1">
               <kbd class="rounded border bg-muted px-1.5 py-0.5 font-mono text-[10px]">Enter</kbd>
               {$translate("playground.chat.send")}

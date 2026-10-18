@@ -88,29 +88,6 @@ export function autoServedModelName(useModelName: string, modelId: string): stri
   return name !== "" ? name : trimmedText(modelId);
 }
 
-// launchToBackend serializes the structured launch draft back into the
-// backend.launch block. Percentages are stored as the 0-1 fraction the
-// engines expect.
-export function launchToBackend(draft: ModelConfigDraft): Record<string, unknown> | undefined {
-  const launch: Record<string, unknown> = {};
-  setOptional(launch, "model", trimmedText(draft.launch.model));
-  setOptional(launch, "servedModelName", trimmedText(draft.launch.servedModelName));
-  setOptional(launch, "contextPerRequest", integer(draft.launch.contextPerRequest, "launch.contextPerRequest", 1));
-  setOptional(launch, "maxConcurrency", integer(draft.launch.maxConcurrency, "launch.maxConcurrency", 1));
-  setOptional(launch, "tensorParallelSize", integer(draft.launch.tensorParallelSize, "launch.tensorParallelSize", 1));
-  // CUDA_VISIBLE_DEVICES in draft.env is the only persisted GPU selector.
-  // draft.launch.gpus is transient card-picker state and must not become a
-  // second config value that can drift from the environment.
-  if (trimmedText(draft.launch.gpuMemoryUtilization) !== "") {
-    const percent = Number(draft.launch.gpuMemoryUtilization);
-    if (!Number.isFinite(percent) || percent <= 0 || percent > 100) {
-      throw new Error("GPU 显存使用上限必须是 (0, 100] 内的百分比");
-    }
-    launch["gpuMemoryUtilization"] = percent / 100;
-  }
-  return Object.keys(launch).length > 0 ? launch : undefined;
-}
-
 export interface ModelConfigDraft {
   id: string;
   name: string;
@@ -434,6 +411,21 @@ export function managedLaunchKind(kind: string, mode: string): string {
   return normalizedKind;
 }
 
+// shouldDeriveLaunchView decides when the editor reads the managed command text
+// into the structured fields.
+//
+// The load effect rebuilds the draft from the configuration every time it runs
+// — an async runtime/GPU catalog arriving re-runs it — and a rebuilt draft has
+// no derived fields even though the text holds --max-model-len and friends.
+// Reading the text on every run keeps the two in sync: the text mirrors the
+// fields (editing a field rewrites its line), so the read is idempotent for an
+// untouched model and restores the values when the draft was just rebuilt.
+// A model+etag memo here used to skip those later runs, which is how a model
+// with --max-num-seqs 8 ended up showing an empty concurrency field.
+export function shouldDeriveLaunchView(kind: string, argumentsText: string): boolean {
+  return kind !== "" && argumentsText.trim() !== "";
+}
+
 // pinnedLaunchView returns the launch draft restricted to the fields the model
 // itself pins. Inherited runtime defaults stay out of backend.args: the server
 // applies them at launch, and materializing them here would silently freeze the
@@ -441,10 +433,18 @@ export function managedLaunchKind(kind: string, mode: string): string {
 export function pinnedLaunchView(draft: ModelConfigDraft): ModelLaunchDraft {
   const pinned = draft.launchPinned ?? {};
   const view = emptyLaunchDraft();
+  // A custom launch head owns the entire command line: the structured engine
+  // fields do not apply to it, mirroring the server's rule that a custom head
+  // receives no injected flags.
+  if (trimmedText(draft.backendEntryPoint) !== "") return view;
   view.gpus = draft.launch.gpus;
   for (const field of ["model", "servedModelName", "contextPerRequest", "maxConcurrency", "tensorParallelSize", "gpuMemoryUtilization"] as const) {
     if (pinned[field]) (view as unknown as Record<string, unknown>)[field] = draft.launch[field];
   }
+  // The model target is intrinsic to a managed model: without it the server
+  // refuses the save ("backend.args must include a model target"), so a value
+  // in the view is always written even if the pinned flag was missed.
+  if (trimmedText(draft.launch.model) !== "") view.model = draft.launch.model;
   return view;
 }
 
@@ -683,12 +683,34 @@ function reassembleLines(rawLines: string[], perLine: string[][], skip: boolean[
   return kept.join("\n");
 }
 
+// effectiveLaunchHead mirrors the server's rule for a managed runtime: the
+// model's own backend.entrypoint wins, then the runtime's launch metadata.
+export function effectiveLaunchHead(modelEntryPoint: string, runtimeEntryPoint: string): string {
+  const model = trimmedText(modelEntryPoint);
+  return model !== "" ? model : trimmedText(runtimeEntryPoint);
+}
+
+// isCustomLaunchHead reports whether the launch head is a custom command line
+// rather than an engine the server knows how to build. A custom head owns the
+// entire command line: the launch binding appends backend.args verbatim and
+// injects nothing — no entrypoint, no bind host, no port, no model target — so
+// the editor must treat the stored text as the operator's own.
+export function isCustomLaunchHead(modelEntryPoint: string, runtimeEntryPoint: string): boolean {
+  return effectiveLaunchHead(modelEntryPoint, runtimeEntryPoint) !== "";
+}
+
 // extraLaunchArguments returns the operator-owned editor text for a managed
 // runtime: the launch head (entrypoint, python module, engine subcommand) and
 // the system-owned bind host and port are removed. Every other line is kept
 // verbatim — "--flag value" lines, quoted JSON values and the operator's
 // model target all round-trip exactly as written in the config file.
-export function extraLaunchArguments(value: string, kind: string): string {
+//
+// A custom launch head is exempt: nothing is system-owned in a command line
+// the server does not build, so the text is returned untouched. Stripping
+// --port there would delete the only copy of the allocated port, because no
+// injection step exists to put it back.
+export function extraLaunchArguments(value: string, kind: string, customHead = false): string {
+  if (customHead) return value;
   const launch = normalizeManagedLaunch(value, kind);
   if (launch.entrypoint === "") return value;
   const rawLines = value.split("\n");
@@ -704,8 +726,12 @@ export function extraLaunchArguments(value: string, kind: string): string {
 }
 
 // withManagedModelTarget replaces every operator-written model target with a
-// single --model line, leaving the remaining editor lines untouched.
-export function withManagedModelTarget(value: string, kind: string, path: string): string {
+// single --model line, leaving the remaining editor lines untouched. A custom
+// launch head is untouched: its model flag is whatever the operator's command
+// line takes, and inventing a --model there would add a flag the program may
+// not accept.
+export function withManagedModelTarget(value: string, kind: string, path: string, customHead = false): string {
+  if (customHead) return value;
   const normalizedKind = kind.trim().toLowerCase();
   const launch = normalizeManagedLaunch(value, normalizedKind);
   if (launch.entrypoint === "" || !path.trim()) return value;
@@ -723,7 +749,12 @@ export function withManagedModelTarget(value: string, kind: string, path: string
 // replaces the operator's targets. The entrypoint, bind host and port are
 // never stored: the launch binding injects them from the runtime and the
 // model's proxy.
-export function rebuildManagedArguments(value: string, kind: string, model: string): string {
+//
+// A custom launch head stores the text exactly as written: the server appends
+// it verbatim to the operator's own head, so every token here is the
+// operator's, including --port ${PORT}.
+export function rebuildManagedArguments(value: string, kind: string, model: string, customHead = false): string {
+  if (customHead) return value;
   const launch = normalizeManagedLaunch(value, kind);
   if (launch.entrypoint === "") return value;
   const text = extraLaunchArguments(value, kind);
@@ -826,15 +857,6 @@ function compareOwnedFlagValue(flag: string, canonical: string, written: string 
   return left === right ? "same" : "different";
 }
 
-// dropOwnedFlagTokens removes the flag at index plus the value token that
-// follows it on the same line, leaving the rest of the line intact.
-function dropOwnedFlagTokens(tokens: string[], index: number): string[] {
-  const survivors = [...tokens];
-  survivors.splice(index, 1);
-  if (index < survivors.length && !survivors[index].startsWith("-")) survivors.splice(index, 1);
-  return survivors;
-}
-
 // syncLaunchOwnedArguments rewrites the launch-owned flag lines of the
 // editor text to match the structured fields: an owned line is replaced in
 // place only when the field really holds a different value, a missing owned
@@ -847,16 +869,27 @@ function dropOwnedFlagTokens(tokens: string[], index: number): string[] {
 // nvidiaGPUs is the number of selected cards the server can actually hand to
 // a CUDA runtime; callers without a hardware catalog pass the full selection
 // count, which is the legacy behavior.
-// materializePinnedLaunchArguments writes the model's pinned launch fields into
-// the command text without ever removing a flag. Args are the source of truth:
-// a flag already in the text stays even when the derived view does not carry it
-// (it may have been written by hand or inherited as a pinned runtime default).
-// Missing pinned flags are appended, and a pinned value that differs from the
-// text replaces it in place.
-export function materializePinnedLaunchArguments(value: string, kind: string, pinned: ModelLaunchDraft, nvidiaGPUs?: number): string {
+// syncLaunchOwnedArguments writes the model's pinned launch fields into the
+// command text. It never removes a flag: args are the source of truth, so a
+// line the operator wrote stays byte-for-byte even when the derived view does
+// not carry its field (an ambiguous parse, a form the parser skipped, an
+// inherited runtime default). Missing pinned flags are appended — the model
+// target first, because it reads first in a command line — and a pinned value
+// that differs from the text replaces it in place.
+//
+// Clearing a field is an explicit removal and is handled by
+// removeOwnedLaunchFlag, not by omission here.
+export function syncLaunchOwnedArguments(value: string, kind: string, pinned: ModelLaunchDraft, nvidiaGPUs?: number, customHead = false): string {
+  if (customHead) return value;
   if (kind !== "vllm" && kind !== "llamacpp") return value;
   const owned = ownedLaunchFlagSet(kind);
   const values = ownedLaunchFlagValues(kind, pinned, nvidiaGPUs ?? pinned.gpus.length);
+  // The model target is intrinsic to a managed model: without it the server
+  // refuses the save ("backend.args must include a model target"). It is not
+  // part of the owned-flag renderer (the picker writes it), so it is
+  // materialized here explicitly.
+  const model = trimmedText(pinned.model);
+  if (model !== "") values["--model"] = model;
   if (Object.keys(values).length === 0) return value;
   const kept: string[] = [];
   const placed = new Set<string>();
@@ -868,6 +901,19 @@ export function materializePinnedLaunchArguments(value: string, kind: string, pi
     }
     const tokens = tokenizeArgLine(trimmed);
     const first = tokens[0] ?? "";
+    if (MODEL_SELECTOR_FLAGS.includes(first)) {
+      if ("--model" in values) {
+        placed.add("--model");
+        if (trimmedText(tokens[1]) === values["--model"]) {
+          kept.push(line);
+          continue;
+        }
+        kept.push(`--model ${serializeLaunchArgument(values["--model"])}`);
+        continue;
+      }
+      kept.push(line);
+      continue;
+    }
     if (owned.has(first)) {
       const flag = OWNED_FLAG_ALIASES[first] ?? first;
       if (flag in values) {
@@ -906,21 +952,65 @@ export function materializePinnedLaunchArguments(value: string, kind: string, pi
       kept.push(line);
       continue;
     }
+    // An inline model form (--model=path) is kept as written unless the view
+    // pins a different target.
+    const inlineModel = tokens.findIndex((token) => MODEL_SELECTOR_PREFIXES.some((prefix) => token.startsWith(prefix) && token.length > prefix.length));
+    if (inlineModel >= 0 && "--model" in values) {
+      const token = tokens[inlineModel];
+      const prefix = MODEL_SELECTOR_PREFIXES.find((candidate) => token.startsWith(candidate)) ?? "";
+      const written = token.slice(prefix.length);
+      placed.add("--model");
+      if (written === values["--model"]) {
+        kept.push(line);
+        continue;
+      }
+      const replaced = [...tokens];
+      replaced[inlineModel] = `--model=${values["--model"]}`;
+      kept.push(replaced.map(serializeLaunchArgument).join(" "));
+      continue;
+    }
     kept.push(line);
   }
+  // Missing flags are appended, except the model target: it reads first in a
+  // command line, so it is prepended when the text did not carry one.
+  const appended: string[] = [];
   for (const [flag, argument] of Object.entries(values)) {
     if (placed.has(flag)) continue;
-    kept.push(`${flag} ${serializeLaunchArgument(argument)}`);
+    if (flag === "--model") {
+      kept.unshift(`${flag} ${serializeLaunchArgument(argument)}`);
+      continue;
+    }
+    appended.push(`${flag} ${serializeLaunchArgument(argument)}`);
   }
-  return kept.join("\n");
+  return kept.concat(appended).join("\n");
 }
 
-export function syncLaunchOwnedArguments(value: string, kind: string, launch: ModelLaunchDraft, nvidiaGPUs?: number): string {
+// ownedFieldFlag maps one derived-view field to the flag it renders, for the
+// explicit removal path.
+const OWNED_FIELD_FLAGS: Record<string, string> = {
+  servedModelName: "--served-model-name",
+  contextPerRequest: "--max-model-len",
+  maxConcurrency: "--max-num-seqs",
+  tensorParallelSize: "--tensor-parallel-size",
+  gpuMemoryUtilization: "--gpu-memory-utilization",
+};
+
+// removeOwnedLaunchFlag deletes one derived-view field's flag (and its value)
+// from the command text. It is the explicit counterpart to the conservative
+// sync: clearing a field in the editor must remove the flag the user cleared
+// and nothing else.
+export function removeOwnedLaunchFlag(value: string, kind: string, field: string): string {
   if (kind !== "vllm" && kind !== "llamacpp") return value;
-  const owned = ownedLaunchFlagSet(kind);
-  const values = ownedLaunchFlagValues(kind, launch, nvidiaGPUs ?? launch.gpus.length);
+  const target =
+    kind === "llamacpp" && field === "servedModelName"
+      ? "--alias"
+      : kind === "llamacpp" && field === "contextPerRequest"
+        ? "--ctx-size"
+        : kind === "llamacpp" && field === "maxConcurrency"
+          ? "--parallel"
+          : OWNED_FIELD_FLAGS[field];
+  if (target === undefined) return value;
   const kept: string[] = [];
-  const placed = new Set<string>();
   for (const line of value.split("\n")) {
     const trimmed = line.trim();
     if (trimmed === "") {
@@ -928,57 +1018,23 @@ export function syncLaunchOwnedArguments(value: string, kind: string, launch: Mo
       continue;
     }
     const tokens = tokenizeArgLine(trimmed);
-    const first = tokens[0] ?? "";
-    if (owned.has(first)) {
-      const flag = OWNED_FLAG_ALIASES[first] ?? first;
-      if (flag in values) {
-        placed.add(flag);
-        if (compareOwnedFlagValue(flag, values[flag], tokens[1]) !== "different") {
-          kept.push(line);
-          continue;
-        }
-        kept.push(`${flag} ${serializeLaunchArgument(values[flag])}`);
-        continue;
-      }
-      // The structured field is unset, so the launch will not pass the flag:
-      // drop it (with its same-line value) and keep the rest of the line.
-      const survivors = dropOwnedFlagTokens(tokens, 0);
-      if (survivors.length > 0) kept.push(survivors.map(serializeLaunchArgument).join(" "));
-      continue;
-    }
-    // Inline form: an owned --flag=value token somewhere in the line.
-    const inline = tokens.findIndex((token) => {
+    const survivors: string[] = [];
+    for (let index = 0; index < tokens.length; index += 1) {
+      const token = tokens[index];
       const equals = token.indexOf("=");
-      return equals > 0 && owned.has(token.slice(0, equals));
-    });
-    if (inline >= 0) {
-      const token = tokens[inline];
-      const rawFlag = token.slice(0, token.indexOf("="));
-      const flag = OWNED_FLAG_ALIASES[rawFlag] ?? rawFlag;
-      const written = token.slice(token.indexOf("=") + 1);
-      if (flag in values) {
-        placed.add(flag);
-        if (compareOwnedFlagValue(flag, values[flag], written) !== "different") {
-          kept.push(line);
-          continue;
-        }
-        const replaced = [...tokens];
-        replaced[inline] = `${flag}=${values[flag]}`;
-        kept.push(replaced.map(serializeLaunchArgument).join(" "));
+      const name = equals > 0 ? token.slice(0, equals) : token;
+      if (name === target || OWNED_FLAG_ALIASES[name] === target) {
+        if (equals <= 0 && !(tokens[index + 1] ?? "").startsWith("-")) index += 1;
         continue;
       }
-      const survivors = tokens.filter((_, index) => index !== inline);
-      if (survivors.length > 0) kept.push(survivors.map(serializeLaunchArgument).join(" "));
-      continue;
+      survivors.push(token);
     }
-    kept.push(line);
-  }
-  for (const [flag, argument] of Object.entries(values)) {
-    if (placed.has(flag)) continue;
-    kept.push(`${flag} ${serializeLaunchArgument(argument)}`);
+    if (survivors.length === 0) continue;
+    kept.push(survivors.length === tokens.length ? trimmed : survivors.map(serializeLaunchArgument).join(" "));
   }
   return kept.join("\n");
 }
+
 
 // CudaEnvSyncState tracks the CUDA environment lines the GPU selection wrote
 // into the environment textarea (the device-order pin and the visible-devices
@@ -1250,7 +1306,7 @@ function cloneRecord(value: unknown): Record<string, unknown> {
   return { ...source };
 }
 
-export function buildModelValue(draft: ModelConfigDraft, current: unknown = {}): Record<string, unknown> {
+export function buildModelValue(draft: ModelConfigDraft, current: unknown = {}, customHead = false): Record<string, unknown> {
   const model = cloneRecord(current);
   setOptional(model, "name", trimmedText(draft.name));
   setOptional(model, "description", trimmedText(draft.description));
@@ -1289,8 +1345,8 @@ export function buildModelValue(draft: ModelConfigDraft, current: unknown = {}):
     let backendArgsText = draft.backendArguments;
     const entryPoint = trimmedText(draft.backendEntryPoint);
     const launchKind = managedLaunchKind(draft.backendType, "");
-    if (launchKind !== "") {
-      backendArgsText = materializePinnedLaunchArguments(backendArgsText, launchKind, pinnedLaunchView(draft), draft.launch.gpus.length);
+    if (launchKind !== "" && !customHead) {
+      backendArgsText = syncLaunchOwnedArguments(backendArgsText, launchKind, pinnedLaunchView(draft), draft.launch.gpus.length);
     }
     const backendArgs = args(backendArgsText);
     const container = cloneRecord(draft.backendContainer);
@@ -1385,11 +1441,11 @@ export function pointerToken(value: string): string {
   return value.replaceAll("~", "~0").replaceAll("/", "~1");
 }
 
-export function buildModelPatch(config: unknown, draft: ModelConfigDraft, editing = false): unknown[] {
+export function buildModelPatch(config: unknown, draft: ModelConfigDraft, editing = false, customHead = false): unknown[] {
   const id = trimmedText(draft.id);
   if (!id) throw new Error("model id is required");
   const current = editing ? modelEntries(config)[id] : undefined;
-  const value = buildModelValue(draft, current);
+  const value = buildModelValue(draft, current, customHead);
   const models = modelEntries(config);
   if (!editing && Object.prototype.hasOwnProperty.call(models, id)) {
     throw new Error(`model ${id} already exists`);

@@ -18,9 +18,16 @@ export interface APIKey {
   maxConcurrency: number;
   group: string;
   allowManagementLogin: boolean;
+  /**
+   * "config" for a key the configuration file declares. The server re-asserts
+   * those on every config change, so the panel shows them read-only.
+   */
+  source?: string;
   createdAt: string;
   expiresAt?: string;
   lastUsedAt?: string;
+  /** Caller address of the most recent request made with this key. */
+  lastIp?: string;
   revokedAt?: string;
   /** Live in-flight requests, reported by the control plane. */
   activeRequests?: number;
@@ -77,9 +84,11 @@ export function normalizeAPIKey(value: unknown): APIKey | null {
     maxConcurrency: typeof record.maxConcurrency === "number" ? record.maxConcurrency : 0,
     group: typeof record.group === "string" ? record.group : "",
     allowManagementLogin: record.allowManagementLogin === true,
+    source: typeof record.source === "string" ? record.source : "",
     createdAt: typeof record.createdAt === "string" ? record.createdAt : "",
     expiresAt: typeof record.expiresAt === "string" ? record.expiresAt : undefined,
     lastUsedAt: typeof record.lastUsedAt === "string" ? record.lastUsedAt : undefined,
+    lastIp: typeof record.lastIp === "string" && record.lastIp ? record.lastIp : undefined,
     revokedAt: typeof record.revokedAt === "string" ? record.revokedAt : undefined,
     activeRequests: typeof record.activeRequests === "number" ? record.activeRequests : 0,
   };

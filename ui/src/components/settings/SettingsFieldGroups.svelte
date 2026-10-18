@@ -18,7 +18,7 @@
   import SettingsFieldEditor from "./SettingsFieldEditor.svelte";
   import SettingsModelsPage from "./model/SettingsModelsPage.svelte";
   import SettingsSectionCard from "./SettingsSectionCard.svelte";
-  import type { SettingsField, SettingsOption } from "../../lib/settingsApi";
+  import type { SettingsChange, SettingsField, SettingsOption } from "../../lib/settingsApi";
 
   // Renders the editable field groups of one settings section. The draft
   // state stays in the route component; this component receives accessors so
@@ -33,6 +33,7 @@
     fieldErrors: Record<string, string>;
     valueAt: (path: string) => unknown;
     update: (field: SettingsField, value: unknown) => void;
+    updateList: (field: SettingsField, value: unknown[], changes: SettingsChange[]) => void;
     updateModels: (value: Record<string, unknown>) => void;
     onModelsExternalChange: () => void;
   }
@@ -47,6 +48,7 @@
     fieldErrors,
     valueAt,
     update,
+    updateList,
     updateModels,
     onModelsExternalChange,
   }: Props = $props();
@@ -110,6 +112,7 @@
             loading={field.provider ? optionLoading[field.provider] : false}
             error={fieldErrors[field.path]}
             onChange={(value) => update(field, value)}
+            onListChange={(value, changes) => updateList(field, value, changes)}
           />
         {/if}
       {/each}

@@ -162,13 +162,6 @@
     showFullscreen = false;
   }
 
-  const samplePrompts = [
-    "A photorealistic portrait of an astronaut on Mars, cinematic lighting, 8k resolution",
-    "Cyberpunk city street at night in rain, glowing neon signs, reflections on wet asphalt",
-    "Cute fluffy red panda sitting on a bamboo branch, studio lighting, highly detailed",
-    "Watercolor landscape of rolling green hills and distant misty mountains at sunrise",
-  ];
-
   let elapsedSeconds = $state(0);
   let timerInterval: ReturnType<typeof setInterval> | null = null;
 
@@ -443,7 +436,7 @@
     <EmptyState message={$translate("playground.image.noModels")} />
   {:else}
     <!-- Image display area -->
-    <div class="pg-panel flex-1 overflow-auto mb-3 flex items-center justify-center border border-border/50 relative bg-muted/10 p-2">
+    <div class="pg-panel min-h-0 flex-1 overflow-hidden mb-3 flex items-center justify-center border border-border/50 relative bg-muted/10 p-2">
       {#if isGenerating}
         <div class="flex flex-col items-center justify-center gap-3 text-center text-muted-foreground p-6">
           <div class="relative flex size-12 items-center justify-center">
@@ -461,11 +454,11 @@
           <p class="text-xs mt-1 leading-relaxed">{$error}</p>
         </div>
       {:else if generatedImages.length > 1}
-        <div class="grid grid-cols-2 gap-3 p-2 w-full h-full overflow-auto">
+        <div class="grid grid-cols-2 gap-3 p-2 w-full h-full min-h-0 overflow-auto">
           {#each generatedImages as img, i}
-            <div class="group relative flex items-center justify-center rounded-xl overflow-hidden border border-border/60 bg-card shadow-xs">
+            <div class="group relative flex min-h-0 items-center justify-center rounded-xl overflow-hidden border border-border/60 bg-card shadow-xs">
               <button
-                class="p-0 border-0 bg-transparent cursor-pointer w-full h-full flex items-center justify-center"
+                class="p-0 border-0 bg-transparent cursor-pointer size-full min-h-0 flex items-center justify-center"
                 onclick={() => openFullscreen(i)}
                 aria-label={$translate("playground.image.viewFullscreen")}
               >
@@ -500,16 +493,16 @@
           {/each}
         </div>
       {:else if generatedImages.length === 1}
-        <div class="group relative max-w-full max-h-full flex items-center justify-center rounded-xl overflow-hidden">
+        <div class="group relative size-full min-h-0 flex items-center justify-center rounded-xl overflow-hidden">
           <button
-            class="p-0 border-0 bg-transparent cursor-pointer flex items-center justify-center"
+            class="p-0 border-0 bg-transparent cursor-pointer size-full min-h-0 flex items-center justify-center"
             onclick={() => openFullscreen(0)}
             aria-label={$translate("playground.image.viewFullscreen")}
           >
             <img
               src={generatedImages[0]}
               alt={$translate("playground.image.alt", { index: 1 })}
-              class="max-w-full max-h-full object-contain rounded-lg shadow-sm transition-opacity hover:opacity-95"
+              class="max-w-full max-h-full min-h-0 object-contain rounded-lg shadow-sm transition-opacity hover:opacity-95"
             />
           </button>
           <div class="absolute bottom-3 right-3 flex items-center gap-1.5 opacity-0 group-hover:opacity-100 transition-opacity">
@@ -535,26 +528,12 @@
           </div>
         </div>
       {:else}
-        <div class="flex h-full flex-col items-center justify-center gap-3 text-center px-4 py-8 max-w-lg mx-auto">
-          <div class="pg-inset flex size-12 items-center justify-center rounded-2xl border border-primary/10 bg-primary/5">
-            <Sparkles class="size-6 text-primary" />
+        <div class="flex h-full flex-col items-center justify-center gap-2 text-center text-muted-foreground p-4">
+          <div class="pg-inset flex size-12 items-center justify-center rounded-2xl border border-border/50 bg-muted/20">
+            <Sparkles class="size-6 text-muted-foreground/60" />
           </div>
-          <div class="space-y-1">
-            <p class="text-sm font-semibold">{$translate("playground.image.empty")}</p>
-            <p class="pg-hint text-xs">{$translate("playground.image.promptPlaceholder")}</p>
-          </div>
-          <div class="flex flex-wrap justify-center gap-1.5 pt-2">
-            {#each samplePrompts as sample}
-              <button
-                type="button"
-                class="text-xs text-left line-clamp-1 max-w-[260px] rounded-lg border border-border/60 bg-card/80 px-2.5 py-1.5 text-muted-foreground hover:text-foreground hover:border-primary/40 hover:bg-muted/40 transition-colors cursor-pointer"
-                onclick={() => (prompt = sample)}
-                title={sample}
-              >
-                {sample}
-              </button>
-            {/each}
-          </div>
+          <p class="text-sm font-medium text-foreground">{$translate("playground.image.empty")}</p>
+          <p class="pg-hint text-xs max-w-xs leading-relaxed">{$translate("playground.image.promptPlaceholder")}</p>
         </div>
       {/if}
     </div>

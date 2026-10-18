@@ -3,6 +3,7 @@
   import { cancelInflightRequest, uiConfig } from "../stores/api";
   import { persistentStore } from "../stores/persistent";
   import { flip } from "svelte/animate";
+  import { untrack } from "svelte";
   import {
     type ColumnDef,
     type SortingState,
@@ -52,7 +53,7 @@
     formatDrafted,
     formatPrefixStability,
   } from "../lib/activityExport";
-  import { formatDuration, formatSpeed } from "../lib/format";
+  import { formatDuration, formatProviderLabel, formatSpeed } from "../lib/format";
   import { formatBytes, liveElapsedMs, requestHeader, sessionID } from "../lib/inflight";
   import { locale, t, translate } from "../lib/i18n";
 
@@ -124,6 +125,20 @@
   let filtersEnabled = $derived(!!filters && !!onFiltersChange);
   let filterCount = $derived(filters ? activeFilterCount(filters) : 0);
 
+  // 供应商列在历史记录与进行中请求两张表里共用同一种写法。没有供应商时两张表
+  // 都要区分“本地”与“没有上游答复”：记录看 provider_local，进行中的行看
+  // route_resolved（路由已定且没有供应商 = 本地）。
+  function formatProvider(row: ActivityLogEntry): string {
+    return formatProviderLabel(row, t("activity.table.provider.local"));
+  }
+
+  function formatInflightProvider(row: InflightRequestEntry): string {
+    return formatProviderLabel(
+      { provider: row.provider, provider_adapter: row.provider_adapter, provider_local: row.route_resolved === true },
+      t("activity.table.provider.local")
+    );
+  }
+
   interface ColMeta {
     id: string;
     label: string;
@@ -136,6 +151,8 @@
       { id: "time", label: t("activity.table.columns.time"), defaultVisible: true },
     ];
     if (withModel) cols.push({ id: "model", label: t("activity.table.columns.model"), defaultVisible: true });
+    // 紧跟在模型之后：先看是哪个模型，再看这个模型由谁服务。
+    cols.push({ id: "provider", label: t("activity.table.columns.provider"), defaultVisible: true });
     cols.push(
       { id: "req_path", label: t("activity.table.columns.path"), defaultVisible: false },
       { id: "resp_status_code", label: t("activity.table.columns.status"), defaultVisible: true },
@@ -201,15 +218,18 @@
   // Reconcile stored order against the current column set: drop stale ids
   // and append any new ones so all columns are always represented.
   $effect(() => {
+    // columnMeta is the only reactive input: reading columnOrder here and
+    // writing it back would make the effect re-run on its own write.
     const known = new Set(columnMeta.map((c) => c.id));
-    const order = columnOrder;
-    const hasStale = order.some((k) => !known.has(k));
-    const missing = columnMeta.filter((c) => !order.includes(c.id)).map((c) => c.id);
-    if (hasStale || missing.length > 0) {
+    untrack(() => {
+      const order = columnOrder;
+      const hasStale = order.some((k) => !known.has(k));
+      const missing = columnMeta.filter((c) => !order.includes(c.id)).map((c) => c.id);
+      if (!hasStale && missing.length === 0) return;
       const cleaned = order.filter((k) => known.has(k));
       columnOrder = [...cleaned, ...missing];
       storedColumnOrder.set(columnOrder);
-    }
+    });
   });
 
   // svelte-ignore state_referenced_locally
@@ -225,6 +245,8 @@
       { id: "phase", label: t("activity.table.inFlightColumns.phase"), defaultVisible: true },
     ];
     if (withModel) cols.push({ id: "model", label: t("activity.table.inFlightColumns.model"), defaultVisible: true });
+    // 紧跟在模型之后：先看是哪个模型，再看这个模型由谁服务。
+    cols.push({ id: "provider", label: t("activity.table.inFlightColumns.provider"), defaultVisible: true });
     cols.push(
       { id: "request", label: t("activity.table.inFlightColumns.request"), defaultVisible: true },
       { id: "identity", label: t("activity.table.inFlightColumns.address"), defaultVisible: true },
@@ -279,17 +301,18 @@
 
   $effect(() => {
     const known = new Set(inflightColumnMeta.map((column) => column.id));
-    const hasStale = inflightColumnOrder.some((id) => !known.has(id));
-    const missing = inflightColumnMeta
-      .filter((column) => !inflightColumnOrder.includes(column.id))
-      .map((column) => column.id);
-    if (hasStale || missing.length > 0) {
+    untrack(() => {
+      const hasStale = inflightColumnOrder.some((id) => !known.has(id));
+      const missing = inflightColumnMeta
+        .filter((column) => !inflightColumnOrder.includes(column.id))
+        .map((column) => column.id);
+      if (!hasStale && missing.length === 0) return;
       inflightColumnOrder = [
         ...inflightColumnOrder.filter((id) => known.has(id)),
         ...missing,
       ];
       storedInflightColumnOrder.set(inflightColumnOrder);
-    }
+    });
   });
 
   // When onSortChange is provided the table sorts on the server: the sort
@@ -388,6 +411,13 @@
     }
 
     cols.push(
+      {
+        id: "provider",
+        accessorKey: "provider",
+        header: t("activity.table.columns.provider"),
+        // 本地模型没有供应商，用 "本地" 明确区分「没有」和「没记录」。
+        cell: ({ row }) => formatProvider(row.original),
+      },
       {
         id: "req_path",
         accessorKey: "req_path",
@@ -856,6 +886,8 @@
                     >{inflightPhaseLabel(request.phase)}</Badge>
                   {:else if columnId === "model"}
                     <MiddleEllipsis value={request.model} tailLength={10} className="max-w-[14rem]" />
+                  {:else if columnId === "provider"}
+                    <MiddleEllipsis value={formatInflightProvider(request)} tailLength={10} className="max-w-[14rem]" />
                   {:else if columnId === "request"}
                     {@const requestLabel = `${request.method || "-"} ${request.req_path || "-"}`}
                     <MiddleEllipsis value={requestLabel} tailLength={14} className="max-w-[20rem] font-mono text-xs" />
@@ -946,7 +978,7 @@
     <div class="flex items-center gap-2">
       <button
         type="button"
-        class="hover:bg-muted inline-flex size-7 items-center justify-center rounded-[min(var(--radius-md),12px)]"
+        class="text-muted-foreground hover:text-foreground hover:bg-muted inline-flex size-7 items-center justify-center rounded-md transition-colors cursor-pointer outline-none focus-visible:ring-2 focus-visible:ring-ring"
         title={$translate("activity.table.exportMarkdown")}
         onclick={openExport}
       >
@@ -955,8 +987,8 @@
       {#if filtersEnabled}
         <button
           type="button"
-          class="hover:bg-muted relative inline-flex size-7 items-center justify-center rounded-[min(var(--radius-md),12px)] {filterOpen
-            ? 'bg-muted'
+          class="text-muted-foreground hover:text-foreground hover:bg-muted relative inline-flex size-7 items-center justify-center rounded-md transition-colors cursor-pointer outline-none focus-visible:ring-2 focus-visible:ring-ring {filterOpen
+            ? 'bg-muted text-foreground'
             : ''}"
           title={$translate(filterOpen ? "activity.table.hideFilters" : "activity.table.showFilters")}
           aria-expanded={filterOpen}
@@ -965,7 +997,7 @@
           <ListFilter class="size-4" />
           {#if filterCount > 0}
             <span
-              class="bg-primary absolute -right-0.5 -top-0.5 size-2 rounded-full"
+              class="bg-primary absolute -right-0.5 -top-0.5 size-2 rounded-full ring-2 ring-background"
               aria-hidden="true"
             ></span>
           {/if}
@@ -973,7 +1005,7 @@
       {/if}
       <DropdownMenu.Root>
         <DropdownMenu.Trigger
-          class="hover:bg-muted inline-flex size-7 items-center justify-center rounded-[min(var(--radius-md),12px)]"
+          class="text-muted-foreground hover:text-foreground hover:bg-muted inline-flex size-7 items-center justify-center rounded-md transition-colors cursor-pointer outline-none focus-visible:ring-2 focus-visible:ring-ring"
           title={$translate("activity.table.selectColumns")}
         >
           <Columns3 class="size-4" />
@@ -1082,7 +1114,7 @@
     </Table.Root>
 
     {#if showPagination && total > 0}
-      <div class="flex items-center justify-between gap-2 border-t px-4 py-2 text-sm">
+      <div class="flex items-center justify-between gap-2 border-t border-border/70 bg-muted/10 px-4 py-2 text-sm">
         <span class="text-muted-foreground text-xs">
           {$translate("common.page.info", { page, pages: pageCount, total })}
         </span>

@@ -80,6 +80,12 @@
   };
 
   onMount(() => {
+    // A draft that has not been named yet has no log stream; subscribing would
+    // request /api/extensions/logs/ and spam 404s.
+    if (!id.trim()) {
+      loading = false;
+      return;
+    }
     controller = new AbortController();
     (async () => {
       const history = await fetchExtensionLogHistory(id);

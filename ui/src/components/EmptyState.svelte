@@ -24,6 +24,8 @@
   {#if children}
     {@render children()}
   {:else}
-    <p>{message}</p>
+    <div class="flex flex-col items-center justify-center gap-2 p-6 text-center">
+      <p class="text-sm font-medium text-muted-foreground max-w-sm leading-relaxed">{message}</p>
+    </div>
   {/if}
 </div>

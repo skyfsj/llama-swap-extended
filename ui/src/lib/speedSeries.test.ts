@@ -5,6 +5,7 @@ import {
   buildSpeedQueryParams,
   contextBucketFullLabel,
   contextBucketShortLabel,
+  contextTableRows,
   contextRows,
   formatTokens,
   rateOrDash,
@@ -247,5 +248,53 @@ describe("dash formatting", () => {
     expect(rateOrDash(812.34)).toBe("812.3");
     expect(secondsOrDash(-1)).toBe("—");
     expect(secondsOrDash(1.24)).toBe("1.24");
+  });
+});
+
+describe("contextTableRows", () => {
+  const bucket = (overrides: Partial<ContextBucketData>): ContextBucketData => ({
+    label: "",
+    min_tokens: 0,
+    max_tokens: 4096,
+    requests: 1,
+    avg_input_tokens: 0,
+    avg_output_tokens: 0,
+    prefill_tps: -1,
+    decode_tps: -1,
+    ttft_ms: -1,
+    ...overrides,
+  });
+  const report = {
+    bucket_seconds: 60,
+    series: [],
+    context: [
+      {
+        model: "deepseek-flash",
+        buckets: [
+          bucket({ max_tokens: 131072, requests: 57, prefill_tps: 260.7, decode_tps: 315.8, ttft_ms: 3170 }),
+          bucket({ max_tokens: 4096, requests: 1 }),
+          bucket({ max_tokens: 0, min_tokens: 1048576, requests: 17, prefill_tps: 2364.5, decode_tps: 334.2, ttft_ms: 23030 }),
+        ],
+      },
+      // An image model: no prefill/decode to report in a throughput table.
+      { model: "gpt-image-2.5", buckets: [bucket({ requests: 1, avg_output_tokens: 343 })] },
+    ],
+  } as never;
+
+  it("keeps measured buckets sorted by context length and hides the rest", () => {
+    const { rows, hidden } = contextTableRows(report);
+    expect(rows.map((row) => row.bucket.max_tokens)).toEqual([131072, 0]);
+    expect(hidden).toBe(2);
+    expect(rows.every((row) => row.model === "deepseek-flash")).toBe(true);
+  });
+
+  it("prints the model name once per group", () => {
+    const { rows } = contextTableRows(report);
+    expect(rows[0].modelFirst).toBe(true);
+    expect(rows[1].modelFirst).toBe(false);
+  });
+
+  it("reports nothing for an empty report", () => {
+    expect(contextTableRows(null)).toEqual({ rows: [], hidden: 0 });
   });
 });

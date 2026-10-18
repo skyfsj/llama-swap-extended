@@ -1,3 +1,5 @@
+import { errorMessageFromPayload } from "./apiError";
+
 export interface PricingCatalogResponse {
   providers: string[];
   models: string[];
@@ -49,8 +51,8 @@ export async function getPricingCatalog(options: { provider?: string; query?: st
   params.set("limit", String(options.limit ?? 200));
   const response = await fetch(`/api/pricing/catalog?${params.toString()}`);
   if (!response.ok) {
-    const payload = await response.json().catch(() => ({})) as { error?: string };
-    throw new Error(payload.error ?? `Unable to load pricing catalog (HTTP ${response.status})`);
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(errorMessageFromPayload(payload, `Unable to load pricing catalog (HTTP ${response.status})`));
   }
   const payload = await response.json() as Partial<PricingCatalogResponse>;
   return {
@@ -60,8 +62,8 @@ export async function getPricingCatalog(options: { provider?: string; query?: st
 }
 
 async function readPricingError(response: Response, fallback: string): Promise<Error> {
-  const payload = await response.json().catch(() => ({})) as { error?: string };
-  return new Error(payload.error ?? `${fallback} (HTTP ${response.status})`);
+  const payload = await response.json().catch(() => ({}));
+  return new Error(errorMessageFromPayload(payload, `${fallback} (HTTP ${response.status})`));
 }
 
 export async function getPricingPrices(options: { provider?: string; query?: string; page?: number; limit?: number } = {}): Promise<PricingPricesResponse> {

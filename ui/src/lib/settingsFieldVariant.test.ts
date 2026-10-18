@@ -34,7 +34,15 @@ describe("fieldEditorVariant", () => {
     expect(fieldEditorVariant(field({ component: "text", sensitive: true }))).toBe("sensitive-input");
   });
 
+  // Regression: a sensitive sequence rendered as the password input submits one
+  // string where the configuration expects a list, and the save failed with
+  // "apiKeys must be a sequence of strings or objects".
+  it("renders a sensitive sequence as a masked list", () => {
+    expect(fieldEditorVariant(field({ component: "list", sensitive: true }))).toBe("sensitive-list");
+  });
+
   it("falls back to the list editor for non-provider lists", () => {
     expect(fieldEditorVariant(field({ component: "list" }))).toBe("list");
+    expect(fieldEditorVariant(field({ component: "list", sensitive: false }))).toBe("list");
   });
 });

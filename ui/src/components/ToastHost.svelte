@@ -15,11 +15,11 @@
   // (bg-success/10, bg-destructive/10, ...) on solid surfaces so text stays
   // readable above any page content.
   const levelClass: Record<ToastLevel, string> = {
-    success: "border-success/40 bg-success/15 text-success",
-    info: "border-border bg-popover text-foreground",
-    warning: "border-warning/40 bg-warning/15 text-warning",
-    error: "border-destructive/40 bg-destructive/15 text-destructive",
-    loading: "border-border bg-popover text-foreground",
+    success: "border-success/30 bg-success/15 dark:bg-success/20 text-success shadow-success/10",
+    info: "border-border/80 bg-popover/95 text-foreground shadow-black/10",
+    warning: "border-warning/30 bg-warning/15 dark:bg-warning/20 text-warning shadow-warning/10",
+    error: "border-destructive/30 bg-destructive/15 dark:bg-destructive/20 text-destructive shadow-destructive/10",
+    loading: "border-border/80 bg-popover/95 text-foreground shadow-black/10",
   };
 </script>
 
@@ -42,7 +42,7 @@
     {#each $toast as item (item.id)}
       {@const Icon = icons[item.level]}
       <div
-        class={`flex items-start gap-2.5 rounded-lg border px-3.5 py-2.5 text-sm shadow-lg transition-transform animate-in slide-in-from-top-2 ${levelClass[item.level]}`}
+        class={`flex items-start gap-2.5 rounded-xl border px-3.5 py-2.5 text-sm shadow-xl backdrop-blur-md transition-all animate-in slide-in-from-top-2 ${levelClass[item.level]}`}
         data-level={item.level}
       >
         <Icon class={`mt-0.5 size-4 shrink-0 ${item.level === "loading" ? "animate-spin" : ""}`} aria-hidden="true" />

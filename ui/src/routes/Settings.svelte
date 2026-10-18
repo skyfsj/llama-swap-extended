@@ -27,6 +27,7 @@
     validateSettingsField,
     valueAtConfig,
   } from "../lib/settingsDraft";
+  import { mergeDraftChanges } from "../lib/settingsListEdits";
   import { record, summarizeChanges, type ConfigChange } from "../lib/modelConfig";
   import { settingsDirty } from "../stores/settingsGuard";
   import {
@@ -36,6 +37,7 @@
     fetchSettingsPermission,
     fetchSettingsSchema,
     previewSettings,
+    type SettingsChange,
     type SettingsDiagnostic,
     type SettingsDraft,
     type SettingsField,
@@ -57,6 +59,11 @@
   let options = $state<Record<string, SettingsOption[]>>({});
   let optionLoading = $state<Record<string, boolean>>({});
   let fieldErrors = $state<Record<string, string>>({});
+  // Operations recorded by list editors whose entries are stored secrets. The
+  // draft diff replaces a changed key wholesale, which cannot round-trip a
+  // redacted list: re-sending untouched rows would make the server restore
+  // secrets by position. Each recorded path contributes its own operations.
+  let listChanges = $state<Record<string, SettingsChange[]>>({});
   let search = $state("");
   let loading = $state(true);
   let busy = $state(false);
@@ -103,6 +110,23 @@
 
   function updateAt(path: string, value: unknown): void {
     draftConfig = updateAtConfig(draftConfig, path, value);
+    // A wholesale write of the same path supersedes anything the list editors
+    // recorded for it.
+    if (listChanges[path]) {
+      const next = { ...listChanges };
+      delete next[path];
+      listChanges = next;
+    }
+    preview = null;
+  }
+
+  function updateList(field: SettingsField, value: unknown[], changes: SettingsChange[]): void {
+    if (!changes.length) return;
+    draftConfig = updateAtConfig(draftConfig, field.path, value);
+    listChanges = { ...listChanges, [field.path]: [...(listChanges[field.path] ?? []), ...changes] };
+    const next = { ...fieldErrors };
+    delete next[field.path];
+    fieldErrors = next;
     preview = null;
   }
 
@@ -206,7 +230,11 @@
   }
 
   function draft(): SettingsDraft {
-    return { mode: "structured", changes: draftChanges(baseline, draftConfig), message: "settings center" };
+    return {
+      mode: "structured",
+      changes: mergeDraftChanges(draftChanges(baseline, draftConfig), listChanges),
+      message: "settings center",
+    };
   }
 
   async function load(): Promise<void> {
@@ -235,6 +263,7 @@
       )) void loadOptions(provider);
       preview = null;
       fieldErrors = {};
+      listChanges = {};
     } catch (cause) {
       error = cause instanceof Error ? cause.message : String(cause);
     } finally {
@@ -259,6 +288,7 @@
         baseline = JSON.stringify(nextSnapshot.config ?? {});
         preview = null;
         fieldErrors = {};
+        listChanges = {};
         return;
       }
       if (JSON.stringify(nextModels) !== JSON.stringify(previousModels)) {
@@ -306,6 +336,7 @@
       snapshot = result.snapshot;
       draftConfig = structuredClone(result.snapshot.config ?? {});
       baseline = JSON.stringify(result.snapshot.config ?? {});
+      listChanges = {};
       preview = result.preview;
       previewOpen = false;
     } catch (cause) {
@@ -402,6 +433,7 @@
                 {fieldErrors}
                 {valueAt}
                 {update}
+                {updateList}
                 {updateModels}
                 onModelsExternalChange={() => void syncFromServer()}
               />

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { params } from "svelte-spa-router";
-  import { fetchPlaygroundModels, models } from "../stores/api";
+  import { fetchPlaygroundModels, models, playgroundModels } from "../stores/api";
   import { statusDotColor } from "../stores/modelLoad";
   import type { Model } from "../lib/types";
   import ModelLoadButton from "../components/ModelLoadButton.svelte";
@@ -13,6 +13,8 @@
   import ModelDetailsTab from "../components/model/ModelDetailsTab.svelte";
   import { translate } from "../lib/i18n";
   import { forceRestartModel, restartModel } from "../stores/api";
+  import { fetchConfigSnapshot, normalizeProvidersSection, providersServingModel, type ModelProviderSurface } from "../lib/providersApi";
+  import { onMount } from "svelte";
   import * as Dialog from "$lib/components/ui/dialog/index.js";
   import { Button } from "$lib/components/ui/button/index.js";
 
@@ -26,7 +28,39 @@
     $models.find((m) => m.id === modelId) ??
       $models.find((m) => m.aliases?.includes(modelId)),
   );
+  // A provider model is a gateway route, not a local launch definition: the
+  // activity and usage tables link here for it too, so name what serves it
+  // instead of reporting a missing model.
+  let providerModel = $derived<Model | undefined>(
+    model
+      ? undefined
+      : $playgroundModels.find(
+          (m) => m.playgroundType === "provider" && (m.id === modelId || m.aliases?.includes(modelId)),
+        ),
+  );
   let resolvedId = $derived(model?.id ?? modelId);
+  let resolvedProviderId = $derived(providerModel?.id ?? modelId);
+
+  // 服务该模型的供应商/适配器。模型名可能同时挂在多个供应商上，一个供应商
+  // 也可能有多个 API 表面，所以这里是一张列表；从配置快照推导而不依赖活动
+  // 记录，页面在没有任何请求时也能回答"谁提供这个模型"。
+  let providerSurfaces = $state<ModelProviderSurface[]>([]);
+  let providerSurfacesLoaded = $state(false);
+
+  onMount(() => {
+    void (async () => {
+      try {
+        const snapshot = await fetchConfigSnapshot();
+        const providers = normalizeProvidersSection(snapshot.config);
+        providerSurfaces = providersServingModel(providers, resolvedProviderId);
+      } catch {
+        // 读不到配置（无权限/离线）时只是少一段说明，不影响页面其它部分。
+        providerSurfaces = [];
+      } finally {
+        providerSurfacesLoaded = true;
+      }
+    })();
+  });
   let configStatus = $derived(model?.configStatus ?? "applied");
   let detailsAvailable = $derived.by(() => {
     const current = model;
@@ -82,7 +116,29 @@
 </script>
 
 <div class="flex h-full flex-col gap-4 overflow-y-auto p-2">
-  {#if !model}
+  {#if !model && providerModel}
+    <Card.Root class="shrink-0 gap-2 p-6">
+      <p class="text-sm font-medium">{$translate("modelDetail.providerTitle", { id: resolvedProviderId })}</p>
+      <p class="text-muted-foreground text-sm">{$translate("modelDetail.providerHint")}</p>
+      {#if providerSurfacesLoaded && providerSurfaces.length > 0}
+        <div class="mt-1 space-y-1">
+          <p class="text-muted-foreground text-xs">{$translate("modelDetail.providerServedBy")}</p>
+          {#each providerSurfaces as surface (`${surface.providerID}/${surface.adapter}`)}
+            <div class="flex items-baseline gap-2 text-xs">
+              <span class="font-medium">{surface.providerID}</span>
+              {#if surface.adapter}
+                <span class="text-muted-foreground">{surface.adapter}</span>
+              {/if}
+              {#if surface.model !== resolvedProviderId}
+                <span class="text-muted-foreground">{surface.model}</span>
+              {/if}
+            </div>
+          {/each}
+        </div>
+      {/if}
+      <a href="#/providers" class="text-primary text-sm hover:underline">{$translate("modelDetail.providerLink")}</a>
+    </Card.Root>
+  {:else if !model}
     <Card.Root class="shrink-0 p-6">
       <p class="text-muted-foreground">{$translate("modelDetail.notFound", { id: modelId })}</p>
       <a href="/" class="text-primary hover:underline">{$translate("modelDetail.backToPlayground")}</a>

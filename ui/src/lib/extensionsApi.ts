@@ -274,6 +274,9 @@ export function settingDiagnosticsFrom(error: unknown): Record<string, string> {
  * extension (plain text, newest tail).
  */
 export async function fetchExtensionLogHistory(id: string): Promise<string> {
+  // A new draft has no manifest id yet; asking for /logs/ produced a 404 on
+  // every render of the editor.
+  if (!id.trim()) return "";
   const response = await fetch(`/api/extensions/logs/${encodeURIComponent(id)}`, { credentials: "same-origin" });
   if (!response.ok) return "";
   return response.text();
@@ -281,6 +284,7 @@ export async function fetchExtensionLogHistory(id: string): Promise<string> {
 
 /** subscribeExtensionLogStream opens the live SSE-ish chunked log stream. */
 export async function* streamExtensionLogs(id: string, options?: { signal?: AbortSignal; noHistory?: boolean }): AsyncGenerator<string> {
+  if (!id.trim()) return;
   const query = options?.noHistory ? "?no-history" : "";
   const response = await fetch(`/api/extensions/logs/${encodeURIComponent(id)}/stream${query}`, {
     credentials: "same-origin",

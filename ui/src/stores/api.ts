@@ -576,8 +576,8 @@ export async function restartModel(model: string): Promise<void> {
     method: "POST",
   });
   if (!response.ok) {
-    const payload = await response.json().catch(() => ({})) as { message?: string; error?: string };
-    throw new Error(payload.message ?? payload.error ?? `Failed to restart model: ${response.status}`);
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(errorMessageFromPayload(payload, `Failed to restart model: ${response.status}`));
   }
 }
 
@@ -586,8 +586,8 @@ export async function forceRestartModel(model: string): Promise<void> {
     method: "POST",
   });
   if (!response.ok) {
-    const payload = await response.json().catch(() => ({})) as { message?: string; error?: string };
-    throw new Error(payload.message ?? payload.error ?? `Failed to force restart model: ${response.status}`);
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(errorMessageFromPayload(payload, `Failed to force restart model: ${response.status}`));
   }
 }
 

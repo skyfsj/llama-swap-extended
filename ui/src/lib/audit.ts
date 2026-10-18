@@ -453,21 +453,29 @@ function toolResult(value: Record<string, unknown>): AuditTranscriptItem | null 
 }
 
 function messageText(value: Record<string, unknown>): string {
-  return contentPartsText(value.content)
+  const raw = contentPartsText(value.content)
     || nonEmptyString(value.content)
     || nonEmptyString(value.text)
     || nonEmptyString(value.output_text);
+  const role = nonEmptyString(value.role);
+  if (raw && (role === "assistant" || !role)) {
+    return raw.replace(/<think>[\s\S]*?(?:<\/think>|$)/g, "").trim();
+  }
+  return raw;
 }
 
 // messageReasoning extracts the chain of thought from one chat message.
-// vLLM's qwen3 parser puts it in reasoning_content; some backends use
-// reasoning, or a <think> block folded into a string content field.
+// vLLM's qwen3/r1 parser puts it in reasoning_content; some backends use
+// reasoning, thought, thinking, or a <think> block folded into content.
 function messageReasoning(value: Record<string, unknown>): string {
-  const direct = nonEmptyString(value.reasoning_content) || nonEmptyString(value.reasoning);
+  const direct = nonEmptyString(value.reasoning_content)
+    || nonEmptyString(value.reasoning)
+    || nonEmptyString(value.thought)
+    || nonEmptyString(value.thinking);
   if (direct) return direct;
-  const content = value.content;
-  if (typeof content === "string") {
-    const match = /<think>([\s\S]*?)<\/think>/.exec(content);
+  const content = typeof value.content === "string" ? value.content : contentPartsText(value.content);
+  if (content) {
+    const match = /<think>([\s\S]*?)(?:<\/think>|$)/.exec(content);
     if (match) return match[1].trim();
   }
   return "";
@@ -661,26 +669,63 @@ export function auditResponseTranscript(value: AuditBytes): AuditTranscriptItem[
   const items: AuditTranscriptItem[] = [];
 
   const reasoningParts: string[] = [];
-  const collectReasoning = (value: unknown): void => {
-    const node = record(value);
+  const collectReasoning = (val: unknown): void => {
+    const node = record(val);
     if (!node) return;
-    // Chat-completions deltas nest under choices[].delta; Responses API and
-    // some adapters put reasoning fields on the frame itself.
-    const deltas: Record<string, unknown>[] = [];
+    // Chat-completions deltas and messages nest under choices[]
+    const sources: Record<string, unknown>[] = [];
     if (Array.isArray(node.choices)) {
       for (const choice of node.choices) {
-        const delta = record(record(choice)?.delta);
-        if (delta) deltas.push(delta);
+        const c = record(choice);
+        const delta = record(c?.delta);
+        if (delta) sources.push(delta);
+        const msg = record(c?.message);
+        if (msg) sources.push(msg);
       }
     }
     const directDelta = record(node.delta);
-    if (directDelta) deltas.push(directDelta);
-    for (const delta of deltas) {
-      const text = nonEmptyString(delta.reasoning_content) || nonEmptyString(delta.reasoning);
+    if (directDelta) sources.push(directDelta);
+    const directMessage = record(node.message);
+    if (directMessage) sources.push(directMessage);
+
+    for (const src of sources) {
+      const text = nonEmptyString(src.reasoning_content)
+        || nonEmptyString(src.reasoning)
+        || nonEmptyString(src.thought)
+        || nonEmptyString(src.thinking);
       if (text) reasoningParts.push(text);
+      // Anthropic content array with { type: "thinking", thinking: "..." }
+      if (Array.isArray(src.content)) {
+        for (const part of src.content) {
+          const p = record(part);
+          if (p && (nonEmptyString(p.type) === "thinking" || nonEmptyString(p.type) === "thinking_delta")) {
+            const thinkText = nonEmptyString(p.thinking) || nonEmptyString(p.text);
+            if (thinkText) reasoningParts.push(thinkText);
+          }
+        }
+      }
     }
-    const direct = nonEmptyString(node.reasoning_content);
+
+    const direct = nonEmptyString(node.reasoning_content)
+      || nonEmptyString(node.reasoning)
+      || nonEmptyString(node.thought)
+      || nonEmptyString(node.thinking);
     if (direct) reasoningParts.push(direct);
+
+    // Anthropic top-level { type: "thinking", thinking: "..." }
+    if ((nonEmptyString(node.type) === "thinking" || nonEmptyString(node.type) === "thinking_delta") && nonEmptyString(node.thinking)) {
+      reasoningParts.push(nonEmptyString(node.thinking));
+    }
+    if (Array.isArray(node.content)) {
+      for (const part of node.content) {
+        const p = record(part);
+        if (p && (nonEmptyString(p.type) === "thinking" || nonEmptyString(p.type) === "thinking_delta")) {
+          const thinkText = nonEmptyString(p.thinking) || nonEmptyString(p.text);
+          if (thinkText) reasoningParts.push(thinkText);
+        }
+      }
+    }
+
     // Responses API: {type:"reasoning", summary:[{type:"summary_text",text}]}
     if (nonEmptyString(node.type) === "reasoning" && Array.isArray(node.summary)) {
       for (const part of node.summary) {
@@ -689,12 +734,26 @@ export function auditResponseTranscript(value: AuditBytes): AuditTranscriptItem[
       }
     }
   };
+
   collectReasoning(parseJSON(view.raw));
   for (const event of view.events) collectReasoning(event.data);
-  const reasoning = reasoningParts.join("").trim();
-  if (reasoning) items.push({ kind: "reasoning", text: reasoning });
+  let reasoning = reasoningParts.join("").trim();
 
-  if (view.text.trim()) items.push({ kind: "message", role: "assistant", text: view.text });
+  // Also check if text body starts with or contains <think>...</think>
+  let assistantText = view.text;
+  if (!reasoning) {
+    const thinkMatch = /<think>([\s\S]*?)(?:<\/think>|$)/.exec(assistantText);
+    if (thinkMatch) {
+      reasoning = thinkMatch[1].trim();
+      assistantText = assistantText.replace(/<think>[\s\S]*?(?:<\/think>|$)/g, "").trim();
+    }
+  } else {
+    // If reasoning was already found from delta/fields, also strip any stray <think> tag in text
+    assistantText = assistantText.replace(/<think>[\s\S]*?(?:<\/think>|$)/g, "").trim();
+  }
+
+  if (reasoning) items.push({ kind: "reasoning", text: reasoning });
+  if (assistantText.trim()) items.push({ kind: "message", role: "assistant", text: assistantText });
 
   const tools: AuditTranscriptItem[] = [];
   const seen = new Set<string>();

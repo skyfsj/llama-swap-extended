@@ -44,11 +44,16 @@
     $playgroundModels.filter(
       (model) =>
         !model.unlisted &&
-        (model.playgroundType === "model" || model.playgroundType === "peer")
+        (model.playgroundType === "model" ||
+          model.playgroundType === "peer" ||
+          model.playgroundType === "provider")
     )
   );
-  const local = $derived(listed.filter((model) => !model.peerID));
-  const peers = $derived(listed.filter((model) => model.peerID));
+  const local = $derived(listed.filter((model) => !model.peerID && model.playgroundType !== "provider"));
+  const peers = $derived(listed.filter((model) => model.peerID && model.playgroundType !== "provider"));
+  // Provider models are forwarded through the gateway: they are selectable the
+  // same way local ones are, they just live upstream.
+  const providers = $derived(listed.filter((model) => model.playgroundType === "provider"));
 
   // Strict category filtering: an image model never appears in the chat
   // selector and vice versa. Profiles and selectors are chat routing
@@ -68,11 +73,18 @@
   );
   const otherModels = $derived(others ? local.filter((m) => !shown.has(m.id)) : []);
   const otherPeerModels = $derived(others ? peers.filter((m) => !shown.has(m.id)) : []);
+  const matchingProviders = $derived(filterByCategory(providers, category));
+  const extraProviders = $derived(extraCategory ? filterByCategory(providers, extraCategory) : []);
+  // One entry per provider model, in the order the groups appear.
+  const providerOptions = $derived(
+    [...matchingProviders, ...extraProviders.filter((model) => !matchingProviders.some((match) => match.id === model.id))]
+  );
   const showProfiles = $derived(category === "chat" && $profileModels.length > 0);
   const showSelectors = $derived(category === "chat" && $selectorModels.length > 0);
   const hasModels = $derived(
     matching.length > 0 ||
       matchingPeers.length > 0 ||
+      matchingProviders.length > 0 ||
       extra.length > 0 ||
       extraPeers.length > 0 ||
       otherModels.length > 0 ||
@@ -108,7 +120,7 @@
             <Select.Item value={model.id}>{model.id}</Select.Item>
             {#if model.aliases}
               {#each model.aliases as alias (alias)}
-                <Select.Item value={alias}>↳ {alias}</Select.Item>
+                <Select.Item value={alias} class="text-muted-foreground pl-6 text-xs">↳ {alias}</Select.Item>
               {/each}
             {/if}
           {/each}
@@ -127,7 +139,7 @@
             <Select.Item value={model.id}>{model.id}</Select.Item>
             {#if model.aliases}
               {#each model.aliases as alias (alias)}
-                <Select.Item value={alias}>↳ {alias}</Select.Item>
+                <Select.Item value={alias} class="text-muted-foreground pl-6 text-xs">↳ {alias}</Select.Item>
               {/each}
             {/if}
           {/each}
@@ -140,7 +152,7 @@
             <Select.Item value={model.id}>{model.id}</Select.Item>
             {#if model.aliases}
               {#each model.aliases as alias (alias)}
-                <Select.Item value={alias}>↳ {alias}</Select.Item>
+                <Select.Item value={alias} class="text-muted-foreground pl-6 text-xs">↳ {alias}</Select.Item>
               {/each}
             {/if}
           {/each}
@@ -156,7 +168,7 @@
             <Select.Item value={model.id}>{model.id}</Select.Item>
             {#if model.aliases}
               {#each model.aliases as alias (alias)}
-                <Select.Item value={alias}>↳ {alias}</Select.Item>
+                <Select.Item value={alias} class="text-muted-foreground pl-6 text-xs">↳ {alias}</Select.Item>
               {/each}
             {/if}
           {/each}
@@ -164,9 +176,18 @@
             <Select.Item value={model.id}>{model.id}</Select.Item>
             {#if model.aliases}
               {#each model.aliases as alias (alias)}
-                <Select.Item value={alias}>↳ {alias}</Select.Item>
+                <Select.Item value={alias} class="text-muted-foreground pl-6 text-xs">↳ {alias}</Select.Item>
               {/each}
             {/if}
+          {/each}
+        </Select.Group>
+      {/if}
+      {#if providerOptions.length > 0}
+        <Select.Separator />
+        <Select.Group>
+          <Select.Label>{$translate("playground.modelSelector.provider")}</Select.Label>
+          {#each providerOptions as model (model.id)}
+            <Select.Item value={model.id}>{model.id}</Select.Item>
           {/each}
         </Select.Group>
       {/if}

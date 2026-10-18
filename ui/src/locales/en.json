@@ -81,6 +81,7 @@
     "error": "Error",
     "loading": "Loading...",
     "view": "View",
+    "edit": "Edit",
     "save": "Save",
     "remove": "Remove",
     "settings": "Settings",
@@ -145,6 +146,7 @@
     "activeModels": "Active Models",
     "costEstimated": "Estimated Cost",
     "costNotConfigured": "Pricing not configured",
+    "pricingBased": "Based on model pricing",
     "totalTokens": "Token Throughput",
     "inputTokens": "Input",
     "outputTokens": "Output",
@@ -212,6 +214,7 @@
         "id": "ID",
         "time": "Time",
         "model": "Model",
+        "provider": "Provider",
         "path": "Path",
         "status": "Status",
         "contentType": "Content-Type",
@@ -234,6 +237,7 @@
         "elapsed": "Elapsed",
         "phase": "Output phase",
         "model": "Model",
+        "provider": "Provider",
         "request": "Request",
         "address": "Address",
         "userAgent": "User Agent",
@@ -270,6 +274,9 @@
         "applied": "Applied",
         "noOutput": "No output yet",
         "waitingForTelemetry": "Waiting for upstream counters"
+      },
+      "provider": {
+        "local": "Local"
       }
     },
     "filters": {
@@ -319,6 +326,7 @@
       "curveTitle": "Inference speed curve",
       "contextTitle": "Throughput by context length",
       "contextTable": "Performance by context length",
+      "contextTableHidden": "Hidden {count} sample(s) without throughput data",
       "series": {
         "prefill": "Prefill throughput (tok/s)",
         "decode": "Decode throughput (tok/s)",
@@ -612,7 +620,11 @@
       "apply_failed": "configuration apply failed",
       "removing": "removing model",
       "unloading": "draining unload"
-    }
+    },
+    "providerTitle": "{id} is served by a provider",
+    "providerHint": "This model is forwarded to an upstream provider through the gateway, so it has no local launch configuration to edit here.",
+    "providerServedBy": "Served by",
+    "providerLink": "Open the providers page"
   },
   "settings": {
     "title": "Settings",
@@ -743,6 +755,7 @@
       "matchingCapabilities": "Matching Capabilities",
       "selectors": "Selectors",
       "local": "Local",
+      "provider": "Providers",
       "groupTranslation": "Translation models",
       "groupChat": "Language models",
       "groupImage": "Image models",
@@ -1601,6 +1614,7 @@
     "keyScopes": "Scopes (comma separated)",
     "keyModels": "Model access",
     "keyModelAll": "All models",
+    "keyAllowedIPsAll": "Any address",
     "keyModelSelected": "{count} model(s) selected",
     "keyModelEmpty": "No models available",
     "keyExpires": "Expires at",
@@ -1612,7 +1626,12 @@
     "keyAccess": "Access",
     "keyManagementLoginEnabled": "Management panel",
     "keyAPIOnly": "API only",
+    "keyAPIOnlyHint": "This key was created as API-only. Enable this to also sign in to the control panel.",
     "keyLastUsed": "Last used",
+    "keyFromIP": "from {ip}",
+    "keyLastIPHint": "Caller address of the most recent request made with this key.",
+    "keyLastIPBlockedHint": "This address is outside the key's allowed IP list.",
+    "keyAllowedIPsMatchedHint": "The key's last request came from this entry.",
     "keyUsage": "Usage",
     "keyRequests": "requests",
     "createKey": "Create key",
@@ -2083,7 +2102,8 @@
       "storeMedia": "Store media content",
       "redactHeaders": "Redact request headers",
       "modelsDev": "Models.dev source",
-      "refreshEvery": "Refresh interval"
+      "refreshEvery": "Refresh interval",
+      "maxContinuationMiB": "Tool continuation round limit (MiB)"
     },
     "configWriteStatus": "Write access",
     "configApplyStatus": "Runtime state",
@@ -2119,8 +2139,13 @@
     "ccswitchAutoKey": "Create an inference key automatically",
     "ccswitchCurrentKey": "Current session key",
     "ccswitchDefaultKey": "llama-swap (default placeholder)",
-    "ccswitchNoKey": "Do not import a key",
     "ccswitchOpen": "Open CC Switch",
+    "ccswitchResolved": "CC Switch will be configured with {endpoint} ({format}).",
+    "ccswitchModelScope": "The model list is limited to this key's allowed models.",
+    "ccswitchFormat_anthropic": "Anthropic Messages",
+    "ccswitchFormat_openai_chat": "OpenAI Chat Completions",
+    "ccswitchFormat_openai_responses": "OpenAI Responses",
+    "ccswitchFormat_gemini_native": "Gemini generateContent",
     "modelManagedModelRequired": "Managed runtimes need a model file selected, or a --model in the launch arguments",
     "auditMediaImage": "Image",
     "auditMediaFile": "File",
@@ -2181,6 +2206,7 @@
     "keyCreateAccess": "Create access key",
     "keyEditAccess": "Edit access key",
     "keyUngrouped": "Ungrouped",
+    "keyUnnamed": "Unnamed key",
     "keyCreateManagement": "Create management key",
     "keyEditManagement": "Edit management key",
     "keyLoginOnlyHint": "Management keys are for signing in and administering the control plane.",
@@ -2200,13 +2226,21 @@
     "auditSessionRequests": "Requests",
     "auditSessionTokens": "Tokens in → out",
     "auditSessionStored": "Stored",
-    "auditSessionShared": "Context shared"
+    "auditSessionShared": "Context shared",
+    "modelCustomHeadHint": "This model runs its own launch head (backend.entrypoint). The structured engine fields do not apply: the head and the arguments below own the whole command line.",
+    "keyManagedByConfig": "config",
+    "keyManagedByConfigHint": "This key comes from the apiKeys section of the configuration file. It follows the file: edit or remove it in the settings center (or the YAML), and the change applies immediately.",
+    "keyConfigLocked": "Managed by the configuration file"
   },
   "settingsCenter": {
     "navigation": {
       "general": {
         "label": "General & service",
         "description": "Core service, ports, and session behavior."
+      },
+      "network": {
+        "label": "Network, proxy & security",
+        "description": "Outbound proxy, caller address behind a reverse proxy, HTTP limits and failed-login throttling."
       },
       "observability": {
         "label": "Monitoring & logs",
@@ -2369,6 +2403,10 @@
       "macros": {
         "title": "Macros",
         "description": "Reusable values expanded into model commands and arguments."
+      },
+      "network": {
+        "title": "Network & boundary",
+        "description": "Inbound and outbound network policy, reverse-proxy trust and caller identity."
       }
     },
     "toolbar": {
@@ -2430,7 +2468,11 @@
       "value": "Value",
       "removeItem": "Remove item",
       "addItem": "Add item",
-      "default": "default"
+      "default": "default",
+      "structuredEntry": "Structured entry",
+      "secretValue": "Secret value",
+      "addSecret": "Add a key and press Enter",
+      "secretListHint": "Saved keys stay masked and only the rows you retype are written. Removing an entry revokes that key as soon as you save; keys created on the API keys page are left alone."
     },
     "list": {
       "all": "All models",
@@ -2688,6 +2730,10 @@
     "providers": "Providers",
     "endpoints": "Endpoints",
     "networkHosts": "Allowed network hosts",
+    "networkHostsHint": "Hosts this extension may reach with fetch or another network call, one per line. Leave it empty to allow any public host. Listing hosts narrows the grant to them, and *.example.com covers subdomains. Local, private and link-local addresses are always blocked.",
+    "proxyHint": "Outbound proxy is a global setting",
+    "proxyHintBody": "Extension fetches, model downloads and runtime builds all use the policy in Settings → Network proxy; when empty they follow the daemon's HTTP_PROXY / HTTPS_PROXY environment.",
+    "proxyHintOpen": "Open network proxy settings",
     "readRoots": "Readable directories",
     "writeRoots": "Writable directories",
     "timeout": "Timeout",
@@ -2722,12 +2768,15 @@
       "installedNotice": "{id} was installed",
       "credential": "credential",
       "targetId": "Extension ID",
+      "anyPublicHost": "any public host",
       "category": {
         "search": "Web search",
         "documents": "Documents",
         "knowledge": "Knowledge",
         "memory": "Memory",
-        "other": "Other"
+        "other": "Other",
+        "media": "Media",
+        "utilities": "Utilities"
       }
     },
     "deleted": "Extension deleted",
@@ -3038,6 +3087,7 @@
     "exportCSV": "Export CSV",
     "colKey": "API key",
     "colModel": "Model",
+    "colProvider": "Provider",
     "colEndpoint": "Endpoint",
     "colIP": "IP",
     "colGroup": "Group",
@@ -3072,7 +3122,12 @@
       "addKey": "Add key",
       "addModel": "Add model",
       "pull": "Pull from upstream",
-      "test": "Test"
+      "test": "Test",
+      "addAdapter": "Add adapter",
+      "addFromTemplate": "From template",
+      "pullDistribute": "Pull & distribute",
+      "enable": "Enable",
+      "disable": "Disable"
     },
     "fields": {
       "name": "Name",
@@ -3092,7 +3147,48 @@
       "maxConcurrent": "Max concurrent",
       "models": "Models",
       "modelLocal": "Local model ID",
-      "modelRemote": "Upstream model name"
+      "modelRemote": "Upstream model name",
+      "sessionHeaders": "Session headers",
+      "sessionHeadersHint": "Request headers set to the session id when forwarding upstream. The caller's session id is passed through; without one, an id derived from the conversation prefix is used.",
+      "adapters": "Adapters",
+      "adaptersHint": "Each adapter is one upstream API surface (dialect + endpoint + models). Add several for subscriptions that expose multiple APIs.",
+      "adapterName": "Name",
+      "adapterNamePlaceholder": "optional label",
+      "adapterAdvanced": "Advanced",
+      "pathMap": "Path rewrites",
+      "pathMapHint": "Comma-separated from=to path prefixes, applied before forwarding (e.g. /v1beta/models/=/v1/models/).",
+      "modelMatch": "Model patterns",
+      "modelMatchHint": "Glob patterns used when pulling models from a template or a shared model list.",
+      "adapterDefault": "Catch-all adapter for pulled models",
+      "modelProxy": "proxy (inherit)",
+      "adapterProxy": "Adapter proxy",
+      "proxyHint": "Outbound proxy for this scope: http/https/socks5/socks5h URL, or \"direct\" to bypass all proxies. Empty inherits the next level (model > adapter > key > provider > global).",
+      "modelPrefix": "Model name prefix",
+      "modelPrefixPlaceholder": "none (bare model IDs)",
+      "modelPrefixHint": "Prepended to every model name this provider exposes in /v1/models and for routing. The legacy provider/model name keeps working.",
+      "cooldownPolicy": "Cooldown policy",
+      "cooldownInherit": "Inherit gateway",
+      "cooldownEnabled": "Enabled",
+      "cooldownDisabled": "Disabled",
+      "cooldownHint": "Disabled keeps this provider's keys schedulable after failures (the error is still recorded and the request still fails over).",
+      "modelAliases": "Aliases (comma separated)",
+      "modelKind": "Model kind",
+      "modelAliasesPlaceholder": "Optional. First name becomes the listed model name, the rest are aliases; empty uses the upstream name",
+      "typeOpenAI": "OpenAI Completions API",
+      "typeOpenAIResponses": "OpenAI Responses API",
+      "typeAnthropic": "Anthropic API",
+      "typeGemini": "Gemini API",
+      "typeGeminiInteractions": "Gemini Interactions",
+      "exposeUpstreamName": "Upstream name callable",
+      "exposeUpstreamNameHint": "Clients may use an alias or the upstream model name; turn this off to publish only the names this provider declares."
+    },
+    "modelKind": {
+      "chat": "Chat",
+      "vision": "Vision",
+      "image": "Image generation",
+      "speech": "Speech (TTS)",
+      "transcription": "Transcription",
+      "translation": "Translation"
     },
     "status": {
       "disabled": "disabled",
@@ -3108,14 +3204,19 @@
       "nameRequired": "Provider name is required.",
       "endpointRequired": "Endpoint is required.",
       "keysRequired": "At least one API key is required.",
-      "modelsRequired": "At least one model is required."
+      "modelsRequired": "At least one model is required.",
+      "duplicateModel": "Model {model} is declared twice by adapter “{adapter}”. Two adapters may share a name (they are its API surfaces); one adapter may not."
     },
     "toast": {
       "saved": "Provider {id} saved.",
       "deleted": "Provider {id} removed.",
       "noModels": "Upstream returned no models.",
       "pulled": "Pulled {count} models from upstream.",
-      "testOk": "Connectivity OK ({count} models visible)."
+      "testOk": "Connectivity OK ({count} models visible).",
+      "pullSkipped": "{count} model(s) already served by another adapter were skipped.",
+      "distributed": "Distributed {count} new model(s) across the adapters.",
+      "enabled": "{id} enabled",
+      "disabled": "{id} disabled"
     },
     "delete": {
       "title": "Remove provider",
@@ -3124,6 +3225,40 @@
     "deleteKey": {
       "title": "Remove API key",
       "message": "Remove this API key from the provider?"
+    },
+    "quota": {
+      "title": "Quota",
+      "subtitle": "Subscription usage windows reported by the upstream, per credential.",
+      "configTitle": "Quota (subscription usage)",
+      "configHint": "Reads each credential's usage from the plan's endpoint and shows it as cards above. Requires a preset or an endpoint mapping.",
+      "preset": "Preset",
+      "refreshInterval": "Auto refresh",
+      "refreshIntervalPlaceholder": "empty = manual only, e.g. 5m",
+      "enforce": "Park full credentials",
+      "threshold": "Threshold %",
+      "refresh": "Refresh",
+      "refreshAll": "Refresh all",
+      "updated": "Updated",
+      "never": "Not refreshed yet",
+      "remaining": "{percent}% left",
+      "missing": "not reported",
+      "resets": "resets",
+      "enforced": "quota full",
+      "noCredentials": "No credential is scheduled for this provider yet.",
+      "windows": {
+        "rolling": "5-hour",
+        "weekly": "Weekly",
+        "monthly": "Monthly"
+      }
+    },
+    "templates": {
+      "title": "Add provider from template",
+      "subtitle": "Templates create a provider with its adapters, session headers and quota mapping, then pull the current model list from the upstream.",
+      "use": "Use template",
+      "applied": "Pulled {count} models from the upstream.",
+      "repull": "Re-pull models",
+      "repulled": "Re-pulled {count} models and redistributed them.",
+      "invalid": "The template produced an invalid provider draft."
     }
   }
 }

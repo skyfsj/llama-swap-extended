@@ -12,7 +12,7 @@
     SPEED_WINDOW_LABEL_KEYS,
     contextBucketFullLabel,
     contextBucketShortLabel,
-    contextRows,
+    contextTableRows,
     isSpeedWindowKey,
     rateOrDash,
     secondsOrDash,
@@ -62,7 +62,7 @@
   let chartData = $derived(speedChartData(series?.points ?? [], report?.bucket_seconds ?? 0));
   let averages = $derived(speedAverages(series?.points ?? []));
   let trend = $derived(speedTrend(series?.points ?? []));
-  let tableRows = $derived(contextRows(report));
+  let contextTable = $derived(contextTableRows(report));
 
   let windowItems = $derived(
     WINDOW_ORDER.map((key) => ({ key, label: $translate(SPEED_WINDOW_LABEL_KEYS[key]) })),
@@ -300,10 +300,15 @@
     {/if}
   {/if}
 
-  {#if !loading && tableRows.length > 0}
+  {#if !loading && (contextTable.rows.length > 0 || contextTable.hidden > 0)}
     <Card.Root class="mt-3 overflow-hidden p-0">
       <Card.Header class="flex items-center justify-between border-b px-4 py-2">
         <Card.Title class="text-sm font-semibold">{$translate("activity.speed.contextTable")}</Card.Title>
+        {#if contextTable.hidden > 0}
+          <span class="text-muted-foreground text-xs">
+            {$translate("activity.speed.contextTableHidden", { count: contextTable.hidden })}
+          </span>
+        {/if}
       </Card.Header>
       <div class="overflow-x-auto">
         <Table.Root class="min-w-[72rem]">
@@ -321,9 +326,9 @@
             </Table.Row>
           </Table.Header>
           <Table.Body>
-            {#each tableRows as row (row.model + row.bucket.label)}
-              <Table.Row>
-                <Table.Cell class="max-w-[18rem] truncate font-medium" title={row.model}>{row.model}</Table.Cell>
+            {#each contextTable.rows as row (row.model + row.bucket.label)}
+              <Table.Row class={row.modelFirst ? "border-t" : ""}>
+                <Table.Cell class="max-w-[18rem] truncate font-medium" title={row.model}>{row.modelFirst ? row.model : ""}</Table.Cell>
                 <Table.Cell title={full(row.bucket.max_tokens || row.bucket.min_tokens)}>
                   {contextBucketFullLabel(row.bucket)}
                 </Table.Cell>

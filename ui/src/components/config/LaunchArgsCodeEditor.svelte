@@ -3,6 +3,7 @@
   import { basicSetup, EditorView } from "codemirror";
   import type { ViewUpdate } from "@codemirror/view";
   import { Compartment, EditorState, type Extension } from "@codemirror/state";
+  import { codeMirrorChromeTheme } from "../../lib/codemirrorChrome";
 
   interface Props {
     value?: string;
@@ -69,16 +70,6 @@
       color: "var(--muted-foreground)",
     },
     ".cm-gutterElement": { padding: "0 0.625rem" },
-    ".cm-activeLine": { backgroundColor: "color-mix(in oklab, var(--primary) 8%, transparent)" },
-    ".cm-activeLineGutter": { backgroundColor: "color-mix(in oklab, var(--primary) 12%, transparent)" },
-    ".cm-selectionBackground, &.cm-focused .cm-selectionBackground, ::selection": {
-      backgroundColor: "color-mix(in oklab, var(--primary) 28%, transparent) !important",
-    },
-    ".cm-cursor, .cm-dropCursor": { borderLeftColor: "var(--foreground)" },
-    ".cm-matchingBracket": {
-      backgroundColor: "color-mix(in oklab, var(--primary) 18%, transparent)",
-      outline: "1px solid color-mix(in oklab, var(--primary) 55%, transparent)",
-    },
     "&.cm-focused": { outline: "2px solid var(--ring)", outlineOffset: "-2px" },
   });
 
@@ -137,6 +128,7 @@
         doc: value ?? "",
         extensions: [
           basicSetup,
+          codeMirrorChromeTheme,
           editorTheme,
           placeholderExtension(),
           EditorView.lineWrapping,

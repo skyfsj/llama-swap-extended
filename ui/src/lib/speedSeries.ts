@@ -289,6 +289,57 @@ export function contextRows(report: SpeedReportData | null): { model: string; bu
   return rows;
 }
 
+/** One table row: a model's context bucket, ready to render. */
+export interface ContextTableRow {
+  model: string;
+  bucket: ContextBucketData;
+  /**
+   * True on the first row of a model's group: the model name is printed once
+   * and the group is separated, which is what keeps a model with five context
+   * buckets readable.
+   */
+  modelFirst: boolean;
+}
+
+/**
+ * contextTableRows prepares the context-length performance table: one row per
+ * measured bucket, sorted by model and then by context length, with the model
+ * name carried only by the group's first row.
+ *
+ * A bucket the backend reported no throughput for at all (an entry with a
+ * single request, or a model that does not generate tokens the way a chat model
+ * does) has nothing to say in a prefill/decode table, so it is left out and
+ * counted in `hidden` instead of showing a row of dashes.
+ */
+export function contextTableRows(report: SpeedReportData | null): { rows: ContextTableRow[]; hidden: number } {
+  const all = contextRows(report);
+  const measured = all.filter((row) => bucketHasThroughput(row.bucket));
+  const sorted = [...measured].sort((a, b) => {
+    if (a.model !== b.model) return a.model.localeCompare(b.model, undefined, { numeric: true });
+    return contextBucketSortKey(a.bucket) - contextBucketSortKey(b.bucket);
+  });
+  const rows: ContextTableRow[] = [];
+  let previous = "";
+  for (const row of sorted) {
+    rows.push({ model: row.model, bucket: row.bucket, modelFirst: row.model !== previous });
+    previous = row.model;
+  }
+  return { rows, hidden: all.length - measured.length };
+}
+
+/** The open-ended bucket (">N") sorts after every bounded range. */
+function contextBucketSortKey(bucket: ContextBucketData): number {
+  return bucket.max_tokens === 0 ? Number.MAX_SAFE_INTEGER : bucket.max_tokens;
+}
+
+function bucketHasThroughput(bucket: ContextBucketData): boolean {
+  return (
+    (isKnown(bucket.prefill_tps) && bucket.prefill_tps > 0) ||
+    (isKnown(bucket.decode_tps) && bucket.decode_tps > 0) ||
+    (isKnown(bucket.ttft_ms) && bucket.ttft_ms > 0)
+  );
+}
+
 /** A metric the backend never reported renders as a dash, not as zero. */
 export function rateOrDash(value: number): string {
   return isKnown(value) && value > 0 ? value.toFixed(1) : "—";

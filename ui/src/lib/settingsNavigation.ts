@@ -44,6 +44,7 @@ interface SettingsGroupMeta {
 const settingsNavigation: SettingsNavigationSource[] = [
   // 基础 (Basic)
   { id: "general", group: "basic", labelKey: "settingsCenter.navigation.general.label", descriptionKey: "settingsCenter.navigation.general.description", sections: ["general", "storage", "ui"] },
+  { id: "network", group: "basic", labelKey: "settingsCenter.navigation.network.label", descriptionKey: "settingsCenter.navigation.network.description", sections: ["network"] },
   { id: "observability", group: "basic", labelKey: "settingsCenter.navigation.observability.label", descriptionKey: "settingsCenter.navigation.observability.description", sections: ["logging", "observability"], drop: ["audit"] },
   // 模型与运行 (Models & runtime)
   { id: "modelFiles", group: "models", labelKey: "settingsCenter.navigation.modelFiles.label", descriptionKey: "settingsCenter.navigation.modelFiles.description", sections: ["modelFiles"] },
@@ -86,6 +87,7 @@ const groupMeta: Record<string, SettingsGroupMeta> = {
   upstream: { id: "upstream", titleKey: "settingsCenter.groups.upstream.title", descriptionKey: "settingsCenter.groups.upstream.description" },
   models: { id: "models", titleKey: "settingsCenter.groups.models.title", descriptionKey: "settingsCenter.groups.models.description" },
   macros: { id: "macros", titleKey: "settingsCenter.groups.macros.title", descriptionKey: "settingsCenter.groups.macros.description" },
+  network: { id: "network", titleKey: "settingsCenter.groups.network.title", descriptionKey: "settingsCenter.groups.network.description" },
   advanced: { id: "advanced", titleKey: "settingsCenter.groups.advanced.title", descriptionKey: "settingsCenter.groups.advanced.description" },
   other: { id: "other", titleKey: "settingsCenter.groups.other.title", descriptionKey: "settingsCenter.groups.other.description" },
 };
@@ -166,6 +168,7 @@ function groupID(navigationID: string, field: SettingsField): string {
   if (navigationID === "selectors") return topLevel === "profiles" ? "profiles" : "selectors";
   if (navigationID === "upstreamPeers") return topLevel === "peers" ? "peers" : "upstream";
   if (navigationID === "macros") return "macros";
+  if (navigationID === "network") return "network";
   if (navigationID === "models") return "models";
   if (navigationID === "advanced") return "advanced";
   return "other";

@@ -149,7 +149,7 @@
 
 <button
   type="button"
-  class="text-muted-foreground hover:bg-accent hover:text-accent-foreground flex {btnSize} shrink-0 items-center justify-center disabled:opacity-50"
+  class="flex {btnSize} shrink-0 items-center justify-center rounded-md transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50 cursor-pointer {model.state === 'ready' ? 'text-emerald-600 dark:text-emerald-400 hover:bg-destructive/10 hover:text-destructive' : model.state === 'starting' ? 'text-amber-500 hover:bg-amber-500/10' : 'text-muted-foreground hover:bg-accent hover:text-accent-foreground'}"
   title={model.disabled ? $translate("modelLoad.disabledHint") : model.state === "ready" || model.state === "sleeping" ? $translate("common.unload") : model.state === "starting" ? $translate("common.stopStart") : pending ? $translate("common.cancel") : $translate("common.load")}
   aria-label={model.disabled ? $translate("modelLoad.disabledHint") : model.state === "ready" || model.state === "sleeping" ? $translate("common.unloadModel") : model.state === "starting" ? $translate("common.stopStart") : $translate("common.loadModel")}
   aria-busy={conflictLoading || stopBusy}
@@ -177,7 +177,7 @@
 {#if sleepCapable}
   <button
     type="button"
-    class="text-info hover:bg-accent hover:text-accent-foreground flex {btnSize} shrink-0 items-center justify-center disabled:opacity-50"
+    class="text-info hover:bg-accent hover:text-accent-foreground flex {btnSize} shrink-0 items-center justify-center rounded-md transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50 cursor-pointer"
     title={model.state === "sleeping" ? $translate("common.wakeModel") : $translate("common.sleepModel")}
     aria-label={model.state === "sleeping" ? $translate("common.wakeModel") : $translate("common.sleepModel")}
     aria-busy={sleepBusy}

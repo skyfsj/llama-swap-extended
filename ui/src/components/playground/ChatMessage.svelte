@@ -35,11 +35,21 @@
       return { blocks: [{ id: -1, html: escapeHtml(textContent).replace(/\n/g, '<br>') }] as RenderedBlock[], pendingHtml: "" };
     }
     if (!isStreaming) {
-      streamingCache = createStreamingCache();
+      // A finished message renders from scratch. Resetting the cache stays
+      // outside the reactive graph: mutating it here re-ran the derived value
+      // that reads it, which Svelte's update-depth guard rejects at runtime.
       return { blocks: [{ id: -1, html: renderMarkdown(textContent) }] as RenderedBlock[], pendingHtml: "" };
     }
     return renderStreamingMarkdown(textContent, streamingCache);
   });
+  // Drop the streaming accumulator after a message stops streaming so the next
+  // turn starts clean; an effect keeps this out of the derived computation.
+  $effect(() => {
+    if (!isStreaming && streamingCache.completeKey !== "") {
+      streamingCache = createStreamingCache();
+    }
+  });
+
   let copied = $state(false);
   let showRaw = $state(false);
   let isEditing = $state(false);

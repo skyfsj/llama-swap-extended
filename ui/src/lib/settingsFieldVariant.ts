@@ -8,6 +8,7 @@ import type { SettingsField } from "./settingsApi";
  */
 export type SettingsFieldVariant =
   | "sensitive-input"
+  | "sensitive-list"
   | "sensitive-status"
   | "switch"
   | "provider-list"
@@ -18,6 +19,13 @@ export type SettingsFieldVariant =
   | "input";
 
 export function fieldEditorVariant(field: SettingsField): SettingsFieldVariant {
+  // A sensitive sequence (apiKeys) must resolve before the masked single-value
+  // input: that input submits one string where the configuration expects a
+  // sequence, and the server answers "apiKeys must be a sequence of strings or
+  // objects".
+  if (field.sensitive && field.component === "list") {
+    return "sensitive-list";
+  }
   if (field.sensitive && field.component !== "map" && field.component !== "json") {
     return "sensitive-input";
   }

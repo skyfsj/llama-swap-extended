@@ -24,7 +24,6 @@
   import * as Tabs from "$lib/components/ui/tabs/index.js";
   import { Button } from "$lib/components/ui/button/index.js";
   import {
-    Activity,
     Boxes,
     Columns3,
     Gauge,
@@ -124,39 +123,23 @@
   });
 </script>
 
-<div class="space-y-5 pb-8">
-  <!-- Top Dashboard Header & Actions -->
-  <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-    <div class="flex items-center gap-3">
-      <div class="flex size-9 items-center justify-center rounded-xl bg-primary/10 text-primary shadow-xs">
-        <Activity class="size-5" />
-      </div>
-      <div>
-        <div class="flex items-center gap-2">
-          <h1 class="text-lg font-bold tracking-tight text-foreground sm:text-xl">
-            {$translate("navigation.activity")}
-          </h1>
-          <!-- Live Status Indicator -->
-          {#if $connectionState === "connected"}
-            <span class="inline-flex items-center gap-1.5 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-2 py-0.5 text-xs font-medium text-emerald-600 dark:text-emerald-400">
-              <span class="relative flex size-2">
-                <span class="absolute inline-flex size-full animate-ping rounded-full bg-emerald-400 opacity-75"></span>
-                <span class="relative inline-flex size-2 rounded-full bg-emerald-500"></span>
-              </span>
-              {$translate("activity.liveSync")}
-            </span>
-          {/if}
-        </div>
-        <p class="text-muted-foreground text-xs">
-          {$translate("activity.overviewSubtitle")}
-        </p>
-      </div>
-    </div>
+<div class="space-y-4 pb-8">
+  <!-- Top Status & Actions Bar -->
+  <div class="flex items-center justify-between gap-2">
+    <div class="flex items-center gap-2">
+      {#if $connectionState === "connected"}
+        <span class="inline-flex items-center gap-1.5 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-2.5 py-0.5 text-xs font-medium text-emerald-600 dark:text-emerald-400">
+          <span class="relative flex size-2">
+            <span class="absolute inline-flex size-full animate-ping rounded-full bg-emerald-400 opacity-75"></span>
+            <span class="relative inline-flex size-2 rounded-full bg-emerald-500"></span>
+          </span>
+          {$translate("activity.liveSync")}
+        </span>
+      {/if}
 
-    <div class="flex flex-wrap items-center gap-2">
       <!-- Active Filters Pill -->
       {#if filterCount > 0}
-        <div class="inline-flex items-center gap-1.5 rounded-lg border bg-muted/40 px-2.5 py-1 text-xs">
+        <div class="inline-flex items-center gap-1.5 rounded-lg border bg-muted/40 px-2.5 py-0.5 text-xs">
           <span class="font-medium text-foreground">
             {filterCount} {$translate("activity.table.columnsMenu")}
           </span>
@@ -171,28 +154,25 @@
           </Button>
         </div>
       {/if}
-
-      <!-- Manual Refresh Button -->
-      <Button
-        variant="outline"
-        size="sm"
-        class="h-8 gap-1.5 text-xs font-medium"
-        onclick={handleManualRefresh}
-        disabled={refreshing}
-      >
-        <RefreshCw class="size-3.5 {refreshing ? 'animate-spin' : ''}" />
-        <span>{$translate("activity.speed.refresh")}</span>
-      </Button>
     </div>
+
+    <!-- Manual Refresh Button -->
+    <Button
+      variant="outline"
+      size="sm"
+      class="h-7 gap-1.5 px-2.5 text-xs font-medium"
+      onclick={handleManualRefresh}
+      disabled={refreshing}
+    >
+      <RefreshCw class="size-3.5 {refreshing ? 'animate-spin' : ''}" />
+      <span>{$translate("activity.speed.refresh")}</span>
+    </Button>
   </div>
 
   <!-- Executive Stats Deck (Cards + Histograms) -->
   <ActivityStats
     {stats}
     inflightCount={$inflightRequestEntries.length}
-    onSelectTab={(tab) => {
-      $activeTab = tab;
-    }}
   />
 
   <!-- Main Activity Workspace Tabs -->

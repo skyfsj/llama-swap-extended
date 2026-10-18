@@ -254,7 +254,7 @@
           </div>
         {:else}
           <header
-            class="bg-background sticky top-0 z-10 flex h-14 shrink-0 items-center gap-2 border-b px-4"
+            class="bg-background/90 backdrop-blur-md sticky top-0 z-10 flex h-14 shrink-0 items-center gap-2 border-b border-border/80 px-4 transition-colors"
           >
             <Sidebar.Trigger class="-ml-1" />
             <Separator orientation="vertical" class="mr-2 !h-4" />

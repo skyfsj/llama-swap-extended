@@ -12,7 +12,6 @@
     ChevronDown,
     ChevronUp,
     Code,
-    Filter,
   } from "@lucide/svelte";
   import { translate } from "../../lib/i18n";
   import { formatBytes, type AuditTranscriptItem } from "../../lib/audit";
@@ -113,6 +112,16 @@
 
   let allBlocks = $derived(transcriptBlocks(items));
 
+  // Determine what role types actually exist
+  let hasSystem = $derived(allBlocks.some((b) => b.kind === "message" && b.message.role === "system"));
+  let hasUser = $derived(allBlocks.some((b) => b.kind === "message" && b.message.role === "user"));
+  let hasAssistant = $derived(allBlocks.some((b) => b.kind === "message" && b.message.role === "assistant"));
+  let hasTools = $derived(allBlocks.some((b) => b.kind === "tool"));
+  let hasReasoning = $derived(allBlocks.some((b) => b.kind === "reasoning"));
+  let hasMultipleCategories = $derived(
+    [hasSystem, hasUser, hasAssistant, hasTools, hasReasoning].filter(Boolean).length >= 3 || allBlocks.length >= 5
+  );
+
   let filteredBlocks = $derived.by(() => {
     if (roleFilter === "all") return allBlocks;
     return allBlocks.filter((b) => {
@@ -136,67 +145,78 @@
   }
 </script>
 
-<div class="space-y-4" aria-label={$translate("controlPlane.auditTranscript")}>
-  <!-- Transcript Toolbar -->
-  <div class="flex flex-wrap items-center justify-between gap-2.5 rounded-lg border bg-muted/30 px-3 py-2 text-xs">
-    <!-- Filter pills -->
-    <div class="flex flex-wrap items-center gap-1">
-      <span class="mr-1 inline-flex items-center gap-1 text-muted-foreground font-medium">
-        <Filter class="size-3.5" aria-hidden="true" />
-        <span>{$translate("controlPlane.auditFilterAll")}:</span>
-      </span>
+<div class="space-y-3.5" aria-label={$translate("controlPlane.auditTranscript")}>
+  <!-- Transcript Toolbar: clean, compact, no heavy box -->
+  <div class="flex flex-wrap items-center justify-between gap-2 border-b border-border/50 pb-2.5 text-xs">
+    <!-- Filter pills (only if rich multi-turn or heterogeneous) -->
+    <div class="flex flex-wrap items-center gap-1.5">
+      {#if hasMultipleCategories}
+        <button
+          type="button"
+          class="rounded-full px-2.5 py-0.5 text-xs font-medium transition-colors {roleFilter === 'all' ? 'bg-primary text-primary-foreground shadow-2xs' : 'bg-muted/60 hover:bg-muted text-muted-foreground'}"
+          onclick={() => (roleFilter = "all")}
+        >
+          {$translate("controlPlane.auditFilterAll")} ({allBlocks.length})
+        </button>
 
-      <button
-        type="button"
-        class="rounded-full px-2.5 py-0.5 text-xs font-medium transition-colors {roleFilter === 'all' ? 'bg-primary text-primary-foreground shadow-xs' : 'bg-background hover:bg-muted text-muted-foreground'}"
-        onclick={() => (roleFilter = "all")}
-      >
-        {$translate("controlPlane.auditFilterAll")} ({allBlocks.length})
-      </button>
+        {#if hasUser}
+          <button
+            type="button"
+            class="rounded-full px-2.5 py-0.5 text-xs font-medium transition-colors {roleFilter === 'user' ? 'bg-primary text-primary-foreground shadow-2xs' : 'bg-muted/60 hover:bg-muted text-muted-foreground'}"
+            onclick={() => (roleFilter = "user")}
+          >
+            {$translate("controlPlane.auditRoleUser")}
+          </button>
+        {/if}
 
-      <button
-        type="button"
-        class="rounded-full px-2.5 py-0.5 text-xs font-medium transition-colors {roleFilter === 'user' ? 'bg-primary text-primary-foreground shadow-xs' : 'bg-background hover:bg-muted text-muted-foreground'}"
-        onclick={() => (roleFilter = "user")}
-      >
-        {$translate("controlPlane.auditRoleUser")}
-      </button>
+        {#if hasAssistant}
+          <button
+            type="button"
+            class="rounded-full px-2.5 py-0.5 text-xs font-medium transition-colors {roleFilter === 'assistant' ? 'bg-primary text-primary-foreground shadow-2xs' : 'bg-muted/60 hover:bg-muted text-muted-foreground'}"
+            onclick={() => (roleFilter = "assistant")}
+          >
+            {$translate("controlPlane.auditRoleAssistant")}
+          </button>
+        {/if}
 
-      <button
-        type="button"
-        class="rounded-full px-2.5 py-0.5 text-xs font-medium transition-colors {roleFilter === 'assistant' ? 'bg-primary text-primary-foreground shadow-xs' : 'bg-background hover:bg-muted text-muted-foreground'}"
-        onclick={() => (roleFilter = "assistant")}
-      >
-        {$translate("controlPlane.auditRoleAssistant")}
-      </button>
+        {#if hasTools}
+          <button
+            type="button"
+            class="rounded-full px-2.5 py-0.5 text-xs font-medium transition-colors {roleFilter === 'tool' ? 'bg-primary text-primary-foreground shadow-2xs' : 'bg-muted/60 hover:bg-muted text-muted-foreground'}"
+            onclick={() => (roleFilter = "tool")}
+          >
+            {$translate("controlPlane.auditToolCall")}
+          </button>
+        {/if}
 
-      <button
-        type="button"
-        class="rounded-full px-2.5 py-0.5 text-xs font-medium transition-colors {roleFilter === 'tool' ? 'bg-primary text-primary-foreground shadow-xs' : 'bg-background hover:bg-muted text-muted-foreground'}"
-        onclick={() => (roleFilter = "tool")}
-      >
-        {$translate("controlPlane.auditToolCall")}
-      </button>
+        {#if hasReasoning}
+          <button
+            type="button"
+            class="rounded-full px-2.5 py-0.5 text-xs font-medium transition-colors {roleFilter === 'reasoning' ? 'bg-primary text-primary-foreground shadow-2xs' : 'bg-muted/60 hover:bg-muted text-muted-foreground'}"
+            onclick={() => (roleFilter = "reasoning")}
+          >
+            {$translate("controlPlane.auditReasoning")}
+          </button>
+        {/if}
 
-      <button
-        type="button"
-        class="rounded-full px-2.5 py-0.5 text-xs font-medium transition-colors {roleFilter === 'reasoning' ? 'bg-primary text-primary-foreground shadow-xs' : 'bg-background hover:bg-muted text-muted-foreground'}"
-        onclick={() => (roleFilter = "reasoning")}
-      >
-        {$translate("controlPlane.auditReasoning")}
-      </button>
-
-      <button
-        type="button"
-        class="rounded-full px-2.5 py-0.5 text-xs font-medium transition-colors {roleFilter === 'system' ? 'bg-primary text-primary-foreground shadow-xs' : 'bg-background hover:bg-muted text-muted-foreground'}"
-        onclick={() => (roleFilter = "system")}
-      >
-        {$translate("controlPlane.auditRoleSystem")}
-      </button>
+        {#if hasSystem}
+          <button
+            type="button"
+            class="rounded-full px-2.5 py-0.5 text-xs font-medium transition-colors {roleFilter === 'system' ? 'bg-primary text-primary-foreground shadow-2xs' : 'bg-muted/60 hover:bg-muted text-muted-foreground'}"
+            onclick={() => (roleFilter = "system")}
+          >
+            {$translate("controlPlane.auditRoleSystem")}
+          </button>
+        {/if}
+      {:else}
+        <span class="text-xs text-muted-foreground font-medium">
+          {allBlocks.length} items
+        </span>
+      {/if}
     </div>
 
     <!-- View & Expand toggles -->
-    <div class="flex items-center gap-2">
+    <div class="flex items-center gap-2 ml-auto">
       <Button
         variant="ghost"
         size="xs"
@@ -207,7 +227,7 @@
         <span>{renderMd ? $translate("controlPlane.auditFormatRaw") : $translate("controlPlane.auditRenderMarkdown")}</span>
       </Button>
 
-      <div class="h-3.5 w-px bg-border" aria-hidden="true"></div>
+      <div class="h-3 w-px bg-border" aria-hidden="true"></div>
 
       <Button
         variant="ghost"
@@ -234,25 +254,25 @@
       {$translate("controlPlane.auditTranscriptUnavailable")}
     </p>
   {:else}
-    <div class="space-y-4">
+    <div class="space-y-3.5">
       {#each filteredBlocks as block, index (`${block.kind}-${index}`)}
         {#if block.kind === "message"}
           <!-- SYSTEM MESSAGE -->
           {#if block.message.role === "system"}
             {@const key = `system-${index}`}
             {@const expanded = isBlockExpanded(key, false)}
-            <div class="rounded-lg border border-border/80 bg-muted/20 transition-colors">
+            <div class="rounded-xl border border-border/70 bg-muted/20 transition-colors">
               <div class="flex items-center justify-between gap-2 px-3.5 py-2 text-xs">
                 <button
                   type="button"
                   class="flex min-w-0 flex-1 items-center gap-2 text-left font-medium text-foreground hover:text-primary transition-colors focus-visible:outline-none"
                   onclick={() => toggleBlock(key, false)}
                 >
-                  <Braces class="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
+                  <Braces class="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
                   <Badge variant="outline" class="font-normal text-xs py-0">
                     {roleLabel(block.message.role)}
                   </Badge>
-                  <span class="truncate text-muted-foreground">
+                  <span class="truncate text-muted-foreground text-xs">
                     {block.message.text.length} {$translate("playground.chat.characters")}
                   </span>
                   {#if expanded}
@@ -265,7 +285,7 @@
               </div>
 
               {#if expanded}
-                <div class="border-t border-border/60 bg-background/50 px-3.5 py-3 text-xs">
+                <div class="border-t border-border/50 bg-background/50 px-3.5 py-3 text-xs">
                   {#if renderMd}
                     <div class="prose prose-sm dark:prose-invert max-w-none break-words">
                       {@html renderSafeMarkdown(block.message.text)}
@@ -282,10 +302,10 @@
             {@const key = `user-${index}`}
             {@const hasLong = isLongText(block.message.text)}
             {@const expanded = isBlockExpanded(key, !hasLong)}
-            <article class="flex justify-end">
-              <div class="w-full max-w-[94%] sm:max-w-[85%] rounded-2xl border border-primary/20 bg-primary/5 p-3.5 shadow-xs transition-shadow hover:shadow-sm dark:bg-primary/10">
+            <article class="w-full">
+              <div class="w-full rounded-2xl border border-primary/20 bg-primary/5 px-4.5 py-3.5 shadow-2xs transition-shadow hover:shadow-sm dark:bg-primary/10">
                 <!-- Header -->
-                <div class="mb-2 flex items-center justify-between gap-2 border-b border-primary/10 pb-1.5 text-xs">
+                <div class="mb-1.5 flex items-center justify-between gap-2 border-b border-primary/10 pb-1 text-xs">
                   <div class="flex items-center gap-1.5 font-medium text-primary">
                     <UserRound class="size-3.5" aria-hidden="true" />
                     <span>{roleLabel(block.message.role)}</span>
@@ -297,20 +317,20 @@
                 <!-- Body -->
                 {#if hasLong && !expanded}
                   <div class="relative">
-                    <div class="max-h-32 overflow-hidden text-sm leading-6">
+                    <div class="max-h-36 overflow-hidden text-sm leading-relaxed">
                       {#if renderMd}
                         <div class="prose prose-sm dark:prose-invert max-w-none break-words">
-                          {@html renderSafeMarkdown(block.message.text.slice(0, 400))}
+                          {@html renderSafeMarkdown(block.message.text.slice(0, 500))}
                         </div>
                       {:else}
-                        <div class="whitespace-pre-wrap break-words">{block.message.text.slice(0, 400)}...</div>
+                        <div class="whitespace-pre-wrap break-words">{block.message.text.slice(0, 500)}...</div>
                       {/if}
                     </div>
                     <div class="absolute inset-x-0 bottom-0 flex h-14 items-end justify-center bg-gradient-to-t from-primary/10 via-primary/5 to-transparent pb-1">
                       <Button
                         variant="secondary"
                         size="xs"
-                        class="h-6 text-xs shadow-xs"
+                        class="h-6 text-xs shadow-2xs"
                         onclick={() => toggleBlock(key, false)}
                       >
                         <ChevronDown class="size-3.5 mr-1" />
@@ -319,7 +339,7 @@
                     </div>
                   </div>
                 {:else}
-                  <div class="text-sm leading-6 text-foreground">
+                  <div class="text-sm leading-relaxed text-foreground">
                     {#if renderMd}
                       <div class="prose prose-sm dark:prose-invert max-w-none break-words">
                         {@html renderSafeMarkdown(block.message.text)}
@@ -350,13 +370,13 @@
             {@const key = `assistant-${index}`}
             {@const hasLong = isLongText(block.message.text)}
             {@const expanded = isBlockExpanded(key, !hasLong)}
-            <article class="flex justify-start">
-              <div class="w-full max-w-[94%] sm:max-w-[85%] rounded-2xl border border-border bg-card p-4 shadow-xs transition-shadow hover:shadow-sm">
+            <article class="w-full">
+              <div class="w-full rounded-2xl border border-border/80 bg-card px-4.5 py-4 shadow-2xs transition-shadow hover:shadow-sm">
                 <!-- Header -->
-                <div class="mb-2.5 flex items-center justify-between gap-2 border-b border-border/60 pb-2 text-xs">
+                <div class="mb-2 flex items-center justify-between gap-2 border-b border-border/50 pb-1.5 text-xs">
                   <div class="flex items-center gap-1.5 font-medium text-foreground">
-                    <div class="flex size-5 items-center justify-center rounded-md bg-primary/10 text-primary">
-                      <Bot class="size-3.5" aria-hidden="true" />
+                    <div class="flex size-4.5 items-center justify-center rounded-md bg-primary/10 text-primary">
+                      <Bot class="size-3" aria-hidden="true" />
                     </div>
                     <span>{roleLabel(block.message.role)}</span>
                     <span class="text-xs font-normal text-muted-foreground">· {block.message.text.length} {$translate("playground.chat.characters")}</span>
@@ -374,20 +394,20 @@
                 <!-- Body -->
                 {#if hasLong && !expanded}
                   <div class="relative">
-                    <div class="max-h-36 overflow-hidden text-sm leading-6">
+                    <div class="max-h-44 overflow-hidden text-sm leading-relaxed">
                       {#if renderMd}
                         <div class="prose prose-sm dark:prose-invert max-w-none break-words">
-                          {@html renderSafeMarkdown(block.message.text.slice(0, 500))}
+                          {@html renderSafeMarkdown(block.message.text.slice(0, 600))}
                         </div>
                       {:else}
-                        <div class="whitespace-pre-wrap break-words">{block.message.text.slice(0, 500)}...</div>
+                        <div class="whitespace-pre-wrap break-words">{block.message.text.slice(0, 600)}...</div>
                       {/if}
                     </div>
                     <div class="absolute inset-x-0 bottom-0 flex h-16 items-end justify-center bg-gradient-to-t from-card via-card/80 to-transparent pb-1">
                       <Button
                         variant="secondary"
                         size="xs"
-                        class="h-6 text-xs shadow-xs"
+                        class="h-6 text-xs shadow-2xs"
                         onclick={() => toggleBlock(key, false)}
                       >
                         <ChevronDown class="size-3.5 mr-1" />
@@ -396,7 +416,7 @@
                     </div>
                   </div>
                 {:else}
-                  <div class="text-sm leading-6 text-foreground">
+                  <div class="text-sm leading-relaxed text-foreground">
                     {#if renderMd}
                       <div class="prose prose-sm dark:prose-invert max-w-none break-words">
                         {@html renderSafeMarkdown(block.message.text)}
@@ -427,7 +447,7 @@
         {:else if block.kind === "reasoning"}
           {@const key = `reasoning-${index}`}
           {@const expanded = isBlockExpanded(key, false)}
-          <div class="mx-auto w-full max-w-[94%] sm:max-w-[85%] rounded-xl border border-amber-500/20 bg-amber-500/5 text-xs text-foreground transition-all">
+          <div class="w-full rounded-xl border border-amber-500/20 bg-amber-500/5 text-xs text-foreground transition-all">
             <div class="flex items-center justify-between gap-2 px-3 py-2">
               <button
                 type="button"
@@ -463,7 +483,7 @@
 
         <!-- MEDIA -->
         {:else if block.kind === "media"}
-          <figure class="mx-auto w-full max-w-[94%] sm:max-w-[85%] overflow-hidden rounded-xl border bg-muted/20 text-sm shadow-xs">
+          <figure class="w-full overflow-hidden rounded-xl border bg-muted/20 text-sm shadow-2xs">
             {#if block.item.kind === "image"}
               <a
                 href={block.item.dataUrl}
@@ -474,7 +494,7 @@
                 <img
                   src={block.item.dataUrl}
                   alt={block.item.label}
-                  class="mx-auto max-h-72 w-auto max-w-full rounded-md object-contain shadow-xs"
+                  class="mx-auto max-h-72 w-auto max-w-full rounded-md object-contain shadow-2xs"
                   loading="lazy"
                 />
               </a>
@@ -511,12 +531,12 @@
         {:else}
           {@const key = `tool-${index}`}
           {@const expanded = isBlockExpanded(key, true)}
-          <article class="mr-auto w-full max-w-[94%] sm:max-w-[85%] overflow-hidden rounded-xl border bg-muted/20 text-sm shadow-xs">
+          <article class="w-full overflow-hidden rounded-xl border bg-muted/20 text-sm shadow-2xs">
             {#if block.call}
               <div class="flex items-center justify-between gap-2 border-b bg-muted/40 px-3.5 py-2 text-xs">
                 <div class="flex min-w-0 items-center gap-2">
-                  <div class="flex size-5 items-center justify-center rounded-md bg-amber-500/10 text-amber-600 dark:text-amber-400">
-                    <Wrench class="size-3.5" aria-hidden="true" />
+                  <div class="flex size-4.5 items-center justify-center rounded-md bg-amber-500/10 text-amber-600 dark:text-amber-400">
+                    <Wrench class="size-3" aria-hidden="true" />
                   </div>
                   <span class="font-medium text-foreground">{$translate("controlPlane.auditToolCall")}</span>
                   <code class="rounded bg-background px-2 py-0.5 font-mono text-xs font-semibold text-primary border border-border/60">

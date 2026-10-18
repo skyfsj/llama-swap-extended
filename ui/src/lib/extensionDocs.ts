@@ -120,7 +120,7 @@ export default {
 
 function 包含 name、可选 description、parameters（JSON Schema）和 strict。execution 为 client 时将调用交给 API 客户端；为 server 时由 onToolCall 执行。call 包含 id、name 和已解析的 arguments。
 
-服务端工具结果写回对话并继续生成，受全局 maxToolRounds 限制。不同接口的工具定义与结果由系统转换；Anthropic 使用 input_schema、tool_use 和 tool_result。
+服务端工具由网关执行；在 Anthropic / Responses 接口上调用与结果作为可见块（server_tool_use + mcp_tool_result、mcp_call）交回调用方并随对话重放，在 Chat / Gemini 接口上对其不可见、延迟到调用方回传对话时执行，受全局 maxToolRounds 与 maxContinuationMiB 限制。不同接口的工具定义与结果由系统转换；Anthropic 使用 input_schema、tool_use 和 tool_result。
 
 开启 interceptClientTools 后，可以在 onToolCall 中接收客户端工具调用，返回 { handled: true, content: ... } 接管；返回 undefined 则保留客户端处理。toolConflict 可选 skip、override、error；skip 保留客户端同名工具及其所有权。
 

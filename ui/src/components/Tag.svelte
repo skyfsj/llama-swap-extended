@@ -11,7 +11,7 @@
 </script>
 
 <span
-  class={cn("bg-muted text-muted-foreground rounded-md px-2 py-0.5 text-xs font-medium", className)}
+  class={cn("bg-muted text-muted-foreground rounded-md px-2 py-0.5 text-xs font-medium inline-flex items-center gap-1 border border-transparent transition-colors", className)}
 >
   {@render children()}
 </span>

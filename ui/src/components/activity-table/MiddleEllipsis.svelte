@@ -16,9 +16,15 @@
   );
 </script>
 
+<!--
+  whitespace-pre, not nowrap: each half is its own flex item, and a flex item
+  drops the whitespace at the edge of its line — "opencode-go / Responses" split
+  into "opencode-go /" and " Responses" rendered as "opencode-go /Responses".
+  Pre preserves the value exactly while the head still truncates with an ellipsis.
+-->
 <span class="flex min-w-0 items-baseline {className}" title={displayValue} aria-label={displayValue}>
-  <span class="min-w-0 overflow-hidden text-ellipsis whitespace-nowrap">{head}</span>
+  <span class="min-w-0 overflow-hidden text-ellipsis whitespace-pre">{head}</span>
   {#if tail}
-    <span class="shrink-0 whitespace-nowrap">{tail}</span>
+    <span class="shrink-0 whitespace-pre">{tail}</span>
   {/if}
 </span>
