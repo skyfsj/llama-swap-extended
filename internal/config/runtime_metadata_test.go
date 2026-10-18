@@ -78,3 +78,30 @@ func TestRuntimeMetadataConfig_Validate(t *testing.T) {
 		t.Fatalf("valid metadata rejected: %v", err)
 	}
 }
+
+// A custom launch head owns its command line: a legacy launch block on such a
+// model must not be folded into engine flags the head cannot parse.
+func TestMigrateLaunchBlocks_SkipsCustomLaunchHead(t *testing.T) {
+	cfg := Config{
+		Runtimes: map[string]RuntimeConfig{"asr": {Kind: "vllm", Mode: "native"}},
+		Models: map[string]ModelConfig{
+			"asr": {
+				Backend: BackendConfig{
+					Type:       "vllm",
+					Runtime:    "asr",
+					EntryPoint: "python3 /scripts/server.py",
+					Arguments:  []string{"--port", "5811"},
+					Launch:     &ModelLaunchConfig{ContextPerRequest: 32768},
+				},
+			},
+		},
+	}
+	cfg.MigrateLaunchBlocks()
+	model := cfg.Models["asr"]
+	if model.Backend.Launch != nil {
+		t.Fatalf("launch block was retained: %+v", model.Backend.Launch)
+	}
+	if want := []string{"--port", "5811"}; !reflect.DeepEqual(model.Backend.Arguments, want) {
+		t.Fatalf("arguments = %v, want %v (no engine flags for a custom head)", model.Backend.Arguments, want)
+	}
+}

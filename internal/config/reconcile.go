@@ -140,6 +140,15 @@ func daemonRestartPaths(active, desired Config) []string {
 	if active.LogToStdout != desired.LogToStdout {
 		paths = append(paths, "/logToStdout")
 	}
+	// The accept-loop limits are read once when http.Server is constructed, so
+	// a reload cannot apply them. Reporting them as hot-applied would leave an
+	// operator believing a tightened limit is already in force.
+	if active.Server.MaxHeaderBytes != desired.Server.MaxHeaderBytes {
+		paths = append(paths, "/server/maxHeaderBytes")
+	}
+	if active.Server.ReadTimeout != desired.Server.ReadTimeout {
+		paths = append(paths, "/server/readTimeout")
+	}
 	return paths
 }
 
@@ -161,5 +170,9 @@ func ApplyDaemonRestartPolicy(active, desired Config) (Config, []string) {
 	}
 	result.RuntimeManager.Root = active.RuntimeManager.Root
 	result.LogToStdout = active.LogToStdout
+	// Keep the active accept-loop limits until the daemon restarts; the
+	// restart paths above tell the operator a restart is pending.
+	result.Server.MaxHeaderBytes = active.Server.MaxHeaderBytes
+	result.Server.ReadTimeout = active.Server.ReadTimeout
 	return result, paths
 }

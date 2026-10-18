@@ -70,6 +70,13 @@ func (c Config) MigrateLaunchBlocks() {
 		if model.Backend.Launch == nil {
 			continue
 		}
+		// A custom launch head owns its entire command line: folding engine
+		// flags into its args would feed flags the head does not understand.
+		if strings.TrimSpace(model.Backend.EntryPoint) != "" {
+			model.Backend.Launch = nil
+			c.Models[name] = model
+			continue
+		}
 		NormalizeModelLaunch(&model, kind)
 		c.Models[name] = model
 	}

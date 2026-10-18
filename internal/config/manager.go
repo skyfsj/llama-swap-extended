@@ -1151,31 +1151,49 @@ func restoreRedactedYAML(candidate, current []byte) ([]byte, error) {
 		return nil, errors.New("top-level YAML must be a mapping")
 	}
 	if currentRoot != nil {
-		restoreRedactedNode(candidateRoot, currentRoot, "")
+		if err := restoreRedactedNode(candidateRoot, currentRoot, ""); err != nil {
+			return nil, err
+		}
 	}
 	return yaml.Marshal(&candidateDoc)
 }
 
-func restoreRedactedNode(candidate, current *yaml.Node, parent string) {
+// restoreRedactedNode puts the stored value back under every "[REDACTED]"
+// placeholder the candidate kept, so a save that never touched a secret cannot
+// overwrite it with the placeholder.
+//
+// A placeholder is anonymous, so pairing it with its original is the whole
+// problem. Two cases carry enough structure to pair safely:
+//
+//   - env entries are "NAME=value", so the variable name identifies the entry
+//     even when the operator deleted or reordered the lines around it;
+//   - object members pair by key, and apiKeys object entries restore their
+//     key/value/secret member the same way.
+//
+// Everything else (a bare apiKeys scalar) can only be paired by position, which
+// is right while the list keeps its shape and silently wrong once it does not:
+// deleting the first of two redacted entries would put the first secret back.
+// Those sequences are refused instead of guessed at.
+func restoreRedactedNode(candidate, current *yaml.Node, parent string) error {
 	if candidate == nil || current == nil {
-		return
+		return nil
 	}
 	if strings.EqualFold(parent, "env") && candidate.Kind == yaml.ScalarNode {
 		if strings.Contains(candidate.Value, "[REDACTED]") {
 			*candidate = *cloneYAMLNode(current)
 		}
-		return
+		return nil
 	}
 	if strings.EqualFold(parent, "apikeys") && candidate.Kind == yaml.ScalarNode {
 		if candidate.Value == "[REDACTED]" {
 			*candidate = *cloneYAMLNode(current)
 		}
-		return
+		return nil
 	}
 	switch candidate.Kind {
 	case yaml.MappingNode:
 		if current.Kind != yaml.MappingNode {
-			return
+			return nil
 		}
 		for i := 0; i+1 < len(candidate.Content); i += 2 {
 			key, value := candidate.Content[i], candidate.Content[i+1]
@@ -1190,18 +1208,117 @@ func restoreRedactedNode(candidate, current *yaml.Node, parent string) {
 				candidate.Content[i+1] = cloneYAMLNode(currentValue)
 				continue
 			}
-			restoreRedactedNode(value, currentValue, key.Value)
+			if err := restoreRedactedNode(value, currentValue, key.Value); err != nil {
+				return err
+			}
 		}
 	case yaml.SequenceNode:
 		if current.Kind != yaml.SequenceNode {
-			return
+			return nil
+		}
+		if strings.EqualFold(parent, "env") {
+			return restoreRedactedEnvSequence(candidate, current)
+		}
+		if strings.EqualFold(parent, "apikeys") && len(candidate.Content) != len(current.Content) && hasRedactedScalar(candidate) {
+			return fmt.Errorf("apiKeys: the list holds %d redacted entries but %d are stored; edit the keys themselves (add/remove/replace at an index) instead of sending [REDACTED] placeholders back", len(candidate.Content), len(current.Content))
 		}
 		for i, child := range candidate.Content {
 			if i < len(current.Content) {
-				restoreRedactedNode(child, current.Content[i], parent)
+				if err := restoreRedactedNode(child, current.Content[i], parent); err != nil {
+					return err
+				}
 			}
 		}
 	}
+	return nil
+}
+
+// restoreRedactedEnvSequence restores masked env entries by variable name, so an
+// entry keeps its stored value even when the operator removed or reordered the
+// lines around it. Positional pairing would hand a neighbour's value to the
+// placeholder — the deleted variable would come back and the secret would be
+// gone. Entries with no NAME= prefix carry no identity, so they keep the old
+// positional behaviour rather than failing the save.
+type storedEnvEntry struct {
+	line int
+	node *yaml.Node
+}
+
+func restoreRedactedEnvSequence(candidate, current *yaml.Node) error {
+	stored := make(map[string][]storedEnvEntry)
+	for line, original := range current.Content {
+		name, ok := envEntryName(original.Value)
+		if !ok {
+			continue
+		}
+		stored[name] = append(stored[name], storedEnvEntry{line: line, node: original})
+	}
+	for index, child := range candidate.Content {
+		if child.Kind != yaml.ScalarNode || !strings.Contains(child.Value, "[REDACTED]") {
+			continue
+		}
+		name, ok := envEntryName(child.Value)
+		if !ok {
+			if index < len(current.Content) {
+				*child = *cloneYAMLNode(current.Content[index])
+			}
+			continue
+		}
+		original := takeClosestEnvEntry(stored, name, index)
+		if original == nil {
+			return fmt.Errorf("env: %q carries a redacted value but no stored entry defines %s; re-enter the value instead of sending the placeholder back", child.Value, name)
+		}
+		*child = *cloneYAMLNode(original)
+	}
+	return nil
+}
+
+// envEntryName returns the variable name of a "NAME=value" environment entry.
+func envEntryName(value string) (string, bool) {
+	index := strings.IndexByte(value, '=')
+	if index <= 0 {
+		return "", false
+	}
+	name := strings.TrimSpace(value[:index])
+	if name == "" {
+		return "", false
+	}
+	return name, true
+}
+
+// takeClosestEnvEntry consumes and returns the stored entry nearest to line: a
+// variable defined twice pairs with the occurrence closest to the placeholder,
+// and no stored entry is handed out twice.
+func takeClosestEnvEntry(stored map[string][]storedEnvEntry, name string, line int) *yaml.Node {
+	entries := stored[name]
+	best, bestDistance := -1, 0
+	for index, entry := range entries {
+		distance := entry.line - line
+		if distance < 0 {
+			distance = -distance
+		}
+		if best < 0 || distance < bestDistance {
+			best, bestDistance = index, distance
+		}
+	}
+	if best < 0 {
+		return nil
+	}
+	entry := entries[best].node
+	entries[best] = entries[len(entries)-1]
+	stored[name] = entries[:len(entries)-1]
+	return entry
+}
+
+// hasRedactedScalar reports whether a sequence directly contains a redacted
+// scalar entry, which is the only shape that needs positional pairing.
+func hasRedactedScalar(node *yaml.Node) bool {
+	for _, child := range node.Content {
+		if child.Kind == yaml.ScalarNode && strings.Contains(child.Value, "[REDACTED]") {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *ConfigManager) validatePatchLocked(ctx context.Context, patchJSON []byte) (PatchValidation, error) {
@@ -1334,16 +1451,32 @@ func patchRestartPaths(ops []PatchOp) []string {
 		paths = append(paths, path)
 	}
 	for _, op := range ops {
-		for _, path := range []string{"/store/path", "/runtimeManager/root", "/logToStdout"} {
-			if jsonPointerUnder(op.Path, path) {
+		// The accept-loop limits are applied once at startup, so a patch that
+		// changes them must be reported as needing a daemon restart.
+		//
+		// The overlap test covers both shapes a patch can take: a leaf edit
+		// (/server/maxHeaderBytes) and the settings center's whole-section
+		// replace (/server with an object value). Matching only descendants
+		// would report the section edit as hot-applied while the running
+		// http.Server kept its old limit.
+		for _, path := range []string{"/store/path", "/runtimeManager/root", "/logToStdout", "/server/maxHeaderBytes", "/server/readTimeout"} {
+			if jsonPointerOverlaps(op.Path, path) {
 				add(path)
 			}
-			if (op.Op == "copy" || op.Op == "move") && jsonPointerUnder(op.From, path) {
+			if (op.Op == "copy" || op.Op == "move") && jsonPointerOverlaps(op.From, path) {
 				add(path)
 			}
 		}
 	}
 	return paths
+}
+
+// jsonPointerOverlaps reports whether a patch path and a watched path touch
+// the same subtree. Two pointers overlap when either one is a prefix of the
+// other at a path boundary: replacing "/server" rewrites everything below it,
+// and replacing "/server/maxHeaderBytes" changes part of "/server".
+func jsonPointerOverlaps(path, prefix string) bool {
+	return jsonPointerUnder(path, prefix) || jsonPointerUnder(prefix, path)
 }
 
 func jsonPointerUnder(path, prefix string) bool {
@@ -1886,7 +2019,12 @@ func (m *ConfigManager) ApplyPatch(ctx context.Context, patchJSON []byte, etag s
 	if err := yaml.Unmarshal(effectiveYAML, &restoreDoc); err != nil {
 		return ConfigSnapshot{}, validation, err
 	}
-	restoreRedactedNode(documentRoot(&doc), documentRoot(&restoreDoc), "")
+	// An unresolvable placeholder stops the transaction before the write:
+	// guessing would persist some other entry's secret under this one, and
+	// leaving the placeholder would store the literal "[REDACTED]" as a key.
+	if err := restoreRedactedNode(documentRoot(&doc), documentRoot(&restoreDoc), ""); err != nil {
+		return ConfigSnapshot{}, validation, err
+	}
 	patched, marshalErr := yaml.Marshal(&doc)
 	if marshalErr != nil {
 		// The write below is the irreversible step of this transaction, so a

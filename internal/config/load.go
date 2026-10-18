@@ -88,6 +88,29 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		return Config{}, fmt.Errorf("power: %w", err)
 	}
 
+	// The HTTP accept-loop limits and the failed-key limiter carry defaults
+	// that the zero-value section cannot express. Resolve them before
+	// validation so the effective configuration is what every consumer sees.
+	config.Server = config.Server.Effective()
+	if err = config.Server.Validate(); err != nil {
+		return Config{}, err
+	}
+	config.Security = config.Security.Effective()
+	if err = config.Security.Validate(); err != nil {
+		return Config{}, fmt.Errorf("security: %w", err)
+	}
+	config.Network = config.Network.Effective()
+
+	if err = config.Gateway.Failover.Validate(); err != nil {
+		return Config{}, err
+	}
+	if err = config.Gateway.Cooldown.Validate(); err != nil {
+		return Config{}, err
+	}
+	if err = config.Gateway.SkipSlow.Validate(); err != nil {
+		return Config{}, err
+	}
+
 	if config.StartPort < 1 {
 		return Config{}, fmt.Errorf("startPort must be greater than 1")
 	}

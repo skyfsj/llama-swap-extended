@@ -248,7 +248,15 @@ type Config struct {
 	Anthropic      AnthropicConfig      `yaml:"anthropic"`
 	Audit          AuditConfig          `yaml:"audit"`
 	Pricing        PricingConfig        `yaml:"pricing"`
-	Power          PowerConfig          `yaml:"power" json:"power"`
+	// Network is the outbound proxy policy for every host-side client, plus
+	// the inbound decision about which address counts as the caller.
+	Network NetworkConfig `yaml:"network" json:"network"`
+	// Server tunes the HTTP accept loop and the defensive response headers.
+	Server HTTPServerConfig `yaml:"server" json:"server"`
+	// Security groups request-time protections such as the failed-key
+	// limiter.
+	Security SecurityConfig `yaml:"security" json:"security"`
+	Power    PowerConfig    `yaml:"power" json:"power"`
 }
 
 // UnmarshalYAML accepts both the historical scalar apiKeys list and the

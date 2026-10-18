@@ -1082,3 +1082,93 @@ func TestConfigManagerRollbackUsesNewestBackup(t *testing.T) {
 		t.Fatalf("older backup should not be restored: %s", baseData)
 	}
 }
+
+// TestConfigManagerPatchReportsServerRestartPaths covers both patch shapes: a
+// leaf edit and the settings center's whole-section replace. The section form
+// is the one the UI actually sends, and missing it would report a tightened
+// header limit as hot-applied while the running http.Server kept the old one.
+func TestConfigManagerPatchReportsServerRestartPaths(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+		patch   string
+	}{
+		{
+			name:    "leaf maxHeaderBytes",
+			content: "startPort: 5800\nmodels: {}\nserver:\n  maxHeaderBytes: 65536\n",
+			patch:   `[{"op":"replace","path":"/server/maxHeaderBytes","value":131072}]`,
+		},
+		{
+			name:    "section replace",
+			content: "startPort: 5800\nmodels: {}\nserver:\n  maxHeaderBytes: 65536\n",
+			patch:   `[{"op":"replace","path":"/server","value":{"maxHeaderBytes":131072}}]`,
+		},
+		{
+			name:    "leaf readTimeout",
+			content: "startPort: 5800\nmodels: {}\nserver:\n  readTimeout: 0s\n",
+			patch:   `[{"op":"replace","path":"/server/readTimeout","value":"30s"}]`,
+		},
+		{
+			name:    "section add",
+			content: "startPort: 5800\nmodels: {}\n",
+			patch:   `[{"op":"add","path":"/server","value":{"readTimeout":"30s"}}]`,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "config.yaml")
+			if err := os.WriteFile(path, []byte(c.content), 0600); err != nil {
+				t.Fatal(err)
+			}
+			manager, err := NewConfigManager(path, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			validation, err := manager.ValidatePatch(context.Background(), []byte(c.patch))
+			if err != nil {
+				t.Fatalf("validation error: %v", err)
+			}
+			if !validation.Valid {
+				t.Fatalf("patch rejected: %+v", validation.Issues)
+			}
+			if !validation.RestartRequired {
+				t.Fatalf("RestartRequired=false for %s; the accept loop is built once at startup", c.patch)
+			}
+			wantPrefix := "/server/"
+			found := false
+			for _, reported := range validation.RestartPaths {
+				if strings.HasPrefix(reported, wantPrefix) {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("restart paths %v do not mention %s", validation.RestartPaths, wantPrefix)
+			}
+		})
+	}
+}
+
+// TestConfigManagerPatchLeavesHotFieldsHot keeps the overlap test from
+// over-reporting: an unrelated patch must stay hot-applied.
+func TestConfigManagerPatchLeavesHotFieldsHot(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte("startPort: 5800\nmodels: {}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := NewConfigManager(path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	validation, err := manager.ValidatePatch(context.Background(), []byte(`[{"op":"replace","path":"/startPort","value":5900}]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !validation.Valid {
+		t.Fatalf("patch rejected: %+v", validation.Issues)
+	}
+	if validation.RestartRequired {
+		t.Fatalf("startPort reported as requiring a restart: %v", validation.RestartPaths)
+	}
+}

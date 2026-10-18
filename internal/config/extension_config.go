@@ -1425,6 +1425,9 @@ func (c Config) ValidateExtensionConfig() error {
 			return err
 		}
 	}
+	if err := c.Network.Validate(); err != nil {
+		return err
+	}
 	if err := c.LMCache.Validate(); err != nil {
 		return err
 	}

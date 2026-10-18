@@ -308,6 +308,14 @@ groups:
 			RetentionDays: 90,
 			FlushInterval: time.Minute,
 		},
+		// Loading fills the server and limiter defaults so every consumer
+		// reads the same effective values.
+		Server: HTTPServerConfig{MaxHeaderBytes: DefaultMaxHeaderBytes},
+		Security: SecurityConfig{AuthRateLimit: AuthRateLimitConfig{
+			MaxFailures: DefaultAuthMaxFailures,
+			Window:      DefaultAuthWindow,
+			BlockFor:    DefaultAuthBlockFor,
+		}},
 	}
 
 	assert.Equal(t, expected, config)

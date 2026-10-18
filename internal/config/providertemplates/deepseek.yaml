@@ -1,0 +1,28 @@
+# DeepSeek 官方 API（https://api-docs.deepseek.com/zh-cn/）。
+#
+# 一个账号同时提供两种方言：
+#   OpenAI 兼容        -> /chat/completions
+#   Anthropic 兼容     -> /anthropic/v1/messages
+# 两者都用 "Authorization: Bearer <DeepSeek API Key>"。
+#
+# 额度：DeepSeek 提供 GET /user/balance 查询账户余额（免费、不占用模型并发），
+# 该接口返回的是标量余额而不是百分比窗口，因此 deepseek 额度预设用 extras 渲染，
+# 卡片上直接显示"可调用 / 总余额 / 赠金 / 充值 / 币种"。
+id: deepseek
+name: DeepSeek
+description: DeepSeek 官方 API：OpenAI 兼容与 Anthropic 兼容两种方言，带账户余额额度卡片。
+modelsEndpoint: https://api.deepseek.com/models
+modelsAuth: bearer
+provider:
+  quota:
+    preset: deepseek
+adapters:
+  - name: Messages
+    type: anthropic
+    endpoint: https://api.deepseek.com/anthropic
+    modelMatch: ["deepseek-*"]
+  - name: Chat
+    type: openai
+    endpoint: https://api.deepseek.com
+    default: true
+    modelMatch: ["deepseek-*"]

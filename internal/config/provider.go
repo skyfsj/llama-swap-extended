@@ -2,19 +2,35 @@ package config
 
 import (
 	"fmt"
+	"net/textproto"
 	"net/url"
+	"path"
 	"sort"
 	"strings"
+	"time"
+
+	"golang.org/x/net/http/httpguts"
 )
 
 // ProviderDictionaryConfig maps provider IDs to their upstream definitions.
 type ProviderDictionaryConfig map[string]ProviderConfig
 
-// Provider types. The type controls auth header injection and which client
-// endpoints the provider can serve.
+// Provider types: one API surface each. The type decides both the auth header
+// style and the request dialect, so a client speaking another dialect is
+// converted before forwarding (see ProviderAdapter.Protocol to override).
 const (
-	ProviderTypeOpenAI    = "openai"
+	// ProviderTypeOpenAI is the OpenAI Completions API (/v1/chat/completions).
+	ProviderTypeOpenAI = "openai"
+	// ProviderTypeOpenAIResponses is the OpenAI Responses API (/v1/responses).
+	ProviderTypeOpenAIResponses = "openai-responses"
+	// ProviderTypeAnthropic is the Anthropic Messages API (/v1/messages).
 	ProviderTypeAnthropic = "anthropic"
+	// ProviderTypeGemini is the Google generateContent API (/v1beta/models/...).
+	ProviderTypeGemini = "gemini"
+	// ProviderTypeGeminiInteractions is Google's stateful Interactions API
+	// (/v1beta/interactions): Steps in, an Interaction with a steps[] transcript
+	// and modality-broken-down usage out.
+	ProviderTypeGeminiInteractions = "gemini-interactions"
 )
 
 // ProxyDirect is a sentinel proxy value meaning "bypass all proxies, including
@@ -42,12 +58,108 @@ type ProviderKey struct {
 type ProviderModel struct {
 	Local  string `yaml:"local" json:"local"`
 	Remote string `yaml:"remote" json:"remote"`
+	// Aliases are extra client-facing names for the same upstream model. They
+	// are routable (and accepted in access-key allowlists) exactly like Local
+	// but are not listed separately in /v1/models.
+	Aliases []string `yaml:"aliases" json:"aliases,omitempty"`
+	// Proxy is the outbound proxy for this model only (http/https/socks5/
+	// socks5h URL, or "direct"). It is the most specific level: empty inherits
+	// the adapter, then the credential, then the provider, then the global
+	// network proxy.
+	Proxy string `yaml:"proxy" json:"proxy,omitempty"`
+	// Capabilities declares what the upstream model accepts and produces (the
+	// same block a local model uses). The playground uses it to file the model
+	// under chat, image, speech or translation tooling; an empty declaration
+	// reads as a plain chat model.
+	Capabilities ModelCapConfig `yaml:"capabilities,omitempty" json:"capabilities,omitempty"`
+}
+
+// Names returns the names the model entry declares for clients: the local name
+// first, then its aliases. The upstream name is not part of it — whether it is
+// callable too is a provider-level decision, see ProviderConfig.ModelNames.
+func (m ProviderModel) Names() []string {
+	names := make([]string, 0, 1+len(m.Aliases))
+	names = append(names, m.Local)
+	names = append(names, m.Aliases...)
+	return names
+}
+
+// ModelNames lists every name a client may use for one model entry: the local
+// name, its aliases, and — unless the provider turns it off — the upstream name.
+//
+// Exposing the upstream name keeps the vendor's own name callable when a model
+// is renamed for clients ("downstream may use an alias or the upstream name"),
+// and an entry that sets no local name takes the upstream name anyway. A
+// provider that would rather publish only its own names sets
+// exposeUpstreamName: false.
+func (p ProviderConfig) ModelNames(m ProviderModel) []string {
+	return append(m.Names(), p.UpstreamNames(m)...)
+}
+
+// UpstreamNames lists the upstream name when it is callable and not already
+// declared by the entry (an equal local name, or an alias). The gateway
+// registers these in a final pass, so an already-claimed name must not be
+// returned here: re-registering it would list the same route twice in the
+// bare-name pool and let a request fail over to the provider it just left.
+func (p ProviderConfig) UpstreamNames(m ProviderModel) []string {
+	if !p.ExposesUpstreamName() {
+		return nil
+	}
+	remote := strings.TrimSpace(m.Remote)
+	if remote == "" {
+		return nil
+	}
+	for _, name := range m.Names() {
+		if strings.TrimSpace(name) == remote {
+			return nil
+		}
+	}
+	return []string{remote}
+}
+
+// ExposesUpstreamName reports whether the upstream (remote) name is callable in
+// addition to the local name and the aliases. Unset means yes.
+func (p ProviderConfig) ExposesUpstreamName() bool {
+	return p.ExposeUpstreamName == nil || *p.ExposeUpstreamName
+}
+
+// ProviderAdapter is one upstream API surface of a provider: a dialect, a base
+// endpoint, and the models served there. A provider without an explicit
+// adapters list has a single implicit adapter built from its top-level
+// type/endpoint/models.
+type ProviderAdapter struct {
+	// Name is an optional label for the UI and for error messages.
+	Name string `yaml:"name" json:"name,omitempty"`
+	// Type is the upstream dialect: openai, anthropic or gemini.
+	Type string `yaml:"type" json:"type"`
+	// Endpoint is the base URL for this adapter.
+	Endpoint string `yaml:"endpoint" json:"endpoint"`
+	// Proxy is the outbound proxy for this adapter (http/https/socks5/socks5h
+	// URL, or "direct"). It overrides the credential and provider level;
+	// empty inherits them, and a model-level proxy overrides this.
+	Proxy string `yaml:"proxy" json:"proxy,omitempty"`
+	// PathMap rewrites literal request path prefixes before the path is
+	// appended to the endpoint; the longest matching prefix wins. It exists
+	// for upstreams that expose a dialect under a different path shape.
+	PathMap map[string]string `yaml:"pathMap" json:"pathMap,omitempty"`
+	// Models are the local -> upstream mappings served by this adapter.
+	Models []ProviderModel `yaml:"models" json:"models"`
+	// ApiKeys optionally overrides the provider credentials for this adapter.
+	ApiKeys []ProviderKey `yaml:"apiKeys" json:"-"`
+	// ModelMatch lists glob patterns used to route models pulled from the
+	// upstream model list into this adapter (templates).
+	ModelMatch []string `yaml:"modelMatch" json:"modelMatch,omitempty"`
+	// Default marks the catch-all adapter for pulled models that match no
+	// other adapter's ModelMatch patterns. At most one adapter may set it.
+	Default bool `yaml:"default" json:"default,omitempty"`
 }
 
 // ProviderConfig defines one upstream provider entry.
 type ProviderConfig struct {
-	Type     string `yaml:"type" json:"type"`
-	Endpoint string `yaml:"endpoint" json:"endpoint"`
+	// Type/Endpoint/Models are the single-adapter shorthand. When Adapters is
+	// set they must be empty and the adapters own the endpoints and models.
+	Type     string `yaml:"type" json:"type,omitempty"`
+	Endpoint string `yaml:"endpoint" json:"endpoint,omitempty"`
 	// Proxy is the provider-level outbound proxy (http/https/socks5/socks5h
 	// URL, or "direct"). Key-level proxy overrides it; empty inherits
 	// environment proxies.
@@ -60,6 +172,10 @@ type ProviderConfig struct {
 
 	// Sticky enables session affinity for this provider (default true).
 	Sticky *bool `yaml:"sticky" json:"sticky,omitempty"`
+	// ExposeUpstreamName keeps the upstream model name callable next to the
+	// local name and its aliases. Unset (the default) exposes it; false
+	// publishes only the names this provider declares.
+	ExposeUpstreamName *bool `yaml:"exposeUpstreamName" json:"exposeUpstreamName,omitempty"`
 	// BareNamePolicy controls arbitration for the bare (unqualified) model
 	// name when a local model shares it: "local-first" (default) keeps local
 	// precedence, "provider-first" lets this provider win.
@@ -70,10 +186,64 @@ type ProviderConfig struct {
 
 	Disabled bool `yaml:"disabled" json:"disabled,omitempty"`
 
+	// ModelPrefix is prepended to every model name this provider exposes to
+	// clients (routing and /v1/models). Default "" exposes the bare model ID.
+	// The legacy provider/model form keeps working as a routing alias.
+	ModelPrefix string `yaml:"modelPrefix" json:"modelPrefix,omitempty"`
+
+	// SessionHeaders are request headers set to the session id on upstream
+	// requests: the caller's value when it sent one of the headers listed in
+	// ui.activity.session_id, otherwise a value derived from the conversation
+	// prefix. Empty means no injection.
+	SessionHeaders []string `yaml:"sessionHeaders" json:"sessionHeaders,omitempty"`
+
+	// Headers are static request headers sent upstream. Credential-derived
+	// headers (Authorization, x-api-key, x-goog-api-key) and session headers
+	// are applied afterwards and win.
+	Headers map[string]string `yaml:"headers" json:"headers,omitempty"`
+
+	// Adapters are the provider's upstream API surfaces. Empty means the
+	// provider has one implicit adapter from Type/Endpoint/Models.
+	Adapters []ProviderAdapter `yaml:"adapters" json:"adapters,omitempty"`
+	// Cooldown optionally overrides the gateway-wide cooldown policy for this
+	// provider: inherit (default), enabled (optionally with its own durations)
+	// or disabled (never bench this provider's credentials).
+	Cooldown ProviderCooldownConfig `yaml:"cooldown" json:"cooldown,omitempty"`
+
+	// Quota describes how to read this subscription's usage windows for the
+	// UI (and, when enforce is enabled, for credential scheduling).
+	Quota *QuotaConfig `yaml:"quota" json:"quota,omitempty"`
+	// Template records the provider template this entry was created from. It
+	// is provenance only and does not affect routing.
+	Template string `yaml:"template" json:"template,omitempty"`
+
 	ApiKeys []ProviderKey   `yaml:"apiKeys" json:"-"`
 	Models  []ProviderModel `yaml:"models" json:"models"`
 
 	Timeouts TimeoutsConfig `yaml:"timeouts" json:"timeouts"`
+}
+
+// EffectiveAdapters returns the provider's adapters: the configured list, or a
+// single implicit adapter built from the top-level type/endpoint/models.
+func (p ProviderConfig) EffectiveAdapters() []ProviderAdapter {
+	if len(p.Adapters) > 0 {
+		return p.Adapters
+	}
+	return []ProviderAdapter{{
+		Type:     p.Type,
+		Endpoint: p.Endpoint,
+		Models:   p.Models,
+	}}
+}
+
+// AllModels returns every model the provider serves, flattened across its
+// adapters in configuration order.
+func (p ProviderConfig) AllModels() []ProviderModel {
+	models := make([]ProviderModel, 0, len(p.Models))
+	for _, adapter := range p.EffectiveAdapters() {
+		models = append(models, adapter.Models...)
+	}
+	return models
 }
 
 // StickyEnabled reports whether session affinity is on for this provider.
@@ -90,6 +260,68 @@ func (p ProviderConfig) ResolveProviderKeyProxy(key ProviderKey) string {
 	return p.Proxy
 }
 
+// Provider cooldown policies.
+const (
+	// ProviderCooldownInherit uses the gateway-wide cooldown settings.
+	ProviderCooldownInherit = "inherit"
+	// ProviderCooldownEnabled keeps cooldowns on (optionally with its own
+	// durations).
+	ProviderCooldownEnabled = "enabled"
+	// ProviderCooldownDisabled never benches this provider's credentials: a
+	// failure is recorded for observability and the request still fails over,
+	// but the credential stays schedulable.
+	ProviderCooldownDisabled = "disabled"
+)
+
+// ProviderCooldownConfig is the per-provider cooldown policy. The scalar YAML
+// form sets just the policy ("inherit", "enabled" or "disabled"); the object
+// form also overrides individual durations.
+type ProviderCooldownConfig struct {
+	Policy string `yaml:"policy" json:"policy,omitempty"`
+	// Durations override the gateway-wide values for this provider; empty
+	// inherits. Ignored when Policy is disabled.
+	Auth      string `yaml:"auth" json:"auth,omitempty"`
+	AuthProbe string `yaml:"authProbe" json:"authProbe,omitempty"`
+	RateLimit string `yaml:"rateLimit" json:"rateLimit,omitempty"`
+	Transient string `yaml:"transient" json:"transient,omitempty"`
+}
+
+// UnmarshalYAML accepts the scalar ("disabled") and object forms.
+func (c *ProviderCooldownConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var scalar string
+	if err := unmarshal(&scalar); err == nil {
+		c.Policy = scalar
+		return nil
+	}
+	type rawCooldown ProviderCooldownConfig
+	var raw rawCooldown
+	if err := unmarshal(&raw); err != nil {
+		return fmt.Errorf("provider cooldown must be a policy string or an object: %w", err)
+	}
+	*c = ProviderCooldownConfig(raw)
+	return nil
+}
+
+// Disabled reports whether cooldowns are turned off for this provider.
+func (c ProviderCooldownConfig) Disabled() bool {
+	return strings.EqualFold(strings.TrimSpace(c.Policy), ProviderCooldownDisabled)
+}
+
+func (c *ProviderCooldownConfig) normalize() error {
+	switch policy := strings.ToLower(strings.TrimSpace(c.Policy)); policy {
+	case "":
+		c.Policy = ProviderCooldownInherit
+	case ProviderCooldownInherit, ProviderCooldownEnabled, ProviderCooldownDisabled:
+		c.Policy = policy
+	default:
+		return fmt.Errorf("providers: cooldown policy must be %q, %q or %q, got %q",
+			ProviderCooldownInherit, ProviderCooldownEnabled, ProviderCooldownDisabled, c.Policy)
+	}
+	return GatewayCooldownConfig{
+		Auth: c.Auth, AuthProbe: c.AuthProbe, RateLimit: c.RateLimit, Transient: c.Transient,
+	}.Validate()
+}
+
 // GatewayConfig holds gateway-wide settings.
 type GatewayConfig struct {
 	// StickyTTL is the idle expiry for session affinity entries. Hits slide
@@ -97,24 +329,195 @@ type GatewayConfig struct {
 	StickyTTL string `yaml:"stickyTTL" json:"stickyTTL"`
 	// Cooldown durations per error class.
 	Cooldown GatewayCooldownConfig `yaml:"cooldown" json:"cooldown"`
+	// Failover decides which upstream responses make the gateway continue on
+	// another credential (or another provider serving the same bare model).
+	Failover GatewayFailoverConfig `yaml:"failover" json:"failover"`
+	// SkipSlow drops providers whose first-token latency is known to be much
+	// worse than the alternatives serving the same model.
+	SkipSlow GatewaySkipSlowConfig `yaml:"skipSlow" json:"skipSlow,omitempty"`
+}
+
+// GatewaySkipSlowConfig makes the gateway prefer the provider that answers
+// fastest, instead of only reacting after a slow one has already been tried.
+//
+// Every observation is a real first-token latency measured on this deployment,
+// so the rule adapts to the workload instead of encoding numbers that only fit
+// one machine. The default is the relative rule alone: an absolute ceiling
+// would have to be guessed, and a wrong guess silently removes capacity.
+type GatewaySkipSlowConfig struct {
+	// Enabled turns the behaviour on (default true). False keeps every
+	// provider a candidate regardless of its observed latency.
+	Enabled *bool `yaml:"enabled" json:"enabled,omitempty"`
+	// MaxFirstTokenMs skips a provider whose observed first-token latency
+	// exceeds this many milliseconds. 0 (default) disables the absolute rule,
+	// which is the safer default: the right ceiling depends on the model.
+	MaxFirstTokenMs int `yaml:"maxFirstTokenMs" json:"maxFirstTokenMs,omitempty"`
+	// RelativeFactor skips a provider whose observed first-token latency is
+	// more than this multiple of the fastest candidate's. Default 3.
+	//
+	// A factor, not a difference: 2s vs 6s and 5s vs 15s are the same kind of
+	// gap in practice, and a fixed difference would not express that.
+	RelativeFactor float64 `yaml:"relativeFactor" json:"relativeFactor,omitempty"`
+	// MinSamples is how many measurements a provider needs before its latency
+	// is trusted (default 3). A cold start or one slow request must not be
+	// enough to drop a provider, and the gateway itself resets on reload.
+	MinSamples int `yaml:"minSamples" json:"minSamples,omitempty"`
+}
+
+// Skip-slow defaults.
+const (
+	GatewaySkipSlowDefaultFactor     = 3.0
+	GatewaySkipSlowDefaultMinSamples = 3
+)
+
+// EnabledValue reports whether the behaviour is on. The default is on, and a
+// zero-value config (no skipSlow block at all) is therefore enabled with the
+// relative rule — an operator gets the tuning without having to write it.
+func (c GatewaySkipSlowConfig) EnabledValue() bool {
+	return c.Enabled == nil || *c.Enabled
+}
+
+// EffectiveRelativeFactor applies the default.
+func (c GatewaySkipSlowConfig) EffectiveRelativeFactor() float64 {
+	if c.RelativeFactor == 0 {
+		return GatewaySkipSlowDefaultFactor
+	}
+	return c.RelativeFactor
+}
+
+// EffectiveMinSamples applies the default.
+func (c GatewaySkipSlowConfig) EffectiveMinSamples() int {
+	if c.MinSamples <= 0 {
+		return GatewaySkipSlowDefaultMinSamples
+	}
+	return c.MinSamples
+}
+
+// Validate rejects settings that cannot mean anything, so a typo is reported
+// instead of quietly changing routing.
+func (c GatewaySkipSlowConfig) Validate() error {
+	if c.MaxFirstTokenMs < 0 {
+		return fmt.Errorf("gateway.skipSlow.maxFirstTokenMs must be >= 0")
+	}
+	if c.RelativeFactor < 0 {
+		return fmt.Errorf("gateway.skipSlow.relativeFactor must be >= 0")
+	}
+	if c.MinSamples < 0 {
+		return fmt.Errorf("gateway.skipSlow.minSamples must be >= 0")
+	}
+	if c.Enabled != nil && *c.Enabled && c.MaxFirstTokenMs == 0 && c.RelativeFactor == 0 {
+		// 显式写了 enabled: true 却两个规则都为 0：等于配了但不生效，属于笔误。
+		//
+		// 判据必须是"显式给了 enabled"，不能用零值判断：整个 skipSlow 块缺失时
+		// 得到的也是零值，把它当错误会让每一份既有配置都加载失败——默认开启的
+		// 行为不需要用户写任何东西。
+		return fmt.Errorf("gateway.skipSlow: set maxFirstTokenMs or relativeFactor, or enabled: false")
+	}
+	return nil
+}
+
+// GatewayFailoverConfig tunes the failover decision. Defaults: every 3xx/4xx/5xx
+// response is provider-specific enough to be worth another credential, except
+// 413 (payload too large, which every upstream repeats), and a request may
+// continue on another provider that serves the same bare model name.
+type GatewayFailoverConfig struct {
+	// CrossProvider allows one request to continue on another provider that
+	// serves the same bare model name. Default true. Names qualified with a
+	// provider (provider/model) always stay pinned to that provider.
+	CrossProvider *bool `yaml:"crossProvider" json:"crossProvider,omitempty"`
+	// Statuses replaces the default eligible set, e.g. [429, 500, 502, 503].
+	// Empty keeps the default.
+	Statuses []int `yaml:"statuses" json:"statuses,omitempty"`
+	// ExcludeStatuses removes statuses from the effective set, e.g. [400, 413]
+	// to hand client-input errors straight back.
+	ExcludeStatuses []int `yaml:"excludeStatuses" json:"excludeStatuses,omitempty"`
+}
+
+// Validate rejects impossible failover statuses early so a typo cannot
+// silently disable protection.
+func (f GatewayFailoverConfig) Validate() error {
+	check := func(field string, values []int) error {
+		for _, status := range values {
+			if status < 100 || status > 599 {
+				return fmt.Errorf("gateway.failover.%s: %d is not an HTTP status code", field, status)
+			}
+		}
+		return nil
+	}
+	if err := check("statuses", f.Statuses); err != nil {
+		return err
+	}
+	if err := check("excludeStatuses", f.ExcludeStatuses); err != nil {
+		return err
+	}
+	return nil
+}
+
+// CrossProviderEnabled reports whether failover may switch providers.
+func (f GatewayFailoverConfig) CrossProviderEnabled() bool {
+	return f.CrossProvider == nil || *f.CrossProvider
 }
 
 // GatewayCooldownConfig holds cooldown durations (Go duration strings) for
 // each error class. Empty values use built-in defaults.
 type GatewayCooldownConfig struct {
-	// Auth is applied on 401/403 (default 10m).
+	// Auth is applied on 401/402 (default 10m).
 	Auth string `yaml:"auth" json:"auth"`
+	// AuthProbe is how long the FIRST 401 benches a credential before the full
+	// auth cooldown applies. Upstreams occasionally answer 401 transiently, so
+	// the credential is retried soon; a repeated 401 within the escalation
+	// window (2 minutes) applies Auth instead (default 30s).
+	// Set to "0s" to disable probing: every 401 gets the full Auth cooldown.
+	AuthProbe string `yaml:"authProbe" json:"authProbe,omitempty"`
 	// RateLimit is applied on 429 without a usable Retry-After (default 60s).
 	RateLimit string `yaml:"rateLimit" json:"rateLimit"`
 	// Transient is applied on 5xx/network errors (default 30s).
 	Transient string `yaml:"transient" json:"transient"`
 }
 
-// ProviderModelFQN returns the fully qualified routing name for a provider
-// model. Provider and model IDs may contain slashes; treat the result as an
-// exact configured name.
+// Validate rejects unparsable cooldown durations so a typo cannot silently
+// fall back to the default (which would hide the mistake).
+func (c GatewayCooldownConfig) Validate() error {
+	for _, entry := range []struct {
+		field string
+		value string
+	}{
+		{"auth", c.Auth},
+		{"authProbe", c.AuthProbe},
+		{"rateLimit", c.RateLimit},
+		{"transient", c.Transient},
+	} {
+		raw := strings.TrimSpace(entry.value)
+		if raw == "" {
+			continue
+		}
+		duration, err := time.ParseDuration(raw)
+		if err != nil {
+			return fmt.Errorf("gateway.cooldown.%s: %q is not a duration", entry.field, entry.value)
+		}
+		if duration < 0 {
+			return fmt.Errorf("gateway.cooldown.%s must be >= 0", entry.field)
+		}
+	}
+	return nil
+}
+
+// ProviderModelFQN returns the legacy fully qualified routing name for a
+// provider model. It stays routable as an alias; the client-facing name is
+// ProviderModelName(ModelPrefix, modelID).
 func ProviderModelFQN(providerID, modelID string) string {
 	return providerID + "/" + modelID
+}
+
+// ProviderModelName returns the client-facing name of a provider model: the
+// provider's prefix plus the local model ID (no prefix by default).
+func ProviderModelName(prefix, modelID string) string {
+	return prefix + modelID
+}
+
+// ExposedName returns the client-facing name of one model of this provider.
+func (p ProviderConfig) ExposedName(modelID string) string {
+	return ProviderModelName(p.ModelPrefix, modelID)
 }
 
 // ResolveProviderModel resolves a fully qualified provider model name, or a
@@ -123,27 +526,39 @@ func ProviderModelFQN(providerID, modelID string) string {
 // true and pool lists every provider exposing it (the gateway schedules
 // between them by priority/weight).
 func (c *Config) ResolveProviderModel(search string) (providerID, modelID string, pool []string, found bool) {
+	// poolModels maps a pool member back to its local model ID: with a
+	// modelPrefix the client-facing name differs from the configured ID.
+	poolModels := make(map[string]string)
 	for id, provider := range c.Providers {
 		if provider.Disabled {
 			continue
 		}
 		seen := make(map[string]struct{})
-		for _, model := range provider.Models {
-			if _, duplicate := seen[model.Local]; duplicate {
-				continue
-			}
-			seen[model.Local] = struct{}{}
-			if ProviderModelFQN(id, model.Local) == search {
-				return id, model.Local, nil, true
-			}
-			if model.Local == search {
-				pool = append(pool, id)
+		for _, model := range provider.AllModels() {
+			for _, name := range provider.ModelNames(model) {
+				// Two models of one provider may collapse to the same
+				// client-facing name when a prefix makes them collide; keep the
+				// first.
+				exposed := provider.ExposedName(name)
+				if _, duplicate := seen[exposed]; duplicate {
+					continue
+				}
+				seen[exposed] = struct{}{}
+				if ProviderModelFQN(id, name) == search {
+					return id, model.Local, nil, true
+				}
+				if exposed == search {
+					if _, exists := poolModels[id]; !exists {
+						pool = append(pool, id)
+					}
+					poolModels[id] = model.Local
+				}
 			}
 		}
 	}
 	sort.Strings(pool)
 	if len(pool) == 1 {
-		return pool[0], search, nil, true
+		return pool[0], poolModels[pool[0]], nil, true
 	}
 	if len(pool) > 1 {
 		return "", search, pool, true
@@ -168,21 +583,28 @@ func ValidateProviderNamespace(c Config) error {
 
 	for _, providerID := range providerIDs {
 		seen := make(map[string]struct{})
-		for _, model := range c.Providers[providerID].Models {
-			if _, duplicate := seen[model.Local]; duplicate {
-				continue
-			}
-			seen[model.Local] = struct{}{}
+		provider := c.Providers[providerID]
+		for _, model := range provider.AllModels() {
+			for _, name := range provider.ModelNames(model) {
+				exposed := provider.ExposedName(name)
+				if _, duplicate := seen[exposed]; duplicate {
+					continue
+				}
+				seen[exposed] = struct{}{}
 
-			fqn := ProviderModelFQN(providerID, model.Local)
-			if existing, ok := fqnTargets[fqn]; ok {
-				return fmt.Errorf(
-					"provider model name %q is ambiguous between providers.%s model %q and providers.%s model %q",
-					fqn, existing, model.Local, providerID, model.Local,
-				)
+				fqn := ProviderModelFQN(providerID, name)
+				if existing, ok := fqnTargets[fqn]; ok && existing != providerID {
+					return fmt.Errorf(
+						"provider model name %q is ambiguous between providers.%s and providers.%s",
+						fqn, existing, providerID,
+					)
+				}
+				fqnTargets[fqn] = providerID
+				// Bare-name ownership follows the client-facing name: several
+				// providers may share one (model pool), but it must not clash
+				// with peer model names.
+				bareOwners[exposed] = append(bareOwners[exposed], providerID)
 			}
-			fqnTargets[fqn] = providerID
-			bareOwners[model.Local] = append(bareOwners[model.Local], providerID)
 		}
 	}
 
@@ -238,8 +660,11 @@ func ValidateProviderNamespace(c Config) error {
 
 func (p *ProviderConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	type rawProviderConfig ProviderConfig
+	// Type is deliberately left empty here: an adapter-style provider must not
+	// get the single-adapter default, which would look like both spellings
+	// being configured. normalize() applies the openai default when no
+	// adapters are present.
 	defaults := rawProviderConfig{
-		Type:           ProviderTypeOpenAI,
 		Sticky:         nil,
 		BareNamePolicy: "local-first",
 		MaxRetries:     2,
@@ -284,31 +709,44 @@ func (p *ProviderConfig) normalize() error {
 		}
 	}
 
-	switch p.Type {
-	case ProviderTypeOpenAI, ProviderTypeAnthropic:
-	default:
-		return fmt.Errorf("providers: type must be one of %q or %q, got %q", ProviderTypeOpenAI, ProviderTypeAnthropic, p.Type)
+	if len(p.Adapters) > 0 {
+		// The adapters own the endpoints and models; the single-adapter
+		// shorthand must not also be set (that would silently shadow one of
+		// the two).
+		if p.Type != "" || p.Endpoint != "" || len(p.Models) > 0 {
+			return fmt.Errorf("providers: adapters cannot be combined with top-level type/endpoint/models; move them into the adapter entries")
+		}
+	} else {
+		if p.Type == "" {
+			p.Type = ProviderTypeOpenAI
+		}
+		adapter := ProviderAdapter{Type: p.Type, Endpoint: p.Endpoint, Models: p.Models}
+		if err := p.normalizeAdapter("the provider", &adapter); err != nil {
+			return err
+		}
+		p.Type, p.Endpoint, p.Models = adapter.Type, adapter.Endpoint, adapter.Models
 	}
 
-	endpoint := strings.TrimRight(strings.TrimSpace(p.Endpoint), "/")
-	if endpoint == "" {
-		return fmt.Errorf("providers: endpoint is required")
+	defaults := 0
+	for i := range p.Adapters {
+		label := fmt.Sprintf("adapters[%d]", i)
+		if name := strings.TrimSpace(p.Adapters[i].Name); name != "" {
+			label = fmt.Sprintf("adapter %q", name)
+			p.Adapters[i].Name = name
+		}
+		if err := p.normalizeAdapter(label, &p.Adapters[i]); err != nil {
+			return err
+		}
+		if p.Adapters[i].Default {
+			defaults++
+		}
 	}
-	// Users following the OpenAI SDK convention put the version prefix in the
-	// base URL, but forwarding appends /v1/... paths to this value. Strip one
-	// trailing /v1 so both spellings behave the same.
-	endpoint = strings.TrimSuffix(endpoint, "/v1")
-	parsed, err := url.Parse(endpoint)
-	if err != nil {
-		return fmt.Errorf("providers: invalid endpoint URL (%s): %w", p.Endpoint, err)
+	if defaults > 1 {
+		return fmt.Errorf("providers: at most one adapter may set default: true")
 	}
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return fmt.Errorf("providers: endpoint must use http or https, got %q", parsed.Scheme)
+	if err := validateModelUniqueness(p.EffectiveAdapters()); err != nil {
+		return err
 	}
-	if parsed.Host == "" {
-		return fmt.Errorf("providers: endpoint is missing a host")
-	}
-	p.Endpoint = endpoint
 
 	if p.BareNamePolicy != "local-first" && p.BareNamePolicy != "provider-first" {
 		return fmt.Errorf("providers: bareNamePolicy must be \"local-first\" or \"provider-first\", got %q", p.BareNamePolicy)
@@ -324,52 +762,231 @@ func (p *ProviderConfig) normalize() error {
 		return fmt.Errorf("providers: %w", err)
 	}
 
-	if len(p.ApiKeys) == 0 {
+	if prefix := strings.TrimSpace(p.ModelPrefix); prefix != p.ModelPrefix || strings.ContainsAny(p.ModelPrefix, "/ 	") {
+		return fmt.Errorf("providers: modelPrefix must not contain slashes or whitespace, got %q", p.ModelPrefix)
+	}
+
+	sessionHeaders := make([]string, 0, len(p.SessionHeaders))
+	seenSessionHeaders := make(map[string]struct{}, len(p.SessionHeaders))
+	for _, header := range p.SessionHeaders {
+		header = strings.TrimSpace(header)
+		if header == "" {
+			continue
+		}
+		if !httpguts.ValidHeaderFieldName(header) {
+			return fmt.Errorf("providers: sessionHeaders entry %q is not a valid HTTP header name", header)
+		}
+		canonical := textproto.CanonicalMIMEHeaderKey(header)
+		key := strings.ToLower(canonical)
+		if _, duplicate := seenSessionHeaders[key]; duplicate {
+			continue
+		}
+		seenSessionHeaders[key] = struct{}{}
+		sessionHeaders = append(sessionHeaders, canonical)
+	}
+	p.SessionHeaders = sessionHeaders
+
+	normalizedHeaders := make(map[string]string, len(p.Headers))
+	if err := normalizeStaticHeaders(normalizedHeaders, p.Headers); err != nil {
+		return err
+	}
+	p.Headers = normalizedHeaders
+
+	if err := normalizeProviderKeys(p.ApiKeys, "providers", p); err != nil {
+		return err
+	}
+	if len(p.ApiKeys) == 0 && !p.hasAdapterKeys() {
 		return fmt.Errorf("providers: at least one apiKey is required")
 	}
-	for i := range p.ApiKeys {
-		key := &p.ApiKeys[i]
-		if key.Value == "" && key.ValueEnv == "" {
-			return fmt.Errorf("providers: apiKeys[%d] needs a value or valueEnv", i)
+
+	if len(p.AllModels()) == 0 {
+		return fmt.Errorf("providers: at least one model is required")
+	}
+
+	if err := p.Cooldown.normalize(); err != nil {
+		return err
+	}
+
+	if err := p.Quota.normalize(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// hasAdapterKeys reports whether any adapter carries its own credentials.
+func (p ProviderConfig) hasAdapterKeys() bool {
+	for _, adapter := range p.Adapters {
+		if len(adapter.ApiKeys) > 0 {
+			return true
 		}
-		if key.Weight < 0 || key.Priority < 0 {
-			return fmt.Errorf("providers: apiKeys[%d]: weight and priority must be >= 0", i)
-		}
-		if key.MaxConcurrent < 0 {
-			return fmt.Errorf("providers: apiKeys[%d]: maxConcurrent must be >= 0", i)
-		}
-		if err := validateProxyValue(key.Proxy); err != nil {
-			return fmt.Errorf("providers: apiKeys[%d]: %w", i, err)
-		}
-		// Inherit provider defaults.
-		if key.Weight == 0 {
-			key.Weight = p.Weight
-		}
-		if key.Priority == 0 {
-			key.Priority = p.Priority
+	}
+	return false
+}
+
+// normalizeAdapter validates one adapter in place. The label appears in error
+// messages ("the provider" for the implicit single adapter).
+func (p *ProviderConfig) normalizeAdapter(label string, adapter *ProviderAdapter) error {
+	if adapter.Type == "" {
+		adapter.Type = ProviderTypeOpenAI
+	}
+	switch adapter.Type {
+	case ProviderTypeOpenAI, ProviderTypeOpenAIResponses, ProviderTypeAnthropic, ProviderTypeGemini, ProviderTypeGeminiInteractions:
+	default:
+		return fmt.Errorf("providers: %s: type must be one of %q, %q, %q, %q or %q, got %q",
+			label, ProviderTypeOpenAI, ProviderTypeOpenAIResponses, ProviderTypeAnthropic, ProviderTypeGemini, ProviderTypeGeminiInteractions, adapter.Type)
+	}
+
+	endpoint := strings.TrimRight(strings.TrimSpace(adapter.Endpoint), "/")
+	if endpoint == "" {
+		return fmt.Errorf("providers: %s: endpoint is required", label)
+	}
+	// Users following the OpenAI SDK convention put the version prefix in the
+	// base URL, but forwarding appends /v1/... paths to this value. Strip one
+	// trailing /v1 so both spellings behave the same.
+	endpoint = strings.TrimSuffix(endpoint, "/v1")
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		return fmt.Errorf("providers: %s: invalid endpoint URL (%s): %w", label, adapter.Endpoint, err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("providers: %s: endpoint must use http or https, got %q", label, parsed.Scheme)
+	}
+	if parsed.Host == "" {
+		return fmt.Errorf("providers: %s: endpoint is missing a host", label)
+	}
+	adapter.Endpoint = endpoint
+
+	if err := validateProxyValue(adapter.Proxy); err != nil {
+		return fmt.Errorf("providers: %s: %w", label, err)
+	}
+
+	for from, to := range adapter.PathMap {
+		if !strings.HasPrefix(strings.TrimSpace(from), "/") || !strings.HasPrefix(strings.TrimSpace(to), "/") {
+			return fmt.Errorf("providers: %s: pathMap entries must be path prefixes starting with %q", label, "/")
 		}
 	}
 
-	if len(p.Models) == 0 {
-		return fmt.Errorf("providers: at least one model is required")
+	for i, pattern := range adapter.ModelMatch {
+		pattern = strings.TrimSpace(pattern)
+		if pattern == "" {
+			return fmt.Errorf("providers: %s: modelMatch[%d] is empty", label, i)
+		}
+		if _, err := path.Match(pattern, "probe"); err != nil {
+			return fmt.Errorf("providers: %s: modelMatch[%d] is not a valid glob pattern: %w", label, i, err)
+		}
+		adapter.ModelMatch[i] = pattern
 	}
-	seen := make(map[string]struct{})
-	for i := range p.Models {
-		model := &p.Models[i]
+
+	for i := range adapter.Models {
+		model := &adapter.Models[i]
 		model.Local = strings.TrimSpace(model.Local)
 		model.Remote = strings.TrimSpace(model.Remote)
 		if model.Local == "" {
-			return fmt.Errorf("providers: models[%d] has an empty local name", i)
+			return fmt.Errorf("providers: %s: models[%d] has an empty local name", label, i)
 		}
 		if model.Remote == "" {
 			model.Remote = model.Local
 		}
-		if _, duplicate := seen[model.Local]; duplicate {
-			return fmt.Errorf("providers: duplicate model %q", model.Local)
+		if err := validateProxyValue(model.Proxy); err != nil {
+			return fmt.Errorf("providers: %s: models[%d] (%s): %w", label, i, model.Local, err)
 		}
-		seen[model.Local] = struct{}{}
+		aliases := make([]string, 0, len(model.Aliases))
+		seenAliases := map[string]struct{}{strings.ToLower(model.Local): {}}
+		for _, alias := range model.Aliases {
+			alias = strings.TrimSpace(alias)
+			if alias == "" {
+				continue
+			}
+			key := strings.ToLower(alias)
+			if _, duplicate := seenAliases[key]; duplicate {
+				continue
+			}
+			seenAliases[key] = struct{}{}
+			aliases = append(aliases, alias)
+		}
+		model.Aliases = aliases
 	}
 
+	if err := normalizeProviderKeys(adapter.ApiKeys, fmt.Sprintf("providers: %s", label), p); err != nil {
+		return err
+	}
+	return nil
+}
+
+// normalizeProviderKeys validates credential entries and applies provider
+// defaults for weight/priority.
+func normalizeProviderKeys(keys []ProviderKey, prefix string, provider *ProviderConfig) error {
+	for i := range keys {
+		key := &keys[i]
+		if key.Value == "" && key.ValueEnv == "" {
+			return fmt.Errorf("%s: apiKeys[%d] needs a value or valueEnv", prefix, i)
+		}
+		if key.Weight < 0 || key.Priority < 0 {
+			return fmt.Errorf("%s: apiKeys[%d]: weight and priority must be >= 0", prefix, i)
+		}
+		if key.MaxConcurrent < 0 {
+			return fmt.Errorf("%s: apiKeys[%d]: maxConcurrent must be >= 0", prefix, i)
+		}
+		if err := validateProxyValue(key.Proxy); err != nil {
+			return fmt.Errorf("%s: apiKeys[%d]: %w", prefix, i, err)
+		}
+		// Inherit provider defaults.
+		if key.Weight == 0 {
+			key.Weight = provider.Weight
+		}
+		if key.Priority == 0 {
+			key.Priority = provider.Priority
+		}
+	}
+	return nil
+}
+
+// normalizeStaticHeaders canonicalizes header names in place and rejects names
+// owned by the credential layer, which would otherwise be silently
+// overwritten when the request is forwarded.
+func normalizeStaticHeaders(dst, headers map[string]string) error {
+	for name, value := range headers {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if !httpguts.ValidHeaderFieldName(name) {
+			return fmt.Errorf("providers: headers entry %q is not a valid HTTP header name", name)
+		}
+		canonical := textproto.CanonicalMIMEHeaderKey(name)
+		switch strings.ToLower(canonical) {
+		case "authorization", "x-api-key", "x-goog-api-key", "proxy-authorization":
+			return fmt.Errorf("providers: headers must not set %q; credential headers are managed by the gateway", canonical)
+		}
+		dst[canonical] = value
+	}
+	return nil
+}
+
+// validateModelUniqueness accepts a name declared more than once, in one
+// adapter or across several: a name that appears on two adapters is the same
+// model exposed by two API surfaces (the gateway picks the surface matching the
+// client's dialect), and a name that appears twice inside one adapter resolves
+// to the model that declares it as its own name before any alias claims it.
+// Duplicates are resolved when routes are built, not rejected here.
+func validateModelUniqueness(adapters []ProviderAdapter) error {
+	for _, adapter := range adapters {
+		for _, model := range adapter.Models {
+			if err := model.Capabilities.Validate(); err != nil {
+				return fmt.Errorf("providers: model %q: %w", model.Local, err)
+			}
+			for _, name := range model.Names() {
+				if strings.TrimSpace(name) == "" {
+					label := adapter.Name
+					if label == "" {
+						label = adapter.Type
+					}
+					return fmt.Errorf("providers: adapter %q declares an empty model name", label)
+				}
+			}
+		}
+	}
 	return nil
 }
 

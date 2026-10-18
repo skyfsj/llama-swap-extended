@@ -1,0 +1,35 @@
+# OpenCode Go / Go Plus subscription usage.
+#
+# GET <endpoint> with the subscription key returns rolling (5 hour), weekly and
+# monthly usage windows:
+#   {"usage":{"rolling":{"status":"ok","percent":0,"resetsAt":"..."}, ...}}
+# percent is the USED share of the window (0-100).
+id: opencode-go
+name: OpenCode Go
+endpoint: https://opencode.ai/inference/go/v1/usage
+method: GET
+auth:
+  style: bearer
+timeoutSeconds: 15
+windows:
+  - id: rolling
+    label: 5-hour
+    path: usage.rolling
+    percent: percent
+    percentMode: used
+    status: status
+    resetsAt: resetsAt
+  - id: weekly
+    label: Weekly
+    path: usage.weekly
+    percent: percent
+    percentMode: used
+    status: status
+    resetsAt: resetsAt
+  - id: monthly
+    label: Monthly
+    path: usage.monthly
+    percent: percent
+    percentMode: used
+    status: status
+    resetsAt: resetsAt

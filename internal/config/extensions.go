@@ -22,7 +22,20 @@ type ExtensionsConfig struct {
 	// retention in days. Zero values take the defaults (100 MiB / 7 days).
 	LogMaxDiskMiB int `yaml:"logMaxDiskMiB" json:"logMaxDiskMiB"`
 	LogRetainDays int `yaml:"logRetainDays" json:"logRetainDays"`
+	// MaxContinuationMiB bounds the record llama-swap keeps for a round whose
+	// model called both an extension's server tool and a caller-run tool on a
+	// surface that cannot show the caller the server call. The record describes
+	// that one round (its calls, plus a result an interceptor already produced),
+	// not the conversation; past it the caller's calls of the round are reported
+	// to the model as failed tool results instead of failing the turn. Zero takes
+	// DefaultMaxContinuationMiB.
+	MaxContinuationMiB int `yaml:"maxContinuationMiB" json:"maxContinuationMiB"`
 }
+
+// DefaultMaxContinuationMiB is the swaputil.MaxRequestBodySize limit expressed
+// in MiB: a continuation record holds a request the gateway already accepted,
+// so the default cannot be the reason a servable conversation is refused.
+const DefaultMaxContinuationMiB = 64
 
 func (c ExtensionsConfig) EffectiveLogMaxDiskMiB() int {
 	if c.LogMaxDiskMiB <= 0 {
@@ -73,9 +86,22 @@ func (c ExtensionsConfig) EffectiveStorageEphemeralTTL() int {
 	return c.StorageEphemeralTTL
 }
 
+// EffectiveMaxContinuationBytes resolves the continuation record ceiling in
+// bytes. Zero (or a negative value, which validation rejects) takes the
+// default.
+func (c ExtensionsConfig) EffectiveMaxContinuationBytes() int {
+	if c.MaxContinuationMiB <= 0 {
+		return DefaultMaxContinuationMiB << 20
+	}
+	return c.MaxContinuationMiB << 20
+}
+
 func (c ExtensionsConfig) Validate() error {
 	if c.MaxToolRounds < 0 || c.MaxToolRounds > 16 {
 		return fmt.Errorf("extensions.maxToolRounds must be between 1 and 16")
+	}
+	if c.MaxContinuationMiB < 0 || c.MaxContinuationMiB > 1024 {
+		return fmt.Errorf("extensions.maxContinuationMiB must be between 0 and 1024")
 	}
 	if !c.Enabled {
 		return nil

@@ -1,0 +1,45 @@
+# OpenCode Go / Go Plus subscription (https://opencode.ai/v2/docs/console/go/).
+#
+# One subscription exposes four API surfaces under a shared base URL:
+#   OpenAI Responses  -> /v1/responses
+#   Anthropic Messages-> /v1/messages
+#   OpenAI-compatible -> /v1/chat/completions
+#   Google (Gemini)    -> /v1beta/models/{model}:generateContent
+# All of them take "Authorization: Bearer <key>"; the docs ask clients to send a
+# stable conversation id in x-opencode-session.
+#
+# Model lists are pulled when the template is applied (https://opencode.ai/inference/go/v1/models
+# is public and lists every model without surface metadata), so routing to the
+# right adapter uses the modelMatch globs below.
+id: opencode-go
+name: OpenCode Go
+description: OpenCode Go / Go Plus subscription with OpenAI, Anthropic and Google API surfaces.
+modelsEndpoint: https://opencode.ai/inference/go/v1/models
+modelsAuth: none
+provider:
+  sessionHeaders: [x-opencode-session]
+  quota:
+    preset: opencode-go
+adapters:
+  - name: Responses
+    type: openai-responses
+    endpoint: https://opencode.ai/inference/go
+    modelMatch: ["grok-*", "gpt-*", "muse-spark-*"]
+  - name: Messages
+    type: anthropic
+    endpoint: https://opencode.ai/inference/go
+    modelMatch: ["claude-*", "minimax-*", "qwen3.6-*", "qwen3.7-*", "qwen3.8-*"]
+  - name: Google
+    type: gemini
+    endpoint: https://opencode.ai/inference/go
+    # The docs expose the Gemini surface at /v1/models/{model}:generateContent
+    # while Google SDKs request /v1beta/models/...; rewrite the prefix.
+    pathMap: {"/v1beta/models/": "/v1/models/"}
+    modelMatch: ["gemini-*"]
+  - name: Chat
+    type: openai
+    endpoint: https://opencode.ai/inference/go
+    default: true
+    # Catch-all: new and unclassified models land on the OpenAI-compatible
+    # chat surface.
+    modelMatch: ["glm-*", "kimi-*", "longcat-*", "deepseek-*", "mimo-*", "hy*", "space-*", "omen-*", "step-*", "cat-*"]

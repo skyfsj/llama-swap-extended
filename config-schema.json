@@ -1162,11 +1162,63 @@
     "apiKeys": {
       "type": "array",
       "items": {
-        "type": "string",
-        "minLength": 1
+        "anyOf": [
+          {
+            "type": "string",
+            "minLength": 1
+          },
+          {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Stable identifier for the key. Derived from the secret when omitted."
+              },
+              "name": {
+                "type": "string",
+                "description": "Human readable label shown in the control plane."
+              },
+              "key": {
+                "type": "string",
+                "minLength": 1,
+                "description": "The secret itself. Also accepted as value or secret."
+              },
+              "value": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Alias of key."
+              },
+              "secret": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Alias of key."
+              },
+              "scopes": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Scopes granted to the key. Defaults to inference only."
+              },
+              "models": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Model IDs the key may call. Empty means every model."
+              },
+              "expiresAt": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Optional expiration time."
+              }
+            },
+            "additionalProperties": true
+          }
+        ]
       },
       "default": [],
-      "description": "Require an API key when making requests to inference endpoints. When empty, authorization will not be checked. Each key is a non-empty string."
+      "description": "Require an API key when making requests to inference endpoints. When empty, authorization will not be checked. Each entry is either a non-empty string (full legacy admin) or an object with key/name/scopes/models. Secrets are hashed into the SQLite store at startup."
     },
     "peers": {
       "type": "object",
@@ -1262,24 +1314,25 @@
       "additionalProperties": {
         "type": "object",
         "required": [
-          "endpoint",
-          "apiKeys",
-          "models"
+          "apiKeys"
         ],
         "properties": {
           "type": {
             "type": "string",
             "enum": [
               "openai",
-              "anthropic"
+              "openai-responses",
+              "anthropic",
+              "gemini",
+              "gemini-interactions"
             ],
             "default": "openai",
-            "description": "Upstream API protocol. openai injects Authorization: Bearer; anthropic injects x-api-key and anthropic-version headers."
+            "description": "Upstream API protocol of the single-adapter shorthand. openai injects Authorization: Bearer; openai-responses speaks /v1/responses; anthropic injects x-api-key and anthropic-version headers; gemini injects x-goog-api-key and serves /v1beta/models/{model}:generateContent paths; gemini-interactions serves /v1beta/interactions (Steps in, an Interaction with steps[] and modality usage out). Must be empty when adapters are configured."
           },
           "endpoint": {
             "type": "string",
             "format": "uri",
-            "description": "Base URL of the upstream API, e.g. https://api.deepseek.com. Request paths are appended to it."
+            "description": "Base URL of the single-adapter shorthand, e.g. https://api.deepseek.com. Request paths are appended to it. Must be empty when adapters are configured."
           },
           "proxy": {
             "type": "string",
@@ -1302,6 +1355,11 @@
             "default": true,
             "description": "Enable session affinity: requests with the same session identifier stick to the same key."
           },
+          "exposeUpstreamName": {
+            "type": "boolean",
+            "default": true,
+            "description": "Keep the upstream model name callable next to the local name and its aliases. Default true: a client may use an alias or the name the vendor itself uses, so renaming a model never takes the vendor name away. Set false to publish only the names this provider declares."
+          },
           "bareNamePolicy": {
             "type": "string",
             "enum": [
@@ -1321,6 +1379,415 @@
             "type": "boolean",
             "default": false,
             "description": "Manually disable this provider. Disabled providers do not serve requests and are excluded from /v1/models."
+          },
+          "sessionHeaders": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "description": "Request headers set to the session id on upstream requests. The caller's session id (the first non-empty header listed in ui.activity.session_id) is passed through when present; otherwise a value derived from the conversation prefix is used."
+          },
+          "headers": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Static request headers sent upstream. Credential headers (Authorization, x-api-key, x-goog-api-key) and session headers are managed by the gateway and cannot be set here."
+          },
+          "adapters": {
+            "type": "array",
+            "minItems": 1,
+            "description": "Upstream API surfaces of one provider. Each adapter carries its own dialect, endpoint and model list; configure several for a subscription that exposes multiple APIs (e.g. OpenAI-compatible, Anthropic and Google surfaces of one plan). When set, the top-level type/endpoint/models must be empty.",
+            "items": {
+              "type": "object",
+              "required": [
+                "type",
+                "endpoint"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "description": "Optional label used by the UI and in error messages, e.g. \"Chat\" or \"Google\"."
+                },
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "openai",
+                    "openai-responses",
+                    "anthropic",
+                    "gemini",
+                    "gemini-interactions"
+                  ],
+                  "default": "openai",
+                  "description": "The upstream API surface: openai (Completions, /v1/chat/completions), openai-responses (/v1/responses), anthropic (/v1/messages) or gemini (/v1beta/models/...). It decides both the auth header style and the request dialect; a client speaking another dialect is converted into this one before forwarding."
+                },
+                "endpoint": {
+                  "type": "string",
+                  "format": "uri",
+                  "description": "Base URL of this adapter. Request paths are appended to it."
+                },
+                "proxy": {
+                  "type": "string",
+                  "description": "Outbound proxy for this adapter: http/https/socks5/socks5h URL, or the literal 'direct' to bypass all proxies. Overrides the credential and provider level; a model-level proxy overrides this one."
+                },
+                "pathMap": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "description": "Literal request-path prefix rewrites applied before forwarding; the longest matching prefix wins. Example: {\"/v1beta/models/\": \"/v1/models/\"} for an upstream that serves the Gemini dialect under /v1."
+                },
+                "modelMatch": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Glob patterns (e.g. \"grok-*\") used to route models pulled from a template's model list into this adapter."
+                },
+                "default": {
+                  "type": "boolean",
+                  "default": false,
+                  "description": "Marks the catch-all adapter for pulled models that match no other adapter's modelMatch patterns. At most one adapter may set it."
+                },
+                "apiKeys": {
+                  "type": "array",
+                  "minItems": 1,
+                  "description": "Optional credential override for this adapter; empty inherits the provider apiKeys.",
+                  "items": {
+                    "oneOf": [
+                      {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "value": {
+                            "type": "string",
+                            "description": "The API key value. Omitted from config JSON output."
+                          },
+                          "valueEnv": {
+                            "type": "string",
+                            "description": "Environment variable holding the key value."
+                          },
+                          "weight": {
+                            "type": "integer",
+                            "minimum": 0
+                          },
+                          "priority": {
+                            "type": "integer",
+                            "minimum": 0
+                          },
+                          "maxConcurrent": {
+                            "type": "integer",
+                            "minimum": 0
+                          },
+                          "proxy": {
+                            "type": "string"
+                          },
+                          "disabled": {
+                            "type": "boolean"
+                          }
+                        },
+                        "additionalProperties": false
+                      }
+                    ]
+                  }
+                },
+                "models": {
+                  "type": "array",
+                  "description": "Models served by this adapter (local -> upstream name).",
+                  "items": {
+                    "oneOf": [
+                      {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "local": {
+                            "type": "string",
+                            "minLength": 1
+                          },
+                          "remote": {
+                            "type": "string"
+                          },
+                          "aliases": {
+                            "type": "array",
+                            "items": {
+                              "type": "string",
+                              "minLength": 1
+                            },
+                            "description": "Extra client-facing names for the same upstream model. They route (and satisfy access-key allowlists) exactly like local, but are not listed separately in /v1/models."
+                          },
+                          "proxy": {
+                            "type": "string",
+                            "description": "Outbound proxy for this model only: http/https/socks5/socks5h URL, or the literal 'direct'. The most specific level; empty inherits the adapter, then the credential, then the provider, then the global network proxy."
+                          },
+                          "capabilities": {
+                            "type": "object",
+                            "description": "What the upstream model accepts and produces. The playground files provider models by it: in/out modalities decide chat, image, speech and transcription tooling (text->image is image generation), translation marks a translation model.",
+                            "properties": {
+                              "in": {
+                                "type": "array",
+                                "items": {
+                                  "type": "string",
+                                  "enum": [
+                                    "text",
+                                    "audio",
+                                    "image",
+                                    "video"
+                                  ]
+                                }
+                              },
+                              "out": {
+                                "type": "array",
+                                "items": {
+                                  "type": "string",
+                                  "enum": [
+                                    "text",
+                                    "audio",
+                                    "image",
+                                    "video"
+                                  ]
+                                }
+                              },
+                              "tools": {
+                                "type": "boolean"
+                              },
+                              "reranker": {
+                                "type": "boolean"
+                              },
+                              "translation": {
+                                "type": "boolean"
+                              },
+                              "context": {
+                                "type": "integer",
+                                "minimum": 0
+                              }
+                            },
+                            "additionalProperties": false
+                          }
+                        },
+                        "required": [
+                          "local"
+                        ],
+                        "additionalProperties": false
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          },
+          "cooldown": {
+            "description": "Per-provider cooldown policy: \"inherit\" (default) uses the gateway-wide settings, \"enabled\" keeps cooldowns (optionally with this provider's own durations), \"disabled\" never benches this provider's credentials (failures are still recorded and requests still fail over).",
+            "oneOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "inherit",
+                  "enabled",
+                  "disabled"
+                ]
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "policy": {
+                    "type": "string",
+                    "enum": [
+                      "inherit",
+                      "enabled",
+                      "disabled"
+                    ],
+                    "default": "inherit"
+                  },
+                  "auth": {
+                    "type": "string",
+                    "description": "Override the auth cooldown (Go duration), e.g. 30s."
+                  },
+                  "authProbe": {
+                    "type": "string",
+                    "description": "Override how long the first 401 benches a key (Go duration, 0s disables probing)."
+                  },
+                  "rateLimit": {
+                    "type": "string",
+                    "description": "Override the 429 cooldown (Go duration)."
+                  },
+                  "transient": {
+                    "type": "string",
+                    "description": "Override the 5xx/network cooldown (Go duration)."
+                  }
+                }
+              }
+            ]
+          },
+          "modelPrefix": {
+            "type": "string",
+            "description": "Prefix prepended to every model name this provider exposes in /v1/models and for routing (e.g. \"go-\" turns glm-5.1 into go-glm-5.1). Empty (the default) exposes the bare model ID. The legacy provider/model form keeps working as a routing alias. Two providers may expose the same name on purpose: the gateway pools them."
+          },
+          "template": {
+            "type": "string",
+            "description": "Provider template this entry was created from (provenance only; it does not affect routing)."
+          },
+          "quota": {
+            "type": "object",
+            "description": "Subscription usage mapping. The gateway queries each credential's own plan endpoint and the UI shows the resulting windows as quota cards. Use a built-in preset, spell the mapping out inline, or mix both (inline values win).",
+            "additionalProperties": false,
+            "properties": {
+              "preset": {
+                "type": "string",
+                "description": "Built-in usage mapping id (see the server's quota presets, e.g. opencode-go)."
+              },
+              "endpoint": {
+                "type": "string",
+                "format": "uri",
+                "description": "Absolute URL polled for usage data. Required unless a preset supplies it."
+              },
+              "method": {
+                "type": "string",
+                "enum": [
+                  "GET"
+                ],
+                "default": "GET"
+              },
+              "auth": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "style": {
+                    "type": "string",
+                    "enum": [
+                      "bearer",
+                      "header",
+                      "none"
+                    ],
+                    "default": "bearer",
+                    "description": "How the credential is presented: Authorization: Bearer (default), a custom header, or nothing."
+                  },
+                  "header": {
+                    "type": "string",
+                    "description": "Header name used when style is \"header\"."
+                  }
+                }
+              },
+              "headers": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "description": "Extra request headers for the quota request."
+              },
+              "timeoutSeconds": {
+                "type": "integer",
+                "minimum": 0,
+                "default": 15
+              },
+              "refreshInterval": {
+                "type": "string",
+                "description": "Background refresh cadence (Go duration, minimum 30s). Empty means manual refresh only; enabling enforce without an interval defaults to 5m."
+              },
+              "windows": {
+                "type": "array",
+                "minItems": 1,
+                "description": "Usage windows shown in order, each mapped out of the response with a gjson path.",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "id",
+                    "path"
+                  ],
+                  "additionalProperties": false,
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "description": "Window identifier (rolling, weekly, monthly, ...). Known ids get a localized label; others use label."
+                    },
+                    "label": {
+                      "type": "string",
+                      "description": "Display fallback when the id has no translation."
+                    },
+                    "path": {
+                      "type": "string",
+                      "description": "gjson path to the window object, e.g. usage.rolling."
+                    },
+                    "percent": {
+                      "type": "string",
+                      "default": "percent",
+                      "description": "Field (relative to path) holding the percentage."
+                    },
+                    "percentMode": {
+                      "type": "string",
+                      "enum": [
+                        "used",
+                        "remaining"
+                      ],
+                      "default": "used",
+                      "description": "Whether the percentage is the used share (default) or the remaining share."
+                    },
+                    "status": {
+                      "type": "string",
+                      "description": "Optional field holding a status string, e.g. ok / rate-limited."
+                    },
+                    "resetsAt": {
+                      "type": "string",
+                      "description": "Optional field holding the window reset timestamp (RFC3339)."
+                    }
+                  }
+                }
+              },
+              "extras": {
+                "type": "array",
+                "description": "Additional scalar rows shown next to the windows (credit balance, counters, ...).",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "id",
+                    "path"
+                  ],
+                  "additionalProperties": false,
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "label": {
+                      "type": "string"
+                    },
+                    "path": {
+                      "type": "string"
+                    }
+                  }
+                }
+              },
+              "enforce": {
+                "type": "object",
+                "description": "Optionally park a credential whose usage window is full. Disabled by default: quota is observability unless enabled here.",
+                "additionalProperties": false,
+                "properties": {
+                  "enabled": {
+                    "type": "boolean",
+                    "default": false
+                  },
+                  "threshold": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100,
+                    "default": 100,
+                    "description": "Used percentage at or above which the credential is parked."
+                  },
+                  "fallbackCooldown": {
+                    "type": "string",
+                    "default": "5m0s",
+                    "description": "Park duration used when the full window carries no reset timestamp."
+                  }
+                }
+              }
+            }
           },
           "apiKeys": {
             "type": "array",
@@ -1472,6 +1939,62 @@
           "default": "1h",
           "description": "Idle expiry for provider session-affinity entries. A hit slides the expiry forward (Go duration, e.g. 30m, 1h)."
         },
+        "failover": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Which upstream responses make the gateway continue on another credential (or another provider serving the same bare model name) before the client sees the error.",
+          "properties": {
+            "crossProvider": {
+              "type": "boolean",
+              "default": true,
+              "description": "Allow one request to continue on another provider that serves the same bare model name. A provider-qualified name (provider/model) always stays pinned to that provider."
+            },
+            "statuses": {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              },
+              "description": "Replace the default failover set (every 3xx/4xx/5xx except 413). Example: [429, 500, 502, 503]."
+            },
+            "excludeStatuses": {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              },
+              "description": "Remove statuses from the effective set, e.g. [400, 413] to hand client-input errors straight back."
+            }
+          }
+        },
+        "skipSlow": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Prefer the provider that answers fastest: a provider whose measured first-token latency is far worse than the alternatives serving the same model is passed over. The measurements are taken from this deployment's own traffic, so the rule adapts to the workload. Skipping only happens when another candidate is available and trusted, so a lone provider, a cold start and a reload are never affected.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true,
+              "description": "Turn the behaviour off to keep every provider a candidate regardless of latency."
+            },
+            "maxFirstTokenMs": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "description": "Skip a provider whose smoothed first-token latency exceeds this many milliseconds. 0 (default) leaves this rule off, since the right ceiling depends on the model."
+            },
+            "relativeFactor": {
+              "type": "number",
+              "minimum": 0,
+              "default": 3,
+              "description": "Skip a provider slower than the fastest candidate by this multiple (default 3). A factor rather than a difference, so 2s vs 6s and 5s vs 15s count the same."
+            },
+            "minSamples": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 3,
+              "description": "How many measurements a provider needs before its latency is trusted (default 3). Fewer samples always fail open, so a cold start or one slow request cannot drop a provider."
+            }
+          }
+        },
         "cooldown": {
           "type": "object",
           "properties": {
@@ -1481,7 +2004,15 @@
                 "integer"
               ],
               "default": "10m",
-              "description": "Cooldown applied to a key after a 401/403 response (Go duration)."
+              "description": "Cooldown applied to a key after a 401/402 response (Go duration). The first 401 only benches for authProbe so a transient upstream hiccup self-heals; a repeated 401 within two minutes escalates to this value. 402 keeps the full cooldown immediately, and a 403 is treated as a model/region policy rejection: it fails over without benching the key."
+            },
+            "authProbe": {
+              "type": [
+                "string",
+                "integer"
+              ],
+              "default": "30s",
+              "description": "How long the FIRST 401 benches a key (Go duration). Set to 0s to disable probing: every 401 gets the full auth cooldown."
             },
             "rateLimit": {
               "type": [
@@ -1610,6 +2141,12 @@
           "minimum": 1,
           "maximum": 16,
           "default": 4
+        },
+        "maxContinuationMiB": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1024,
+          "default": 64
         }
       },
       "additionalProperties": false
@@ -1639,6 +2176,38 @@
           "type": "boolean",
           "default": false,
           "description": "Queue model loads when the runtime is busy instead of rejecting the load."
+        }
+      }
+    },
+    "network": {
+      "type": "object",
+      "description": "Outbound proxy policy for every host-side client and child process: model downloads, pricing refresh, runtime metadata, extension fetches, provider fallbacks, and the package managers runtime builds run. The section also decides which address counts as the caller for API-key IP allowlists and audit rows.",
+      "properties": {
+        "proxy": {
+          "type": "string",
+          "default": "",
+          "description": "Proxy URL: http(s)://, socks5:// or socks5h:// (credentials allowed). 'direct' or 'none' forces direct connections, ignoring the process environment. Empty follows HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY."
+        },
+        "noProxy": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Hosts that bypass the proxy. An exact host or a leading-dot domain suffix matches that domain and its subdomains; '*' disables proxying entirely."
+        },
+        "trustForwardedFor": {
+          "type": "boolean",
+          "default": false,
+          "description": "Trust X-Forwarded-For / X-Real-IP when resolving the caller address. Enable only when every request arrives through a reverse proxy you control: a direct client could otherwise claim any address and defeat the per-key allowedIps allowlist. When false (the default) the TCP peer address is always used."
+        },
+        "trustedProxies": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Peer addresses or CIDR blocks allowed to supply forwarding headers (for example 127.0.0.1/32 or 10.0.0.0/8). Requires trustForwardedFor: true. Empty means any peer, which is only safe when the listener is reachable solely through the proxy."
         }
       }
     },
@@ -2051,6 +2620,63 @@
                 "maximum": 1,
                 "description": "Default GPU memory utilization (0-1) for vLLM models that do not pin it."
               }
+            }
+          }
+        }
+      }
+    },
+    "server": {
+      "type": "object",
+      "description": "HTTP accept-loop limits and defensive response headers. Timeouts that would cut a streaming response are intentionally absent.",
+      "properties": {
+        "maxHeaderBytes": {
+          "type": "integer",
+          "default": 65536,
+          "minimum": 4096,
+          "maximum": 1048576,
+          "description": "Upper bound on the request line plus headers. Defaults to 64 KiB, well below Go's 1 MiB default."
+        },
+        "readTimeout": {
+          "type": "string",
+          "default": "0s",
+          "description": "Bounds reading one complete request. 0 disables it so a large payload on a slow link is not cut off."
+        },
+        "securityHeaders": {
+          "type": "boolean",
+          "default": true,
+          "description": "Emit X-Content-Type-Options, X-Frame-Options, Referrer-Policy, Permissions-Policy and, for the UI, a Content-Security-Policy. Set false only when a fronting proxy already supplies them."
+        }
+      }
+    },
+    "security": {
+      "type": "object",
+      "description": "Request-time protections.",
+      "properties": {
+        "authRateLimit": {
+          "type": "object",
+          "description": "Throttle failed credential checks per caller address. A success clears the counter.",
+          "properties": {
+            "disabled": {
+              "type": "boolean",
+              "default": false,
+              "description": "Turn the limiter off."
+            },
+            "maxFailures": {
+              "type": "integer",
+              "default": 10,
+              "minimum": 1,
+              "maximum": 100000,
+              "description": "Failed checks allowed inside window before blockFor starts."
+            },
+            "window": {
+              "type": "string",
+              "default": "1m",
+              "description": "Sliding window the failures are counted over."
+            },
+            "blockFor": {
+              "type": "string",
+              "default": "5m",
+              "description": "How long a caller is rejected once the limit is reached."
             }
           }
         }

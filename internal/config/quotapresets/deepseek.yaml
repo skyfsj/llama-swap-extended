@@ -1,0 +1,37 @@
+# DeepSeek 账户余额。
+#
+#   GET https://api.deepseek.com/user/balance
+#   Authorization: Bearer <DeepSeek API Key>
+#
+#   {"is_available":true,
+#    "balance_infos":[{"currency":"CNY","total_balance":"110.00",
+#                      "granted_balance":"10.00","topped_up_balance":"100.00"}]}
+#
+# 余额是标量而不是百分比窗口，所以整份映射都用 extras 表达：卡片上直接列出
+# "是否可调用 / 总余额 / 赠金 / 充值"四行。balance_infos 是数组，用 gjson 的
+# 下标路径取值（balance_infos.0.…）。
+#
+# 该接口免费且不占用搜索/抓取的 QPS，因此适合放进额度卡片随时刷新。
+id: deepseek
+name: DeepSeek
+endpoint: https://api.deepseek.com/user/balance
+method: GET
+auth:
+  style: bearer
+timeoutSeconds: 15
+extras:
+  - id: available
+    label: 可调用
+    path: is_available
+  - id: total
+    label: 总余额
+    path: balance_infos.0.total_balance
+  - id: granted
+    label: 赠金余额
+    path: balance_infos.0.granted_balance
+  - id: topped_up
+    label: 充值余额
+    path: balance_infos.0.topped_up_balance
+  - id: currency
+    label: 币种
+    path: balance_infos.0.currency

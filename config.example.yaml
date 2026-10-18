@@ -284,6 +284,13 @@ apiKeys:
 # SQLite store and are never returned by the control API after startup. The
 # scalar form above retains full legacy-admin permissions; structured entries
 # should declare only the scopes they need.
+#
+# This section is the source of truth for the keys it declares: saving the file
+# adds and updates them, and removing an entry revokes that key (and the access
+# keys nested under it) on the next reload, without a restart. Keys created on
+# the API keys page are not touched. A deployment whose store already holds
+# keys always needs one that can sign in, so the file cannot remove the last
+# management key; the save is rejected and the file rolled back instead.
 # apiKeys:
 #   - key: "${env.INFERENCE_KEY}"
 #     name: "automation"
@@ -1313,6 +1320,60 @@ peers:
           data_collection: "deny"
           zdr: true
 
+# network: outbound proxy policy and, optionally, reverse-proxy trust
+# - optional
+# - the proxy settings are described in docs/configuration.md
+# - trustForwardedFor: honour X-Forwarded-For / X-Real-IP when resolving the
+#   caller address
+#   - default: false, the TCP peer address is always used
+#   - enable only when every request arrives through a reverse proxy you
+#     control; a direct client could otherwise claim any address and defeat
+#     the per-key allowedIps allowlist
+# - trustedProxies: peer addresses or CIDR blocks allowed to supply those
+#   headers; requires trustForwardedFor: true
+#   - empty uses only the right-most hop (the address the directly connected
+#     proxy appended), which is the safe single-switch form
+#   - if that appended hop is not a valid address (some proxies write
+#     "unknown"), the whole X-Forwarded-For value is ignored and the connection
+#     address is used
+#   - X-Real-IP is only a fallback when X-Forwarded-For yields no address, so
+#     the proxy must overwrite it rather than pass a client value through
+#   - set it when several proxies forward to each other, so trusted hops are
+#     skipped and the first untrusted address is reported
+# network:
+#   proxy: http://proxy.example.com:3128
+#   noProxy:
+#     - localhost
+#     - .corp.example.com
+#   trustForwardedFor: true
+#   trustedProxies:
+#     - 127.0.0.1/32
+#     - 10.0.0.0/8
+
+# server: HTTP accept-loop limits and defensive response headers
+# - optional
+# - maxHeaderBytes: request line + headers, default 65536 (4 KiB - 1 MiB)
+# - readTimeout: bounds reading one complete request; default 0s disables it
+#   so a large payload arriving over a slow link is not cut off
+# - securityHeaders: emit nosniff, frame denial, referrer policy, permissions
+#   policy and (for the UI) a content security policy; default true
+# server:
+#   maxHeaderBytes: 65536
+#   readTimeout: 0s
+#   securityHeaders: true
+
+# security: request-time protections
+# - optional
+# - authRateLimit throttles failed credential checks per caller address; a
+#   successful authentication clears the counter, and only an invalid
+#   credential counts (a valid key lacking a scope does not)
+# security:
+#   authRateLimit:
+#     disabled: false
+#     maxFailures: 10    # failures allowed inside one window
+#     window: 1m
+#     blockFor: 5m       # rejection period once the limit is reached
+
 # providers: upstream LLM providers served through the gateway forwarding path
 # - optional, default: no providers
 # - requests for provider models are forwarded to the provider's API
@@ -1327,10 +1388,51 @@ providers:
     # - optional, default: openai
     # - openai: Authorization: Bearer (DeepSeek, Qwen, Moonshot, OpenRouter, ...)
     # - anthropic: x-api-key + anthropic-version headers
+    # - gemini: x-goog-api-key header; clients call the native Gemini paths
+    #   (/v1beta/models/<model>:generateContent), forwarded as-is
     type: openai
     # endpoint: base URL of the upstream API
     # - required
     endpoint: https://api.deepseek.com
+    # type (adapter level): which API surface this upstream speaks
+    # - openai | openai-responses | anthropic | gemini | gemini-interactions
+    # - it decides the auth headers AND the request dialect, so one llama-swap
+    #   endpoint can serve an OpenAI-Responses client from a Gemini-only
+    #   upstream (other client dialects are converted, responses convert back)
+    # - gemini-interactions is Google's stateful Interactions API
+    #   (/v1beta/interactions): clients send Steps, the response carries a
+    #   steps[] transcript plus modality-broken-down usage, and
+    #   previous_interaction_id / cached_content stay with this surface
+    # proxy (adapter level): outbound proxy for one API surface; a model can
+    # override it, and "direct" bypasses every proxy (including this one)
+    # - optional, default: "" (inherit the credential, then the provider)
+    #   proxy: socks5://127.0.0.1:1080
+    # models may carry their own proxy for a single upstream:
+    #   models: [{local: glm-5.1, remote: glm-5.1, proxy: direct}]
+    # a model may also declare what it accepts and produces, exactly like a
+    # local model. The playground uses it to file the model under its tooling
+    # (an upstream image model belongs to the image tool, a translation model
+    # to the translation tool):
+    #   models:
+    #     - {local: gpt-image-2, remote: gpt-image-2,
+    #        capabilities: {in: [text], out: [image]}}
+    #     - {local: hy-mt2, remote: hy-mt2, capabilities: {translation: true}}
+    # cooldown: per-provider cooldown policy
+    # - optional, default: inherit (the gateway-wide gateway.cooldown settings)
+    # - disabled: failures never bench this provider's keys (still recorded,
+    #   requests still fail over); enabled: keep cooldowns, and the object form
+    #   may override durations: {policy: enabled, auth: 30s, transient: 5s}
+    # cooldown: disabled
+    # modelPrefix: client-facing prefix for this provider's models
+    # - optional, default: "" (model IDs are exposed as-is)
+    # - the legacy <providerID>/<model> name keeps working for routing
+    # modelPrefix: go-
+    # sessionHeaders: request headers set to the session id when forwarding
+    # - optional, default: [] (no injection)
+    # - the caller's session id (first non-empty header listed in
+    #   ui.activity.session_id) is passed through when present; otherwise a
+    #   value derived from the conversation prefix is used
+    # sessionHeaders: [X-Session-Id]
     # proxy: provider-level outbound proxy
     # - optional, default: "" (use environment proxies)
     # - http/https/socks5/socks5h URLs; socks5 upgrades to socks5h (remote DNS)
@@ -1340,6 +1442,13 @@ providers:
     # - optional, default: 0 / 0
     # priority: 10
     # weight: 1
+    # exposeUpstreamName: keep the upstream model name callable
+    # - optional, default: true
+    # - a client may address a model by an alias or by the name the upstream
+    #   itself uses, and an entry that sets no local name takes that name, so
+    #   renaming a model for clients never takes the vendor name away
+    # - false publishes only the names this provider declares (local + aliases)
+    # exposeUpstreamName: false
     # sticky: session affinity - same session sticks to the same key
     # - optional, default: true
     sticky: true
@@ -1360,9 +1469,21 @@ providers:
         weight: 2
         priority: 1
         maxConcurrent: 4
+    # quota: display the account's usage/balance on the provider's quota card
+    # - optional. "preset" selects a built-in mapping; inline fields override it
+    # - preset deepseek reads GET /user/balance (free, not tied to model
+    #   concurrency) and shows 可调用 / 总余额 / 赠金 / 充值 / 币种. A balance
+    #   has no percentage window, so this mapping is extras-only.
+    # - enforce: {enabled: true} additionally cools the key down once a window
+    #   is full; it needs percentage windows, so it does not apply to a balance
+    quota:
+      preset: deepseek
     # models: models served by this provider
     # - required, at least one
     # - a string maps the model to itself; an object maps local -> upstream
+    #   and may add client-facing aliases for the same upstream model:
+    #   - {remote: gemini-4-argon-contributor, local: gemini-4-argon,
+    #      aliases: [argon, g4a]}
     models:
       - deepseek-chat
       - deepseek-r1: deepseek-reasoner
@@ -1383,6 +1504,57 @@ providers:
     models:
       - claude-sonnet
 
+  # A subscription whose plan exposes several API surfaces at once uses one
+  # provider with multiple adapters. Each adapter has its own dialect,
+  # endpoint and model list; the provider credentials are shared unless an
+  # adapter overrides them. Add "providers.<id>.quota" to display the plan's
+  # usage windows in the UI (see the Go/OpenCode-style example below).
+  # One model may be listed by several adapters: those are its API surfaces,
+  # and llama-swap picks one without any manual choice. The client's own
+  # dialect wins (an Anthropic client reaches the anthropic adapter), other
+  # dialects are converted, and an upstream that rejects the request on its
+  # surface hands it to the next surface instead of failing the request.
+  # Duplicating a name inside ONE adapter stays an error.
+  # opencode-go:
+  #   apiKeys:
+  #     - ${env.OPENCODE_GO_API_KEY}
+  #   # The plan documents a stable session header so upstream routing and
+  #   # prompt caching can group a conversation.
+  #   sessionHeaders: [x-opencode-session]
+  #   template: opencode-go
+  #   # quota:
+  #   #   preset: opencode-go            # built-in usage preset
+  #   #   enforce: {enabled: false}      # cool a credential once a window is full
+  #   adapters:
+  #     - name: Chat
+  #       type: openai
+  #       endpoint: https://opencode.ai/inference/go
+  #       modelMatch: ["glm-*", "kimi-*", "deepseek-*"]
+  #       default: true
+  #       models:
+  #         - kimi-k3
+  #     - name: Recent
+  #       type: openai
+  #       endpoint: https://opencode.ai/inference/go
+  #       modelMatch: ["grok-*", "gpt-*"]
+  #       models:
+  #         - grok-4.7
+  #     - name: Messages
+  #       type: anthropic
+  #       endpoint: https://opencode.ai/inference/go
+  #       modelMatch: ["claude-*", "qwen3*", "minimax-*"]
+  #       models:
+  #         - claude-haiku-5-5
+  #     - name: Google
+  #       type: gemini
+  #       # The upstream serves the Gemini dialect under /v1/models; rewrite
+  #       # the client's /v1beta/models/ prefix instead of changing the base.
+  #       endpoint: https://opencode.ai/inference/go
+  #       pathMap: {"/v1beta/models/": "/v1/models/"}
+  #       modelMatch: ["gemini-*"]
+  #       models:
+  #         - gemini-4-argon-contributor
+
 # gateway: gateway-wide settings for provider forwarding
 # - optional, defaults shown below
 gateway:
@@ -1390,6 +1562,41 @@ gateway:
   stickyTTL: 1h
   # cooldown: cooldown durations per upstream error class
   cooldown:
-    auth: 10m        # 401/403
+    auth: 10m        # 401/402; a first 401 only benches authProbe (below), 403 = policy: no cooldown
+    # authProbe: 30s  # how long the first 401 benches; 0s disables probing
     rateLimit: 60s   # 429 without Retry-After
     transient: 30s   # 5xx / network errors
+  # failover: which upstream responses continue on another key/provider before
+  # the client sees the error
+  # - a failed attempt is retried while nothing has reached the client yet:
+  #   connection EOFs, truncated or empty success responses, and (by default)
+  #   every 3xx/4xx/5xx except 413
+  # - with crossProvider (default true) a bare model name can continue on
+  #   another provider serving the same name; provider/model names stay pinned
+  # failover:
+  #   crossProvider: false
+  #   statuses: [429, 500, 502, 503]      # replace the default set
+  #   excludeStatuses: [400]              # hand client-input errors straight back
+  # skipSlow: prefer the fastest provider instead of only reacting after a slow
+  # one was tried
+  # - enabled by default; the latency is measured from THIS deployment's own
+  #   traffic (the first content token of a streaming reply), so the rule adapts
+  #   to the machine and model instead of encoding numbers that fit one setup
+  # - relativeFactor (default 3): a provider more than this many times slower
+  #   than the fastest candidate for the same model is passed over. A factor,
+  #   not a difference: 2s vs 6s and 5s vs 15s are the same kind of gap.
+  # - maxFirstTokenMs (default 0 = off): an absolute ceiling, for when you know
+  #   the budget. Left off by default because the right value depends on the
+  #   model.
+  # - minSamples (default 3): measurements needed before a provider is judged.
+  #   Fewer always fail open, so a cold start, a reload (measurements reset) or
+  #   a newly added provider is never dropped.
+  # - a lone candidate is never skipped, and if every candidate looks slow they
+  #   are all kept: turning "this provider is slow" into "this model is
+  #   unavailable" would be strictly worse. Observed latency per provider shows
+  #   up under GET /api/providers/status (the "latency" map).
+  # skipSlow:
+  #   maxFirstTokenMs: 15000   # pass over a provider slower than 15s
+  #   relativeFactor: 2.5      # and one more than 2.5x the fastest
+  #   minSamples: 5
+  #   enabled: false           # turn it off entirely
