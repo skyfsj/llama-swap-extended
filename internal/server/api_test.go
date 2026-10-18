@@ -886,7 +886,7 @@ func TestServer_HandleMetrics_Unavailable(t *testing.T) {
 func TestServer_Redirects(t *testing.T) {
 	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
 
-	for path, want := range map[string]string{"/": "/ui", "/upstream": "/ui/models"} {
+	for path, want := range map[string]string{"/": "/ui", "/upstream": "/ui/#/models"} {
 		w := httptest.NewRecorder()
 		s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
 		if w.Code != http.StatusFound {
@@ -894,6 +894,14 @@ func TestServer_Redirects(t *testing.T) {
 		}
 		if got := w.Header().Get("Location"); got != want {
 			t.Errorf("%s: Location = %q, want %q", path, got, want)
+		}
+		if path == "/upstream" {
+			// The target must be a hash route. A path route like /ui/models
+			// only resolved while unknown /ui/* paths still fell back to
+			// index.html, and now returns 404.
+			if !strings.Contains(want, "#/") {
+				t.Errorf("/upstream target %q is a path route, want a hash route", want)
+			}
 		}
 	}
 }

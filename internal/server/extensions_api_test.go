@@ -175,9 +175,10 @@ func TestAPIExtensions_PresetStore(t *testing.T) {
 			t.Fatalf("catalog entry is unusable: %+v", entry)
 		}
 		for _, host := range entry.Hosts {
-			// A leading subdomain wildcard is allowed for hosted services; a
-			// bare one would hand the extension every host on the network.
-			if strings.Contains(host, "*") && !strings.HasPrefix(host, "*.") {
+			// A leading subdomain wildcard is allowed for hosted services, and
+			// "*" for a tool whose targets the model picks (a web fetch); any
+			// other wildcard is a typo that silently widens the permission.
+			if host != "*" && strings.Contains(host, "*") && !strings.HasPrefix(host, "*.") {
 				t.Fatalf("preset %s declares wildcard host %q", entry.ID, host)
 			}
 			if strings.ContainsAny(host, "?[]") {

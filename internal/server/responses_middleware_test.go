@@ -164,7 +164,7 @@ func TestResponsesAdapterStreamsChatSSEAndPersistsAffinity(t *testing.T) {
 		_, _ = w.Write([]byte(`data: {"choices":[{"delta":{"content":"llo","tool_calls":[{"index":0,"function":{"arguments":"1}"}}]}}],"usage":{"prompt_tokens":2,"completion_tokens":3}}` + "\n\n"))
 		_, _ = w.Write([]byte("data: [DONE]\n\n"))
 	})
-	handler := CreateProtocolAdapterMiddleware(cfg, st)(next)
+	handler := CreateProtocolAdapterMiddleware(cfg, st, nil)(next)
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"m","input":"hi","stream":true}`))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -363,10 +363,17 @@ func TestServer_ChatOnlyResponsesAffinityGetCancelEndToEnd(t *testing.T) {
 	if get.Code != http.StatusOK || !strings.Contains(get.Body.String(), `"id":"resp_chat-1"`) {
 		t.Fatalf("Responses GET = %d %s", get.Code, get.Body.String())
 	}
+	// Cancelling a stored response cannot stop anything (it finished before it
+	// was stored), so the response comes back with its real status. The old
+	// behaviour rewrote it to "cancelled", which claimed a stop that never
+	// happened.
 	cancel := httptest.NewRecorder()
 	s.ServeHTTP(cancel, httptest.NewRequest(http.MethodPost, "/v1/responses/resp_chat-1/cancel", nil))
-	if cancel.Code != http.StatusOK || !strings.Contains(cancel.Body.String(), `"status":"cancelled"`) {
+	if cancel.Code != http.StatusOK || !strings.Contains(cancel.Body.String(), `"status":"completed"`) {
 		t.Fatalf("Responses cancel = %d %s", cancel.Code, cancel.Body.String())
+	}
+	if strings.Contains(cancel.Body.String(), "cancelled") {
+		t.Fatalf("cancel must not rewrite a completed response: %s", cancel.Body.String())
 	}
 	_ = s.Shutdown(time.Second)
 }
@@ -728,7 +735,7 @@ func TestResponsesAdapterRejectsPreviousResponseFromAnotherModel(t *testing.T) {
 		"target": {Backend: config.BackendConfig{Type: "vllm", Protocol: config.AdapterProtocolResponsesToChat}},
 	}}
 	called := false
-	handler := CreateProtocolAdapterMiddleware(cfg, st)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called = true }))
+	handler := CreateProtocolAdapterMiddleware(cfg, st, nil)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called = true }))
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"target","input":"continue","previous_response_id":"resp-other"}`))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -746,7 +753,7 @@ func TestResponsesAdapterRejectsOversizedRequestBeforeConversion(t *testing.T) {
 		"m": {Backend: config.BackendConfig{Type: "vllm", Protocol: config.AdapterProtocolResponsesToChat}},
 	}}
 	called := false
-	handler := CreateProtocolAdapterMiddleware(cfg, nil)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+	handler := CreateProtocolAdapterMiddleware(cfg, nil, nil)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		called = true
 	}))
 	body := bytes.Repeat([]byte{'x'}, backendTransformBodyLimit+1)

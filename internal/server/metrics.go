@@ -50,14 +50,18 @@ type metricsMonitor struct {
 	audit      config.AuditConfig
 	// dirtyAudit wakes the background audit maintenance task after a
 	// conversation is persisted. Wired by the Server; nil in standalone use.
-	dirtyAudit     func()
-	priceStore     *store.Store
-	priceRefs      map[string]config.PricingRef
-	priceMu        sync.Mutex
-	priceCache     map[string]priceLookup
-	cacheObserver  func(string, backend.CacheReport)
-	sessionUsage   *anthropiccache.SessionUsage
-	controlMetrics *controlMetrics
+	dirtyAudit    func()
+	priceStore    *store.Store
+	priceRefs     map[string]config.PricingRef
+	priceMu       sync.Mutex
+	priceCache    map[string]priceLookup
+	cacheObserver func(string, backend.CacheReport)
+	// firstTokenObserver 把一条请求的真实首字延迟交给网关做供应商选择。
+	// 与 cacheObserver 同样是回调注入：指标层只负责测量，网关只负责路由，
+	// 两者不需要互相认识。
+	firstTokenObserver func(provider string, firstTokenMs int)
+	sessionUsage       *anthropiccache.SessionUsage
+	controlMetrics     *controlMetrics
 }
 
 type priceLookup struct {
@@ -116,6 +120,21 @@ func (mp *metricsMonitor) setCacheObserver(observer func(string, backend.CacheRe
 		return
 	}
 	mp.cacheObserver = observer
+}
+
+// setFirstTokenObserver connects the measured first-token latency to the
+// gateway, which uses it to prefer the faster provider serving a model.
+//
+// The measurement lives here because this is where the response body is
+// already parsed: the parser knows the true first content delta (a placeholder
+// frame emitted during prefill does not count), and it now also knows which
+// provider answered. The gateway would have to duplicate all of that parsing
+// to measure the same thing.
+func (mp *metricsMonitor) setFirstTokenObserver(observer func(provider string, firstTokenMs int)) {
+	if mp == nil {
+		return
+	}
+	mp.firstTokenObserver = observer
 }
 
 // queueMetrics persists a metric and returns the store-assigned row. It
@@ -178,9 +197,40 @@ func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *resp
 		// access log printed, so resolve it once here.
 		ClientIP: clientIP(r),
 	}
+	// Where the request actually went: the gateway publishes the route that
+	// produced the answer, which is the only layer that knows it (a bare model
+	// name may be served by several providers, and one provider may expose it
+	// on several API surfaces). A locally hosted model publishes nothing, so
+	// both fields stay empty and the UI reads the row as local.
+	if diagnostics := swaputil.RequestDiagnosticsFrom(r.Context()); diagnostics != nil {
+		tm.Provider = diagnostics.Provider
+		tm.Adapter = diagnostics.Adapter
+		tm.ProviderLocal = diagnostics.Local
+	}
 	if identity := identityFromContext(r.Context()); identity.ID != "" && identity.ID != "anonymous" {
 		tm.KeyID = identity.ID
 	}
+	// Feed the measured first-token latency back to the gateway, which uses it
+	// to prefer the faster provider next time.
+	//
+	// Deferred rather than called at the end: record() returns early on several
+	// paths (a truncated body, a non-2xx status, an empty body, a failed
+	// decompression), and every one of those would otherwise skip the
+	// observation entirely — leaving the gateway blind exactly when an upstream
+	// is misbehaving. The value is read through the final tm by closure.
+	//
+	// Only a 2xx response counts: an error body has no first token, and a fast
+	// failure must not make a provider look quick. An empty provider means a
+	// local model, which takes no part in provider selection.
+	defer func() {
+		if mp.firstTokenObserver == nil || tm.Provider == "" || tm.FirstTokenMs <= 0 {
+			return
+		}
+		if tm.RespStatusCode < 200 || tm.RespStatusCode >= 300 {
+			return
+		}
+		mp.firstTokenObserver(tm.Provider, tm.FirstTokenMs)
+	}()
 
 	if ctxData, ok := swaputil.ReadContext(r.Context()); ok && len(ctxData.Metadata) > 0 {
 		tm.Metadata = make(map[string]string, len(ctxData.Metadata))
@@ -298,18 +348,28 @@ func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *resp
 	}
 
 	if strings.Contains(recorder.Header().Get("Content-Type"), "text/event-stream") {
+		// First-token timing is measured from the response bytes alone, so it
+		// is computed before (and independently of) usage parsing. Coupling the
+		// two meant any stream without usage telemetry — which is most of them,
+		// a backend only sends usage when asked — reported -1: the usage parser
+		// failed, and the branch that recorded the timing never ran. The timing
+		// is a transport fact; the counters are a protocol fact.
+		firstContent, lastContent, hasContent := recorder.StreamingContentTimes()
 		if parsed, err := processStreamingResponse(modelID, recorder.StartTime(), body); err != nil {
 			mp.warnf("error processing streaming response: %v, path=%s, recording minimal metrics", err, r.URL.Path)
 		} else {
-			if firstContent, lastContent, ok := recorder.StreamingContentTimes(); ok {
+			if hasContent {
 				applyObservedStreamingRates(&parsed, recorder.StartTime(), firstContent, lastContent)
-				parsed.FirstTokenMs = elapsedMillis(recorder.StartTime(), firstContent)
-				// Phase telemetry for the per-request detail view: the decode
-				// window plus a bounded (time, cumulative tokens) curve.
-				parsed.DecodeMs = elapsedMillis(firstContent, lastContent)
 				parsed.SpeedTimeline = streamingSpeedTimeline(body, recorder.writes, recorder.StartTime(), parsed.Tokens.OutputTokens)
 			}
 			mergeParsedMetrics(&tm, &parsed)
+		}
+		if hasContent {
+			tm.FirstTokenMs = elapsedMillis(recorder.StartTime(), firstContent)
+			// Phase telemetry for the per-request detail view: the decode window
+			// plus a bounded (time, cumulative tokens) curve. The curve needs
+			// the parsed token count, so it stays inside the success branch.
+			tm.DecodeMs = elapsedMillis(firstContent, lastContent)
 		}
 	} else if gjson.ValidBytes(body) {
 		parsed := gjson.ParseBytes(body)
@@ -712,6 +772,8 @@ func extractUsageTokens(usage gjson.Result) (input, output, cached int64, ok boo
 		return
 	}
 
+	// total_input_tokens/total_output_tokens are the Interactions names; without
+	// them an Interactions stream or body recorded zero tokens.
 	if v := firstUsageResult(usage, "prompt_tokens", "promptTokens"); v.Exists() {
 		if parsed, valid := usageInt(v); valid {
 			input = parsed
@@ -719,7 +781,7 @@ func extractUsageTokens(usage gjson.Result) (input, output, cached int64, ok boo
 		} else {
 			input = 0
 		}
-	} else if v := firstUsageResult(usage, "input_tokens", "inputTokens"); v.Exists() {
+	} else if v := firstUsageResult(usage, "input_tokens", "inputTokens", "total_input_tokens", "totalInputTokens"); v.Exists() {
 		if parsed, valid := usageInt(v); valid {
 			input = parsed
 			ok = true
@@ -735,7 +797,7 @@ func extractUsageTokens(usage gjson.Result) (input, output, cached int64, ok boo
 		} else {
 			output = 0
 		}
-	} else if v := firstUsageResult(usage, "output_tokens", "outputTokens"); v.Exists() {
+	} else if v := firstUsageResult(usage, "output_tokens", "outputTokens", "total_output_tokens", "totalOutputTokens"); v.Exists() {
 		if parsed, valid := usageInt(v); valid {
 			output = parsed
 			ok = true
@@ -751,7 +813,7 @@ func extractUsageTokens(usage gjson.Result) (input, output, cached int64, ok boo
 		} else {
 			cached = -1
 		}
-	} else if v := firstUsageResult(usage, "input_tokens_details.cached_tokens", "inputTokensDetails.cachedTokens"); v.Exists() {
+	} else if v := firstUsageResult(usage, "input_tokens_details.cached_tokens", "inputTokensDetails.cachedTokens", "total_cached_tokens", "totalCachedTokens"); v.Exists() {
 		if parsed, valid := usageInt(v); valid {
 			cached = parsed
 			ok = true
@@ -933,7 +995,7 @@ func applyUsageTelemetry(entry *ActivityLogEntry, body []byte) {
 		input := firstUsageInt(usage, "input_tokens", "inputTokens", "prompt_tokens", "promptTokens")
 		output := firstUsageInt(usage, "output_tokens", "outputTokens", "completion_tokens", "completionTokens")
 		uncached := firstUsageInt(usage, "uncached_input_tokens", "uncached_tokens", "input_tokens_uncached", "uncachedInputTokens", "uncachedTokens", "inputTokensUncached")
-		cached := firstUsageInt(usage, "cache_read_input_tokens", "cache_read_tokens", "cacheReadInputTokens", "cacheReadTokens", "input_tokens_details.cached_tokens", "input_tokens_details.cachedTokens", "inputTokensDetails.cachedTokens", "prompt_tokens_details.cached_tokens", "prompt_tokens_details.cachedTokens", "promptTokensDetails.cachedTokens")
+		cached := firstUsageInt(usage, "cache_read_input_tokens", "cache_read_tokens", "cacheReadInputTokens", "cacheReadTokens", "input_tokens_details.cached_tokens", "input_tokens_details.cachedTokens", "inputTokensDetails.cachedTokens", "prompt_tokens_details.cached_tokens", "prompt_tokens_details.cachedTokens", "promptTokensDetails.cachedTokens", "total_cached_tokens", "totalCachedTokens")
 		created := firstUsageInt(usage, "cache_creation_input_tokens", "cache_creation_tokens", "cacheCreationInputTokens", "cacheCreationTokens", "prompt_tokens_details.created_cache_tokens", "prompt_tokens_details.createdCacheTokens", "promptTokensDetails.createdCacheTokens")
 		if output >= 0 {
 			entry.Tokens.OutputTokens = boundedInt(output)

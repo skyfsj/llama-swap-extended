@@ -1,7 +1,6 @@
 package server
 
 import (
-	"bytes"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,10 +11,19 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
+// ProviderModelNamer reports the client-facing name of a provider-routed
+// model; "" means the name is not served by the gateway.
+type ProviderModelNamer func(model string) string
+
 // CreateMetricsMiddleware returns middleware that records token metrics for
 // model-dispatched POST requests. It resolves the model, tees the response into
 // a buffer, and parses token usage once the upstream handler returns.
-func CreateMetricsMiddleware(mm *metricsMonitor, cfg config.Config) chain.Middleware {
+//
+// providerName canonicalizes a provider model to its client-facing name so the
+// usage and request tables show one row per model: the same model can be
+// requested by its client-facing name, an alias or the provider-qualified form,
+// and the records would otherwise split across spellings. It may be nil.
+func CreateMetricsMiddleware(mm *metricsMonitor, cfg config.Config, providerName ProviderModelNamer) chain.Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if mm == nil || r.Method != http.MethodPost {
@@ -59,7 +67,7 @@ func CreateMetricsMiddleware(mm *metricsMonitor, cfg config.Config) chain.Middle
 					if buffered, err := io.ReadAll(io.LimitReader(r.Body, swaputil.MaxRequestBodySize+1)); err == nil && len(buffered) <= swaputil.MaxRequestBodySize {
 						reqBody = buffered
 						r.Body.Close()
-						r.Body = io.NopCloser(bytes.NewReader(reqBody))
+						swaputil.ReplaceRequestBody(r, reqBody)
 					} else if err != nil {
 						swaputil.SendResponse(w, r, http.StatusBadRequest, "could not read request body for metrics")
 						return
@@ -83,7 +91,13 @@ func CreateMetricsMiddleware(mm *metricsMonitor, cfg config.Config) chain.Middle
 			// A request abandoned before any response was written must not be
 			// filed as a successful (empty-body) metric. See #1029.
 			swaputil.MarkClientClosed(recorder, r)
-			mm.record(data.ModelID, r, recorder, reqBody, reqHeaders)
+			recorded := data.ModelID
+			if providerName != nil {
+				if canonical := providerName(data.ModelID); canonical != "" {
+					recorded = canonical
+				}
+			}
+			mm.record(recorded, r, recorder, reqBody, reqHeaders)
 		})
 	}
 }

@@ -166,8 +166,11 @@ func TestServer_InflightMiddleware_AddsAndRemovesEntriesAroundRequestHandling(t 
 	if entry.Metadata["source"] != "test" {
 		t.Errorf("metadata = %v, want source=test", entry.Metadata)
 	}
-	if entry.RemoteIP != "203.0.113.9" {
-		t.Errorf("remote ip = %q, want 203.0.113.9", entry.RemoteIP)
+	if entry.RemoteIP != "192.0.2.1" {
+		// The forwarding header is deliberately not trusted here: the test
+		// handler has no client-IP middleware, so the connection address is
+		// the only honest source.
+		t.Errorf("remote ip = %q, want 192.0.2.1", entry.RemoteIP)
 	}
 	if entry.ReqHeaders["User-Agent"] != "test-agent" || entry.ReqHeaders["Authorization"] != "[REDACTED]" {
 		t.Errorf("request headers = %v", entry.ReqHeaders)
@@ -196,6 +199,180 @@ func TestServer_InflightMiddleware_IgnoresConfiguredWebsocket(t *testing.T) {
 
 	if len(duringRequest.Requests) != 0 {
 		t.Fatalf("inflight during ignored websocket = %+v, want empty", duringRequest)
+	}
+}
+
+func TestServer_InflightMiddleware_PublishesProviderRoute(t *testing.T) {
+	events := make(chan swaputil.InFlightRequestsEvent, 8)
+	tracker := newInflightTrackerWithPublisher(8, func(update swaputil.InFlightRequestsEvent) {
+		events <- update
+	})
+
+	handler := CreateInflightMiddleware(tracker, config.Config{})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The gateway publishes once a route produces an answer, which happens
+		// after the middleware created the row.
+		swaputil.PublishRequestProvider(r.Context(), "opencode-go", "Claude")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	// The outermost request log middleware attaches the diagnostics holder that
+	// carries the route decision; the in-flight row reads the same decision, so
+	// a request without the holder is not the production shape.
+	ctx := swaputil.WithRequestDiagnostics(swaputil.SetContext(req.Context(), swaputil.ReqContextData{ModelID: "claude-sonnet"}))
+	req = req.WithContext(ctx)
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+
+	// The row is published before the route is known, so it starts without a
+	// provider and only gains one once the upstream answers.
+	created := waitInflightEvent(t, events, inflightOperationUpsert)
+	if created.Request == nil || created.Request.Provider != "" {
+		t.Fatalf("initial inflight entry = %+v, want no provider yet", created.Request)
+	}
+
+	update := waitInflightEventPredicate(t, events, func(e swaputil.InFlightRequestsEvent) bool {
+		return e.Operation == inflightOperationUpsert && e.Request != nil && e.Request.Provider != ""
+	})
+	if update.Request.Provider != "opencode-go" || update.Request.Adapter != "Claude" {
+		t.Fatalf("inflight route = %q/%q, want opencode-go/Claude", update.Request.Provider, update.Request.Adapter)
+	}
+	if !update.Request.RouteResolved {
+		t.Fatal("inflight route resolved = false, want the row marked resolved once attributed")
+	}
+}
+
+func TestServer_InflightMiddleware_ReportsAttemptBeforeTheAnswer(t *testing.T) {
+	events := make(chan swaputil.InFlightRequestsEvent, 8)
+	tracker := newInflightTrackerWithPublisher(8, func(update swaputil.InFlightRequestsEvent) {
+		events <- update
+	})
+
+	release := make(chan struct{})
+	handler := CreateInflightMiddleware(tracker, config.Config{})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The gateway reports the route it picked, long before the upstream
+		// answers: this is what keeps a slow row attributed.
+		swaputil.ReportInferenceAttempt(r.Context(), "slowprov", "")
+		w.WriteHeader(http.StatusOK)
+		<-release
+	}))
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		req = req.WithContext(swaputil.SetContext(req.Context(), swaputil.ReqContextData{ModelID: "slow-model"}))
+		handler.ServeHTTP(httptest.NewRecorder(), req)
+	}()
+
+	update := waitInflightEventPredicate(t, events, func(e swaputil.InFlightRequestsEvent) bool {
+		return e.Operation == inflightOperationUpsert && e.Request != nil && e.Request.Provider != ""
+	})
+	if update.Request.Provider != "slowprov" || update.Request.RespBytes != 0 {
+		t.Fatalf("inflight entry = %+v, want slowprov attributed with no bytes yet", update.Request)
+	}
+	close(release)
+	<-done
+}
+
+func TestServer_InflightMiddleware_LocalModelResolvesToNoProvider(t *testing.T) {
+	tracker := newInflightTracker()
+	var duringRequest swaputil.InFlightRequestsEvent
+	handler := CreateInflightMiddleware(tracker, config.Config{})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The dispatch point reports a locally served request, which is the
+		// only place that knows the bare-name arbitration outcome.
+		swaputil.ReportLocalRoute(r.Context())
+		duringRequest = tracker.Current()
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req = req.WithContext(swaputil.SetContext(req.Context(), swaputil.ReqContextData{ModelID: "local-model"}))
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+
+	if len(duringRequest.Requests) != 1 {
+		t.Fatalf("inflight during request = %+v, want 1 request", duringRequest)
+	}
+	// A locally served request resolves to no provider, which the table reads
+	// as "local" rather than as an undecided route.
+	entry := duringRequest.Requests[0]
+	if entry.Provider != "" || entry.Adapter != "" {
+		t.Fatalf("local inflight route = %q/%q, want empty", entry.Provider, entry.Adapter)
+	}
+	if !entry.RouteResolved {
+		t.Fatal("local inflight route resolved = false, want the row marked resolved")
+	}
+}
+
+func TestServer_DispatchReportsLocalRoute(t *testing.T) {
+	local := newStubRouter([]string{"local-model"}, "")
+	s := newTestServer(local, newStubRouter(nil, ""))
+
+	var entry swaputil.InflightRequestEntry
+	var reached bool
+	local.serveHTTP = func(w http.ResponseWriter, _ *http.Request) {
+		current := s.inflight.Current()
+		if len(current.Requests) == 1 {
+			entry, reached = current.Requests[0], true
+		}
+		w.WriteHeader(http.StatusOK)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"local-model"}`))
+	req.Header.Set("Content-Type", "application/json")
+	s.ServeHTTP(httptest.NewRecorder(), req)
+
+	if !reached {
+		t.Fatal("local router was not reached")
+	}
+	// The dispatch point is the only layer that knows the request is served
+	// here rather than by a provider, so the row is resolved from there.
+	if !entry.RouteResolved || entry.Provider != "" {
+		t.Fatalf("local dispatch entry = %+v, want a resolved route with no provider", entry)
+	}
+	// The record carries the same distinction: an empty provider alone would
+	// also describe a provider request that failed before any upstream answered.
+	record := waitForActivityRecord(t, s)
+	if !record.ProviderLocal || record.Provider != "" {
+		t.Fatalf("record = provider %q local %v, want a local row", record.Provider, record.ProviderLocal)
+	}
+}
+
+// waitForActivityRecord returns the most recent activity row, which the metrics
+// middleware writes after the response completes.
+func waitForActivityRecord(t *testing.T, s *Server) ActivityLogEntry {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		page, err := s.store.ListActivity(context.Background(), store.ActivityQuery{Limit: 1})
+		if err == nil && len(page.Data) > 0 {
+			return page.Data[0]
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no activity record was written (err=%v)", err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestServer_InflightMiddleware_UnattributedRowStaysUnresolved(t *testing.T) {
+	tracker := newInflightTracker()
+	var duringRequest swaputil.InFlightRequestsEvent
+	handler := CreateInflightMiddleware(tracker, config.Config{})(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		duringRequest = tracker.Current()
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req = req.WithContext(swaputil.SetContext(req.Context(), swaputil.ReqContextData{ModelID: "slow-model"}))
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+
+	// A provider request that has not been routed yet must not claim to be
+	// local: the table renders it as unknown until a route is reported.
+	entry := duringRequest.Requests[0]
+	if entry.RouteResolved {
+		t.Fatal("unrouted inflight row resolved = true, want it left undecided")
 	}
 }
 

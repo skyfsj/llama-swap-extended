@@ -24,6 +24,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/modeldownload"
 	"github.com/mostlygeek/llama-swap/internal/modelmanager"
+	"github.com/mostlygeek/llama-swap/internal/netproxy"
 	"github.com/mostlygeek/llama-swap/internal/perf"
 	"github.com/mostlygeek/llama-swap/internal/pricing"
 	"github.com/mostlygeek/llama-swap/internal/process"
@@ -69,13 +70,17 @@ type Server struct {
 	keys         *keyCache
 	// auditDirty is the single-slot wake-up signal for the background
 	// audit maintenance task; bursts coalesce into one pass.
-	auditDirty         chan struct{}
-	auditMaintMu       sync.Mutex
-	auditLastMaint     time.Time
-	auditLastGC        time.Time
-	store              *store.Store
-	extensionsMu       sync.RWMutex
-	extensions         *extensions.Manager
+	auditDirty     chan struct{}
+	auditMaintMu   sync.Mutex
+	auditLastMaint time.Time
+	auditLastGC    time.Time
+	store          *store.Store
+	extensionsMu   sync.RWMutex
+	extensions     *extensions.Manager
+	// extensionKVMu serializes the persistent-KV key-count check with the
+	// write, so concurrent extension requests cannot both observe room for
+	// one more key and exceed storageMaxKeys.
+	extensionKVMu      sync.Mutex
 	configManager      *config.ConfigManager
 	settingsManager    *settings.Manager
 	configReconciler   *ConfigReconciler
@@ -114,7 +119,9 @@ type Server struct {
 	// It is nil when no providers are configured; dispatch and /v1/models
 	// merge skip it in that case.
 	gatewayMu sync.RWMutex
-	gateway   *gateway.Gateway
+	// quota caches upstream subscription usage snapshots per credential.
+	quota   *quotaStore
+	gateway *gateway.Gateway
 
 	mux       *http.ServeMux
 	handler   http.Handler
@@ -134,6 +141,10 @@ type Server struct {
 	extensionKV     *ephemeralKV
 	// extensionLogs owns the per-extension log monitors and rolling store.
 	extensionLogs *extensionLogRegistry
+	// authLimiter throttles failed credential checks per caller address. It is
+	// rebuilt by every routes() pass so a configuration reload applies the
+	// new policy.
+	authLimiter *authFailureLimiter
 
 	shutdownCtx  context.Context
 	shutdownFn   context.CancelFunc
@@ -330,10 +341,15 @@ func (s *Server) reconfigureModelFileServices(active, desired config.ModelFilesC
 
 func (s *Server) applyConfigCandidate(active, desired config.Config, changes config.ConfigChangeSet) error {
 	effective, restartPaths := config.ApplyDaemonRestartPolicy(active, desired)
+	// Installing the policy before anything else means a reload that changes
+	// it also changes every subsequent download, metadata refresh and child
+	// process.
+	networkPolicy := effective.Network.Settings()
+	netproxy.Install(networkPolicy)
 	var nextExtensions *extensions.Manager
 	if effective.Extensions.Enabled {
 		var err error
-		nextExtensions, err = extensions.NewManager(effective.Extensions.Directory)
+		nextExtensions, err = extensions.NewManagerWithNetwork(effective.Extensions.Directory, networkPolicy)
 		if err != nil {
 			return fmt.Errorf("loading extensions: %w", err)
 		}
@@ -353,9 +369,12 @@ func (s *Server) applyConfigCandidate(active, desired config.Config, changes con
 		return err
 	}
 	// Mirror startup keys from the candidate config before the topology is
-	// touched, so a hot reload that adds or changes startup_api_keys behaves
-	// like startup: the durable key table and the auth snapshot converge
-	// without a restart. Upserts are idempotent for unchanged entries.
+	// touched, so a hot reload that adds, changes or removes startup_api_keys
+	// behaves like startup: the durable key table and the auth snapshot converge
+	// without a restart. Upserts are idempotent for unchanged entries, and a key
+	// the file no longer declares is revoked with them. An edit that would leave
+	// no way to sign in rejects the whole reload, and the config file is rolled
+	// back rather than applied.
 	if !reflect.DeepEqual(active.StartupAPIKeys, effective.StartupAPIKeys) || !reflect.DeepEqual(active.RequiredAPIKeys, effective.RequiredAPIKeys) {
 		if err := s.seedStartupAPIKeys(effective); err != nil {
 			return fmt.Errorf("seeding startup api keys: %w", err)
@@ -633,10 +652,18 @@ type BuildInfo struct {
 }
 
 func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, upstreamlog *logmon.Monitor, perfMon *perf.Monitor, st *store.Store, build BuildInfo, hardware *hw.HardwareSnapshot) (*Server, error) {
+	// The network policy is published to the process before any client is
+	// built: subsystems that create their own transports (model downloads,
+	// pricing refresh, runtime metadata) follow the default transport, and
+	// child processes (runtime builds, extension installs) get the
+	// environment.
+	networkPolicy := cfg.Network.Settings()
+	netproxy.Install(networkPolicy)
+
 	var extensionManager *extensions.Manager
 	if cfg.Extensions.Enabled {
 		var err error
-		extensionManager, err = extensions.NewManager(cfg.Extensions.Directory)
+		extensionManager, err = extensions.NewManagerWithNetwork(cfg.Extensions.Directory, networkPolicy)
 		if err != nil {
 			return nil, fmt.Errorf("loading extensions: %w", err)
 		}
@@ -708,6 +735,7 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 		peer:            peer,
 		gateway:         gw,
 		shutdownCtx:     shutdownCtx,
+		quota:           newQuotaStore(),
 		shutdownFn:      shutdownFn,
 		backendProgress: make(map[string]swaputil.BackendProgressEvent),
 	}
@@ -748,7 +776,15 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 		s.releaseLMCacheReference(change)
 	})
 	if err := s.seedStartupAPIKeys(cfg); err != nil {
-		return nil, err
+		// A configuration whose key changes cannot be reconciled without
+		// locking everyone out must not stop the server: the stored keys stay
+		// as they are, and the operator can still sign in and fix the file.
+		if !errors.Is(err, errConfigKeysWouldLockOut) {
+			return nil, err
+		}
+		if s.proxylog != nil {
+			s.proxylog.Errorf("startup api keys: %v", err)
+		}
 	}
 	// Authentication state must be in memory before the first request. The
 	// load is synchronous and fails startup on error: a server that cannot
@@ -789,6 +825,14 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 	s.backendAdapters = make(map[string]backend.BackendAdapter)
 	s.cacheController = backend.NewCacheController()
 	s.metrics.setCacheObserver(s.cacheController.Observe)
+	// 首字延迟回流给网关做"跳过过慢供应商"的判据。走 currentGateway() 而不是
+	// 捕获一个具体实例：配置重载会整体重建网关（观测数据也随之清零），
+	// 回调必须始终落在当前生效的那个网关上。
+	s.metrics.setFirstTokenObserver(func(provider string, firstTokenMs int) {
+		if gw := s.currentGateway(); gw != nil {
+			gw.ObserveFirstToken(provider, firstTokenMs)
+		}
+	})
 	for modelID, modelConfig := range cfg.Models {
 		adapter, adapterErr := newModelBackendAdapter(modelID, modelConfig)
 		if adapterErr != nil {
@@ -949,6 +993,7 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 	go s.runKeyTouchFlusher()
 	go s.runPowerFlusher()
 	go s.runExtensionPendingCleanup()
+	go s.runQuotaRefresher()
 	s.startThermalMonitor(cfg)
 	return s, nil
 }
@@ -1074,6 +1119,15 @@ func (s *Server) localPeerHandlerWithConfig(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
+	if gw := s.currentGateway(); gw != nil && gw.Handles(data.ModelID) {
+		// The gateway knows this model but has no credential to serve it
+		// right now (every key is cooling down or parked). Say so instead of
+		// reporting an unroutable model.
+		swaputil.SendResponse(w, r, http.StatusBadGateway, fmt.Sprintf(
+			"gateway: no credential is currently available for model %s (all keys are cooling down, parked or disabled)", data.ModelID))
+		return
+	}
+
 	switch {
 	case s.local.Handles(data.ModelID):
 		// Thermal guard failover: a model parked by the thermal guard is
@@ -1084,13 +1138,25 @@ func (s *Server) localPeerHandlerWithConfig(w http.ResponseWriter, r *http.Reque
 		if !s.forwardMaintenanceModel(w, r, data, cfg) {
 			return
 		}
+		// The route is settled here: this request is served on this host, so it
+		// has no upstream provider. Published after the thermal-guard failover
+		// above, which may have handed the request to a provider instead. A
+		// provider-served request learns its route from the gateway.
+		swaputil.PublishLocalRoute(r.Context())
 		s.proxylog.Debugf("dispatch: using local process for model: %s", data.ModelID)
 		s.local.ServeHTTP(w, r)
 	case s.peer.Handles(data.ModelID):
+		// A peer is neither a local model nor an upstream provider: nothing is
+		// published, so the record and the live row both report it as
+		// unattributed instead of claiming it ran here.
 		s.proxylog.Debugf("dispatch: using peer for model: %s", data.ModelID)
 		s.peer.ServeHTTP(w, r)
 	default:
-		swaputil.SendError(w, r, router.ErrNoRouterFound)
+		// Name what was asked for: this 404 is the common shape of a client
+		// holding a stale model name, and "no router for requested model" alone
+		// leaves the operator to guess which one.
+		swaputil.SendError(w, r, fmt.Errorf("%w: %q is not configured (ask /v1/models for the current list)",
+			router.ErrNoRouterFound, data.ModelID))
 	}
 }
 
@@ -1140,6 +1206,36 @@ func (s *Server) forwardMaintenanceModel(w http.ResponseWriter, r *http.Request,
 // request through the gateway, keeping the audit attribution on the original
 // (gateway-facing) model ID.
 func (s *Server) serveGateway(w http.ResponseWriter, r *http.Request, gw *gateway.Gateway, route *gateway.Route, data swaputil.ReqContextData, cfg config.Config) {
+	// A model exposed on several upstream surfaces (one adapter per API) is
+	// forwarded surface by surface: the client's own dialect first, then the
+	// others, converting the request for each. An upstream that rejects the
+	// request on its surface makes the next surface try instead, so a model
+	// listed on both an OpenAI and an Anthropic adapter works from either kind
+	// of client without any manual bookkeeping.
+	if groups := gw.SurfaceGroups(data.ModelID, s.local.Handles(data.ModelID), clientSurface(r)); len(groups) > 1 {
+		if data.Model != route.ModelID {
+			rewritten, err := swaputil.ReplaceRequestModel(r, data.Model, route.ModelID)
+			if err != nil {
+				swaputil.SendResponse(w, r, http.StatusBadRequest, err.Error())
+				return
+			}
+			r = rewritten
+		}
+		session := gatewaySession(r, cfg)
+		s.forwardAcrossSurfaces(w, r, gw, groups, data, session)
+		return
+	}
+	if route.Type() == config.ProviderTypeGemini {
+		// A Gemini adapter speaks the native dialect: the upstream paths are
+		// /v1beta/models/... . Forwarding an OpenAI/Anthropic path would only
+		// produce a confusing upstream 404, so name the mismatch instead.
+		if geminiRoute, ok := protocolrelaykit.RouteForRequest(r.Method, r.URL.Path); !ok || geminiRoute.Format != protocolrelaykit.Gemini {
+			swaputil.SendResponse(w, r, http.StatusBadRequest, fmt.Sprintf(
+				"%s is type gemini; call /v1beta/models/<model>:generateContent instead of %s",
+				providerRouteLabel(route), r.URL.Path))
+			return
+		}
+	}
 	if data.Model != route.ModelID {
 		rewritten, err := swaputil.ReplaceRequestModel(r, data.Model, route.ModelID)
 		if err != nil {
@@ -1148,22 +1244,232 @@ func (s *Server) serveGateway(w http.ResponseWriter, r *http.Request, gw *gatewa
 		}
 		r = rewritten
 	}
-	// Rewrite to the upstream model name just before forwarding; the request
-	// context keeps the original model for metrics/audit.
-	if route.RemoteName != route.ModelID {
-		rewritten, err := swaputil.ReplaceRequestModel(r, route.ModelID, route.RemoteName)
-		if err != nil {
-			swaputil.SendResponse(w, r, http.StatusBadRequest, err.Error())
-			return
-		}
-		r = rewritten
-	}
+	// The upstream model name is rewritten per attempt inside the gateway:
+	// a failover may continue on another provider whose model name differs.
 
 	// Session affinity hash: explicit configured headers first, falling back
-	// to client identity + a body fingerprint.
-	sessionHash := gatewaySessionHash(r, cfg)
+	// to client identity + a body fingerprint. The raw session id accompanies
+	// the hash so providers can opt into receiving it as a request header.
+	session := gatewaySession(r, cfg)
 
-	gw.ServeHTTP(w, r, route, sessionHash)
+	// A bare model name may continue on every provider that serves it; a
+	// provider-qualified name stays pinned to that provider.
+	chain := gw.FailoverRoutes(data.ModelID, s.local.Handles(data.ModelID), route)
+	// A request the conversion layer rewrote for one dialect cannot continue on
+	// a provider speaking another one: keep only same-dialect siblings.
+	if target := protocolTargetFormat(r); target != "" {
+		chain = sameDialectRoutes(chain, route)
+	}
+
+	gw.ServeHTTPWithFailover(w, r, chain, session)
+}
+
+// clientSurface names the API surface the client itself speaks, from the
+// request path. The protocol middleware rewrites the path only for requests it
+// converted; a request that reaches the gateway unconverted still carries the
+// client's own path, which is exactly the case where the surface order matters.
+func clientSurface(r *http.Request) string {
+	route, ok := protocolrelaykit.RouteForRequest(r.Method, r.URL.Path)
+	if !ok {
+		return ""
+	}
+	return surfaceTypeForFormat(route.Format)
+}
+
+// forwardAcrossSurfaces tries the model's upstream surfaces in order until one
+// serves the request. The request is converted per surface; the response is
+// converted back to the client's dialect. An upstream that rejects the request
+// on its surface (a request-scoped 4xx) hands it to the next surface instead of
+// answering the client, so a model that several adapters expose keeps working
+// from any client dialect.
+func (s *Server) forwardAcrossSurfaces(w http.ResponseWriter, r *http.Request, gw *gateway.Gateway, groups [][]*gateway.Route, data swaputil.ReqContextData, session gateway.Session) {
+	clientRoute, ok := protocolrelaykit.RouteForRequest(r.Method, r.URL.Path)
+	if !ok {
+		// No dialect information (a non-generation path): forward normally.
+		gw.ServeHTTPWithFailover(w, r, groups[0], session)
+		return
+	}
+	client := clientRoute.Format
+
+	// Buffer the client body once: every surface conversion starts from it.
+	body, err := io.ReadAll(io.LimitReader(r.Body, backendTransformBodyLimit+1))
+	if err != nil {
+		swaputil.SendResponse(w, r, http.StatusBadRequest, "could not read request body")
+		return
+	}
+	if len(body) > backendTransformBodyLimit {
+		swaputil.SendResponse(w, r, http.StatusRequestEntityTooLarge, "request body exceeds the gateway limit")
+		return
+	}
+	_ = r.Body.Close()
+
+	stream := protocolrelaykit.RequestStreamed(clientRoute, body)
+	meta := protocolrelaykit.NewMeta(data.ModelID, stream)
+	last := len(groups) - 1
+
+	var lastStatus int
+	var lastBody string
+	for index, group := range groups {
+		surface := group[0]
+		target := surfaceFormatForType(surface.Type())
+		if target == "" {
+			target = client
+		}
+		attempt := r.Clone(r.Context())
+		attempt.Body = io.NopCloser(bytes.NewReader(body))
+		attempt.ContentLength = int64(len(body))
+		attempt.GetBody = func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(body)), nil
+		}
+
+		out := w
+		var writer *protocolResponseWriter
+		if target != client {
+			converted, convErr := convertProtocolRequest(r.Context(), meta, client, target, body, data.ModelID, s.store)
+			if convErr != nil {
+				swaputil.SendResponse(w, r, http.StatusBadRequest, convErr.Error())
+				return
+			}
+			path, pathErr := protocolrelaykit.TargetPathForRequest(target, data.ModelID, stream, r.URL.Path)
+			if pathErr != nil {
+				swaputil.SendResponse(w, r, http.StatusBadRequest, pathErr.Error())
+				return
+			}
+			if err := setProtocolRequestBody(attempt, converted); err != nil {
+				swaputil.SendResponse(w, r, http.StatusBadRequest, err.Error())
+				return
+			}
+			// The gateway replays the body from GetBody on every attempt: it
+			// must hand out the converted body, not the one the client sent.
+			attempt.GetBody = func() (io.ReadCloser, error) {
+				return io.NopCloser(bytes.NewReader(converted)), nil
+			}
+			// The response writer converts back from this surface's dialect;
+			// the request keeps the client request for context and Responses
+			// affinity, which is keyed on the client path.
+			writer, err = newProtocolResponseWriter(w, r, s.store, data.ModelID, surfaceLabel(surface), target, client, body, meta, stream)
+			if err != nil {
+				swaputil.SendResponse(w, r, http.StatusBadGateway, err.Error())
+				return
+			}
+			out = writer
+			attempt = markProtocolBackendRequest(attempt, client, target, path, stream)
+			// The attempt is a private clone: the rewritten path lives for
+			// this pass only and needs no restore.
+			rewriteProtocolBackendPath(attempt)
+			if target == protocolrelaykit.Gemini {
+				if targetRoute, ok := protocolrelaykit.RouteForRequest(attempt.Method, path); ok {
+					attempt.SetPathValue("model", targetRoute.Model)
+					attempt.SetPathValue("geminiPath", targetRoute.Model+":"+targetRoute.Action)
+				}
+			}
+		}
+
+		opts := gateway.AttemptOptions{StopOnRequestScoped: index < last}
+		result := gw.ServeHTTPAttempt(out, attempt, group, session, opts)
+		if !result.Committed {
+			// The upstream refused this request on this surface and the
+			// gateway wrote nothing, so the next surface still gets a clean
+			// shot at it.
+			lastStatus = result.Status
+			lastBody = result.Snippet
+			s.proxylog.Warnf("dispatch: model %s not served by the %s surface (status %d), trying the next surface",
+				data.ModelID, surface.Type(), result.Status)
+			continue
+		}
+		if writer != nil {
+			if writer.overflow {
+				swaputil.SendResponse(w, r, http.StatusBadGateway, fmt.Sprintf("protocol response body exceeds %d bytes", backendTransformBodyLimit))
+				return
+			}
+			if finishErr := writer.finish(); finishErr != nil && !writer.committed() {
+				swaputil.SendResponse(w, r, http.StatusBadGateway, finishErr.Error())
+				return
+			}
+		}
+		return
+	}
+	swaputil.SendResponse(w, r, lastStatus, truncateForClient(lastBody))
+}
+
+func surfaceLabel(route *gateway.Route) string {
+	label := route.ProviderID
+	if adapter := route.Adapter(); adapter != "" {
+		label += "/" + adapter
+	}
+	return label
+}
+
+func truncateForClient(s string) string {
+	const limit = 2048
+	if len(s) <= limit {
+		return s
+	}
+	return s[:limit] + "..."
+}
+
+// sameDialectRoutes keeps the primary route plus the siblings whose adapter
+// speaks the same dialect and protocol, so a converted request never lands on
+// an upstream that cannot read it.
+func sameDialectRoutes(chain []*gateway.Route, primary *gateway.Route) []*gateway.Route {
+	if len(chain) <= 1 {
+		return chain
+	}
+	keep := make([]*gateway.Route, 0, len(chain))
+	for _, route := range chain {
+		if route == primary || route.Type() == primary.Type() {
+			keep = append(keep, route)
+		}
+	}
+	return keep
+}
+
+// providerModelName maps a provider model name onto the client-facing name the
+// model is listed under; "" means the gateway does not serve that name. The
+// usage and request tables record it so one model keeps one row however it was
+// requested.
+func (s *Server) providerModelName(model string) string {
+	gw := s.currentGateway()
+	if gw == nil {
+		return ""
+	}
+	route := gw.RouteFor(model, s.local.Handles(model))
+	if route == nil {
+		return ""
+	}
+	if route.ExposedName != "" {
+		return route.ExposedName
+	}
+	return route.ModelID
+}
+
+// providerDialectFor reports the upstream dialect of a provider-routed model.
+// The protocol conversion layer uses it the same way local models use their
+// backend protocol.
+func (s *Server) providerDialectFor(modelID string) (ProviderDialect, bool) {
+	gw := s.currentGateway()
+	if gw == nil {
+		return ProviderDialect{}, false
+	}
+	route := gw.RouteFor(modelID, s.local.Handles(modelID))
+	if route == nil {
+		return ProviderDialect{}, false
+	}
+	label := route.ProviderID
+	if adapter := route.Adapter(); adapter != "" {
+		label += "/" + adapter
+	}
+	surfaces := len(gw.SurfaceGroups(modelID, s.local.Handles(modelID), ""))
+	return ProviderDialect{Type: route.Type(), Label: label, Surfaces: surfaces}, true
+}
+
+// providerRouteLabel describes the provider (and adapter, when named) a route
+// belongs to for user-facing errors.
+func providerRouteLabel(route *gateway.Route) string {
+	if adapter := route.Adapter(); adapter != "" {
+		return fmt.Sprintf("provider %s adapter %q", route.ProviderID, adapter)
+	}
+	return "provider " + route.ProviderID
 }
 
 // currentGateway returns the active provider gateway (nil when none is
@@ -1188,17 +1494,20 @@ func (s *Server) setGateway(gw *gateway.Gateway) {
 	}
 }
 
-// gatewaySessionHash derives the sticky session key for provider routing.
-func gatewaySessionHash(r *http.Request, cfg config.Config) string {
-	headerValue := ""
-	for _, header := range cfg.UI.Activity.SessionID {
-		if v := strings.TrimSpace(r.Header.Get(header)); v != "" {
-			headerValue = v
-			break
-		}
-	}
+// gatewaySession derives the sticky session key for provider routing and the
+// session id providers can opt into receiving as a request header
+// (providers.<id>.sessionHeaders).
+//
+// The session id is the caller's value when it sent one of the configured
+// session headers; otherwise it is derived from the cache-prefix signal
+// (metadata.user_id, prompt_cache_key or the first message/part content) so
+// follow-up turns of one conversation share an id. Requests carrying neither
+// signal inject nothing.
+func gatewaySession(r *http.Request, cfg config.Config) gateway.Session {
+	sessionID := clientSessionID(r, cfg)
 
-	// Content signals: Anthropic metadata.user_id, OpenAI prompt_cache_key.
+	// Content signals: Anthropic metadata.user_id, OpenAI prompt_cache_key,
+	// then the conversation prefix itself.
 	bodyFingerprint := ""
 	if r.Body != nil && r.Method != http.MethodGet {
 		fingerprint, err := gatewayBodyFingerprint(r)
@@ -1212,34 +1521,67 @@ func gatewaySessionHash(r *http.Request, cfg config.Config) string {
 	if identity := identityFromContext(r.Context()); identity.ID != "" {
 		keyID = identity.ID
 	}
-	return gateway.SessionHash(headerValue, clientIP, keyID, bodyFingerprint)
+
+	upstreamID := sessionID
+	if upstreamID == "" && bodyFingerprint != "" {
+		// Hash the raw prefix before it can become a header value; client
+		// identity is mixed in so tenants sharing a prompt prefix do not
+		// share one upstream session. This is the sticky affinity key too.
+		upstreamID = gateway.SessionHash("", clientIP, keyID, bodyFingerprint)
+	}
+	return gateway.Session{
+		Hash: gateway.SessionHash(sessionID, clientIP, keyID, bodyFingerprint),
+		ID:   upstreamID,
+	}
+}
+
+// clientSessionID returns the value of the first non-empty header listed in
+// ui.activity.session_id; empty when the caller sent none of them.
+func clientSessionID(r *http.Request, cfg config.Config) string {
+	for _, header := range cfg.UI.Activity.SessionID {
+		if v := strings.TrimSpace(r.Header.Get(header)); v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // gatewayBodyFingerprint extracts session-bearing fields from the request
-// body without permanently consuming it.
+// body without permanently consuming it. Only a bounded prefix is inspected;
+// the body the downstream handlers see is the complete original stream, stitched
+// back together from the prefix and the unconsumed remainder. Replacing the body
+// with the prefix alone used to truncate every provider request larger than the
+// peek window (a long conversation crossing 1 MB) to that window, which then
+// failed the dialect conversion with a JSON error pointing at the cut.
 func gatewayBodyFingerprint(r *http.Request) (string, error) {
 	if r.Body == nil || r.Body == http.NoBody {
 		return "", nil
 	}
-	// Read a bounded prefix and restore it; body consumers downstream
-	// (model rewrite, dispatch) re-read from the restored reader.
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
-	if err != nil {
+	prefix := make([]byte, 1<<20)
+	n, err := io.ReadFull(r.Body, prefix)
+	prefix = prefix[:n]
+	// Restore the stream before anything else, whatever happened: a replayable
+	// body (a client-side request or a middleware-installed GetBody) restarts
+	// from the beginning, otherwise the unconsumed remainder continues where
+	// the read above stopped. The function must never lose body bytes.
+	restore := func() {
+		if r.GetBody != nil {
+			if replay, rbErr := r.GetBody(); rbErr == nil {
+				r.Body = replay
+				return
+			}
+		}
+		r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(prefix), r.Body))
+	}
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		restore()
 		return "", err
 	}
-	r.Body.Close()
-	r.Body = io.NopCloser(bytes.NewReader(body))
-	if r.GetBody != nil {
-		// Keep the replayable contract intact when one exists.
-		if replay, rbErr := r.GetBody(); rbErr == nil {
-			r.Body = replay
-		} else {
-			r.Body = io.NopCloser(bytes.NewReader(body))
-		}
-	}
-	if len(body) == 0 {
+	restore()
+	if len(prefix) == 0 {
 		return "", nil
 	}
+	body := prefix
 	// metadata.user_id (Anthropic/Claude Code) and prompt_cache_key (OpenAI).
 	if v := gjson.GetBytes(body, "metadata.user_id").String(); v != "" {
 		return v, nil
@@ -1247,8 +1589,12 @@ func gatewayBodyFingerprint(r *http.Request) (string, error) {
 	if v := gjson.GetBytes(body, "prompt_cache_key").String(); v != "" {
 		return v, nil
 	}
-	// Fall back to the first message content.
+	// Fall back to the first message content: OpenAI/Anthropic messages shape,
+	// then the Gemini contents shape.
 	if v := gjson.GetBytes(body, "messages.0.content").String(); v != "" {
+		return v, nil
+	}
+	if v := gjson.GetBytes(body, "contents.0.parts.0.text").String(); v != "" {
 		return v, nil
 	}
 	return "", nil
@@ -1328,7 +1674,14 @@ func (s *Server) routes() {
 		}
 	}
 
-	authMW := CreateScopedAuthMiddleware(cfg, s.store, s.keys)
+	// The limiter is rebuilt per routes() pass so a reload applies the new
+	// policy. Counters reset with it, which is acceptable: a reload is an
+	// operator action, not an attacker-controlled event.
+	s.authLimiter = newAuthFailureLimiter(cfg.Security.AuthRateLimit)
+	authMW := composeMiddlewares(
+		CreateAuthRateLimitMiddleware(s.authLimiter),
+		CreateScopedAuthMiddleware(cfg, s.store, s.keys),
+	)
 	controlActivity := CreateControlActivityMiddleware(&s.controlPlaneActive)
 	modelMiddlewares := []chain.Middleware{
 		authMW,
@@ -1347,14 +1700,14 @@ func (s *Server) routes() {
 	if cfg.Extensions.Enabled && extensionManager != nil {
 		modelMiddlewares = append(modelMiddlewares,
 			CreateInflightMiddleware(s.inflight, cfg),
-			CreateMetricsMiddleware(s.metrics, cfg),
+			CreateMetricsMiddleware(s.metrics, cfg, s.providerModelName),
 			CreateExtensionsMiddleware(s, cfg, extensionManager),
 		)
 	}
 	modelMiddlewares = append(modelMiddlewares,
 		CreateBackendCapabilityMiddleware(cfg),
 		CreateAnthropicCacheMiddleware(cfg),
-		CreateProtocolAdapterMiddleware(cfg, s.store),
+		CreateProtocolAdapterMiddleware(cfg, s.store, s.providerDialectFor),
 		CreateResponseAffinityMiddleware(cfg, s.store),
 	)
 	if cfg.Extensions.Enabled && extensionManager != nil {
@@ -1364,7 +1717,7 @@ func (s *Server) routes() {
 			CreateInflightMiddleware(s.inflight, cfg),
 			CreateFilterMiddleware(cfg),
 			CreateFormFilterMiddleware(cfg),
-			CreateMetricsMiddleware(s.metrics, cfg),
+			CreateMetricsMiddleware(s.metrics, cfg, s.providerModelName),
 		)
 	}
 	if cfg.Extensions.Enabled && extensionManager != nil {
@@ -1420,6 +1773,15 @@ func (s *Server) routes() {
 	// Responses retrieval/cancellation carry the response id in the path, so
 	// they cannot use the model-in-body dispatcher. The affinity record supplies
 	// the model and lets the stored response remain available after a restart.
+	mux.Handle("GET /v/interactions/{interaction_id}", inferenceAPI.ThenFunc(s.interactionsPassthrough))
+	mux.Handle("POST /v/interactions/{interaction_id}/cancel", inferenceAPI.ThenFunc(s.interactionsPassthrough))
+	mux.Handle("DELETE /v/interactions/{interaction_id}", inferenceAPI.ThenFunc(s.interactionsPassthrough))
+	mux.Handle("GET /v1/interactions/{interaction_id}", inferenceAPI.ThenFunc(s.interactionsPassthrough))
+	mux.Handle("POST /v1/interactions/{interaction_id}/cancel", inferenceAPI.ThenFunc(s.interactionsPassthrough))
+	mux.Handle("DELETE /v1/interactions/{interaction_id}", inferenceAPI.ThenFunc(s.interactionsPassthrough))
+	mux.Handle("GET /v1beta/interactions/{interaction_id}", inferenceAPI.ThenFunc(s.interactionsPassthrough))
+	mux.Handle("POST /v1beta/interactions/{interaction_id}/cancel", inferenceAPI.ThenFunc(s.interactionsPassthrough))
+	mux.Handle("DELETE /v1beta/interactions/{interaction_id}", inferenceAPI.ThenFunc(s.interactionsPassthrough))
 	mux.Handle("GET /v1/responses/{response_id}", inferenceAPI.ThenFunc(s.handleAPIResponseGet))
 	mux.Handle("POST /v1/responses/{response_id}/cancel", inferenceAPI.ThenFunc(s.handleAPIResponseCancel))
 	mux.Handle("GET /v/responses/{response_id}", inferenceAPI.ThenFunc(s.handleAPIResponseGet))
@@ -1446,8 +1808,14 @@ func (s *Server) routes() {
 	// Browser session bootstrap is deliberately unauthenticated so a user can
 	// exchange a known startup/managed key for the HttpOnly cookie required by
 	// EventSource. The handler validates the presented secret before setting it.
-	mux.HandleFunc("GET /api/auth/session", s.handleAPIAuthSession)
-	mux.HandleFunc("POST /api/auth/session", s.handleAPIAuthSession)
+	//
+	// GET and POST both validate a credential, so both go through the throttle:
+	// leaving GET outside it would let guessing move to the read-only form. The
+	// handler only records an outcome when a credential was actually presented,
+	// so the login screen polling for state is not penalised.
+	sessionAuthAPI := chain.New(CreateAuthRateLimitMiddleware(s.authLimiter))
+	mux.Handle("GET /api/auth/session", sessionAuthAPI.ThenFunc(s.handleAPIAuthSession))
+	mux.Handle("POST /api/auth/session", sessionAuthAPI.ThenFunc(s.handleAPIAuthSession))
 	mux.HandleFunc("DELETE /api/auth/session", s.handleAPIAuthSession)
 
 	// Prometheus metrics are protected by the logs scope, matching the legacy endpoint.
@@ -1465,7 +1833,7 @@ func (s *Server) routes() {
 		CreateProfileMiddleware(s),
 		CreateModelNameRewriteMiddleware(cfg),
 		CreateUpstreamInflightMiddleware(s.inflight, cfg),
-		CreateMetricsMiddleware(s.metrics, cfg),
+		CreateMetricsMiddleware(s.metrics, cfg, s.providerModelName),
 	)
 	mux.HandleFunc("GET /upstream", handleUpstreamRedirect)
 	mux.Handle("/upstream/{upstreamPath...}", upstreamChain.ThenFunc(s.handleUpstream))
@@ -1501,6 +1869,10 @@ func (s *Server) routes() {
 	mux.Handle("GET /api/providers/status", configAPI.ThenFunc(s.handleAPIProvidersStatus))
 	mux.Handle("POST /api/providers/keys/{keyID}/clear-cooldown", configAPI.ThenFunc(s.handleAPIProvidersClearCooldown))
 	mux.Handle("POST /api/providers/probe", configAPI.ThenFunc(s.handleAPIProvidersProbe))
+	mux.Handle("GET /api/providers/quotas", configAPI.ThenFunc(s.handleAPIProvidersQuotas))
+	mux.Handle("POST /api/providers/quotas/refresh", configAPI.ThenFunc(s.handleAPIProvidersQuotasRefresh))
+	mux.Handle("GET /api/providers/templates", configAPI.ThenFunc(s.handleAPIProviderTemplates))
+	mux.Handle("POST /api/providers/templates/{id}/apply", configAPI.ThenFunc(s.handleAPIProviderTemplateApply))
 	mux.Handle("GET /api/extensions", configAPI.ThenFunc(s.handleAPIExtensions))
 	mux.Handle("POST /api/extensions", configAPI.ThenFunc(s.handleAPIExtensions))
 	mux.Handle("GET /api/extensions/{id}", configAPI.ThenFunc(s.handleAPIExtension))
@@ -1607,7 +1979,12 @@ func (s *Server) routes() {
 	mux.Handle("POST /api/backends/{model}/sleep", modelUnloadAPI.ThenFunc(s.handleAPIBackendAction))
 	mux.Handle("POST /api/backends/{model}/wake", modelUnloadAPI.ThenFunc(s.handleAPIBackendAction))
 
-	handler := chain.New(CreateRequestLogMiddleware(s.proxylog, s.recordRequestError), CreateCORSMiddleware()).Then(mux)
+	handler := chain.New(
+		CreateClientIPMiddleware(cfg.Network),
+		CreateSecurityHeadersMiddleware(cfg.Server.HeadersEnabled()),
+		CreateRequestLogMiddleware(s.proxylog, s.recordRequestError),
+		CreateCORSMiddleware(),
+	).Then(mux)
 	s.handlerMu.Lock()
 	s.mux = mux
 	s.handler = handler

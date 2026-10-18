@@ -260,7 +260,7 @@ func (s *Server) handleAPIUsageExport(w http.ResponseWriter, r *http.Request) {
 func writeUsageCSVHeader(w http.ResponseWriter) {
 	writer := csv.NewWriter(w)
 	_ = writer.Write([]string{
-		"id", "time", "model", "key", "key_id", "key_kind", "group", "endpoint",
+		"id", "time", "model", "provider", "provider_adapter", "key", "key_id", "key_kind", "group", "endpoint",
 		"client_ip", "status", "input_tokens", "output_tokens", "cached_tokens",
 		"cache_creation_tokens", "reasoning_tokens", "estimated_cost", "duration_ms",
 	})
@@ -273,6 +273,8 @@ func writeUsageCSVRow(w http.ResponseWriter, record store.UsageRecord) {
 		strconv.Itoa(record.ID),
 		record.Timestamp.Format(time.RFC3339),
 		record.Model,
+		record.Provider,
+		record.Adapter,
 		record.KeyName,
 		record.KeyID,
 		record.KeyKind,

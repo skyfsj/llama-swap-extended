@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net/http"
 	"sort"
@@ -75,6 +76,9 @@ func addPreviousResponseChainForModel(ctx context.Context, chatBody, responsesBo
 		return chatBody, err
 	}
 	messages, _ := chat["messages"].([]any)
+	// skipped names the provider-hosted items this replay cannot carry; they are
+	// reported once per follow-up instead of failing the request.
+	var skipped []string
 	for _, raw := range output {
 		item, _ := raw.(map[string]any)
 		if item == nil {
@@ -137,6 +141,26 @@ func addPreviousResponseChainForModel(ctx context.Context, chatBody, responsesBo
 			messages = append(messages, map[string]any{"role": "assistant", "content": nil, "tool_calls": []any{map[string]any{
 				"id": callID, "type": "function", "function": map[string]any{"name": name, "arguments": argumentsJSON},
 			}}})
+		case "mcp_call":
+			// A server-executed call the daemon handed back as an artifact: replay
+			// it as the ordinary call/result pair the Chat conversion expects.
+			callID, _ := item["id"].(string)
+			name, _ := item["name"].(string)
+			if strings.TrimSpace(callID) == "" || strings.TrimSpace(name) == "" {
+				return chatBody, fmt.Errorf("previous_response_id %q contains malformed mcp_call", previous)
+			}
+			arguments, err := responseToolArgumentsToChat(item["arguments"])
+			if err != nil {
+				return chatBody, fmt.Errorf("previous_response_id %q mcp_call: %w", previous, err)
+			}
+			messages = append(messages, map[string]any{"role": "assistant", "content": nil, "tool_calls": []any{map[string]any{
+				"id": callID, "type": "function", "function": map[string]any{"name": name, "arguments": arguments},
+			}}})
+			output, err := responseToolOutputToChat(item["output"])
+			if err != nil {
+				return chatBody, fmt.Errorf("previous_response_id %q mcp_call output: %w", previous, err)
+			}
+			messages = append(messages, map[string]any{"role": "tool", "tool_call_id": callID, "content": output})
 		case "function_call_output", "custom_tool_call_output", "tool_search_output":
 			callID, _ := item["call_id"].(string)
 			if strings.TrimSpace(callID) == "" {
@@ -148,10 +172,24 @@ func addPreviousResponseChainForModel(ctx context.Context, chatBody, responsesBo
 			}
 			messages = append(messages, map[string]any{"role": "tool", "tool_call_id": callID, "content": output})
 		default:
+			// A provider-hosted artifact (web_search_call, computer_call,
+			// image_generation_call, local_shell_call, code_execution_call, ...)
+			// has no Chat equivalent. Failing the whole follow-up made every
+			// later turn of such a conversation unusable; skipping it keeps the
+			// conversation replayable, and the omission is recorded so it is
+			// never silent.
+			if isHostedResponsesItem(itemType) {
+				skipped = append(skipped, itemType)
+				continue
+			}
 			return chatBody, fmt.Errorf("previous_response_id %q contains unsupported output item %q", previous, item["type"])
 		}
 	}
 	chat["messages"] = messages
+	if len(skipped) > 0 {
+		slog.Warn("previous_response_id replay skipped provider-hosted items",
+			"response_id", previous, "item_types", skipped)
+	}
 	return json.Marshal(chat)
 }
 
@@ -240,6 +278,21 @@ func emptyJSONList(value any) bool {
 	default:
 		return false
 	}
+}
+
+// isHostedResponsesItem reports whether an output item type is produced by a
+// provider-hosted tool rather than by the client. These carry no Chat
+// equivalent: their content is a provider artifact, not a message.
+func isHostedResponsesItem(itemType string) bool {
+	switch itemType {
+	case "web_search_call", "file_search_call", "computer_call", "computer_call_output",
+		"local_shell_call", "local_shell_call_output", "image_generation_call",
+		"code_execution_call", "code_interpreter_call", "mcp_list_tools",
+		"mcp_approval_request", "mcp_approval_response", "tool_search_call",
+		"apply_patch_call", "apply_patch_call_output", "shell_call", "shell_call_output":
+		return true
+	}
+	return false
 }
 
 func responseReasoningToChat(value any) (string, error) {
@@ -342,7 +395,11 @@ func persistResponseAffinity(r *http.Request, st *store.Store, model, backend st
 	now := time.Now()
 	ctx, cancel := affinityWriteContext()
 	defer cancel()
-	_ = st.UpsertResponseAffinity(ctx, store.ResponseAffinity{ResponseID: id, Model: model, Backend: backend, Status: state, Response: storedResponse, ExpiresAt: now.Add(30 * 24 * time.Hour), CreatedAt: now, UpdatedAt: now})
+	_ = st.UpsertResponseAffinity(ctx, store.ResponseAffinity{
+		ResponseID: id, Model: model, Backend: backend, Status: state, Response: storedResponse,
+		IdentityID: identityIDFromContext(r.Context()),
+		ExpiresAt:  now.Add(30 * 24 * time.Hour), CreatedAt: now, UpdatedAt: now,
+	})
 }
 
 // responseFromSSE builds the small canonical response chain needed for

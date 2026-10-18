@@ -734,7 +734,7 @@ func TestServer_MetricsMiddleware_ClientClosed(t *testing.T) {
 	proxylog := logmon.NewWriter(io.Discard)
 	handler := chain.New(
 		CreateRequestLogMiddleware(proxylog),
-		CreateMetricsMiddleware(mm, cfg),
+		CreateMetricsMiddleware(mm, cfg, nil),
 	).ThenFunc(func(w http.ResponseWriter, r *http.Request) {})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -772,7 +772,7 @@ func TestServer_MetricsMiddleware_ServerSideCancelIsNotClientClosed(t *testing.T
 	// answers the still-connected client, as the proxy ErrorHandler does.
 	handler := chain.New(
 		CreateRequestLogMiddleware(proxylog),
-		CreateMetricsMiddleware(mm, cfg),
+		CreateMetricsMiddleware(mm, cfg, nil),
 	).ThenFunc(func(w http.ResponseWriter, r *http.Request) {
 		derived, cancel := context.WithCancel(r.Context())
 		defer cancel()
@@ -1066,7 +1066,7 @@ func TestServer_MetricsMiddleware_UpstreamAudioAuditSkipsMediaBody(t *testing.T)
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("BINARY-AUDIO-DATA"))
 	})
-	handler := CreateMetricsMiddleware(mm, cfg)(inner)
+	handler := CreateMetricsMiddleware(mm, cfg, nil)(inner)
 
 	req := httptest.NewRequest(http.MethodPost, "/upstream/m1/v1/audio/speech", strings.NewReader(`{"model":"m1"}`))
 	handler.ServeHTTP(httptest.NewRecorder(), req)
@@ -1171,7 +1171,7 @@ func TestMetricsMonitor_FormCapturePersistsStructuredJSON(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"text":"テスト"}`))
 	})
-	handler := CreateMetricsMiddleware(mm, config.Config{Models: map[string]config.ModelConfig{"Qwen/Qwen3-ASR-1.7B": {}}})(upstream)
+	handler := CreateMetricsMiddleware(mm, config.Config{Models: map[string]config.ModelConfig{"Qwen/Qwen3-ASR-1.7B": {}}}, nil)(upstream)
 	req := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", &buf)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	handler.ServeHTTP(httptest.NewRecorder(), req)
@@ -1239,7 +1239,7 @@ func TestMetricsMonitor_FormCaptureInlinesFileWithStoreMedia(t *testing.T) {
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"text":""}`))
 	})
-	handler := CreateMetricsMiddleware(mm, config.Config{Models: map[string]config.ModelConfig{"Qwen/Qwen3-ASR-1.7B": {}}})(upstream)
+	handler := CreateMetricsMiddleware(mm, config.Config{Models: map[string]config.ModelConfig{"Qwen/Qwen3-ASR-1.7B": {}}}, nil)(upstream)
 	req := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", &buf)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	handler.ServeHTTP(httptest.NewRecorder(), req)

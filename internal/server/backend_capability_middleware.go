@@ -59,6 +59,8 @@ func backendProtocolCapability(_ string, method, path, requestCapability string)
 	switch path {
 	case "/v1/chat/completions", "/v/chat/completions", "/v1/responses", "/v/responses", "/v1/messages", "/v/messages":
 		supported = method == http.MethodPost
+	case "/v1beta/interactions", "/v1/interactions", "/v/interactions":
+		supported = method == http.MethodPost
 	default:
 		supported = method == http.MethodPost && strings.HasPrefix(path, "/v1beta/models/") &&
 			(strings.HasSuffix(path, ":generateContent") || strings.HasSuffix(path, ":streamGenerateContent"))

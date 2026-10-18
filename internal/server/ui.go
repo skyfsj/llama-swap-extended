@@ -3,7 +3,6 @@ package server
 import (
 	"io/fs"
 	"net/http"
-	"path"
 	"strings"
 )
 
@@ -65,8 +64,14 @@ func (s *Server) handleUI(w http.ResponseWriter, r *http.Request) {
 }
 
 // serveUI serves the SPA from fsys. Real files are served with compression
-// support; unknown paths without a file extension fall back to index.html so
-// client-side routing works.
+// support.
+//
+// The UI routes with the URL hash (svelte-spa-router), so every navigation
+// after the first load stays on /ui/ and only asset paths reach this handler.
+// Consequently an unknown path is a genuine 404 rather than a request to
+// return index.html: the old fallback made every guessed path under /ui/
+// indistinguishable from a real one, which is both a path-disclosure oracle
+// and pointless noise in access logs.
 func serveUI(fsys http.FileSystem, w http.ResponseWriter, r *http.Request) {
 	name := strings.TrimPrefix(r.URL.Path, "/ui/")
 	if name == "" {
@@ -80,13 +85,7 @@ func serveUI(fsys http.FileSystem, w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := serveCompressedFile(fsys, w, r, name); err != nil {
-		if strings.Contains(path.Base(name), ".") {
-			http.NotFound(w, r)
-			return
-		}
-		if err := serveCompressedFile(fsys, w, r, "index.html"); err != nil {
-			http.NotFound(w, r)
-		}
+		http.NotFound(w, r)
 	}
 }
 

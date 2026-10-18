@@ -3,6 +3,7 @@ package server
 import (
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 
@@ -298,5 +299,94 @@ func TestServer_RuntimeAllowedForIdentityRequiresExclusiveModelOwnership(t *test
 	}
 	if !runtimeAllowedForIdentity(cfg, auth.Identity{Legacy: true}, "unconfigured") {
 		t.Fatal("legacy identity should retain global runtime access")
+	}
+}
+
+// Provider models are forwarded upstream, so their usage and request records
+// are as real as a local model's and the activity page must be able to select
+// them.
+func TestScopedActivityModels_IncludesProviderModels(t *testing.T) {
+	prefix := "go-"
+	cfg := config.Config{
+		Models: map[string]config.ModelConfig{
+			"local-model": {Cmd: "echo hi"},
+		},
+		Providers: config.ProviderDictionaryConfig{
+			"opencode-go": {
+				ModelPrefix: prefix,
+				Type:        config.ProviderTypeOpenAI,
+				Endpoint:    "https://example.com",
+				Models: []config.ProviderModel{
+					{Local: "glm-5.1", Remote: "glm-5.1", Aliases: []string{"glm"}},
+				},
+			},
+		},
+	}
+
+	models := configuredActivityModels(cfg)
+	want := []string{"go-glm", "go-glm-5.1", "local-model", "opencode-go/glm", "opencode-go/glm-5.1"}
+	if !slices.Equal(want, models) {
+		t.Fatalf("configuredActivityModels = %v, want %v", models, want)
+	}
+
+	// The UI filter sends the row name back, so every recorded spelling must
+	// resolve instead of turning into an empty view.
+	for _, requested := range want {
+		resolved, ok := configuredActivityModel(cfg, requested)
+		if !ok || resolved != requested {
+			t.Fatalf("configuredActivityModel(%q) = %q, %v", requested, resolved, ok)
+		}
+	}
+	// An alias of a local model still canonicalizes.
+	if resolved, ok := configuredActivityModel(cfg, "local-alias"); ok {
+		t.Fatalf("unknown model %q resolved to %q", "local-alias", resolved)
+	}
+}
+
+// A key restricted to one spelling of a model must authorize every spelling of
+// that same model: the operator selects a model once, not each of its names.
+func TestExpandModelAliases_ProviderModelGroup(t *testing.T) {
+	cfg := config.Config{
+		Models: map[string]config.ModelConfig{"local-model": {Cmd: "echo hi"}},
+		Providers: config.ProviderDictionaryConfig{
+			"opencode-go": {
+				Type:     config.ProviderTypeOpenAI,
+				Endpoint: "https://example.com",
+				Models: []config.ProviderModel{
+					{Local: "glm-5.1", Remote: "glm-5.1", Aliases: []string{"glm"}},
+					{Local: "kimi-k3", Remote: "kimi-k3"},
+				},
+			},
+		},
+	}
+
+	// Selecting the model by its own name authorizes its alias and FQN spellings.
+	group := expandModelAliases(cfg, []string{"glm-5.1"})
+	for _, want := range []string{"glm-5.1", "glm", "opencode-go/glm-5.1", "opencode-go/glm"} {
+		if !slices.Contains(group, want) {
+			t.Fatalf("expansion of glm-5.1 = %v, missing %q", group, want)
+		}
+	}
+	// ...and selecting it by an alias authorizes the model's own name.
+	fromAlias := expandModelAliases(cfg, []string{"glm"})
+	if !slices.Contains(fromAlias, "glm-5.1") {
+		t.Fatalf("expansion of the alias = %v, missing the model name", fromAlias)
+	}
+	// An unrelated model is untouched.
+	if slices.Contains(fromAlias, "kimi-k3") {
+		t.Fatalf("expansion leaked into another model: %v", fromAlias)
+	}
+
+	// Authorization accepts any spelling in the group, whichever one the key
+	// stored.
+	identity := auth.Identity{Models: []string{"glm-5.1"}}
+	identity.Models = expandModelAliases(cfg, identity.Models)
+	for _, requested := range []string{"glm-5.1", "glm", "opencode-go/glm-5.1", "opencode-go/glm"} {
+		if !modelAllowedForIdentity(cfg, identity, requested) {
+			t.Fatalf("request %q denied for a key restricted to glm-5.1 (models=%v)", requested, identity.Models)
+		}
+	}
+	if modelAllowedForIdentity(cfg, identity, "kimi-k3") {
+		t.Fatal("an unrelated model must stay denied")
 	}
 }

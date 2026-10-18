@@ -578,6 +578,17 @@ var powerWindowBounds = map[string]time.Duration{
 	"30d": 30 * 24 * time.Hour,
 }
 
+// localActivityModels lists the models that run on this machine: the energy
+// panel attributes card time, and a provider-routed request never occupies one.
+func localActivityModels(cfg config.Config) []string {
+	models := make([]string, 0, len(cfg.Models))
+	for model := range cfg.Models {
+		models = append(models, model)
+	}
+	sort.Strings(models)
+	return models
+}
+
 // handleAPIPower serves the activity page's energy panel: per-source power
 // series, per-model attributed energy with cost, and window/calendar totals.
 // The tariff configuration is echoed back so the UI renders costs with the
@@ -612,8 +623,13 @@ func (s *Server) handleAPIPower(w http.ResponseWriter, r *http.Request) {
 	}
 
 	report, err := s.store.PowerReport(r.Context(), store.PowerReportQuery{
-		Start:   start,
-		End:     end,
+		Start: start,
+		End:   end,
+		// Only locally served models consume a card, so only they can own
+		// attributed energy. Provider models and names that are not configured
+		// at all still appear in the audit trail, but a row for them here would
+		// report 0 kWh next to a request count that reads like a real entry.
+		Models:  localActivityModels(s.currentConfig()),
 		ModelID: modelID,
 	})
 	if err != nil {

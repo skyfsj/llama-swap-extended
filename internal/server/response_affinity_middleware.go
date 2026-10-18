@@ -106,8 +106,7 @@ func readRequestBodyForAffinity(r *http.Request) ([]byte, bool) {
 		return nil, false
 	}
 	_ = original.Close()
-	r.Body = io.NopCloser(bytes.NewReader(body))
-	r.ContentLength = int64(len(body))
+	swaputil.ReplaceRequestBody(r, body)
 	return body, true
 }
 
@@ -137,7 +136,7 @@ func (r *replayReadCloser) Close() error {
 	return r.err
 }
 
-func persistNativeResponseAffinity(_ context.Context, st *store.Store, model, backend string, body []byte, headers http.Header, status int) {
+func persistNativeResponseAffinity(ctx context.Context, st *store.Store, model, backend string, body []byte, headers http.Header, status int) {
 	// Responses ids are useful for routing subsequent GET/cancel calls even
 	// when the initial request failed (for example an upstream may return a
 	// response.failed SSE lifecycle with HTTP 200, or an error response with a
@@ -163,9 +162,14 @@ func persistNativeResponseAffinity(_ context.Context, st *store.Store, model, ba
 	}
 	state := responseAffinityState(response, status)
 	now := time.Now()
-	ctx, cancel := affinityWriteContext()
+	owner := identityIDFromContext(ctx)
+	writeCtx, cancel := affinityWriteContext()
 	defer cancel()
-	_ = st.UpsertResponseAffinity(ctx, store.ResponseAffinity{ResponseID: id, Model: model, Backend: backend, Status: state, Response: canonical, ExpiresAt: now.Add(30 * 24 * time.Hour), CreatedAt: now, UpdatedAt: now})
+	_ = st.UpsertResponseAffinity(writeCtx, store.ResponseAffinity{
+		ResponseID: id, Model: model, Backend: backend, Status: state, Response: canonical,
+		IdentityID: owner,
+		ExpiresAt:  now.Add(30 * 24 * time.Hour), CreatedAt: now, UpdatedAt: now,
+	})
 }
 
 // responseAffinityState prefers the protocol-level Responses status when one

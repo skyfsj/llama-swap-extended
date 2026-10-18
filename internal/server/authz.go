@@ -22,6 +22,13 @@ func identityFromContext(ctx context.Context) auth.Identity {
 	return identity
 }
 
+// identityIDFromContext names the credential for stored-state scoping. An
+// empty id means no credential was presented (a keyless deployment), which is
+// a single trust domain.
+func identityIDFromContext(ctx context.Context) string {
+	return strings.TrimSpace(identityFromContext(ctx).ID)
+}
+
 func withIdentity(ctx context.Context, identity auth.Identity) context.Context {
 	return context.WithValue(ctx, authIdentityKey{}, identity)
 }
@@ -98,18 +105,28 @@ func CreateScopedAuthMiddleware(cfg config.Config, st *store.Store, keys *keyCac
 				}
 			}
 			if !valid {
+				markAuthFailure(r)
 				w.Header().Set("WWW-Authenticate", apiKeyAuthChallenge)
 				swaputil.SendResponse(w, r, http.StatusUnauthorized, "unauthorized: invalid or missing API key")
 				return
 			}
+			// The credential is valid; clear the caller's failure window even
+			// if a later layer (scope, model restriction, upstream) rejects the
+			// request. Those rejections are not credential guessing.
+			markAuthSuccess(r)
 			// Last-used timestamps are buffered in memory and persisted by a
 			// background flusher: the authentication hot path must stay
 			// store-free, and all traffic shares one SQLite connection.
-			if !identity.Legacy {
+			if identity.ID != "" {
+				// The caller address travels with the timestamp: it is the other
+				// half of "who used this key, from where". A key declared in the
+				// configuration file is seeded as a durable row under the same
+				// id, so it gets the same audit trail as a panel-created one.
+				callerIP := clientIP(r)
 				if keys != nil {
-					keys.recordTouch(identity.ID, time.Now())
+					keys.recordTouch(identity.ID, time.Now(), callerIP)
 				} else if st != nil {
-					_ = st.TouchAPIKey(r.Context(), identity.ID, time.Now())
+					_ = st.TouchAPIKey(r.Context(), identity.ID, time.Now(), callerIP)
 				}
 			}
 			// RequireScope runs before CreateRequestContextMiddleware, so a
@@ -146,7 +163,7 @@ func CreateScopedAuthMiddleware(cfg config.Config, st *store.Store, keys *keyCac
 // RequireScope runs before request-context normalization and would reject a
 // valid alias even though dispatch resolves it to the same backend.
 func expandModelAliases(cfg config.Config, models []string) []string {
-	if len(models) == 0 || (len(cfg.Models) == 0 && len(cfg.Selectors) == 0) {
+	if len(models) == 0 || (len(cfg.Models) == 0 && len(cfg.Selectors) == 0 && len(cfg.Providers) == 0) {
 		return append([]string(nil), models...)
 	}
 	out := append([]string(nil), models...)
@@ -185,6 +202,36 @@ func expandModelAliases(cfg config.Config, models []string) []string {
 			}
 		}
 	}
+	// Provider models work the same way: the client-facing name, every alias
+	// and the provider-qualified form all name one model, so an allowlist entry
+	// in any of those spellings authorizes the whole group. An operator picks
+	// the model once; the alias spellings follow from the model definition.
+	for _, providerID := range sortedProviderIDs(cfg) {
+		provider := cfg.Providers[providerID]
+		if provider.Disabled {
+			continue
+		}
+		for _, model := range provider.AllModels() {
+			names := providerActivityNames(providerID, provider, model)
+			authorized := false
+			for _, name := range names {
+				if _, exists := seen[name]; exists {
+					authorized = true
+					break
+				}
+			}
+			if !authorized {
+				continue
+			}
+			for _, name := range names {
+				if _, exists := seen[name]; !exists {
+					seen[name] = struct{}{}
+					out = append(out, name)
+				}
+			}
+		}
+	}
+
 	// RequireScope runs before selector rewriting, so a model-scoped key must
 	// also carry the selector name when every concrete target is already
 	// allowed.  Appending only fully-authorized selectors prevents a selector
@@ -225,6 +272,37 @@ func modelAllowedForIdentity(cfg config.Config, identity auth.Identity, requeste
 	}
 	if identity.HasModel(requested) {
 		return true
+	}
+	// A provider model answers to its client-facing name (modelPrefix + model
+	// ID) and to the legacy provider/model form; an allowlist entry in either
+	// spelling grants access, so introducing a modelPrefix cannot lock a key
+	// out of models it was already allowed to use.
+	if providerID, modelID, pool, found := cfg.ResolveProviderModel(requested); found {
+		owners := []string{providerID}
+		if len(pool) > 0 {
+			owners = pool
+		}
+		for _, owner := range owners {
+			if identity.HasModel(config.ProviderModelFQN(owner, modelID)) {
+				return true
+			}
+			// The request resolved to this model: an allowlist entry naming any
+			// of its spellings (client-facing name, alias, qualified form)
+			// authorizes it. Requesting one name and being denied because the
+			// key listed another spelling of the same model is the trap this
+			// prevents.
+			provider := cfg.Providers[owner]
+			for _, model := range provider.AllModels() {
+				if model.Local != modelID {
+					continue
+				}
+				for _, name := range providerActivityNames(owner, provider, model) {
+					if identity.HasModel(name) {
+						return true
+					}
+				}
+			}
+		}
 	}
 	canonical, ok := cfg.RealModelName(requested)
 	if ok {
@@ -348,6 +426,25 @@ func configuredActivityModels(cfg config.Config) []string {
 		seen[model] = struct{}{}
 		models = append(models, model)
 	}
+	// Provider models are forwarded upstream, so usage and request records for
+	// them are as real as a local model's. A request may name one through any
+	// of its routing names: the client-facing name (prefix + model), an alias,
+	// or the provider-qualified form.
+	for _, providerID := range sortedProviderIDs(cfg) {
+		provider := cfg.Providers[providerID]
+		if provider.Disabled {
+			continue
+		}
+		for _, model := range provider.AllModels() {
+			for _, name := range providerActivityNames(providerID, provider, model) {
+				if _, duplicate := seen[name]; duplicate {
+					continue
+				}
+				seen[name] = struct{}{}
+				models = append(models, name)
+			}
+		}
+	}
 	for peerID, peer := range cfg.Peers {
 		for _, model := range peer.Models {
 			fqn := config.PeerModelFQN(peerID, model)
@@ -362,6 +459,35 @@ func configuredActivityModels(cfg config.Config) []string {
 	return models
 }
 
+// providerActivityNames lists every name a provider model can be requested
+// under, so a usage filter can resolve what was recorded.
+func providerActivityNames(providerID string, provider config.ProviderConfig, model config.ProviderModel) []string {
+	names := make([]string, 0, 4)
+	if name := strings.TrimSpace(config.ProviderModelName(provider.ModelPrefix, model.Local)); name != "" {
+		names = append(names, name)
+	}
+	if fqn := config.ProviderModelFQN(providerID, model.Local); fqn != "" {
+		names = append(names, fqn)
+	}
+	for _, alias := range model.Aliases {
+		alias = strings.TrimSpace(alias)
+		if alias == "" {
+			continue
+		}
+		names = append(names, config.ProviderModelName(provider.ModelPrefix, alias))
+		names = append(names, config.ProviderModelFQN(providerID, alias))
+	}
+	// The upstream name is callable when the provider exposes it, so a key
+	// restricted to this model has to accept it as well.
+	if provider.ExposesUpstreamName() {
+		if remote := strings.TrimSpace(model.Remote); remote != "" {
+			names = append(names, config.ProviderModelName(provider.ModelPrefix, remote))
+			names = append(names, config.ProviderModelFQN(providerID, remote))
+		}
+	}
+	return names
+}
+
 func configuredActivityModel(cfg config.Config, requested string) (string, bool) {
 	requested = strings.TrimSpace(requested)
 	if requested == "" {
@@ -372,6 +498,22 @@ func configuredActivityModel(cfg config.Config, requested string) (string, bool)
 	}
 	if peerID, peerModel, ok := cfg.ResolvePeerModel(requested); ok {
 		return config.PeerModelFQN(peerID, peerModel), true
+	}
+	// A provider model keeps the spelling the client used: the gateway accepts
+	// the client-facing name, an alias and the provider-qualified form, and the
+	// recorded row carries whatever the request said.
+	for _, providerID := range sortedProviderIDs(cfg) {
+		provider := cfg.Providers[providerID]
+		if provider.Disabled {
+			continue
+		}
+		for _, model := range provider.AllModels() {
+			for _, name := range providerActivityNames(providerID, provider, model) {
+				if name == requested {
+					return requested, true
+				}
+			}
+		}
 	}
 	return "", false
 }

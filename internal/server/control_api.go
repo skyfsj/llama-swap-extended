@@ -48,17 +48,40 @@ func (s *Server) handleAPIAuthSession(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	case http.MethodGet:
-		identity, valid, err := s.lookupIdentity(r.Context(), cfg, swaputil.ExtractAPIKey(r))
+		presented := swaputil.ExtractAPIKey(r)
+		identity, credentialValid, err := s.lookupIdentity(r.Context(), cfg, presented)
 		if err != nil {
 			swaputil.SendResponse(w, r, http.StatusInternalServerError, err.Error())
 			return
 		}
+		// The configured flag is served from the in-memory key cache so a
+		// transient storage failure cannot make the login prompt flicker. It is
+		// resolved before the throttle so a keyless deployment can skip
+		// counting entirely: with no key configured, nothing can authenticate
+		// and every presented value is expected to be rejected, so charging
+		// those rejections to the caller's IP would let a stale cookie lock an
+		// operator out of the inference endpoints.
+		configured := s.authConfigured()
+		// GET is a credentials oracle as much as POST: it validates the
+		// presented secret and reports the answer, so it must feed the same
+		// throttle or guessing simply moves here.
+		//
+		// The counter follows the credential, not the login policy: a valid
+		// key that is merely not allowed to sign in (an access key, or a
+		// management key with allowManagementLogin: false) is still a valid
+		// key, and counting it as a failed attempt would lock a legitimate
+		// caller out of its own inference endpoints after a few page loads.
+		if presented != "" && configured {
+			if credentialValid {
+				markAuthSuccess(r)
+			} else {
+				markAuthFailure(r)
+			}
+		}
+		valid := credentialValid
 		if valid && !identity.Legacy && !identity.AllowManagementLogin {
 			valid = false
 		}
-		// The configured flag is served from the in-memory key cache so a
-		// transient storage failure cannot make the login prompt flicker.
-		configured := s.authConfigured()
 		w.Header().Set("Content-Type", "application/json")
 		response := map[string]any{"authenticated": valid, "configured": configured}
 		if valid {
@@ -82,10 +105,19 @@ func (s *Server) handleAPIAuthSession(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !valid {
+			// A keyless deployment expects every submission to fail: nothing
+			// can authenticate, so charging it to the caller would let anyone
+			// block a NAT egress (and its inference traffic) with a few posts.
+			if s.authConfigured() {
+				markAuthFailure(r)
+			}
 			w.Header().Set("WWW-Authenticate", apiKeyAuthChallenge)
 			swaputil.SendResponse(w, r, http.StatusUnauthorized, "unauthorized: invalid or missing API key")
 			return
 		}
+		// The credential itself is valid; whether it may sign in is a policy
+		// decision below, not a failed login.
+		markAuthSuccess(r)
 		if !identity.Legacy && !identity.AllowManagementLogin {
 			swaputil.SendResponse(w, r, http.StatusForbidden, "forbidden: this API key cannot sign in to the management panel")
 			return
@@ -101,7 +133,7 @@ func (s *Server) handleAPIAuthSession(w http.ResponseWriter, r *http.Request) {
 			Secure:   r.TLS != nil,
 		})
 		if !identity.Legacy && s.store != nil {
-			_ = s.store.TouchAPIKey(r.Context(), identity.ID, time.Now())
+			_ = s.store.TouchAPIKey(r.Context(), identity.ID, time.Now(), clientIP(r))
 		}
 		w.Header().Set("Content-Type", "application/json")
 		// Keep the login response backward-compatible; clients can call the GET
@@ -125,10 +157,23 @@ func identityScopeList(identity auth.Identity) []string {
 	return result
 }
 
+// errConfigKeysWouldLockOut marks a configuration edit that would leave the
+// deployment demanding a key nobody can present. The reload caller turns it
+// into a rejected config change; startup only warns, because a server that
+// refuses to boot also refuses the login that would repair the file.
+var errConfigKeysWouldLockOut = errors.New("configuration would leave no management key that can sign in")
+
+// seedStartupAPIKeys reconciles the configuration's apiKeys section with the
+// durable key table: entries the file declares are upserted, and the
+// config-owned rows it no longer declares are revoked together with their
+// nested access keys. Editing the file therefore takes effect immediately —
+// without this, deleting a key left its stored row active until an operator
+// revoked it by hand on the API keys page.
 func (s *Server) seedStartupAPIKeys(cfg config.Config) error {
 	if s == nil || s.store == nil {
 		return nil
 	}
+	configured := make(map[string]struct{})
 	seed := func(id, name, secret string, scopes []string, models []string, expiresAt *time.Time, allowManagementLogin bool) error {
 		secret = strings.TrimSpace(secret)
 		if secret == "" {
@@ -154,6 +199,26 @@ func (s *Server) seedStartupAPIKeys(cfg config.Config) error {
 		if id == "" {
 			id = "startup-" + auth.Hash(secret)[:16]
 		}
+		// A configured id that collides with an authentication sentinel would
+		// make that credential indistinguishable from the keyless state. Remap
+		// it to the same stable derived id an unnamed entry uses instead of
+		// rejecting the configuration: refusing here would stop the daemon
+		// from starting for a deployment that already used that id, and the
+		// remap is idempotent so a reload keeps the same row.
+		if store.IsReservedAPIKeyID(id) {
+			derived := "startup-" + auth.Hash(secret)[:16]
+			if s.proxylog != nil {
+				s.proxylog.Warnf("api key id %q is reserved; using %q instead", id, derived)
+			}
+			id = derived
+		}
+		// Two entries can resolve to the same final id (a remapped reserved id
+		// colliding with an explicit startup-<hash> entry, or a repeated id).
+		// Upserting the second would silently replace the first credential, so
+		// the collision is reported instead of guessed at.
+		if _, duplicate := configured[id]; duplicate {
+			return fmt.Errorf("api key id %q is declared more than once", id)
+		}
 		salt, digest, err := auth.GenerateSalted(secret)
 		if err != nil {
 			return err
@@ -162,10 +227,11 @@ func (s *Server) seedStartupAPIKeys(cfg config.Config) error {
 			ID: id, Name: strings.TrimSpace(name), KeyHash: digest,
 			KeySalt: salt, KeySecret: secret, AllowManagementLogin: allowManagementLogin,
 			Scopes: scopeList, Models: normalizedModels,
-			ExpiresAt: expiresAt, CreatedAt: time.Now(),
+			ExpiresAt: expiresAt, CreatedAt: time.Now(), Source: store.KeySourceConfig,
 		}); err != nil {
 			return err
 		}
+		configured[id] = struct{}{}
 		return nil
 	}
 	for _, entry := range cfg.StartupAPIKeys {
@@ -178,6 +244,67 @@ func (s *Server) seedStartupAPIKeys(cfg config.Config) error {
 	// importer can resolve their secret just like structured startup keys.
 	for _, secret := range cfg.RequiredAPIKeys {
 		if err := seed(store.KeyFingerprint(secret), "Configured API key", secret, auth.ManagementScopes(), nil, nil, true); err != nil {
+			return err
+		}
+	}
+	return s.revokeUnconfiguredStartupAPIKeys(cfg, configured)
+}
+
+// revokeUnconfiguredStartupAPIKeys revokes the config-owned rows the current
+// apiKeys section no longer declares. Only rows this server seeded on behalf of
+// the configuration are eligible, so an edit to the file can never remove a key
+// an operator created through the control plane.
+//
+// The revoke is refused when it would leave the store with no management key
+// that can sign in while other keys still require authentication — the same dead
+// end the control plane refuses to create when the last key is deleted from the
+// panel, and one the config file must not be able to create silently either.
+// Nothing is revoked when the guard trips, so a rejected edit leaves the
+// previous keys exactly as they were.
+func (s *Server) revokeUnconfiguredStartupAPIKeys(cfg config.Config, configured map[string]struct{}) error {
+	rows, err := s.store.ListAPIKeys(context.Background(), false)
+	if err != nil {
+		return err
+	}
+	stale := make(map[string]struct{})
+	for _, row := range rows {
+		if row.Source != store.KeySourceConfig {
+			continue
+		}
+		if _, keep := configured[row.ID]; keep {
+			continue
+		}
+		stale[row.ID] = struct{}{}
+	}
+	if len(stale) == 0 {
+		return nil
+	}
+	// A removed management key takes its nested access keys with it, so the
+	// guard has to judge the state that would remain after that cascade.
+	remaining := make([]store.APIKeyRecord, 0, len(rows))
+	for _, row := range rows {
+		if _, dropped := stale[row.ID]; dropped {
+			continue
+		}
+		if row.ParentID != "" {
+			if _, parentDropped := stale[row.ParentID]; parentDropped {
+				continue
+			}
+		}
+		remaining = append(remaining, row)
+	}
+	if !hasManagementRecoveryKey(cfg, remaining) {
+		ids := make([]string, 0, len(stale))
+		for id := range stale {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		return fmt.Errorf("%w: removing apiKeys %s; a deployment with stored keys always needs one that can sign in",
+			errConfigKeysWouldLockOut, strings.Join(ids, ", "))
+	}
+	when := time.Now()
+	for id := range stale {
+		if err := s.store.RevokeAPIKeyCascade(context.Background(), id, when); err != nil {
 			return err
 		}
 	}
@@ -274,6 +401,13 @@ func keyID() string {
 
 func (s *Server) handleAPIKeys(w http.ResponseWriter, r *http.Request) {
 	includeRevoked := r.URL.Query().Get("include_revoked") == "true"
+	// Last-used timestamps (and the caller addresses recorded with them) live in
+	// a memory buffer between background flushes. An operator who just made a
+	// request opens this page to see it, so drain the buffer first: the flush
+	// writes only what is already pending and is a no-op when nothing is.
+	if s.keys != nil {
+		s.keys.flushTouches(r.Context())
+	}
 	keys, err := s.store.ListAPIKeys(r.Context(), includeRevoked)
 	if err != nil {
 		swaputil.SendResponse(w, r, http.StatusInternalServerError, err.Error())
@@ -1133,7 +1267,11 @@ func parseAuditQuery(r *http.Request) (store.AuditQuery, error) {
 }
 
 type deeplinkRequest struct {
-	App         string `json:"app"`
+	App string `json:"app"`
+	// ApiFormat is the wire format CC Switch configures the imported provider
+	// with. It defaults to the target application's native format, which is
+	// also the surface llama-swap converts from.
+	ApiFormat   string `json:"apiFormat"`
 	Endpoint    string `json:"endpoint"`
 	Name        string `json:"name"`
 	Model       string `json:"model"`
@@ -1155,6 +1293,78 @@ type ccSwitchKeyOption struct {
 	ID     string   `json:"id"`
 	Name   string   `json:"name"`
 	Models []string `json:"models,omitempty"`
+}
+
+// generatedDeeplinkKeyRecord builds the row a CC Switch import creates.
+//
+// The new credential must never be stronger than the one that asked for it.
+// When the caller is a stored management key the generated key becomes an
+// access key nested under it, so revoking or expiring the parent also ends the
+// child, and the parent's model restriction, IP allowlist and expiry are
+// copied down. Without this inheritance an inference-scoped key could mint an
+// unrestricted, non-expiring credential (and a management-kind one at that,
+// which the parent-revocation cascade does not reach).
+//
+// A keyless deployment (no credential presented) has no parent to nest under.
+// There the row must be a full management key that may sign in: the moment it
+// is written the deployment stops being keyless, so an inference-only key
+// would leave nobody able to reach the control plane and the panel would be
+// locked out until the operator edits the YAML or deletes the database. The
+// caller is already holding full anonymous access in that state, so this
+// grants no additional authority — it only keeps the deployment operable.
+func (s *Server) generatedDeeplinkKeyRecord(
+	r *http.Request,
+	identity auth.Identity,
+	id, name string,
+	models []string,
+	digest string,
+	salt []byte,
+	secret string,
+) (store.APIKeyRecord, error) {
+	record := store.APIKeyRecord{
+		ID: id, Name: name, KeyHash: digest, KeySalt: salt, KeySecret: secret,
+		Scopes: []string{auth.ScopeInference}, Models: models, AllowManagementLogin: false,
+		CreatedAt: time.Now(),
+	}
+	callerID := strings.TrimSpace(identity.ID)
+	// Only the keyless state is a bootstrap: the auth middleware represents it
+	// as a *legacy* anonymous identity. Matching on the ID alone would collide
+	// with a configured startup key that happens to use "anonymous" as its id;
+	// that row is a stored management key (Legacy=false) and must go through
+	// the parent path like any other credential, otherwise a restricted key
+	// could mint a full management key here.
+	if s.store == nil || callerID == "" || (identity.Legacy && callerID == "anonymous") {
+		// First-run bootstrap. Without AllowManagementLogin + keys-admin this
+		// row would authenticate inference traffic while locking the panel.
+		record.Scopes = auth.ManagementScopes()
+		record.AllowManagementLogin = true
+		return record, nil
+	}
+	parent, found, err := s.store.FindAPIKeyByID(r.Context(), callerID)
+	if err != nil {
+		return store.APIKeyRecord{}, err
+	}
+	if !found {
+		// A key declared only in the configuration file is seeded into the
+		// store at startup, so a missing row means the credential is not a
+		// durable management key. Refuse rather than guess a parent.
+		return store.APIKeyRecord{}, errors.New("forbidden: the calling credential has no stored management key to nest the new key under")
+	}
+	if parent.Kind == auth.KeyKindAccess {
+		return store.APIKeyRecord{}, errors.New("forbidden: access keys cannot create further API keys")
+	}
+	if parent.RevokedAt != nil {
+		return store.APIKeyRecord{}, errors.New("forbidden: the calling credential is revoked")
+	}
+	record.Kind = auth.KeyKindAccess
+	record.ParentID = parent.ID
+	record.Models = intersectModels(models, parent.Models)
+	record.AllowedIPs = append([]string(nil), parent.AllowedIPs...)
+	record.MaxConcurrency = parent.MaxConcurrency
+	record.Group = parent.Group
+	// A child must not outlive its parent.
+	record.ExpiresAt = parent.ExpiresAt
+	return record, nil
 }
 
 func (s *Server) handleAPICCOptions(w http.ResponseWriter, r *http.Request) {
@@ -1221,6 +1431,10 @@ func (s *Server) handleAPICCLinks(w http.ResponseWriter, r *http.Request) {
 		req.Name = "llama-swap"
 	}
 	req.App = strings.TrimSpace(req.App)
+	req.ApiFormat = strings.TrimSpace(req.ApiFormat)
+	if req.App != "" && req.ApiFormat == "" {
+		req.ApiFormat = ccswitch.NativeFormat(req.App)
+	}
 	req.KeyID = strings.TrimSpace(req.KeyID)
 	identity := identityFromContext(r.Context())
 	if req.CreateKey && (req.KeyID != "" || strings.TrimSpace(req.Key) != "") {
@@ -1285,6 +1499,17 @@ func (s *Server) handleAPICCLinks(w http.ResponseWriter, r *http.Request) {
 	}
 	createdKeyID := ""
 	if req.CreateKey {
+		// An access key is a model credential, not a control-plane credential:
+		// it can never mint another key. Management keys keep this feature (the
+		// UI's "auto key" flow) because the generated key is nested under them
+		// and inherits their restrictions — see generatedDeeplinkKeyRecord. That
+		// inheritance, not a scope check, is what prevents a restricted
+		// credential from being laundered into an unrestricted one.
+		if !identity.Legacy && identity.Kind == auth.KeyKindAccess {
+			swaputil.SendResponse(w, r, http.StatusForbidden,
+				"forbidden: access keys cannot create further API keys")
+			return
+		}
 		if req.App == "" || strings.TrimSpace(req.Model) == "" {
 			swaputil.SendResponse(w, r, http.StatusBadRequest, "app and model are required when createKey is true")
 			return
@@ -1292,7 +1517,7 @@ func (s *Server) handleAPICCLinks(w http.ResponseWriter, r *http.Request) {
 		// Validate every provider field before creating a durable key, so malformed
 		// requests cannot leave unused credentials behind.
 		if _, err := ccswitch.BuildProvider(ccswitch.Provider{
-			App: req.App, Name: req.Name, Endpoint: req.Endpoint, Model: req.Model,
+			App: req.App, ApiFormat: req.ApiFormat, Name: req.Name, Endpoint: req.Endpoint, Model: req.Model,
 			HaikuModel: req.HaikuModel, SonnetModel: req.SonnetModel, OpusModel: req.OpusModel,
 		}); err != nil {
 			swaputil.SendResponse(w, r, http.StatusBadRequest, err.Error())
@@ -1322,11 +1547,12 @@ func (s *Server) handleAPICCLinks(w http.ResponseWriter, r *http.Request) {
 			models = append(models, model)
 		}
 		createdKeyID = keyID()
-		if err := s.store.UpsertAPIKey(r.Context(), store.APIKeyRecord{
-			ID: createdKeyID, Name: req.Name, KeyHash: digest, KeySalt: salt, KeySecret: secret,
-			Scopes: []string{auth.ScopeInference}, Models: models, AllowManagementLogin: false,
-			CreatedAt: time.Now(),
-		}); err != nil {
+		record, recordErr := s.generatedDeeplinkKeyRecord(r, identity, createdKeyID, req.Name, models, digest, salt, secret)
+		if recordErr != nil {
+			swaputil.SendResponse(w, r, http.StatusForbidden, recordErr.Error())
+			return
+		}
+		if err := s.store.UpsertAPIKey(r.Context(), record); err != nil {
 			swaputil.SendResponse(w, r, http.StatusInternalServerError, err.Error())
 			return
 		}
@@ -1345,7 +1571,7 @@ func (s *Server) handleAPICCLinks(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.App != "" {
 		link, err := ccswitch.BuildProvider(ccswitch.Provider{
-			App: req.App, Name: req.Name, Endpoint: req.Endpoint, Model: req.Model,
+			App: req.App, ApiFormat: req.ApiFormat, Name: req.Name, Endpoint: req.Endpoint, Model: req.Model,
 			HaikuModel: req.HaikuModel, SonnetModel: req.SonnetModel, OpusModel: req.OpusModel,
 			APIKey: req.Key, IncludeKey: req.IncludeKey,
 		})
@@ -1358,7 +1584,15 @@ func (s *Server) handleAPICCLinks(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Referrer-Policy", "no-referrer")
 		}
 		w.Header().Set("Content-Type", "application/json")
+		// Report the endpoint and format exactly as they appear in the link:
+		// CC Switch resolves them per application, and the WebUI shows the
+		// resolved values so the operator can check the import before opening it.
 		payload := map[string]string{"app": req.App, "link": link}
+		if parsed, parseErr := url.Parse(link); parseErr == nil {
+			query := parsed.Query()
+			payload["endpoint"] = query.Get("endpoint")
+			payload["apiFormat"] = query.Get("apiFormat")
+		}
 		if createdKeyID != "" {
 			payload["keyId"] = createdKeyID
 		}

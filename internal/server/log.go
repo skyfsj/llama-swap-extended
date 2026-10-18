@@ -348,22 +348,23 @@ func (sr *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return nil, nil, fmt.Errorf("underlying ResponseWriter does not support hijacking")
 }
 
-// clientIP resolves the originating client address, preferring proxy headers
-// over the raw connection address.
+// clientIP returns the caller address resolved by CreateClientIPMiddleware.
+//
+// Without that middleware (direct handler tests, embedders that mount the mux
+// themselves) it falls back to the connection address only. Forwarding
+// headers are never consulted here: they are attacker-controlled unless the
+// operator opted into trusted proxies.
 func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if first, _, found := strings.Cut(xff, ","); found {
-			return strings.TrimSpace(first)
-		}
-		return strings.TrimSpace(xff)
+	if r == nil {
+		return ""
 	}
-	if xr := r.Header.Get("X-Real-IP"); xr != "" {
-		return strings.TrimSpace(xr)
+	if resolved, ok := r.Context().Value(clientIPContextKey{}).(string); ok {
+		return resolved
 	}
-	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		return host
+	if addr, ok := parseClientAddr(r.RemoteAddr); ok {
+		return addr.String()
 	}
-	return r.RemoteAddr
+	return strings.TrimSpace(r.RemoteAddr)
 }
 
 // CreateRequestLogMiddleware returns middleware that records one access-log

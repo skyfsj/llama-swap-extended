@@ -183,6 +183,32 @@ func (t *inflightTracker) Remove(id string) {
 	t.mu.Unlock()
 }
 
+// SetRoute records the upstream serving the request and marks the row's route
+// resolved. An empty provider means the route resolved to no provider at all,
+// which is what a locally hosted model reports; the flag is what keeps that
+// distinct from a row whose route is still undecided.
+//
+// It runs on the request's own goroutine — the gateway reports through the
+// request context, and the middleware resolves a local model before handing
+// control on — so the entry stays race-free against the snapshot the UI reads.
+func (t *inflightTracker) SetRoute(id, provider, adapter string) {
+	if t == nil || strings.TrimSpace(id) == "" {
+		return
+	}
+	provider = strings.TrimSpace(provider)
+	adapter = strings.TrimSpace(adapter)
+	t.mu.Lock()
+	req, ok := t.requests[id]
+	if ok {
+		req.entry.Provider = provider
+		req.entry.Adapter = adapter
+		req.entry.RouteResolved = true
+		req.lastEmitted = time.Now()
+		t.enqueueLocked(upsertInflightEvent(req.entry))
+	}
+	t.mu.Unlock()
+}
+
 func (t *inflightTracker) SetResponseHeaders(id string, headers http.Header) {
 	values := headerMap(headers)
 	redactHeaders(values)
@@ -686,6 +712,9 @@ func CreateInflightMiddleware(t *inflightTracker, cfg config.Config) chain.Middl
 			id := t.Add(r, cancel)
 			r = r.WithContext(swaputil.WithInferencePhaseReporter(r.Context(), func(phase, message string) {
 				t.SetPhase(id, phase, message)
+			}))
+			r = r.WithContext(swaputil.WithInferenceRouteReporter(r.Context(), func(provider, adapter string) {
+				t.SetRoute(id, provider, adapter)
 			}))
 			data, _ := swaputil.ReadContext(r.Context())
 			model := data.ModelID

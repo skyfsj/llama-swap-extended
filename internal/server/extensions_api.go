@@ -490,9 +490,9 @@ func (s *Server) handleAPIExtensionTest(w http.ResponseWriter, r *http.Request) 
 			result["requestAfter"] = after
 			testRequest := map[string]any{"tools": after["tools"]}
 			if payload.Context.Endpoint == "anthropic.messages" {
-				_ = injectAnthropicTools(testRequest, item, map[string]*extensions.Compiled{})
+				_ = injectAnthropicTools(testRequest, item, map[string]*extensions.Compiled{}, nil)
 			} else {
-				_ = injectExtensionTools(testRequest, item, payload.Context.Endpoint != "responses", map[string]*extensions.Compiled{})
+				_ = injectExtensionTools(testRequest, item, payload.Context.Endpoint != "responses", map[string]*extensions.Compiled{}, nil)
 			}
 			result["injectedTools"] = testRequest["tools"]
 		}

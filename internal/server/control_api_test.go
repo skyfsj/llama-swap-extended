@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/auth"
 	"github.com/mostlygeek/llama-swap/internal/config"
@@ -385,13 +386,26 @@ func TestServer_SecretBearingResponsesDisableCaching(t *testing.T) {
 	if err := json.Unmarshal(browserResponse.Body.Bytes(), &browserLinks); err != nil {
 		t.Fatalf("decode browser deeplink: %v", err)
 	}
+	// CC Switch configures each application with the base URL it appends its own
+	// request path to: Claude Code posts to {base}/v1/messages and the Gemini CLI
+	// to {base}/v1beta/models/..., while Codex posts to {base}/responses and the
+	// AI-SDK clients to {base}/chat/completions.
 	for name, link := range map[string]string{"codex": browserLinks.Codex, "claude": browserLinks.Claude} {
 		parsed, err := url.Parse(link)
 		if err != nil {
 			t.Fatalf("parse %s deeplink: %v", name, err)
 		}
-		if got, want := parsed.Query().Get("endpoint"), "http://console.example:9292/v1"; got != want {
-			t.Fatalf("%s endpoint=%q, want %q", name, got, want)
+		wantEndpoint := "http://console.example:9292/v1"
+		wantFormat := "openai_responses"
+		if name == "claude" {
+			wantEndpoint = "http://console.example:9292"
+			wantFormat = "anthropic"
+		}
+		if got := parsed.Query().Get("endpoint"); got != wantEndpoint {
+			t.Fatalf("%s endpoint=%q, want %q", name, got, wantEndpoint)
+		}
+		if got := parsed.Query().Get("apiFormat"); got != wantFormat {
+			t.Fatalf("%s apiFormat=%q, want %q", name, got, wantFormat)
 		}
 		if got, want := parsed.Query().Get("apiKey"), rotated.Key; got != want {
 			t.Fatalf("%s apiKey=%q, want current session key", name, got)
@@ -504,8 +518,10 @@ func TestServer_CCSwitchDeepLinkUsesRetainedSelectedKey(t *testing.T) {
 		t.Fatalf("selected key deeplink status=%d body=%s", response.Code, response.Body.String())
 	}
 	var payload struct {
-		App  string `json:"app"`
-		Link string `json:"link"`
+		App       string `json:"app"`
+		Link      string `json:"link"`
+		Endpoint  string `json:"endpoint"`
+		ApiFormat string `json:"apiFormat"`
 	}
 	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
 		t.Fatal(err)
@@ -516,6 +532,12 @@ func TestServer_CCSwitchDeepLinkUsesRetainedSelectedKey(t *testing.T) {
 	}
 	if payload.App != "claude" || link.Query().Get("apiKey") != "selected-secret" || link.Query().Get("model") != "allowed" || link.Query().Get("haikuModel") != "allowed" {
 		t.Fatalf("selected key deeplink payload=%+v query=%v", payload, link.Query())
+	}
+	if payload.ApiFormat != "anthropic" || payload.Endpoint != "http://example.com" {
+		t.Fatalf("resolved import fields = %+v, want anthropic at the bare origin", payload)
+	}
+	if got := link.Query().Get("endpoint"); got != payload.Endpoint {
+		t.Fatalf("link endpoint=%q, response endpoint=%q", got, payload.Endpoint)
 	}
 
 	listRequest := httptest.NewRequest(http.MethodGet, "/api/keys", nil)
@@ -598,9 +620,46 @@ func TestServer_CCSwitchOptionsAndAutoCreatedKey(t *testing.T) {
 		t.Fatalf("restricted options=%+v, want current key only", options.Data)
 	}
 
+	// A management key may create a client key even when it only carries the
+	// inference scope (the UI's "auto key" flow). The generated credential is
+	// nested under it, so it cannot exceed the caller's own access.
+	allowedCreate := httptest.NewRequest(http.MethodPost, "/api/cc-switch/deeplink", strings.NewReader(`{"app":"codex","name":"client","model":"allowed","createKey":true}`))
+	allowedCreate.Header.Set("Content-Type", "application/json")
+	allowedCreate.Header.Set("Authorization", "Bearer selected-secret")
+	allowedResponse := httptest.NewRecorder()
+	s.ServeHTTP(allowedResponse, allowedCreate)
+	if allowedResponse.Code != http.StatusOK {
+		t.Fatalf("management-key auto-create status=%d body=%s, want 200", allowedResponse.Code, allowedResponse.Body.String())
+	}
+
+	// An access key is a model credential, not a control-plane credential: it
+	// must never mint another key.
+	accessSalt, accessDigest, err := auth.GenerateSalted("access-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.store.UpsertAPIKey(t.Context(), store.APIKeyRecord{
+		ID: "access", Name: "access", KeyHash: accessDigest, KeySalt: accessSalt,
+		KeySecret: "access-secret", Kind: auth.KeyKindAccess, ParentID: "admin",
+		Scopes: []string{auth.ScopeInference}, Models: []string{"allowed"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s.refreshKeyCache()
+	denied := httptest.NewRequest(http.MethodPost, "/api/cc-switch/deeplink", strings.NewReader(`{"app":"codex","name":"escalated","model":"allowed","createKey":true}`))
+	denied.Header.Set("Content-Type", "application/json")
+	denied.Header.Set("Authorization", "Bearer access-secret")
+	deniedResponse := httptest.NewRecorder()
+	s.ServeHTTP(deniedResponse, denied)
+	if deniedResponse.Code != http.StatusForbidden {
+		t.Fatalf("access-key auto-create status=%d body=%s, want 403", deniedResponse.Code, deniedResponse.Body.String())
+	}
+
+	// A keys-admin key may create one, and the new credential is nested under
+	// the caller and inherits its constraints.
 	createRequest := httptest.NewRequest(http.MethodPost, "/api/cc-switch/deeplink", strings.NewReader(`{"app":"codex","name":"allowed","model":"allowed","createKey":true}`))
 	createRequest.Header.Set("Content-Type", "application/json")
-	createRequest.Header.Set("Authorization", "Bearer selected-secret")
+	createRequest.Header.Set("Authorization", "Bearer admin-secret")
 	createResponse := httptest.NewRecorder()
 	s.ServeHTTP(createResponse, createRequest)
 	if createResponse.Code != http.StatusOK {
@@ -627,6 +686,70 @@ func TestServer_CCSwitchOptionsAndAutoCreatedKey(t *testing.T) {
 	}
 	if record.ID != created.KeyID || record.Name != "allowed" || record.AllowManagementLogin || len(record.Scopes) != 1 || record.Scopes[0] != auth.ScopeInference || len(record.Models) != 1 || record.Models[0] != "allowed" {
 		t.Fatalf("auto-created key=%+v", record)
+	}
+	if record.Kind != auth.KeyKindAccess || record.ParentID != "admin" {
+		t.Fatalf("auto-created key kind=%q parent=%q, want an access key under admin", record.Kind, record.ParentID)
+	}
+}
+
+// TestServer_CCSwitchAutoCreatedKeyInheritsCallerRestrictions is the
+// regression guard for credential-laundering: an access key that survived the
+// scope check must still produce a child no stronger than itself.
+func TestServer_CCSwitchAutoCreatedKeyInheritsCallerRestrictions(t *testing.T) {
+	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	t.Cleanup(func() { _ = s.Shutdown(0) })
+	s.cfg = config.Config{Models: map[string]config.ModelConfig{"allowed": {}}}
+	s.routes()
+
+	expires := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
+	salt, digest, err := auth.GenerateSalted("boss-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.store.UpsertAPIKey(t.Context(), store.APIKeyRecord{
+		ID: "boss", Name: "boss", KeyHash: digest, KeySalt: salt, KeySecret: "boss-secret",
+		Kind: auth.KeyKindManagement, AllowManagementLogin: true,
+		Scopes: []string{auth.ScopeInference, auth.ScopeKeysAdmin},
+		Models: []string{"allowed"}, AllowedIPs: []string{"203.0.113.0/24"},
+		MaxConcurrency: 4, ExpiresAt: &expires,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s.refreshKeyCache()
+
+	request := httptest.NewRequest(http.MethodPost, "/api/cc-switch/deeplink", strings.NewReader(`{"app":"codex","name":"child","model":"allowed","createKey":true}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer boss-secret")
+	response := httptest.NewRecorder()
+	s.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("auto-create status=%d body=%s", response.Code, response.Body.String())
+	}
+	var created struct {
+		Link string `json:"link"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	link, err := url.Parse(created.Link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, found, err := s.store.FindAPIKeyBySecret(t.Context(), link.Query().Get("apiKey"))
+	if err != nil || !found {
+		t.Fatalf("find child found=%v err=%v", found, err)
+	}
+	if record.Kind != auth.KeyKindAccess || record.ParentID != "boss" {
+		t.Fatalf("child kind=%q parent=%q", record.Kind, record.ParentID)
+	}
+	if len(record.AllowedIPs) != 1 || record.AllowedIPs[0] != "203.0.113.0/24" {
+		t.Fatalf("child allowedIps=%v, want the parent's", record.AllowedIPs)
+	}
+	if record.MaxConcurrency != 4 {
+		t.Fatalf("child maxConcurrency=%d, want the parent's 4", record.MaxConcurrency)
+	}
+	if record.ExpiresAt == nil || !record.ExpiresAt.Equal(expires) {
+		t.Fatalf("child expiresAt=%v, want the parent's %v", record.ExpiresAt, expires)
 	}
 }
 
@@ -990,5 +1113,519 @@ func TestServer_ModelScopedAuditDestructiveActionsAreBounded(t *testing.T) {
 	}
 	if response := request(http.MethodDelete, "/api/audit/conversations/allowed"); response.Code != http.StatusNoContent {
 		t.Fatalf("allowed delete status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+// TestServer_AuthSessionGetIsThrottled pins the oracle: GET reports whether a
+// credential is valid, so it must share the failed-login budget with POST.
+// Otherwise guessing simply moves to the read-only form.
+func TestServer_AuthSessionGetIsThrottled(t *testing.T) {
+	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	t.Cleanup(func() { _ = s.Shutdown(0) })
+	s.cfg = config.Config{
+		RequiredAPIKeys: []string{"correct-key"},
+		Security: config.SecurityConfig{AuthRateLimit: config.AuthRateLimitConfig{
+			MaxFailures: 3, Window: time.Minute, BlockFor: time.Minute,
+		}},
+	}
+	s.routes()
+
+	get := func(bearer string) int {
+		request := httptest.NewRequest(http.MethodGet, "/api/auth/session", nil)
+		request.RemoteAddr = "198.51.100.4:5000"
+		if bearer != "" {
+			request.Header.Set("Authorization", "Bearer "+bearer)
+		}
+		recorder := httptest.NewRecorder()
+		s.ServeHTTP(recorder, request)
+		return recorder.Code
+	}
+
+	for attempt := 1; attempt <= 3; attempt++ {
+		if code := get("wrong-key"); code != http.StatusOK {
+			t.Fatalf("guess %d status=%d, want the oracle to answer 200 while under the limit", attempt, code)
+		}
+	}
+	if code := get("wrong-key"); code != http.StatusTooManyRequests {
+		t.Fatalf("guess after the budget status=%d, want 429", code)
+	}
+
+	// Anonymous polling by the login screen must never be penalised.
+	other := httptest.NewRequest(http.MethodGet, "/api/auth/session", nil)
+	other.RemoteAddr = "203.0.113.9:5000"
+	recorder := httptest.NewRecorder()
+	s.ServeHTTP(recorder, other)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("anonymous poll status=%d, want 200", recorder.Code)
+	}
+}
+
+// TestServer_AuthSessionGetDoesNotPenaliseNonLoginCredential guards the
+// distinction between "this credential is invalid" and "this credential may
+// not sign in". Counting the latter as a failed login would let a few page
+// loads of a perfectly valid access key block that IP from inference.
+func TestServer_AuthSessionGetDoesNotPenaliseNonLoginCredential(t *testing.T) {
+	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	t.Cleanup(func() { _ = s.Shutdown(0) })
+	s.cfg = config.Config{
+		RequiredAPIKeys: []string{"admin-key"},
+		Security: config.SecurityConfig{AuthRateLimit: config.AuthRateLimitConfig{
+			MaxFailures: 3, Window: time.Minute, BlockFor: time.Minute,
+		}},
+	}
+	s.routes()
+
+	salt, digest, err := auth.GenerateSalted("api-only-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.store.UpsertAPIKey(t.Context(), store.APIKeyRecord{
+		ID: "api-only", Name: "api-only", KeyHash: digest, KeySalt: salt,
+		KeySecret: "api-only-secret", Kind: auth.KeyKindManagement,
+		Scopes: []string{auth.ScopeInference}, AllowManagementLogin: false,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s.refreshKeyCache()
+
+	// Poll the session endpoint as a client with a valid but non-login key
+	// more times than the failure budget allows.
+	for attempt := 1; attempt <= 5; attempt++ {
+		request := httptest.NewRequest(http.MethodGet, "/api/auth/session", nil)
+		request.RemoteAddr = "198.51.100.4:5000"
+		request.Header.Set("Authorization", "Bearer api-only-secret")
+		recorder := httptest.NewRecorder()
+		s.ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("poll %d status=%d, want 200", attempt, recorder.Code)
+		}
+		var payload struct {
+			Authenticated bool `json:"authenticated"`
+		}
+		if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload.Authenticated {
+			t.Fatalf("poll %d reported a non-login key as authenticated", attempt)
+		}
+	}
+
+	// The same caller must still be able to use the credential it holds.
+	inference := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	inference.RemoteAddr = "198.51.100.4:5000"
+	inference.Header.Set("Authorization", "Bearer api-only-secret")
+	recorder := httptest.NewRecorder()
+	s.ServeHTTP(recorder, inference)
+	if recorder.Code == http.StatusTooManyRequests {
+		t.Fatalf("inference was throttled after session polls: status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+// TestServer_CCSwitchAutoCreatedKeyInheritsGroup pins the usage-group
+// inheritance, which is easy to drop silently.
+func TestServer_CCSwitchAutoCreatedKeyInheritsGroup(t *testing.T) {
+	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	t.Cleanup(func() { _ = s.Shutdown(0) })
+	s.cfg = config.Config{Models: map[string]config.ModelConfig{"allowed": {}}}
+	s.routes()
+
+	salt, digest, err := auth.GenerateSalted("grouped-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.store.UpsertAPIKey(t.Context(), store.APIKeyRecord{
+		ID: "grouped", Name: "grouped", KeyHash: digest, KeySalt: salt,
+		KeySecret: "grouped-secret", Kind: auth.KeyKindManagement,
+		Scopes: []string{auth.ScopeInference}, AllowManagementLogin: true, Group: "team-a",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s.refreshKeyCache()
+
+	request := httptest.NewRequest(http.MethodPost, "/api/cc-switch/deeplink", strings.NewReader(`{"app":"codex","name":"child","model":"allowed","createKey":true}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer grouped-secret")
+	response := httptest.NewRecorder()
+	s.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("auto-create status=%d body=%s", response.Code, response.Body.String())
+	}
+	var created struct {
+		Link string `json:"link"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	link, err := url.Parse(created.Link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, found, err := s.store.FindAPIKeyBySecret(t.Context(), link.Query().Get("apiKey"))
+	if err != nil || !found {
+		t.Fatalf("find child found=%v err=%v", found, err)
+	}
+	if record.Group != "team-a" {
+		t.Fatalf("child group=%q, want the parent's team-a", record.Group)
+	}
+}
+
+// TestServer_DeeplinkKeylessBootstrapCanSignIn pins the keyless path: once the
+// generated row is written the deployment is no longer keyless, so the row must
+// be able to reach the control plane or the panel is locked out.
+func TestServer_DeeplinkKeylessBootstrapCanSignIn(t *testing.T) {
+	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	t.Cleanup(func() { _ = s.Shutdown(0) })
+	s.cfg = config.Config{Models: map[string]config.ModelConfig{"allowed": {}}}
+	s.routes()
+
+	request := httptest.NewRequest(http.MethodPost, "/api/cc-switch/deeplink", strings.NewReader(`{"app":"codex","name":"bootstrap","model":"allowed","createKey":true}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	s.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("keyless auto-create status=%d body=%s", response.Code, response.Body.String())
+	}
+	var created struct {
+		Link  string `json:"link"`
+		KeyID string `json:"keyId"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	link, err := url.Parse(created.Link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret := link.Query().Get("apiKey")
+	if secret == "" {
+		t.Fatalf("created link carries no key: %s", created.Link)
+	}
+	record, found, err := s.store.FindAPIKeyBySecret(t.Context(), secret)
+	if err != nil || !found {
+		t.Fatalf("find bootstrap key found=%v err=%v", found, err)
+	}
+	if record.Kind != auth.KeyKindManagement || !record.AllowManagementLogin {
+		t.Fatalf("bootstrap key kind=%q allowLogin=%v, want a management key that can sign in", record.Kind, record.AllowManagementLogin)
+	}
+	hasKeysAdmin := false
+	for _, scope := range record.Scopes {
+		if scope == auth.ScopeKeysAdmin {
+			hasKeysAdmin = true
+		}
+	}
+	if !hasKeysAdmin {
+		t.Fatalf("bootstrap scopes=%v, want keys-admin so the panel can be repaired", record.Scopes)
+	}
+
+	// The generated secret must actually work for a control-plane request.
+	s.refreshKeyCache()
+	keysRequest := httptest.NewRequest(http.MethodGet, "/api/keys", nil)
+	keysRequest.Header.Set("Authorization", "Bearer "+secret)
+	keysResponse := httptest.NewRecorder()
+	s.ServeHTTP(keysResponse, keysRequest)
+	if keysResponse.Code != http.StatusOK {
+		t.Fatalf("bootstrap key cannot read /api/keys: status=%d body=%s", keysResponse.Code, keysResponse.Body.String())
+	}
+}
+
+// TestServer_DeeplinkAnonymousIDIsNotKeylessTarget is the regression guard for
+// a sentinel collision: only the legacy keyless identity may take the bootstrap
+// path. A stored credential whose id happens to be "anonymous" is a real key
+// and must be nested like any other, or a restricted key could mint a full
+// management key from here.
+func TestServer_DeeplinkAnonymousIDIsNotKeylessTarget(t *testing.T) {
+	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	t.Cleanup(func() { _ = s.Shutdown(0) })
+	s.cfg = config.Config{Models: map[string]config.ModelConfig{"allowed": {}}}
+	s.routes()
+
+	// A non-legacy identity carrying the sentinel id must not be treated as
+	// the keyless state. With no matching store row the helper fails closed,
+	// which is the safe outcome; the important part is that it does not fall
+	// through to the bootstrap branch.
+	record, err := s.generatedDeeplinkKeyRecord(
+		httptest.NewRequest(http.MethodPost, "/api/cc-switch/deeplink", nil),
+		auth.Identity{ID: "anonymous", Scopes: map[string]struct{}{auth.ScopeInference: {}}},
+		"child", "child", []string{"allowed"}, "digest", []byte("salt"), "secret",
+	)
+	if err == nil {
+		t.Fatalf("non-legacy anonymous identity took the bootstrap path: %+v", record)
+	}
+
+	// The legacy keyless identity is the one that may bootstrap.
+	bootstrap, err := s.generatedDeeplinkKeyRecord(
+		httptest.NewRequest(http.MethodPost, "/api/cc-switch/deeplink", nil),
+		auth.Identity{ID: "anonymous", Legacy: true},
+		"boot", "boot", []string{"allowed"}, "digest", []byte("salt"), "secret",
+	)
+	if err != nil {
+		t.Fatalf("legacy keyless identity rejected: %v", err)
+	}
+	if bootstrap.Kind == auth.KeyKindAccess {
+		t.Fatal("legacy keyless identity was nested instead of bootstrapped")
+	}
+	if !bootstrap.AllowManagementLogin {
+		t.Fatal("bootstrap key cannot sign in to the panel")
+	}
+}
+
+// TestServer_AuthSessionKeylessIgnoresStaleCookie keeps a keyless deployment
+// from locking itself out. With no key configured nothing can authenticate, so
+// charging those rejections to the caller would let a stale cookie from an
+// earlier keyed deployment block that IP's inference traffic.
+func TestServer_AuthSessionKeylessIgnoresStaleCookie(t *testing.T) {
+	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	t.Cleanup(func() { _ = s.Shutdown(0) })
+	s.cfg = config.Config{
+		Security: config.SecurityConfig{AuthRateLimit: config.AuthRateLimitConfig{
+			MaxFailures: 2, Window: time.Minute, BlockFor: time.Minute,
+		}},
+	}
+	s.routes()
+
+	for attempt := 1; attempt <= 6; attempt++ {
+		request := httptest.NewRequest(http.MethodGet, "/api/auth/session", nil)
+		request.RemoteAddr = "198.51.100.4:5000"
+		request.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: "stale-key"})
+		recorder := httptest.NewRecorder()
+		s.ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("poll %d status=%d, want 200 on a keyless deployment", attempt, recorder.Code)
+		}
+	}
+
+	// The same caller must not be throttled.
+	health := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	health.RemoteAddr = "198.51.100.4:5000"
+	recorder := httptest.NewRecorder()
+	s.ServeHTTP(recorder, health)
+	if recorder.Code == http.StatusTooManyRequests {
+		t.Fatalf("keyless caller throttled by a stale cookie: %s", recorder.Body.String())
+	}
+}
+
+// TestServer_SeedStartupAPIKeysRemapsReservedID keeps an existing deployment
+// from failing to start. A configuration that already declared the reserved id
+// must be remapped to the derived id rather than rejected, and the remap must
+// be stable across reloads.
+func TestServer_SeedStartupAPIKeysRemapsReservedID(t *testing.T) {
+	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	t.Cleanup(func() { _ = s.Shutdown(0) })
+	s.cfg = config.Config{StartupAPIKeys: []config.StartupAPIKey{{
+		ID: "anonymous", Key: "legacy-reserved-secret",
+		Scopes: []string{auth.ScopeInference},
+	}}}
+	s.routes()
+
+	if err := s.seedStartupAPIKeys(s.cfg); err != nil {
+		t.Fatalf("seeding a config with a reserved id failed: %v", err)
+	}
+	record, found, err := s.store.FindAPIKeyBySecret(t.Context(), "legacy-reserved-secret")
+	if err != nil || !found {
+		t.Fatalf("seeded key found=%v err=%v", found, err)
+	}
+	if record.ID == "anonymous" {
+		t.Fatal("reserved id was stored verbatim")
+	}
+	derived := record.ID
+
+	// A reload must resolve to the same row instead of creating a second one.
+	if err := s.seedStartupAPIKeys(s.cfg); err != nil {
+		t.Fatalf("second seed failed: %v", err)
+	}
+	keys, err := s.store.ListAPIKeys(t.Context(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for _, key := range keys {
+		if key.ID == derived {
+			count++
+		}
+	}
+	if count != 1 {
+		var ids []string
+		for _, key := range keys {
+			ids = append(ids, key.ID)
+		}
+		t.Fatalf("derived row appears %d times (ids=%v), want exactly one stable row", count, ids)
+	}
+	if derived == "" || derived == "anonymous" {
+		t.Fatalf("derived id = %q", derived)
+	}
+}
+
+// TestServer_AuthSessionKeylessPostDoesNotThrottle is the POST half of the
+// keyless rule: a submission that cannot possibly succeed must not consume the
+// shared failure budget and block inference for that address.
+func TestServer_AuthSessionKeylessPostDoesNotThrottle(t *testing.T) {
+	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	t.Cleanup(func() { _ = s.Shutdown(0) })
+	s.cfg = config.Config{
+		Security: config.SecurityConfig{AuthRateLimit: config.AuthRateLimitConfig{
+			MaxFailures: 2, Window: time.Minute, BlockFor: time.Minute,
+		}},
+	}
+	s.routes()
+
+	for attempt := 1; attempt <= 5; attempt++ {
+		request := httptest.NewRequest(http.MethodPost, "/api/auth/session", strings.NewReader(`{"key":"bogus"}`))
+		request.Header.Set("Content-Type", "application/json")
+		request.RemoteAddr = "198.51.100.4:5000"
+		recorder := httptest.NewRecorder()
+		s.ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusUnauthorized {
+			t.Fatalf("post %d status=%d, want 401 on a keyless deployment", attempt, recorder.Code)
+		}
+	}
+
+	health := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	health.RemoteAddr = "198.51.100.4:5000"
+	recorder := httptest.NewRecorder()
+	s.ServeHTTP(recorder, health)
+	if recorder.Code == http.StatusTooManyRequests {
+		t.Fatalf("keyless caller throttled after failed logins: %s", recorder.Body.String())
+	}
+}
+
+// TestServer_LegacyAnonymousRowUpgradeStaysOperable is the upgrade guard for a
+// row written by an older build that declared id: anonymous. The row must not
+// stop startup and must remain addressable so it can be revoked.
+func TestServer_LegacyAnonymousRowUpgradeStaysOperable(t *testing.T) {
+	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	t.Cleanup(func() { _ = s.Shutdown(0) })
+	s.cfg = config.Config{
+		RequiredAPIKeys: []string{"legacy-secret"},
+		Models:          map[string]config.ModelConfig{"allowed": {}},
+	}
+	s.routes()
+
+	// Simulate the historical row: reserved id, config source, no remap.
+	salt, digest, err := auth.GenerateSalted("legacy-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.store.UpsertAPIKey(t.Context(), store.APIKeyRecord{
+		ID: "anonymous", Name: "anonymous", KeyHash: digest, KeySalt: salt,
+		KeySecret: "legacy-secret", Kind: auth.KeyKindManagement,
+		Scopes: auth.ManagementScopes(), AllowManagementLogin: true,
+		Source: store.KeySourceConfig,
+	}); err != nil {
+		t.Fatalf("historical row could not be stored: %v", err)
+	}
+
+	// Lookup, secret resolution and revocation must all still work.
+	if _, found, err := s.store.FindAPIKeyByID(t.Context(), "anonymous"); err != nil || !found {
+		t.Fatalf("lookup found=%v err=%v", found, err)
+	}
+	if _, found, err := s.store.GetAPIKeySecret(t.Context(), "anonymous"); err != nil || !found {
+		t.Fatalf("secret lookup found=%v err=%v", found, err)
+	}
+	if err := s.store.RevokeAPIKeyCascade(t.Context(), "anonymous", time.Now()); err != nil {
+		t.Fatalf("revoking the historical row failed: %v", err)
+	}
+
+	// Seeding a config that declares the reserved id must not fail startup.
+	s.cfg.StartupAPIKeys = []config.StartupAPIKey{{
+		ID: "anonymous", Key: "legacy-secret", Scopes: []string{auth.ScopeInference},
+	}}
+	if err := s.seedStartupAPIKeys(s.cfg); err != nil {
+		t.Fatalf("seeding after the historical row failed: %v", err)
+	}
+}
+
+// TestServer_UpgradeFromReservedIDKeepsRecoveryKey walks the full upgrade: a
+// historical config-owned row with the reserved id is replaced by the remapped
+// row, and the stale one is cleaned up without tripping the lockout guard.
+func TestServer_UpgradeFromReservedIDKeepsRecoveryKey(t *testing.T) {
+	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	t.Cleanup(func() { _ = s.Shutdown(0) })
+
+	// Historical state: one config-owned row using the reserved id and a
+	// full-management scope set, as an older build would have written it.
+	salt, digest, err := auth.GenerateSalted("legacy-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.store.UpsertAPIKey(t.Context(), store.APIKeyRecord{
+		ID: "anonymous", Name: "legacy", KeyHash: digest, KeySalt: salt,
+		KeySecret: "legacy-secret", Kind: auth.KeyKindManagement,
+		Scopes: auth.ManagementScopes(), AllowManagementLogin: true,
+		Source: store.KeySourceConfig,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	s.cfg = config.Config{StartupAPIKeys: []config.StartupAPIKey{{
+		ID: "anonymous", Key: "legacy-secret", Scopes: auth.ManagementScopes(),
+	}}}
+	s.routes()
+	if err := s.seedStartupAPIKeys(s.cfg); err != nil {
+		t.Fatalf("upgrade seeding failed: %v", err)
+	}
+
+	keys, err := s.store.ListAPIKeys(t.Context(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var remapped, reserved *store.APIKeyRecord
+	for index := range keys {
+		switch keys[index].ID {
+		case "anonymous":
+			reserved = &keys[index]
+		default:
+			if keys[index].Source == store.KeySourceConfig {
+				remapped = &keys[index]
+			}
+		}
+	}
+	if remapped == nil {
+		t.Fatalf("no remapped config row was written: %+v", keys)
+	}
+	if reserved != nil && reserved.RevokedAt == nil {
+		t.Fatalf("stale reserved-id row was left active: %+v", reserved)
+	}
+	if !remapped.AllowManagementLogin {
+		t.Fatal("remapped row cannot sign in; the deployment would be locked out")
+	}
+}
+
+// TestServer_SeedStartupAPIKeysRejectsDuplicateIDs keeps two configured
+// entries from silently collapsing into one row: an Upsert on the same id
+// replaces the credential, so the second one would win without any warning.
+func TestServer_SeedStartupAPIKeysRejectsDuplicateIDs(t *testing.T) {
+	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	t.Cleanup(func() { _ = s.Shutdown(0) })
+
+	cases := []struct {
+		name string
+		keys []config.StartupAPIKey
+	}{
+		{
+			name: "explicit duplicate id",
+			keys: []config.StartupAPIKey{
+				{ID: "shared", Key: "first"},
+				{ID: "shared", Key: "second"},
+			},
+		},
+		{
+			name: "remapped id collides with an explicit entry",
+			keys: []config.StartupAPIKey{
+				{ID: "anonymous", Key: "first"},
+				// The remap of the entry above is startup-<hash(first)>; a
+				// second entry may declare that same derived id explicitly.
+				{ID: "startup-" + auth.Hash("first")[:16], Key: "other"},
+			},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s.cfg = config.Config{StartupAPIKeys: c.keys}
+			if err := s.seedStartupAPIKeys(s.cfg); err == nil {
+				t.Fatal("duplicate final key id was accepted")
+			} else if !strings.Contains(err.Error(), "declared more than once") {
+				t.Fatalf("error = %v, want a duplicate-id explanation", err)
+			}
+		})
 	}
 }

@@ -41,6 +41,7 @@ type stubRouter struct {
 	unloadCalls   atomic.Int32
 	unloadModels  []string
 	unloadTimeout time.Duration
+	unloadFunc    func(timeout time.Duration, models ...string)
 	loggers       map[string]*logmon.Monitor
 	loggersMu     sync.Mutex
 	maintenance   map[string]string
@@ -75,6 +76,9 @@ func (s *stubRouter) Unload(timeout time.Duration, models ...string) {
 	s.unloadCalls.Add(1)
 	s.unloadTimeout = timeout
 	s.unloadModels = append([]string(nil), models...)
+	if s.unloadFunc != nil {
+		s.unloadFunc(timeout, models...)
+	}
 }
 func (s *stubRouter) EnterMaintenance(modelID, reason string) {
 	if s.maintenance == nil {

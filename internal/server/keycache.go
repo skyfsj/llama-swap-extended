@@ -81,28 +81,41 @@ type keyCache struct {
 	// with repeated credential-carrying requests.
 	lastProbe atomic.Int64
 
-	// touchMu guards the buffered last-used timestamps. The hot path records
-	// touches in memory; flushTouches persists them in batches so authentication
-	// stays store-free.
+	// touchMu guards the buffered last-used state. The hot path records
+	// touches in memory; flushTouches persists them in batches so
+	// authentication stays store-free.
 	touchMu sync.Mutex
-	touches map[string]time.Time
+	touches map[string]keyTouch
 }
 
-// recordTouch buffers a last-used timestamp for the key. Keeping the maximum
-// is all that matters: last_used is display data, not an audit record.
-func (k *keyCache) recordTouch(id string, at time.Time) {
+// keyTouch is the buffered audit state of one key: when it was last used and
+// from where. Keeping the newest pair matters, not the history.
+type keyTouch struct {
+	at time.Time
+	ip string
+}
+
+// recordTouch buffers a last-used timestamp (and caller address) for the key.
+// The newest touch wins; an empty address never replaces a recorded one so a
+// touch from an internal caller cannot erase the address a real request left.
+func (k *keyCache) recordTouch(id string, at time.Time, clientIP string) {
 	if k == nil || id == "" {
 		return
 	}
+	clientIP = strings.TrimSpace(clientIP)
 	k.touchMu.Lock()
 	defer k.touchMu.Unlock()
 	if k.touches == nil {
-		k.touches = make(map[string]time.Time)
+		k.touches = make(map[string]keyTouch)
 	}
-	if prev, ok := k.touches[id]; ok && prev.After(at) {
+	prev, ok := k.touches[id]
+	if ok && prev.at.After(at) {
 		return
 	}
-	k.touches[id] = at
+	if clientIP == "" {
+		clientIP = prev.ip
+	}
+	k.touches[id] = keyTouch{at: at, ip: clientIP}
 }
 
 // flushTouches persists the buffered last-used timestamps and returns how
@@ -117,9 +130,9 @@ func (k *keyCache) flushTouches(ctx context.Context) int {
 	k.touches = nil
 	k.touchMu.Unlock()
 	flushed := 0
-	for id, at := range pending {
+	for id, touch := range pending {
 		tctx, cancel := context.WithTimeout(ctx, keyReadTimeout)
-		err := k.store.TouchAPIKey(tctx, id, at)
+		err := k.store.TouchAPIKey(tctx, id, touch.at, touch.ip)
 		cancel()
 		if err != nil {
 			if k.log != nil {

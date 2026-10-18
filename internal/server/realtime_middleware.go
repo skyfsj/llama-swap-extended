@@ -142,7 +142,7 @@ func CreateRealtimeMiddleware(cfg config.Config) chain.Middleware {
 			query := r.URL.Query()
 			query.Set("model", model)
 			r.URL.RawQuery = query.Encode()
-			r.Body = io.NopCloser(bytes.NewReader(wire))
+			swaputil.ReplaceRequestBody(r, wire)
 			next.ServeHTTP(w, r)
 		})
 	}

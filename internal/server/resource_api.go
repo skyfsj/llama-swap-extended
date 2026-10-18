@@ -167,21 +167,48 @@ func (s *Server) prepareResourceLoadContext(ctx context.Context, requested strin
 	if footprint.VRAMMiB == 0 && footprint.RAMMiB == 0 {
 		return nil
 	}
+	evicted := make(map[string]bool)
 	for {
 		s.resourceMu.Lock()
-		err := s.tryPrepareResourceLoadWithPlanner(planner, model, footprint)
+		admission := s.evaluateResourceLoad(planner, model, footprint)
 		s.resourceMu.Unlock()
-		if err == nil {
+
+		if admission.reserved {
 			return nil
 		}
+		// Evict outside the admission lock: unloading can take the model's
+		// full unload timeout, and holding resourceMu for it would serialize
+		// every other cold start behind one slow backend.
+		var toEvict []string
+		for _, id := range admission.evict {
+			if !evicted[id] {
+				toEvict = append(toEvict, id)
+			}
+		}
+		if len(toEvict) > 0 {
+			for _, id := range toEvict {
+				evicted[id] = true
+			}
+			var evictionErrs []error
+			for _, id := range toEvict {
+				if err := s.releaseResourceCandidate(id); err != nil {
+					evictionErrs = append(evictionErrs, err)
+				}
+			}
+			if len(evictionErrs) > 0 {
+				return fmt.Errorf("resource budget cannot admit model %q after eviction attempts: %w", model, errors.Join(evictionErrs...))
+			}
+			// Re-plan with a fresh snapshot now that the lock was released.
+			continue
+		}
 		if !queue {
-			return err
+			return admission.err
 		}
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("resource budget wait canceled for model %q: %w", model, ctx.Err())
 		case <-waitTimer.C:
-			return fmt.Errorf("resource budget wait timed out for model %q: %w", model, err)
+			return fmt.Errorf("resource budget wait timed out for model %q: %w", model, admission.err)
 		case <-waitTicker.C:
 			// Retry with a fresh process/backend snapshot. The error is only
 			// returned after the bounded wait, so callers can distinguish a
@@ -190,18 +217,27 @@ func (s *Server) prepareResourceLoadContext(ctx context.Context, requested strin
 	}
 }
 
-func (s *Server) tryPrepareResourceLoadWithPlanner(planner *resourcePlanner.Planner, model string, footprint resourcePlanner.Footprint) error {
+// resourceAdmission is the planner's verdict for one cold start. Evictions are
+// returned to the caller instead of performed here: an unload can take the
+// model's full unload timeout, and the caller must not hold resourceMu for it.
+type resourceAdmission struct {
+	reserved bool
+	evict    []string
+	err      error
+}
+
+func (s *Server) evaluateResourceLoad(planner *resourcePlanner.Planner, model string, footprint resourcePlanner.Footprint) resourceAdmission {
 	if planner == nil {
-		return nil
+		return resourceAdmission{reserved: true}
 	}
 	cfg := s.currentConfig()
 	s.reconcileResources()
 	candidates, planErr := planner.PlanLoad(model, footprint)
 	if planErr == nil && len(candidates) == 0 {
 		if err := planner.Reserve(model, footprint); err != nil {
-			return fmt.Errorf("reserve resources for model %q: %w", model, err)
+			return resourceAdmission{err: fmt.Errorf("reserve resources for model %q: %w", model, err)}
 		}
-		return nil
+		return resourceAdmission{reserved: true}
 	}
 	if len(candidates) > 0 && cfg.ResourceBudget.AutoEvict {
 		ids := make([]string, 0, len(candidates))
@@ -210,34 +246,14 @@ func (s *Server) tryPrepareResourceLoadWithPlanner(planner *resourcePlanner.Plan
 				ids = append(ids, candidate.ID)
 			}
 		}
-		var evictionErrs []error
 		if len(ids) > 0 {
-			for _, id := range ids {
-				if err := s.releaseResourceCandidate(id); err != nil {
-					evictionErrs = append(evictionErrs, err)
-				}
-			}
-			s.reconcileResources()
-			candidates, planErr = planner.PlanLoad(model, footprint)
-			if planErr == nil && len(candidates) == 0 {
-				if err := planner.Reserve(model, footprint); err != nil {
-					return fmt.Errorf("reserve resources for model %q: %w", model, err)
-				}
-				return nil
-			}
-			if len(evictionErrs) > 0 {
-				// Keep the admission error explicit about the safe-eviction
-				// postcondition that failed. This is useful to callers using
-				// queueLoads (and to operators) because a generic 507 would not
-				// distinguish a protected in-flight model from an unload failure.
-				return fmt.Errorf("resource budget cannot admit model %q after eviction attempts: %w", model, errors.Join(evictionErrs...))
-			}
+			return resourceAdmission{evict: ids}
 		}
 	}
 	if planErr != nil {
-		return fmt.Errorf("resource budget cannot admit model %q: %w", model, planErr)
+		return resourceAdmission{err: fmt.Errorf("resource budget cannot admit model %q: %w", model, planErr)}
 	}
-	return fmt.Errorf("resource budget cannot admit model %q while protected models are active", model)
+	return resourceAdmission{err: fmt.Errorf("resource budget cannot admit model %q while protected models are active", model)}
 }
 
 func (s *Server) releaseResourceReservation(model string) {

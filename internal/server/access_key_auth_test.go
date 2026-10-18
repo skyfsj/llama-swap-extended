@@ -125,13 +125,49 @@ func TestServer_ScopedAuthAccessKeyIPAllowlist(t *testing.T) {
 		t.Fatalf("rejection body = %q", rejected.Body.String())
 	}
 
-	// A proxy header is honoured, matching the access log's resolution.
+	// A forwarding header is ignored by default: the caller is the connection
+	// peer. This is the regression guard for the spoofable-allowlist issue.
+	proxied := accessKeyRequest("/v1/chat/completions", "access-secret", "10.1.1.1:5000")
+	proxied.Header.Set("X-Forwarded-For", "203.0.113.8")
+	forwarded := httptest.NewRecorder()
+	handler.ServeHTTP(forwarded, proxied)
+	if forwarded.Code != http.StatusForbidden {
+		t.Fatalf("untrusted forwarded caller status=%d body=%s, want 403", forwarded.Code, forwarded.Body.String())
+	}
+}
+
+func TestServer_ScopedAuthAccessKeyIPAllowlistTrustedProxy(t *testing.T) {
+	st, _, _ := newAccessKeyStore(t)
+	enabled := true
+	trusted := config.Config{Network: config.NetworkConfig{
+		TrustForwardedFor: enabled,
+		TrustedProxies:    []string{"10.1.1.0/24"},
+	}}
+	final := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	handler := chain.New(
+		CreateClientIPMiddleware(trusted.Network),
+		CreateScopedAuthMiddleware(trusted, st, nil),
+		RequireScope(auth.ScopeInference),
+	).Then(final)
+
+	// The proxy is trusted, so the header decides the caller.
 	proxied := accessKeyRequest("/v1/chat/completions", "access-secret", "10.1.1.1:5000")
 	proxied.Header.Set("X-Forwarded-For", "203.0.113.8")
 	forwarded := httptest.NewRecorder()
 	handler.ServeHTTP(forwarded, proxied)
 	if forwarded.Code != http.StatusNoContent {
-		t.Fatalf("forwarded caller status=%d body=%s", forwarded.Code, forwarded.Body.String())
+		t.Fatalf("trusted proxy caller status=%d body=%s", forwarded.Code, forwarded.Body.String())
+	}
+
+	// A peer outside the trusted list cannot use headers to move its address.
+	direct := accessKeyRequest("/v1/chat/completions", "access-secret", "198.51.100.4:5000")
+	direct.Header.Set("X-Forwarded-For", "203.0.113.8")
+	spoofed := httptest.NewRecorder()
+	handler.ServeHTTP(spoofed, direct)
+	if spoofed.Code != http.StatusForbidden {
+		t.Fatalf("untrusted peer spoof status=%d body=%s, want 403", spoofed.Code, spoofed.Body.String())
 	}
 }
 

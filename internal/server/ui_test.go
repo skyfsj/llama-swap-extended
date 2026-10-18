@@ -88,10 +88,13 @@ func TestServer_ServeUI_IndexAndRoot(t *testing.T) {
 	}
 }
 
-func TestServer_ServeUI_SPAFallback(t *testing.T) {
+func TestServer_ServeUI_UnknownPathIsNotFound(t *testing.T) {
+	// The UI routes with the URL hash, so every real navigation stays on
+	// /ui/. An unknown path is a genuine 404 instead of an index.html
+	// fallback, which used to make any guessed path look like a valid one.
 	w := serveUIRequest(t, "/ui/models", "")
-	if w.Code != http.StatusOK || w.Body.String() != "<html>app</html>" {
-		t.Errorf("SPA fallback: status=%d body=%q", w.Code, w.Body.String())
+	if w.Code != http.StatusNotFound {
+		t.Errorf("unknown UI path: status=%d body=%q, want 404", w.Code, w.Body.String())
 	}
 }
 

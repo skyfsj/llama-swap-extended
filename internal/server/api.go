@@ -277,28 +277,44 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 	// dispatch arbitration with local models is the same rule).
 	if gw := s.currentGateway(); gw != nil {
 		for _, route := range gw.AllRoutes() {
-			fqn := config.ProviderModelFQN(route.ProviderID, route.ModelID)
-			if !modelAllowedForIdentity(cfg, identity, fqn) {
+			// The client-facing name is the provider's modelPrefix plus the
+			// model ID (the bare ID when no prefix is configured). A provider
+			// may still be called with the legacy provider/model form, but the
+			// listing shows one stable name per model.
+			name := route.ExposedName
+			if name == "" {
+				name = config.ProviderModelName("", route.ModelID)
+			}
+			legacy := config.ProviderModelFQN(route.ProviderID, route.ModelID)
+			if !modelAllowedForIdentity(cfg, identity, name) && !modelAllowedForIdentity(cfg, identity, legacy) {
 				continue
 			}
-			modelIDs[fqn] = struct{}{}
-			if _, baseOK := cfg.ResolveBaseModel(route.ModelID); baseOK && gw.RouteFor(route.ModelID, false) == route {
-				modelIDs[route.ModelID] = struct{}{}
+			if _, duplicate := modelIDs[name]; duplicate {
+				// Another provider exposes the same client-facing name; the
+				// gateway arbitrates, the listing shows it once.
+				continue
 			}
+			modelIDs[name] = struct{}{}
 			status := "loaded"
 			if route.BestCredential() == nil {
 				// Every credential is cooling down or saturated; the model
 				// stays listed but reports unavailable.
 				status = "unavailable"
 			}
+			metadata := map[string]any{"type": "provider", "providerID": route.ProviderID}
+			if len(route.ModelAliases) > 0 {
+				// Same shape as a local model's aliases so the pickers nest
+				// them under the model they resolve to.
+				metadata["aliases"] = route.ModelAliases
+			}
 			data = append(data, newRecord(
-				fqn,
+				name,
 				route.ProviderID+": "+route.ModelID,
 				"",
 				nil,
-				config.ModelCapConfig{},
+				route.Capabilities,
 				status,
-				map[string]any{"type": "provider", "providerID": route.ProviderID},
+				metadata,
 			))
 		}
 	}
@@ -540,7 +556,10 @@ func handleRootRedirect(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleUpstreamRedirect(w http.ResponseWriter, r *http.Request) {
-	http.Redirect(w, r, "/ui/models", http.StatusFound)
+	// The UI is a hash-routed SPA: the models page lives at /ui/#/models, not
+	// /ui/models. The old target only resolved while unknown /ui/* paths still
+	// fell back to index.html.
+	http.Redirect(w, r, "/ui/#/models", http.StatusFound)
 }
 
 func handleComfyUIRedirect(w http.ResponseWriter, r *http.Request) {
@@ -594,6 +613,11 @@ func (s *Server) handleComfyUI(w http.ResponseWriter, r *http.Request) {
 		ModelID:  config.ComfyUIModelID,
 		Metadata: make(map[string]string),
 	}))
+	if err := s.prepareResourceLoadContext(r.Context(), config.ComfyUIModelID); err != nil {
+		swaputil.SendResponse(w, r, http.StatusInsufficientStorage, err.Error())
+		return
+	}
+	defer s.releaseResourceReservation(config.ComfyUIModelID)
 	s.local.ServeHTTP(w, r)
 }
 
@@ -664,6 +688,18 @@ func (s *Server) handleUpstream(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case s.local.Handles(modelID):
+		if err := s.prepareResourceLoadContext(r.Context(), modelID); err != nil {
+			swaputil.SendResponse(w, r, http.StatusInsufficientStorage, err.Error())
+			return
+		}
+		defer s.releaseResourceReservation(modelID)
+		// The raw passthrough path shares the same maintenance contract as
+		// the model-dispatch chain: a thermally parked model fails over
+		// instead of being started.
+		data := swaputil.ReqContextData{Model: searchName, ModelID: modelID, Metadata: map[string]string{}}
+		if !s.forwardMaintenanceModel(w, r, data, cfg) {
+			return
+		}
 		s.local.ServeHTTP(w, r)
 	case s.peer.Handles(modelID):
 		s.peer.ServeHTTP(w, r)

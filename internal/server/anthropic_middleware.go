@@ -1,12 +1,10 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"net/http"
-	"strconv"
 	"strings"
 
 	"github.com/mostlygeek/llama-swap/internal/chain"
@@ -74,17 +72,14 @@ func CreateAnthropicCacheMiddleware(cfg config.Config) chain.Middleware {
 					swaputil.SendResponse(w, r, http.StatusBadRequest, err.Error())
 					return
 				}
-				r.Body = io.NopCloser(bytes.NewReader(body))
+				swaputil.ReplaceRequestBody(r, body)
 				next.ServeHTTP(w, r)
 				return
 			}
 			if result.Enabled {
 				body = result.Body
 			}
-			r.Body = io.NopCloser(bytes.NewReader(body))
-			r.Header.Del("Transfer-Encoding")
-			r.Header.Set("Content-Length", strconv.Itoa(len(body)))
-			r.ContentLength = int64(len(body))
+			swaputil.ReplaceRequestBody(r, body)
 			telemetry := anthropicCacheTelemetry{
 				Applied:    result.Changed,
 				Detected:   result.Detected,

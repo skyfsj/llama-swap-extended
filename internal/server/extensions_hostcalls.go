@@ -55,6 +55,11 @@ func (h *extensionHost) exec(ctx context.Context, fn string, args json.RawMessag
 		return h.execFileRead(ctx, args)
 	case fn == "files.write":
 		return h.execFileWrite(ctx, args)
+	case fn == "images.apply":
+		// Local pixel work on bytes the extension already holds: no permission
+		// gate is needed, and the ceilings live with the implementation so a
+		// script cannot talk the daemon into a larger allocation.
+		return extensions.ImageHostCall(fn, args)
 	default:
 		return nil, fmt.Errorf("host function %s is not supported", fn)
 	}
@@ -75,11 +80,17 @@ func (h *extensionHost) execHTTPFetch(ctx context.Context, args json.RawMessage)
 	if !ok {
 		return nil, errors.New("http.fetch is unavailable without a resolved extension")
 	}
-	body, status, err := extensions.FetchAllowed(item.Manifest.Permissions.NetworkHosts, call.URL, call.Options)
+	result, err := extensions.FetchAllowed(item.Manifest.Permissions.NetworkHosts, call.URL, call.Options)
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{"status": status, "ok": status >= 200 && status < 300, "body": string(body)}, nil
+	return map[string]any{
+		"status":  result.Status,
+		"ok":      result.Status >= 200 && result.Status < 300,
+		"url":     result.FinalURL,
+		"headers": extensions.HeadersToMap(result.Header),
+		"body":    string(result.Body),
+	}, nil
 }
 
 // execFileRead / execFileWrite serve the Node executor's ctx.files with the
@@ -143,6 +154,21 @@ type extensionForwardDepthKey struct{}
 // forward's inner call runs the pipeline without hooks.
 type extensionSkipKey struct{}
 
+// extensionServerToolsKey marks a request whose tool list was extended by an
+// extension. The protocol adapter strips provider-hosted search tools that a
+// client sent (many upstreams reject them), but a tool an extension injected on
+// purpose is the operator's intent and must survive that strip.
+type extensionServerToolsKey struct{}
+
+func markExtensionServerTools(r *http.Request) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), extensionServerToolsKey{}, true))
+}
+
+func requestHasExtensionServerTools(r *http.Request) bool {
+	marked, _ := r.Context().Value(extensionServerToolsKey{}).(bool)
+	return marked
+}
+
 func (h *extensionHost) execForward(ctx context.Context, args json.RawMessage) (any, error) {
 	if h.server.modelChainHandler == nil {
 		return nil, errors.New("model forwarding is unavailable")
@@ -170,13 +196,18 @@ func (h *extensionHost) execForward(ctx context.Context, args json.RawMessage) (
 	}
 	// Only "messages"-style bodies are forwarded: a chat.completions shape is
 	// what the extension saw, and stream is always off for a buffered reply.
-	payload := map[string]any{"model": model, "stream": false}
+	// The caller-chosen model and stream mode are applied after the merge so
+	// call.Fields cannot override the allowlist-checked model or re-enable
+	// streaming on the buffered inner round-trip.
+	payload := map[string]any{"stream": false}
 	for name, value := range call.Fields {
 		payload[name] = value
 	}
 	if _, ok := payload["messages"]; !ok {
 		return nil, errors.New("forward requires a messages array")
 	}
+	payload["model"] = model
+	payload["stream"] = false
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
@@ -350,6 +381,10 @@ func (h *extensionHost) kvSet(ctx context.Context, manifest extensions.Manifest,
 	maxKeys := h.server.currentConfig().Extensions.EffectiveStorageMaxKeys()
 	extensionID := manifest.ID
 	if persistent {
+		// The limit check and the write must be one critical section: two
+		// concurrent requests otherwise both see room for the last key.
+		h.server.extensionKVMu.Lock()
+		defer h.server.extensionKVMu.Unlock()
 		count, err := h.server.store.CountExtensionKVs(ctx, extensionID)
 		if err != nil {
 			return nil, err
@@ -526,7 +561,15 @@ var dryRunFeatureByPrefix = []struct {
 	{"session.", "session usage"},
 }
 
-func (dryRunHost) Exec(_ context.Context, fn string, _ json.RawMessage) (any, error) {
+func (dryRunHost) Exec(_ context.Context, fn string, args json.RawMessage) (any, error) {
+	// Image processing is local work on bytes the script already holds: it
+	// reaches nothing outside the process, so unlike the other host functions
+	// there is no reason to refuse it in test mode. That is what lets the
+	// editor's Test action exercise the image tools at all, and those tools are
+	// otherwise untestable without a model.
+	if fn == "images.apply" {
+		return extensions.ImageHostCall(fn, args)
+	}
 	for _, entry := range dryRunFeatureByPrefix {
 		if len(fn) > len(entry.prefix) && fn[:len(entry.prefix)] == entry.prefix {
 			return nil, fmt.Errorf("%s is disabled in extension test mode", entry.feature)

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strconv"
 	"strings"
 
 	"github.com/mostlygeek/llama-swap/internal/backend"
@@ -132,10 +131,9 @@ func setBackendRequestBody(r *http.Request, body []byte) {
 	if r == nil {
 		return
 	}
-	r.Body = io.NopCloser(bytes.NewReader(body))
-	r.ContentLength = int64(len(body))
-	r.Header.Del("Transfer-Encoding")
-	r.Header.Set("Content-Length", strconv.Itoa(len(body)))
+	// Every body rewrite must refresh GetBody: the gateway replays retries
+	// from it and the session fingerprint restores from it.
+	swaputil.ReplaceRequestBody(r, body)
 }
 
 func cloneHeader(header http.Header) http.Header {
