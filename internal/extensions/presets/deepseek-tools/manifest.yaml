@@ -1,0 +1,12 @@
+id: deepseek-tools
+name: DeepSeek Tools
+enabled: true
+description: "DeepSeek 官方工具 API。deepseek_search 联网搜索（支持 site: 与 lang: 等检索语法，可选返回整页正文）、deepseek_fetch 网页抓取（服务端渲染后返回 Markdown）。按成功请求数计费（每千次 5 元），账户级 QPS 上限为 5，需要一个 DeepSeek API Key。账户余额请用供应商的额度面板（内置 deepseek 额度预设）查看。"
+priority: 100
+match:
+  endpoints: [chat.completions, responses, anthropic.messages]
+permissions:
+  networkHosts: [api.deepseek.com]
+timeout: 30s
+maxCpuMillis: 3000
+maxMemoryMiB: 256

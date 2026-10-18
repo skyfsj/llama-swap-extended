@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"strings"
 )
 
 // pumpWorkerStdio is the host side of the worker protocol. It writes the
@@ -13,8 +15,24 @@ import (
 // log records to onLog, and delivers the terminal response line. stdin is
 // owned here and closed on return, which ends the worker if it keeps running
 // after its response.
-func pumpWorkerStdio(ctx context.Context, stdin io.WriteCloser, stdout io.Reader, request *workerRequest, host HostCaller, onLog func(logLine)) <-chan workerResponse {
+// logSlots caps concurrent log-consumer goroutines for one worker pump. Real
+// logging bursts are small; a script logging in a loop would otherwise spawn a
+// goroutine per line faster than they drain.
+var logSlots = make(chan struct{}, 8)
+
+// pumpWorkerStdioObserved is pumpWorkerStdio with an observer for a terminal
+// transport error. The error channel alone is not enough: when the worker is
+// blocked writing an oversized line, the run loop is waiting on the process and
+// never selects on the channel, so the pump's diagnosis would be lost behind a
+// deadline.
+func pumpWorkerStdioObserved(ctx context.Context, stdin io.WriteCloser, stdout io.Reader, request *workerRequest, host HostCaller, onLog func(logLine), onTerminal func(error)) <-chan workerResponse {
 	responseCh := make(chan workerResponse, 1)
+	report := func(err error) {
+		if onTerminal != nil {
+			onTerminal(err)
+		}
+		responseCh <- workerResponse{Error: err.Error()}
+	}
 	go func() {
 		defer stdin.Close()
 		writer := bufio.NewWriter(stdin)
@@ -63,7 +81,19 @@ func pumpWorkerStdio(ctx context.Context, stdin io.WriteCloser, stdout io.Reader
 					return
 				}
 				if onLog != nil {
-					go onLog(record)
+					// Bound the log fan-out: a script that logs in a tight
+					// loop must not spawn unbounded goroutines doing file I/O.
+					// Log lines are observational, so shedding them under
+					// pressure is safe; the terminal response never shares this
+					// path.
+					select {
+					case logSlots <- struct{}{}:
+						go func(record logLine) {
+							defer func() { <-logSlots }()
+							onLog(record)
+						}(record)
+					default:
+					}
 				}
 			case "response":
 				var response workerResponse
@@ -82,7 +112,16 @@ func pumpWorkerStdio(ctx context.Context, stdin io.WriteCloser, stdout io.Reader
 		// closed stdout early): report EOF so the caller surfaces a clear
 		// error instead of hanging on the channel.
 		if scanErr := scanner.Err(); scanErr != nil {
-			responseCh <- workerResponse{Error: fmt.Sprintf("extension worker stdout: %s", scanErr.Error())}
+			// A token longer than the buffer means the worker wrote a response
+			// line past the protocol limit. It is blocked writing the rest of
+			// that line, so waiting for the process would end at the hook's
+			// deadline and report a timeout for what is really a size limit.
+			if errors.Is(scanErr, bufio.ErrTooLong) || strings.Contains(scanErr.Error(), "token too long") {
+				report(fmt.Errorf("%w: the hook returned a result larger than the %s protocol line",
+					ErrHookOutputTooLarge, humanMebi(maxWorkerLine)))
+				return
+			}
+			report(fmt.Errorf("extension worker stdout: %s", scanErr.Error()))
 			return
 		}
 		responseCh <- workerResponse{Error: "extension worker closed stdout without a response"}

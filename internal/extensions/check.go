@@ -109,14 +109,33 @@ func checkBundle(files map[string]string) []CheckDiagnostic {
 // is what keeps the whole check off the disk.
 const virtualNamespace = "llama-swap-tree"
 
+// sdkSpecifier is the import name the extension SDK is published under. It is
+// part of the runtime contract rather than an npm dependency: the runtime
+// bundles its own copy, so an extension never installs it.
+const sdkSpecifier = "@llama-swap/extension"
+
+// sdkVirtualPath is where the embedded SDK lives inside the virtual namespace.
+// It is deliberately not a tree key: it belongs to the runtime, and an
+// extension that happened to ship a file by that name must not shadow it.
+const sdkVirtualPath = "__llama-swap-sdk__/extension.js"
+
 // virtualTreeSetup serves imports from the in-memory tree. Nothing is read from
 // the working directory.
 func virtualTreeSetup(files map[string]string) func(api.PluginBuild) {
 	return func(build api.PluginBuild) {
 		build.OnResolve(api.OnResolveOptions{Filter: ".*"}, func(args api.OnResolveArgs) (api.OnResolveResult, error) {
 			if args.Kind != api.ResolveEntryPoint && !strings.HasPrefix(args.Path, ".") && !strings.HasPrefix(args.Path, "/") {
-				// A bare specifier is a dependency installed when the extension
-				// is saved, so it is left external on purpose.
+				// The SDK is provided by the runtime, not by npm: resolving it
+				// here is what lets a checked or bundled tree use the same
+				// `import { defineTool } from "@llama-swap/extension"` the
+				// production compiler accepts. Leaving it external instead
+				// produced "Dynamic require of ... is not supported", which
+				// said nothing about the real problem.
+				if args.Path == sdkSpecifier {
+					return api.OnResolveResult{Path: sdkVirtualPath, Namespace: virtualNamespace}, nil
+				}
+				// Any other bare specifier is a dependency installed when the
+				// extension is saved, so it is left external on purpose.
 				return api.OnResolveResult{Path: args.Path, External: true}, nil
 			}
 			if resolved, ok := matchTreePath(files, path.Join(path.Dir(args.Importer), args.Path)); ok {
@@ -127,6 +146,10 @@ func virtualTreeSetup(files map[string]string) func(api.PluginBuild) {
 			return api.OnResolveResult{}, nil
 		})
 		build.OnLoad(api.OnLoadOptions{Filter: ".*", Namespace: virtualNamespace}, func(args api.OnLoadArgs) (api.OnLoadResult, error) {
+			if args.Path == sdkVirtualPath {
+				source := sdkBundle
+				return api.OnLoadResult{Contents: &source, Loader: api.LoaderJS}, nil
+			}
 			data, ok := files[args.Path]
 			if !ok {
 				return api.OnLoadResult{}, nil

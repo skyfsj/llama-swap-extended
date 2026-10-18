@@ -63,6 +63,13 @@ function buildContext(request, manifest, extensionID, config, callLog) {
       delete: (key, options) => hostCall("kv.delete", { key, ...options }, extensionID),
       keys: (prefix, options) => hostCall("kv.keys", { prefix, ...options }, extensionID),
     },
+    images: {
+      // apply(request) runs one image operation on the host, which is where the
+      // pixel work belongs: a byte loop in the sandbox VM runs at about two
+      // million array accesses a second, so the same screenshot took half a
+      // minute there and milliseconds in Go.
+      apply: (request) => hostCall("images.apply", request, extensionID),
+    },
     forward: (model, request2) => hostCall("models.forward", { model, request: request2 }, extensionID),
     usage: () => hostCall("session.usage", {}, extensionID),
     http: {

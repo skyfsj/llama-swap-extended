@@ -1,0 +1,11 @@
+id: unit-convert
+name: Unit Converter
+enabled: true
+description: "Convert lengths, masses, volumes, temperatures, speeds, pressures, energies, powers, data sizes, angles, frequencies, forces and torques - offline, with no network access and no API key. One tool, unit_convert. Decimal and binary data prefixes stay separate (1 GB = 10^9 B, 1 GiB = 2^30 B), torque is not energy even though both are newton-metres, and a conversion across quantities (centimetres to kilograms) is refused with the reason instead of answered with a number."
+priority: 100
+match:
+  endpoints: [chat.completions, responses, anthropic.messages]
+permissions: {}
+timeout: 10s
+maxCpuMillis: 1500
+maxMemoryMiB: 128

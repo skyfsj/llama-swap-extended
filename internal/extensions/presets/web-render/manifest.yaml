@@ -1,0 +1,12 @@
+id: web-render
+name: Web Render
+enabled: true
+description: "Read a page the way a browser does: the address is given to a rendering service that runs the page's JavaScript in a real browser and returns the finished content as Markdown. That is the difference from web-fetch, which reads the HTML a server sends and therefore sees an empty shell for a single-page app, a client-rendered documentation site or a dashboard. The service is configured rather than fixed: the default is r.jina.ai, and a self-hosted renderer can be pointed at instead so that no address leaves the operator's own infrastructure (it has to be published on a public host - the sandbox refuses loopback and private addresses). An API key is optional and only needed when the chosen service asks for one."
+priority: 100
+match:
+  endpoints: [chat.completions, responses, anthropic.messages]
+permissions:
+  networkHosts: ["*"]
+timeout: 150s
+maxCpuMillis: 8000
+maxMemoryMiB: 512

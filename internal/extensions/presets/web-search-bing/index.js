@@ -1,13 +1,16 @@
-// Microsoft Bing Web Search v7.
+// Bing Web Search v7（微软）。
 //
 //   GET https://api.bing.microsoft.com/v7.0/search
-//       ?q=...&count=...&mkt=...&responseFilter=Webpages
-//   Header: Ocp-Apim-Subscription-Key: <your-key>
+//       ?q=...&count=...&mkt=...&safeSearch=...&responseFilter=Webpages
+//   请求头：Ocp-Apim-Subscription-Key: <key>
 //
-// Response: {webPages: {value: [{name, url, snippet, displayUrl, ...}]}}.
-// When there are no results the API omits webPages entirely, so check it
-// defensively. The subscription key belongs in the API Key setting below
-// (declared secret, no default); never hard-code it in this file.
+//   响应：{webPages: {value: [{name, url, snippet, displayUrl, ...}]}}
+//   无结果时服务端直接省略 webPages，所以要防御式取值。
+//
+// 工具名带 bing 后缀：多个搜索器可同时启用（重名会被工具冲突策略跳过）。
+// 密钥只在设置里填写，绝不写进本文件。
+
+import { clampCount, defineExtension, searchTool } from "@llama-swap/extension";
 
 export const settings = {
   apiKey: {
@@ -30,89 +33,56 @@ export const settings = {
     label: "Market",
     hint: "Market code that biases results toward a language and region.",
     options: ["en-US", "zh-CN", "ja-JP", "en-GB", "de-DE", "fr-FR", "es-ES", "pt-BR", "ru-RU"],
-    default: "en-US"
+    default: "zh-CN"
   },
   safeSearch: {
     type: "select",
     label: "Safe search",
-    options: ["Moderate", "Strict", "Off"]
+    options: ["Moderate", "Strict", "Off"],
+    default: "Moderate"
+  },
+  requestTimeoutMs: {
+    type: "number",
+    label: "HTTP timeout (ms)",
+    hint: "Per-request timeout for the search call. The extension's own timeout still caps the whole hook.",
+    default: 15000,
+    min: 1000,
+    max: 20000
   }
 };
 
-function clampCount(value) {
-  const count = Math.floor(Number(value));
-  if (!isFinite(count) || count < 1) return 10;
-  if (count > 50) return 50;
-  return count;
-}
-
-function formatResults(results, query) {
-  const lines = ["Bing results for: " + query, ""];
-  for (let index = 0; index < results.length; index += 1) {
-    const item = results[index] || {};
-    lines.push((index + 1) + ". " + (item.name || "(untitled)"));
-    if (item.url) lines.push("   " + item.url);
-    if (item.snippet) lines.push("   " + String(item.snippet));
-    lines.push("");
-  }
-  return lines.join("\n").slice(0, 8000);
-}
-
-export default {
-  tools: [{
-    type: "function",
-    execution: "server",
-    function: {
-      name: "web_search",
-      description: "Search the web with Bing and return numbered results with title, URL and snippet.",
-      parameters: {
-        type: "object",
-        properties: {
-          query: { type: "string", description: "Search query." }
-        },
-        required: ["query"]
+export default defineExtension({
+  tools: [
+    searchTool({
+      name: "web_search_bing",
+      title: "Bing",
+      description:
+        "Search the web with Microsoft Bing and return numbered results with title, URL and snippet. Use it for current facts, news and sources.",
+      maxQueryLength: 400,
+      credential: { setting: "apiKey", label: "API Key", header: "Ocp-Apim-Subscription-Key" },
+      request({ query, config }) {
+        // Bing 的查询参数名是 q（工具参数仍叫 query），条数是 count。
+        const params = [
+          "q=" + encodeURIComponent(query),
+          "count=" + clampCount(config.maxResults, 10, 1, 50),
+          "responseFilter=Webpages",
+          "safeSearch=" + encodeURIComponent(config.safeSearch || "Moderate")
+        ];
+        if (config.market) {
+          params.push("mkt=" + encodeURIComponent(config.market));
+        }
+        return { url: "https://api.bing.microsoft.com/v7.0/search?" + params.join("&") };
+      },
+      parse(payload) {
+        const page = payload.webPages;
+        const items = page && Array.isArray(page.value) ? page.value : [];
+        return items.map((item) => ({
+          title: item.name,
+          url: item.url,
+          snippet: item.snippet,
+          source: item.displayUrl
+        }));
       }
-    }
-  }],
-
-  async onToolCall(ctx, call) {
-    if (call.name !== "web_search") return undefined;
-    const query = String(call.arguments.query || "").trim();
-    if (query.length === 0) {
-      throw new Error("web_search: query must not be empty");
-    }
-    const apiKey = String(ctx.config.apiKey || "").trim();
-    if (apiKey.length === 0) {
-      throw new Error("web_search: set the API Key in the extension settings");
-    }
-
-    const params = [
-      "q=" + encodeURIComponent(query),
-      "count=" + clampCount(ctx.config.maxResults),
-      "responseFilter=Webpages",
-      "safeSearch=" + encodeURIComponent(ctx.config.safeSearch || "Moderate")
-    ];
-    if (ctx.config.market) {
-      params.push("mkt=" + encodeURIComponent(ctx.config.market));
-    }
-    const url = "https://api.bing.microsoft.com/v7.0/search?" + params.join("&");
-
-    const response = await ctx.http.fetch(url, {
-      headers: { "Ocp-Apim-Subscription-Key": apiKey }
-    });
-    if (!response.ok) {
-      throw new Error("Bing search failed with HTTP " + response.status);
-    }
-    const payload = response.json();
-    if (!payload || typeof payload !== "object") {
-      throw new Error("Bing search returned a response that is not JSON");
-    }
-
-    const page = payload.webPages;
-    const results = page && Array.isArray(page.value) ? page.value : [];
-    if (results.length === 0) {
-      return { content: "No Bing results found for: " + query };
-    }
-    return { content: formatResults(results, query) };
-  }
-};
+    })
+  ]
+});

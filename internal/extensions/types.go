@@ -20,6 +20,10 @@ type Match struct {
 }
 
 type Permissions struct {
+	// NetworkHosts narrows what ctx.http.fetch may reach. An empty list is the
+	// default and means every public host; entries are hostnames or "*.domain"
+	// patterns, and "*" spells the default out. Loopback, private, link-local
+	// and reserved addresses are refused whatever this says.
 	NetworkHosts []string `json:"networkHosts" yaml:"networkHosts"`
 	ReadRoots    []string `json:"readRoots" yaml:"readRoots"`
 	WriteRoots   []string `json:"writeRoots" yaml:"writeRoots"`
@@ -38,20 +42,26 @@ const (
 )
 
 type Manifest struct {
-	ID                   string         `json:"id" yaml:"id"`
-	Name                 string         `json:"name" yaml:"name"`
-	Description          string         `json:"description" yaml:"description"`
-	Enabled              bool           `json:"enabled" yaml:"enabled"`
-	Priority             int            `json:"priority" yaml:"priority"`
-	Match                Match          `json:"match" yaml:"match"`
-	Permissions          Permissions    `json:"permissions" yaml:"permissions"`
-	Config               map[string]any `json:"config,omitempty" yaml:"config,omitempty"`
-	Timeout              string         `json:"timeout" yaml:"timeout"`
-	MaxCPUMillis         int            `json:"maxCpuMillis" yaml:"maxCpuMillis"`
-	MaxMemoryMiB         int            `json:"maxMemoryMiB" yaml:"maxMemoryMiB"`
-	ContinueOnError      bool           `json:"continueOnError" yaml:"continueOnError"`
-	ToolConflict         string         `json:"toolConflict" yaml:"toolConflict"`
-	InterceptClientTools bool           `json:"interceptClientTools" yaml:"interceptClientTools"`
+	ID              string         `json:"id" yaml:"id"`
+	Name            string         `json:"name" yaml:"name"`
+	Description     string         `json:"description" yaml:"description"`
+	Enabled         bool           `json:"enabled" yaml:"enabled"`
+	Priority        int            `json:"priority" yaml:"priority"`
+	Match           Match          `json:"match" yaml:"match"`
+	Permissions     Permissions    `json:"permissions" yaml:"permissions"`
+	Config          map[string]any `json:"config,omitempty" yaml:"config,omitempty"`
+	Timeout         string         `json:"timeout" yaml:"timeout"`
+	MaxCPUMillis    int            `json:"maxCpuMillis" yaml:"maxCpuMillis"`
+	MaxMemoryMiB    int            `json:"maxMemoryMiB" yaml:"maxMemoryMiB"`
+	ContinueOnError bool           `json:"continueOnError" yaml:"continueOnError"`
+	// FailOnToolError makes a failing tool handler abort the request instead of
+	// reporting the failure back to the model as the tool result. The default
+	// is resilient: a tool that cannot run (quota exhausted, upstream down)
+	// must not take the whole conversation with it, so the error text is
+	// returned as the tool result and the model decides what to do next.
+	FailOnToolError      bool   `json:"failOnToolError" yaml:"failOnToolError"`
+	ToolConflict         string `json:"toolConflict" yaml:"toolConflict"`
+	InterceptClientTools bool   `json:"interceptClientTools" yaml:"interceptClientTools"`
 	// Directories lists empty directories the extension keeps on disk. They
 	// survive reloads; anything non-empty lives in the extension's file tree.
 	Directories []string `json:"directories,omitempty" yaml:"directories,omitempty"`
@@ -176,12 +186,21 @@ func (m Manifest) Validate() error {
 	return nil
 }
 
-// validateHostPattern accepts a hostname or a single leading subdomain wildcard
-// such as "*.pinecone.io". A bare "*" would hand the extension every host on
-// the network, which the per-host check exists to prevent.
+// validateHostPattern accepts a hostname, a single leading subdomain wildcard
+// such as "*.pinecone.io", or the wildcard "*" meaning every public host.
+//
+// "*" is how an extension states an unrestricted grant in so many words; it is
+// also the default an empty list already gives, so a manifest that names it is
+// documenting the decision rather than making it. Neither form is a licence to
+// reach the local network: checkPublicHost still refuses loopback, private,
+// link-local and reserved addresses, on the first request and again on every
+// redirect hop.
 func validateHostPattern(pattern string) error {
 	if pattern == "" {
 		return errors.New("network host pattern must not be empty")
+	}
+	if pattern == "*" {
+		return nil
 	}
 	body := pattern
 	if rest, ok := strings.CutPrefix(pattern, "*."); ok {

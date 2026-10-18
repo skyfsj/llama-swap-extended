@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -111,7 +112,7 @@ func TestExtensions_WorkerRunsAsyncHook(t *testing.T) {
 func TestExtensions_WorkerNetworkPermission(t *testing.T) {
 	// The real guard refuses loopback addresses, so this test runs against a
 	// loopback server with the guard swapped out: what it covers is the host
-	// allowlist. TestCheckPublicHost covers the guard itself.
+	// list. TestCheckPublicHost covers the guard itself.
 	restore := publicHostCheck
 	publicHostCheck = func(host string) error { return nil }
 	defer func() { publicHostCheck = restore }()
@@ -131,25 +132,33 @@ func TestExtensions_WorkerNetworkPermission(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	input, _ := json.Marshal(workerRequest{Bundle: item.Bundle, Manifest: item.Manifest, Hook: "onRequest", Input: json.RawMessage(`{"model":"m"}`)})
-	var output bytes.Buffer
-	RunWorker(bytes.NewReader(input), &output)
-	var response workerResponse
-	if err := json.Unmarshal(output.Bytes(), &response); err != nil {
-		t.Fatal(err)
+	invoke := func(t *testing.T) workerResponse {
+		t.Helper()
+		input, _ := json.Marshal(workerRequest{Bundle: item.Bundle, Manifest: item.Manifest, Hook: "onRequest", Input: json.RawMessage(`{"model":"m"}`)})
+		var output bytes.Buffer
+		RunWorker(bytes.NewReader(input), &output)
+		response := workerResponse{}
+		if err := json.Unmarshal(output.Bytes(), &response); err != nil {
+			t.Fatal(err)
+		}
+		return response
 	}
-	if response.Error != "" || !bytes.Contains(response.Output, []byte("result")) {
-		t.Fatalf("response = %+v", response)
+
+	if response := invoke(t); response.Error != "" || !bytes.Contains(response.Output, []byte("result")) {
+		t.Fatalf("a listed host was refused: %+v", response)
 	}
+
+	// The list narrows the grant: a host that is not on it is refused.
+	item.Manifest.Permissions.NetworkHosts = []string{"elsewhere.example"}
+	if response := invoke(t); !strings.Contains(response.Error, "not permitted") {
+		t.Fatalf("a host outside the list was reachable: %+v", response)
+	}
+
+	// An empty list is the default and narrows nothing: the public-address
+	// guard is what bounds it, not the list.
 	item.Manifest.Permissions.NetworkHosts = nil
-	input, _ = json.Marshal(workerRequest{Bundle: item.Bundle, Manifest: item.Manifest, Hook: "onRequest", Input: json.RawMessage(`{"model":"m"}`)})
-	output.Reset()
-	RunWorker(bytes.NewReader(input), &output)
-	if err := json.Unmarshal(output.Bytes(), &response); err != nil {
-		t.Fatal(err)
-	}
-	if response.Error == "" {
-		t.Fatal("network access was not denied")
+	if response := invoke(t); response.Error != "" || !bytes.Contains(response.Output, []byte("result")) {
+		t.Fatalf("the default grant refused a public host: %+v", response)
 	}
 }
 

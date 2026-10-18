@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -63,13 +64,28 @@ func (c *Compiled) runNodeHook(ctx context.Context, req workerRequest, budget ti
 		ctx, cancel = context.WithTimeout(ctx, budget)
 		defer cancel()
 	}
+	// The script sees its configuration with declared defaults filled in, exactly
+	// as the goja worker builds it: a debug run whose ctx.config were empty would
+	// not be the code that runs in production.
+	req.Config = applySettingDefaults(c.Settings, c.Manifest.Config)
 	// The extension bundle is evaluated with new Function() by the executor
 	// itself, so --disallow-code-generation-from-strings cannot be used here.
 	// Hardening instead: no Node builtins are reachable from the bundle (the
 	// executor imports its own readline only), env is minimal, and the
 	// host-call channel is the only authority.
 	cmd := exec.CommandContext(ctx, nodePath, executorScript)
-	cmd.Env = append(os.Environ(), "NODE_OPTIONS=--no-warnings")
+	// Match the goja worker's minimal environment: the debug executor runs
+	// editor-draft code, which must not inherit the daemon's secrets.
+	nodeEnv := []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOME=" + os.Getenv("HOME"),
+		"NODE_OPTIONS=--no-warnings",
+	}
+	// Same reason as the goja worker: "local" has to mean the daemon's zone.
+	if tz := os.Getenv("TZ"); tz != "" {
+		nodeEnv = append(nodeEnv, "TZ="+tz)
+	}
+	cmd.Env = append(nodeEnv, c.network.Env()...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return workerResponse{}, err
@@ -78,6 +94,9 @@ func (c *Compiled) runNodeHook(ctx context.Context, req workerRequest, budget ti
 	if err != nil {
 		return workerResponse{}, err
 	}
+	// Same reason as the goja worker: Wait can close the read side of the pipe
+	// before this host has read the response the executor already wrote.
+	cmd.WaitDelay = 2 * time.Second
 	stderr := &boundedBuffer{limit: 64 << 10}
 	cmd.Stderr = stderr
 	if err := cmd.Start(); err != nil {
@@ -120,8 +139,8 @@ func (c *Compiled) runNodeHook(ctx context.Context, req workerRequest, budget ti
 					logs = append(logs, record.Level+": "+record.Message)
 				}
 				logMu.Unlock()
-				if c.LogSink != nil {
-					c.LogSink(record)
+				if sink := c.logSink(); sink != nil {
+					sink(record)
 				}
 			case "call":
 				var call hostCallMessage
@@ -149,6 +168,18 @@ func (c *Compiled) runNodeHook(ctx context.Context, req workerRequest, budget ti
 				return
 			}
 		}
+		// The scanner stops on a token longer than the protocol line, which is
+		// what an oversized result looks like while the executor is blocked
+		// writing it. Reporting a size limit is what stops the caller waiting
+		// for the whole budget and hearing "budget exceeded" instead.
+		if scanErr := scanner.Err(); scanErr != nil {
+			if errors.Is(scanErr, bufio.ErrTooLong) || strings.Contains(scanErr.Error(), "token too long") {
+				responseCh <- workerResponse{Error: fmt.Sprintf("%v: the hook returned a result larger than the %s protocol line",
+					ErrHookOutputTooLarge, humanMebi(maxWorkerLine))}
+				return
+			}
+			responseCh <- workerResponse{Error: fmt.Sprintf("node executor stdout: %s", scanErr.Error())}
+		}
 	}()
 
 	done := make(chan error, 1)
@@ -170,12 +201,30 @@ func (c *Compiled) runNodeHook(ctx context.Context, req workerRequest, budget ti
 			gotResponse = true
 		case waitErr = <-done:
 			if !gotResponse {
-				return workerResponse{}, fmt.Errorf("node executor ended without a response: %s", strings.TrimSpace(stderr.String()))
+				// The executor may have written its response just before it
+				// exited, with the pump still holding it; take it rather than
+				// reporting a death that did not happen.
+				select {
+				case candidate := <-responseCh:
+					response = candidate
+					gotResponse = true
+				case <-time.After(250 * time.Millisecond):
+					return workerResponse{}, fmt.Errorf("node executor ended without a response: %s", strings.TrimSpace(stderr.String()))
+				}
 			}
 			goto complete
 		case <-deadline:
 			_ = cmd.Process.Kill()
 			<-done
+			// A diagnosis the pump reached first wins: an oversized line and a
+			// spent budget can coincide, and only one of them is actionable.
+			select {
+			case candidate := <-responseCh:
+				if strings.Contains(candidate.Error, ErrHookOutputTooLarge.Error()) {
+					return workerResponse{}, fmt.Errorf("%w: %s", ErrHookOutputTooLarge, candidate.Error)
+				}
+			case <-time.After(250 * time.Millisecond):
+			}
 			return workerResponse{}, fmt.Errorf("node executor budget exceeded")
 		case <-ctx.Done():
 			_ = cmd.Process.Kill()
@@ -196,7 +245,16 @@ complete:
 		return workerResponse{}, fmt.Errorf("node executor stopped: %w: %s", waitErr, strings.TrimSpace(stderr.String()))
 	}
 	if response.Error != "" {
-		return response, fmt.Errorf("%s", response.Error)
+		// Preserve the sentinel: %s rebuilt the error and lost it, so a caller
+		// could not tell a size limit from any other failure.
+		if strings.Contains(response.Error, ErrHookOutputTooLarge.Error()) {
+			return response, fmt.Errorf("%w: %s", ErrHookOutputTooLarge, response.Error)
+		}
+		return response, errors.New(response.Error)
+	}
+	if len(response.Output) > MaxHookOutputBytes {
+		return workerResponse{}, fmt.Errorf("%w: the hook returned %s, over the %s one result may carry",
+			ErrHookOutputTooLarge, humanMebi(len(response.Output)), humanMebi(MaxHookOutputBytes))
 	}
 	logMu.Lock()
 	response.Logs = logs

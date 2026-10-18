@@ -1,0 +1,12 @@
+id: web-search-parallel
+name: Parallel Web Search
+enabled: true
+description: Search with the Parallel Search API (https://api.parallel.ai/v1/search). One call takes a natural-language objective and returns ranked sources with LLM-optimized excerpts, in turbo (~200ms), fast (~700ms) or advanced (~3s) mode. Requires a Parallel API key.
+priority: 100
+match:
+  endpoints: [chat.completions, responses, anthropic.messages]
+permissions:
+  networkHosts: [api.parallel.ai]
+timeout: 30s
+maxCpuMillis: 3000
+maxMemoryMiB: 256

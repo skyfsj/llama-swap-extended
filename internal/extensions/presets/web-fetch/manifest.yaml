@@ -1,0 +1,12 @@
+id: web-fetch
+name: Web Fetch
+enabled: true
+description: Read a URL the way a browser does and return the page as clean Markdown - title, final URL after redirects, and the main content with navigation, cookie banners and comments removed. Sends a browser-like request (User-Agent, Accept, Accept-Language, Sec-Fetch-*) and follows the daemon's network proxy policy. Needs no API key. Its networkHosts entry states the default grant explicitly - any public host - which the runtime bounds to public addresses only, so local, private and link-local targets are refused.
+priority: 100
+match:
+  endpoints: [chat.completions, responses, anthropic.messages]
+permissions:
+  networkHosts: ["*"]
+timeout: 60s
+maxCpuMillis: 8000
+maxMemoryMiB: 512

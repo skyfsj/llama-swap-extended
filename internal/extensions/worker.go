@@ -16,9 +16,11 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/dop251/goja"
+	"github.com/mostlygeek/llama-swap/internal/netproxy"
 	"github.com/shirou/gopsutil/v4/process"
 )
 
@@ -38,6 +40,11 @@ type workerRequest struct {
 	Hook     string          `json:"hook"`
 	Context  Context         `json:"context"`
 	Input    json.RawMessage `json:"input"`
+	// Config is the manifest's configuration with the declared defaults filled
+	// in. The goja worker computes it from Manifest and Settings on its side;
+	// the Node executor, which has no settings parser, is handed the finished
+	// map so both runtimes show a script the same ctx.config.
+	Config map[string]any `json:"config,omitempty"`
 }
 
 type workerResponse struct {
@@ -85,6 +92,22 @@ const maxHostCalls = 512
 // maxWorkerLine caps one protocol line: the request (bundle + input) fits in
 // 8 MiB, results and responses reuse the same bound.
 const maxWorkerLine = 8 << 20
+
+// responseDelayHook is test-only: when set, it receives the response channel
+// before the run loop starts, so a test can hold the delivery back past the
+// process exit.
+var responseDelayHook atomic.Pointer[func(<-chan workerResponse) <-chan workerResponse]
+
+// MaxHookInputBytes and MaxHookOutputBytes are the ceilings one hook's input and
+// output may have, derived from the protocol line the worker reads and writes.
+// They are exported so the caller that builds an input - a tool call whose
+// argument is a base64 image - can refuse an oversized one with a message that
+// names the limit, instead of letting the worker die mid-line and reporting that
+// the worker "ended without a response".
+const (
+	MaxHookInputBytes  = maxWorkerLine - (64 << 10)
+	MaxHookOutputBytes = maxWorkerLine - (64 << 10)
+)
 
 // workerBridge is the worker-side end of the host-call channel. Calls are
 // fire-and-register: the promise is settled later by settleOne when the host's
@@ -203,7 +226,15 @@ func (c *Compiled) run(ctx context.Context, req workerRequest, budget time.Durat
 	if limit == 0 {
 		limit = 256
 	}
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), fmt.Sprintf("GOMEMLIMIT=%dMiB", limit)}
+	// TZ is passed through so the "local" zone means the daemon's timezone: the
+	// environment is otherwise built from scratch, and a worker without it
+	// reads /etc/localtime, which is a different clock in a container. It is not
+	// a secret.
+	workerEnv := []string{"PATH=" + os.Getenv("PATH"), fmt.Sprintf("GOMEMLIMIT=%dMiB", limit)}
+	if tz := os.Getenv("TZ"); tz != "" {
+		workerEnv = append(workerEnv, "TZ="+tz)
+	}
+	cmd.Env = append(workerEnv, c.network.Env()...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return workerResponse{}, err
@@ -212,6 +243,12 @@ func (c *Compiled) run(ctx context.Context, req workerRequest, budget time.Durat
 	if err != nil {
 		return workerResponse{}, err
 	}
+	// The worker writes its terminal response and then exits. Wait closes the
+	// read side of that pipe as soon as the process is reaped, which can be
+	// before this host has read the line the worker already wrote - the
+	// "ended without a response" that showed up under load. WaitDelay makes Wait
+	// wait for the reader instead of racing it.
+	cmd.WaitDelay = 2 * time.Second
 	stderr := &boundedBuffer{limit: 64 << 10}
 	cmd.Stderr = stderr
 	if err := cmd.Start(); err != nil {
@@ -222,11 +259,38 @@ func (c *Compiled) run(ctx context.Context, req workerRequest, budget time.Durat
 	// pumpWorkerStdio owns stdin and answers host calls until the terminal
 	// response line arrives. Live log records go to the extension's sink.
 	logSink := c.LogSink
-	responseCh := pumpWorkerStdio(ctx, stdin, stdout, &req, HostCallerFrom(ctx), func(record logLine) {
+	// transportErr records a diagnosis the pump reached while the run loop was
+	// waiting on the process (an oversized response line is the case that
+	// matters: the worker blocks writing and never exits on its own).
+	//
+	// The pump goroutine writes it and this goroutine reads it, and the read in
+	// the deadline branch has no channel receive in front of it, so the value
+	// has to be atomic: a plain variable was a data race that only showed up
+	// under -race with a widened timing window.
+	var transportErr atomic.Value // of error
+	responseCh := pumpWorkerStdioObserved(ctx, stdin, stdout, &req, HostCallerFrom(ctx), func(record logLine) {
 		if logSink != nil {
 			logSink(record)
 		}
+	}, func(err error) {
+		transportErr.Store(err)
+		_ = cmd.Process.Kill()
 	})
+	// reportedTransportErr is the diagnosis, if the pump reached one.
+	reportedTransportErr := func() error {
+		if value := transportErr.Load(); value != nil {
+			return value.(error)
+		}
+		return nil
+	}
+	// responseDelay is a test seam: it lets a test hold the delivery of a
+	// response the pump has already read past the process exit, which is the
+	// state the drain exists for. Without it the race is only reachable by luck,
+	// and the regression test that guards the drain would pass on the pre-fix
+	// code most of the time.
+	if hook := responseDelayHook.Load(); hook != nil {
+		responseCh = (*hook)(responseCh)
+	}
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 	pid, _ := process.NewProcess(int32(cmd.Process.Pid))
@@ -266,6 +330,12 @@ func (c *Compiled) run(ctx context.Context, req workerRequest, budget time.Durat
 			}
 			_ = cmd.Process.Kill()
 			<-done
+			// A size diagnosis is worth surfacing, but a cancellation is not
+			// something to sit on: ctx.Err() is what the caller asked for, and
+			// waiting for a diagnosis here delayed it.
+			if err := reportedTransportErr(); err != nil {
+				return workerResponse{}, err
+			}
 			return workerResponse{}, ctx.Err()
 		}
 		if gotResponse {
@@ -289,25 +359,57 @@ complete:
 		// A hook failure (response.Error set) still ends the worker with a
 		// non-zero exit; the error text is in the response, not stderr.
 		if gotResponse && response.Error != "" {
+			if transport := reportedTransportErr(); transport != nil && transport.Error() == response.Error {
+				return response, transport
+			}
 			return response, errors.New(response.Error)
 		}
 		return workerResponse{}, fmt.Errorf("extension worker stopped: %w: %s", waitErr, strings.TrimSpace(stderr.String()))
 	}
 	if !gotResponse {
-		// EOF without a response line: a hook that rejected with a proper
-		// error still emits its terminal response first, so this can only be
-		// an abnormal worker death. But a benign os.Exit path raced the
-		// scanner in rare loads — accept a captured error response too.
-		if response.Error != "" {
-			return response, errors.New(response.Error)
+		// The process-exit path can win the select while the pump is still
+		// holding a response it has already read. That response is the result,
+		// success or failure, so take it rather than discarding the work: an
+		// error-only fallback turned a finished hook into "ended without a
+		// response" whenever the two raced.
+		//
+		// The wait is on the pump finishing, not on a guessed timeout: the pump
+		// ends exactly when stdout is exhausted, at which point a response has
+		// either been delivered or never existed. A timeout shorter than a
+		// reader's delay reproduced the bug the drain exists to fix.
+		// A bounded wait on the channel itself: the pump read the line already,
+		// so this is delivery latency, not I/O. Waiting on the pump's own
+		// completion would miss a value that a consumer between the pump and
+		// this loop is still handing over.
+		select {
+		case candidate := <-responseCh:
+			response = candidate
+			gotResponse = true
+		case <-time.After(2 * time.Second):
 		}
+	}
+	if !gotResponse {
 		return workerResponse{}, errors.New("extension worker ended without a response")
 	}
 	if response.Error != "" {
+		if transport := reportedTransportErr(); transport != nil && transport.Error() == response.Error {
+			return response, transport
+		}
 		return response, errors.New(response.Error)
+	}
+	// The response travels back on the same bounded line. A hook that returns
+	// more than fits cannot be reported to the caller at all, so it is refused
+	// here with the limit named - a truncated protocol line would be worse.
+	if len(response.Output) > MaxHookOutputBytes {
+		return workerResponse{}, fmt.Errorf("%w: the hook returned %s, over the %s one result may carry; return less, or split the work across calls",
+			ErrHookOutputTooLarge, humanMebi(len(response.Output)), humanMebi(MaxHookOutputBytes))
 	}
 	return response, nil
 }
+
+// ErrHookOutputTooLarge marks a hook result that does not fit on the worker's
+// protocol line.
+var ErrHookOutputTooLarge = errors.New("hook result is too large")
 
 func RunWorker(in io.Reader, out io.Writer) {
 	response := workerResponse{}
@@ -354,12 +456,20 @@ func RunWorker(in io.Reader, out io.Writer) {
 		response.Error = err.Error()
 		return
 	}
-	exported := vm.Get("__llamaSwapExtension")
-	if goja.IsUndefined(exported) {
-		response.Error = "extension has no default export"
+	// A bundle may assign null/undefined to the global. Read the namespace
+	// only after proving it is an object: ToObject on a null export panics at
+	// the JS boundary and is reported as an opaque worker kill.
+	namespaceValue := vm.Get("__llamaSwapExtension")
+	if goja.IsUndefined(namespaceValue) || goja.IsNull(namespaceValue) {
+		response.Error = "extension has no default export (export default { ... } is required)"
 		return
 	}
-	module := exported.ToObject(vm).Get("default")
+	namespaceObject, ok := namespaceValue.(*goja.Object)
+	if !ok {
+		response.Error = "extension has no default export (export default { ... } is required)"
+		return
+	}
+	module := namespaceObject.Get("default")
 	// A namespace without a default export yields a Go nil *Object here (not
 	// an undefined/null value), which would nil-panic in ToObject below.
 	if module == nil {
@@ -373,7 +483,7 @@ func RunWorker(in io.Reader, out io.Writer) {
 	object := module.ToObject(vm)
 	// Named exports live beside `default` on the module namespace, which is
 	// where a script declares its settings.
-	namespace := exported.ToObject(vm)
+	namespace := namespaceObject
 	if req.Hook == "__metadata" {
 		for _, name := range []string{"onRequest", "onBeforeForward", "onToolCall", "onToolResult", "onResponse", "onStreamEvent", "onError"} {
 			if _, ok := goja.AssertFunction(object.Get(name)); ok {
@@ -962,11 +1072,11 @@ func makeContext(vm *goja.Runtime, manifest Manifest, settings []SettingField, m
 				options = exported
 			}
 		}
-		body, status, err := FetchAllowed(manifest.Permissions.NetworkHosts, target, options)
+		result, err := FetchAllowed(manifest.Permissions.NetworkHosts, target, options)
 		if err != nil {
 			_ = reject(err.Error())
 		} else {
-			_ = resolve(map[string]any{"status": status, "ok": status >= 200 && status < 300, "text": func() string { return string(body) }, "json": func() any { var result any; _ = json.Unmarshal(body, &result); return result }})
+			_ = resolve(fetchResponseValue(result))
 		}
 		return vm.ToValue(p)
 	}}
@@ -1118,6 +1228,36 @@ func makeContext(vm *goja.Runtime, manifest Manifest, settings []SettingField, m
 				return vm.ToValue(promise)
 			},
 		}
+		// images.apply(request) runs one image operation and resolves to the
+		// metadata, the encoded result and the notes. The pixels are handled by
+		// the host because a byte loop in this VM manages about six million array
+		// element touches a second and a decode plus resample is dozens of passes
+		// over the pixels: through this call a 1.4 MP image is analysed in about
+		// 115 ms. Passing the payload as one JSON object also keeps the argument
+		// marshalling out of the hot path.
+		ctx["images"] = map[string]any{
+			"apply": func(call goja.FunctionCall) goja.Value {
+				payload := map[string]any{}
+				if argument := call.Argument(0); argument != nil && !goja.IsUndefined(argument) && !goja.IsNull(argument) {
+					if exported, ok := argument.Export().(map[string]any); ok {
+						payload = exported
+					}
+				}
+				encoded, err := json.Marshal(payload)
+				if err != nil {
+					p, _, reject := vm.NewPromise()
+					_ = reject("host call arguments are invalid: " + err.Error())
+					return vm.ToValue(p)
+				}
+				promise, err := bridge.call("images.apply", encoded)
+				if err != nil {
+					p, _, reject := vm.NewPromise()
+					_ = reject(err.Error())
+					return vm.ToValue(p)
+				}
+				return vm.ToValue(promise)
+			},
+		}
 		// forward(model, request) runs one non-streaming model call on behalf
 		// of the caller's identity and resolves to {status, body}.
 		ctx["forward"] = func(call goja.FunctionCall) goja.Value {
@@ -1163,22 +1303,132 @@ func makeContext(vm *goja.Runtime, manifest Manifest, settings []SettingField, m
 	return vm.ToValue(ctx)
 }
 
-func FetchAllowed(hosts []string, raw string, options map[string]any) ([]byte, int, error) {
+// fetchTransport builds the client transport for ctx.http.fetch. The policy
+// arrives from the daemon through the worker environment; without it the
+// transport follows the process proxy variables, which is what it always did.
+func fetchTransport() *http.Transport {
+	settings := netproxy.FromEnv()
+	if transport, err := settings.Transport(); err == nil && settings.Configured() {
+		return transport
+	}
+	return &http.Transport{
+		DialContext: (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
+		Proxy:       http.ProxyFromEnvironment,
+	}
+}
+
+// FetchResult is what an allowed ctx.http.fetch hands back. Headers and the
+// final URL are part of it because the body alone cannot say what it is: a
+// script has to tell HTML from JSON from an image, and a page's declared
+// charset is the difference between text and mojibake.
+type FetchResult struct {
+	Body     []byte
+	Status   int
+	Header   http.Header
+	FinalURL string
+}
+
+// Fetch timeout bounds. The default is the historical fixed 8s; a script may
+// ask for more (a long page, a slow origin, an egress proxy) or for less. The
+// hook budget still caps the whole call, so a timeout the manifest cannot
+// afford ends as a hook timeout rather than as a hung worker.
+const (
+	defaultFetchTimeout = 8 * time.Second
+	minFetchTimeout     = time.Second
+	maxFetchTimeout     = 60 * time.Second
+)
+
+// fetchTimeout reads options.timeoutMs, which is the only way a script can
+// outlive the default: fetching a page is slower than calling an API, and the
+// script knows which of the two it is doing.
+func fetchTimeout(options map[string]any) time.Duration {
+	raw, ok := options["timeoutMs"]
+	if !ok {
+		return defaultFetchTimeout
+	}
+	var millis float64
+	switch value := raw.(type) {
+	case float64:
+		millis = value
+	case int:
+		millis = float64(value)
+	case int64:
+		millis = float64(value)
+	case json.Number:
+		parsed, err := value.Float64()
+		if err != nil {
+			return defaultFetchTimeout
+		}
+		millis = parsed
+	default:
+		return defaultFetchTimeout
+	}
+	if !(millis > 0) {
+		return defaultFetchTimeout
+	}
+	timeout := time.Duration(millis) * time.Millisecond
+	if timeout < minFetchTimeout {
+		return minFetchTimeout
+	}
+	if timeout > maxFetchTimeout {
+		return maxFetchTimeout
+	}
+	return timeout
+}
+
+// HeadersToMap renders response headers the way fetch() exposes them: lowercased
+// names, repeated values joined with ", ".
+func HeadersToMap(header http.Header) map[string]any {
+	out := make(map[string]any, len(header))
+	for name, values := range header {
+		out[strings.ToLower(name)] = strings.Join(values, ", ")
+	}
+	return out
+}
+
+// hostPermitted reports whether an extension's network list reaches a host.
+//
+// An empty list is the default posture: every public host, with the address
+// guard below as the thing that keeps that off the local network. Listing hosts
+// narrows the grant to them, which is how an operator pins an extension that
+// talks to one service - and how a reviewed extension states what it talks to.
+func hostPermitted(hosts []string, host string) bool {
+	if len(hosts) == 0 {
+		return true
+	}
+	return matchesExcluded(hosts, host)
+}
+
+// fetchResponseValue is the object ctx.http.fetch resolves to. It is built in
+// one place so the shape a script sees is testable without a network.
+func fetchResponseValue(result FetchResult) map[string]any {
+	return map[string]any{
+		"status":  result.Status,
+		"ok":      result.Status >= 200 && result.Status < 300,
+		"url":     result.FinalURL,
+		"headers": HeadersToMap(result.Header),
+		"text":    func() string { return string(result.Body) },
+		"json":    func() any { var value any; _ = json.Unmarshal(result.Body, &value); return value },
+	}
+}
+
+func FetchAllowed(hosts []string, raw string, options map[string]any) (FetchResult, error) {
 	u, err := url.Parse(raw)
 	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.User != nil {
-		return nil, 0, errors.New("invalid HTTP URL")
+		return FetchResult{}, errors.New("invalid HTTP URL")
 	}
 	if u.Hostname() == "" {
-		return nil, 0, errors.New("invalid HTTP URL")
+		return FetchResult{}, errors.New("invalid HTTP URL")
 	}
-	if !matchesExcluded(hosts, u.Hostname()) {
-		return nil, 0, errors.New("network host is not permitted")
+	if !hostPermitted(hosts, u.Hostname()) {
+		return FetchResult{}, errors.New("network host is not permitted")
 	}
-	// The allowlist names a host, not a machine: a URL that points at the
-	// daemon's own host, at something on the loopback interface, or into a
-	// private network is refused before a socket is opened.
+	// The list names hosts, not machines: a URL that points at the daemon's own
+	// host, at something on the loopback interface, or into a private network is
+	// refused before a socket is opened. This is what keeps an unrestricted
+	// extension - an empty list, or "*" - on the public internet.
 	if err := publicHostCheck(u.Hostname()); err != nil {
-		return nil, 0, err
+		return FetchResult{}, err
 	}
 	method, _ := options["method"].(string)
 	if method == "" {
@@ -1188,36 +1438,39 @@ func FetchAllowed(hosts []string, raw string, options map[string]any) ([]byte, i
 	switch method {
 	case http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
 	default:
-		return nil, 0, errors.New("HTTP method is not permitted")
+		return FetchResult{}, errors.New("HTTP method is not permitted")
 	}
 	var requestBody io.Reader
 	if body, ok := options["body"].(string); ok {
 		if len(body) > 10<<20 {
-			return nil, 0, errors.New("HTTP request exceeds 10 MiB")
+			return FetchResult{}, errors.New("HTTP request exceeds 10 MiB")
 		}
 		requestBody = strings.NewReader(body)
 	}
 	request, err := http.NewRequest(method, raw, requestBody)
 	if err != nil {
-		return nil, 0, err
+		return FetchResult{}, err
 	}
 	if headers, ok := options["headers"].(map[string]any); ok {
 		for key, rawValue := range headers {
 			value, ok := rawValue.(string)
 			if !ok || len(key)+len(value) > 8192 || strings.EqualFold(key, "Host") {
-				return nil, 0, errors.New("invalid HTTP header")
+				return FetchResult{}, errors.New("invalid HTTP header")
 			}
 			request.Header.Set(key, value)
 		}
 	}
-	client := &http.Client{Timeout: 8 * time.Second, CheckRedirect: func(req *http.Request, via []*http.Request) error {
+	client := &http.Client{Timeout: fetchTimeout(options), CheckRedirect: func(req *http.Request, via []*http.Request) error {
 		if len(via) >= 5 {
 			return errors.New("too many redirects")
 		}
-		if !matchesExcluded(hosts, req.URL.Hostname()) {
+		if !hostPermitted(hosts, req.URL.Hostname()) {
 			return errors.New("redirect host is not permitted")
 		}
-		if err := checkPublicHost(req.URL.Hostname()); err != nil {
+		// Every hop goes through the same seam as the first request. Calling the
+		// guard directly here would leave a test that replaces it checking only
+		// the first hop, which is the one hop an attacker does not control.
+		if err := publicHostCheck(req.URL.Hostname()); err != nil {
 			return err
 		}
 		if len(via) > 0 && !strings.EqualFold(req.URL.Hostname(), via[0].URL.Hostname()) {
@@ -1225,20 +1478,24 @@ func FetchAllowed(hosts []string, raw string, options map[string]any) ([]byte, i
 			req.Header.Del("Cookie")
 		}
 		return nil
-	}, Transport: &http.Transport{DialContext: (&net.Dialer{Timeout: 5 * time.Second}).DialContext}}
+	}, Transport: fetchTransport()}
 	resp, err := client.Do(request)
 	if err != nil {
-		return nil, 0, err
+		return FetchResult{}, err
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20+1))
 	if err != nil {
-		return nil, 0, err
+		return FetchResult{}, err
 	}
 	if len(data) > 10<<20 {
-		return nil, 0, errors.New("HTTP response exceeds 10 MiB")
+		return FetchResult{}, errors.New("HTTP response exceeds 10 MiB")
 	}
-	return data, resp.StatusCode, nil
+	final := raw
+	if resp.Request != nil && resp.Request.URL != nil {
+		final = resp.Request.URL.String()
+	}
+	return FetchResult{Body: data, Status: resp.StatusCode, Header: resp.Header, FinalURL: final}, nil
 }
 
 func AllowedPath(roots []string, file string, write bool) (string, error) {

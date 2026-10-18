@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/evanw/esbuild/pkg/api"
+	"github.com/mostlygeek/llama-swap/internal/netproxy"
 	"github.com/shirou/gopsutil/v4/process"
 	"gopkg.in/yaml.v3"
 )
@@ -36,12 +37,19 @@ type Compiled struct {
 	// LogSink receives structured log records the script emits live. It is set
 	// by the server (per-extension monitor) and nil in tests.
 	LogSink func(logLine)
+	// network is the daemon's outbound proxy policy, passed to the worker
+	// subprocess so its ctx.http.fetch calls honor it.
+	network netproxy.Settings
 	// runtime selects the executor for Invoke: zero value = goja worker
 	// (production); RuntimeNode is set only for debug sessions.
 	runtime   runtimeKind
 	poolSlots chan struct{}
 	statusMu  sync.RWMutex
 	lastError string
+	// room caches HookInputRoom's measurement of the request envelope; the
+	// bundle and manifest do not change for a compiled extension.
+	roomOnce sync.Once
+	room     int
 }
 
 // runtimeKind selects the hook executor.
@@ -70,6 +78,7 @@ func (c *Compiled) WithRuntime(kind runtimeKind) *Compiled {
 		Hooks:        c.Hooks,
 		Settings:     c.Settings,
 		LogSink:      c.LogSink,
+		network:      c.network,
 		runtime:      kind,
 		poolSlots:    c.poolSlots,
 		lastError:    c.lastError,
@@ -78,12 +87,106 @@ func (c *Compiled) WithRuntime(kind runtimeKind) *Compiled {
 
 // Invoke dispatches one hook to the configured executor.
 func (c *Compiled) Invoke(ctx context.Context, hook string, meta Context, input json.RawMessage) (json.RawMessage, []string, error) {
+	room := c.HookInputRoom()
+	if err := CheckHookInputFor(c.Manifest.ID, hook, room, meta, input); err != nil {
+		c.setLastError(err)
+		return nil, nil, err
+	}
 	if c.runtime == RuntimeNode {
 		return c.InvokeWithNode(ctx, hook, meta, input, DebugNodePath(), DebugExecutorScript())
 	}
 	response, err := c.run(ctx, workerRequest{Bundle: c.Bundle, Manifest: c.Manifest, Settings: c.Settings, Hook: hook, Context: meta, Input: input}, c.hookBudget())
 	c.setLastError(err)
 	return response.Output, response.Logs, err
+}
+
+// HookInputRoom reports how many bytes of hook input this extension can carry,
+// given the bundle that has to travel on the same protocol line. The caller that
+// builds an input uses it to decide whether the payload fits; the limit is a
+// property of the extension's size as much as of the protocol.
+func (c *Compiled) HookInputRoom() int {
+	// Measure the real envelope, not an estimate of it. The bundle is re-sent on
+	// every call, its JSON escaping can grow it (every "<", ">" and "&" becomes a
+	// six-byte sequence), and the manifest's config travels too. Adding up field
+	// lengths under-counted all of that, so an input the guard accepted could
+	// still overflow the line and kill the worker - which on a request hook is
+	// the 502 the skip path exists to prevent.
+	//
+	// The empty-input request is marshalled once and cached: the bundle and the
+	// config do not change for a compiled extension.
+	c.roomOnce.Do(func() {
+		probe := workerRequest{
+			Bundle:   c.Bundle,
+			Manifest: c.Manifest,
+			Settings: c.Settings,
+			Hook:     "onToolCall",
+			Input:    json.RawMessage(`{}`),
+		}
+		encoded, err := json.Marshal(probe)
+		if err != nil {
+			c.room = 0
+			return
+		}
+		// The input is one field of that envelope; what is left over is the room
+		// it has, less the braces and quoting the field itself needs.
+		room := MaxHookInputBytes - (len(encoded) - len(`"input":{}`))
+		if room < 0 {
+			room = 0
+		}
+		c.room = room
+	})
+	return c.room
+}
+
+// checkHookInput refuses a call whose input cannot cross the worker protocol.
+// The whole request is one line with an 8 MiB ceiling, so a payload that does
+// not fit has to be named as such: without this the worker dies mid-line and the
+// failure reads as "ended without a response", which tells a caller nothing.
+//
+// The room depends on the bundle, which shares the line, so the check measures
+// the extension's own budget rather than the raw limit. A preset whose bundle is
+// large therefore reaches the limit sooner - and gets told the real number
+// instead of a generic protocol error.
+// CheckHookInputFor reports whether one hook call fits, given the context that
+// travels with it. The context is not cached: it carries the caller's model
+// snapshot, which is per request.
+func CheckHookInputFor(extension, hook string, room int, meta Context, input json.RawMessage) error {
+	if encoded, err := json.Marshal(meta); err == nil {
+		room -= len(encoded)
+	}
+	return checkHookInput(extension, hook, room, input)
+}
+
+func checkHookInput(extension, hook string, room int, input json.RawMessage) error {
+	// room <= 0 means the extension's own envelope already fills the line, so
+	// nothing fits. Treating it as "no limit" (the first version did) let a
+	// bundle in the reserve window accept every input and then die on the wire.
+	if room <= 0 {
+		return fmt.Errorf("%w: %s %s has no room left on the %s protocol line after its own bundle; the extension is too large to run a hook that takes an input",
+			ErrHookInputTooLarge, extension, hook, humanMebi(maxWorkerLine))
+	}
+	if len(input) <= room {
+		return nil
+	}
+	if room == MaxHookInputBytes {
+		// The context-free message, for callers that do not know the bundle.
+		return fmt.Errorf("%w: %s %s carries %s, over the %s one hook may receive",
+			ErrHookInputTooLarge, extension, hook, humanMebi(len(input)), humanMebi(MaxHookInputBytes))
+	}
+	return fmt.Errorf("%w: %s %s carries %s, over the %s available beside this extension's own code (the protocol line is %s, shared with the bundle); a base64 image is the usual cause, so downscale or crop it first",
+		ErrHookInputTooLarge, extension, hook, humanMebi(len(input)), humanMebi(room), humanMebi(MaxHookInputBytes))
+}
+
+// ErrHookInputTooLarge marks a hook that could not run because its payload does
+// not fit on the worker's protocol line. It is a capacity limit rather than a
+// fault in the extension, so a caller decides whether to skip the hook or to
+// report the failure - a request hook on a conversation that has grown past the
+// limit must not fail the user's request.
+var ErrHookInputTooLarge = errors.New("hook payload too large")
+
+// humanMebi renders a byte count for a size-limit message.
+func humanMebi(bytes int) string {
+	return fmt.Sprintf("%.1f MiB", float64(bytes)/(1<<20))
 }
 
 func (c *Compiled) setLastError(err error) {
@@ -110,11 +213,27 @@ type Manager struct {
 	directory   string
 	items       map[string]*Compiled
 	errors      map[string]string
+	network     netproxy.Settings
 	watchCancel context.CancelFunc
 }
 
+// Network reports the proxy policy extension fetches use.
+func (m *Manager) Network() netproxy.Settings {
+	if m == nil {
+		return netproxy.Settings{}
+	}
+	return m.network
+}
+
 func NewManager(directory string) (*Manager, error) {
-	m := &Manager{directory: directory, items: map[string]*Compiled{}, errors: map[string]string{}}
+	return NewManagerWithNetwork(directory, netproxy.Settings{})
+}
+
+// NewManagerWithNetwork opens the manager with the daemon's outbound proxy
+// policy: extension fetches go through it (they used to ignore the proxy
+// entirely, including the environment).
+func NewManagerWithNetwork(directory string, network netproxy.Settings) (*Manager, error) {
+	m := &Manager{directory: directory, items: map[string]*Compiled{}, errors: map[string]string{}, network: network}
 	if err := m.Reload(context.Background()); err != nil {
 		return nil, err
 	}
@@ -198,6 +317,7 @@ func (m *Manager) CompileDraft(ctx context.Context, manifest Manifest, files map
 		return nil, err
 	}
 	compiled.Manifest = manifest
+	compiled.network = m.network
 	return compiled, nil
 }
 
@@ -239,6 +359,7 @@ func (m *Manager) Reload(ctx context.Context) error {
 			failed[entry.Name()] = "manifest id does not match directory name"
 			continue
 		}
+		compiled.network = m.network
 		next[entry.Name()] = compiled
 	}
 	m.mu.Lock()
@@ -617,7 +738,13 @@ func compileDirectory(ctx context.Context, root string) (*Compiled, error) {
 	if err != nil {
 		return nil, err
 	}
-	compiled := &Compiled{Manifest: manifest, Bundle: string(result.OutputFiles[0].Contents), ETag: treeETag(manifestBytes, files), Directories: emptyDirectories}
+	compiled := &Compiled{
+		Manifest: manifest, Bundle: string(result.OutputFiles[0].Contents),
+		ETag: treeETag(manifestBytes, files), Directories: emptyDirectories,
+		// A lone compile (the editor's check endpoint, tests) has no daemon
+		// policy to inherit; Reload stamps the configured one below.
+		network: netproxy.FromEnv(),
+	}
 	if len(compiled.Bundle) > 4<<20 {
 		return nil, fmt.Errorf("extension %s: bundle exceeds 4 MiB", manifest.ID)
 	}
@@ -787,4 +914,15 @@ func (c *Compiled) SetLogSink(sink func(logLine)) {
 		c.LogSink = sink
 	}
 	c.statusMu.Unlock()
+}
+
+// logSink returns the installed sink under the same lock that guards its
+// installation; reading the field directly raced with SetLogSink.
+func (c *Compiled) logSink() func(logLine) {
+	if c == nil {
+		return nil
+	}
+	c.statusMu.Lock()
+	defer c.statusMu.Unlock()
+	return c.LogSink
 }

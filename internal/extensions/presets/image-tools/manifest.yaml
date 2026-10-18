@@ -1,0 +1,11 @@
+id: image-tools
+name: Image Tools
+enabled: true
+description: "Crop, resize, rotate and inspect images without leaving the machine: the pixel work runs in the daemon's own Go image codec, so a user's screenshot or photo is never uploaded anywhere. image_crop and image_resize produce an image (attached on Anthropic endpoints, a data URL on request, a summary otherwise); image_analyze reports dimensions, format, tone, transparency and dominant colours. Images are passed as base64 or a data URL, because the sandbox cannot carry binary bytes from a URL or a file, and one call carries at most about 5 MiB of image (a hook call is one 8 MiB protocol line, shared with this extension's own code). PNG (every colour type a normal encoder writes) and JPEG (baseline, progressive and greyscale) are read; WebP, HEIC and GIF are refused with a clear message."
+priority: 100
+match:
+  endpoints: [chat.completions, responses, anthropic.messages]
+permissions: {}
+timeout: 180s
+maxCpuMillis: 120000
+maxMemoryMiB: 1024

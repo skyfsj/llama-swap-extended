@@ -1,41 +1,44 @@
-// Volcengine Networked Search (联网搜索) web API.
+// 火山引擎「联网搜索」Web API。
 //
-// The official doc page (docs.volcengine.com/docs/Networkedsearch/...) is a
-// JavaScript-rendered application that could not be fetched as text, so the
-// contract below was verified against the open-source Volcengine clients that
-// ship this exact API:
-//   - volcengine/mcp-server -> server/mcp_server_askecho_search_infinity
-//   - bytedance/agentkit-samples -> skills/byted-web-search
-//
-// Endpoint (API-key auth):
 //   POST https://open.feedcoopapi.com/search_api/web_search
 //   Authorization: Bearer <api-key>
 //   Content-Type: application/json
-//   Body: {Query, SearchType:"web", Count, TimeRange?, Filter?, QueryControl?, ContentFormats?}
-// Response envelope:
-//   {Result: {ResultCount, TimeCost, WebResults: [{SortId, Title, SiteName,
-//    Url, Summary, Snippet, AuthInfoDes, Content, PublishTime, LogoUrl}]}}
+//   请求体：{Query, SearchType: "web"|"image", Count, TimeRange?, ContentFormats?}
+//     TimeRange: OneDay | OneWeek | OneMonth | OneYear
+//     ContentFormats: text | markdown
 //
-// The console also issues Volcengine AK/SK pairs that sign requests to
-// https://mercury.volcengineapi.com/?Action=WebSearch&Version=2025-01-01
-// (service volc_torchlight_api, HMAC-SHA256). That path is NOT implemented
-// here: the extension sandbox has no crypto primitives.
+//   响应形态在不同代理/版本间有差异，结果数组可能位于
+//   Result.WebResults / Result.Results / WebResults / results / search_result，
+//   业务错误可能在 error 或 ResponseMetadata.Error 里，所以解析要防御式。
 //
-// Put your key in the API Key setting (declared secret below, no default);
-// never hard-code it in this file.
+// 工具名带 doubao 后缀：多个搜索器可同时启用。
+
+import { clampCount, collapseText, defineExtension, searchTool } from "@llama-swap/extension";
+
+// 服务端错误码的中文释义，便于模型与运维判断该重试还是该改配置。
+const ERROR_HINTS = {
+  "10400": "参数错误，检查查询与参数",
+  "10402": "不支持的搜索类型，只支持 web 与 image",
+  "10403": "密钥或权限错误，确认 API Key 来自联网搜索控制台",
+  "10406": "免费额度已用尽，检查账户余额",
+  "10407": "该账户没有可用的免策略",
+  "10500": "服务内部错误，稍后重试",
+  "700429": "免费链路限流，降低频率后重试",
+  "100013": "子账号未被授予 TorchlightApiFullAccess"
+};
 
 export const settings = {
   apiKey: {
     type: "string",
     label: "API Key",
-    hint: "API key from the Volcengine networked-search (联网搜索) console. Required for the tool to work; fill it in after installing the preset.",
+    hint: "Volcengine networked-search API key (from the 联网搜索 console), sent as a Bearer token. Required for the tool to work; fill it in after installing the preset.",
     secret: true,
     required: true
   },
   maxResults: {
     type: "number",
     label: "Max results",
-    hint: "How many results to return. The API accepts 1-50 for web search.",
+    hint: "How many results to request (Count). The API accepts up to 50.",
     default: 5,
     min: 1,
     max: 50
@@ -43,160 +46,120 @@ export const settings = {
   timeRange: {
     type: "select",
     label: "Time range",
-    hint: "Restrict results by recency. 'any' leaves the parameter out.",
+    hint: "Restrict results to a recent window (TimeRange).",
     options: ["any", "OneDay", "OneWeek", "OneMonth", "OneYear"],
     default: "any"
   },
   contentFormat: {
     type: "select",
     label: "Content format",
-    hint: "Format used for returned page content, when content is requested.",
+    hint: "Ask the service for plain text or Markdown bodies (ContentFormats).",
     options: ["any", "text", "markdown"],
     default: "any"
+  },
+  requestTimeoutMs: {
+    type: "number",
+    label: "HTTP timeout (ms)",
+    hint: "Per-request timeout for the search call.",
+    default: 20000,
+    min: 1000,
+    max: 30000
   }
 };
 
-// Known API error codes with actionable hints.
-const ERROR_HINTS = {
-  "10400": "parameter error; check the query and parameters",
-  "10402": "unsupported search type; only 'web' and 'image' exist",
-  "10403": "key or permission error; confirm the API key comes from the networked-search console",
-  "10406": "free quota exhausted; check the account balance",
-  "10407": "no usable free strategy on this account",
-  "10500": "service internal error; retry later",
-  "700429": "rate limited on the free link; slow down and retry",
-  "100013": "sub-account is not granted TorchlightApiFullAccess"
-};
-
-function clampCount(value) {
-  const count = Math.floor(Number(value));
-  if (!isFinite(count) || count < 1) return 5;
-  if (count > 50) return 50;
-  return count;
-}
-
-// Pull the result list out of the response, tolerating the shape variants the
-// service and its proxies use.
+/** 从响应里取出结果数组，兼容服务端与各代理的形状差异。 */
 function extractResults(payload) {
-  if (!payload || typeof payload !== "object") return [];
+  if (!payload || typeof payload !== "object") {
+    return [];
+  }
   const candidates = [];
   if (payload.Result && typeof payload.Result === "object") {
-    if (Array.isArray(payload.Result.WebResults)) candidates.push(payload.Result.WebResults);
-    if (Array.isArray(payload.Result.Results)) candidates.push(payload.Result.Results);
+    if (Array.isArray(payload.Result.WebResults)) {
+      candidates.push(payload.Result.WebResults);
+    }
+    if (Array.isArray(payload.Result.Results)) {
+      candidates.push(payload.Result.Results);
+    }
   }
-  if (Array.isArray(payload.WebResults)) candidates.push(payload.WebResults);
-  if (Array.isArray(payload.results)) candidates.push(payload.results);
-  if (Array.isArray(payload.search_result)) candidates.push(payload.search_result);
+  if (Array.isArray(payload.WebResults)) {
+    candidates.push(payload.WebResults);
+  }
+  if (Array.isArray(payload.results)) {
+    candidates.push(payload.results);
+  }
+  if (Array.isArray(payload.search_result)) {
+    candidates.push(payload.search_result);
+  }
   for (let index = 0; index < candidates.length; index += 1) {
-    if (candidates[index].length > 0) return candidates[index];
+    if (candidates[index].length > 0) {
+      return candidates[index];
+    }
   }
   return [];
 }
 
-function formatResults(results, query) {
-  const lines = ["Web results for: " + query, ""];
-  for (let index = 0; index < results.length; index += 1) {
-    const item = results[index] || {};
-    const title = item.Title || item.title || "(untitled)";
-    lines.push((index + 1) + ". " + title);
-    const meta = [];
-    if (item.SiteName || item.media) meta.push(item.SiteName || item.media);
-    if (item.AuthInfoDes) meta.push(item.AuthInfoDes);
-    if (item.PublishTime || item.publish_date) meta.push(String(item.PublishTime || item.publish_date));
-    if (meta.length > 0) lines.push("   " + meta.join(" | "));
-    const url = item.Url || item.link || item.url;
-    if (url) lines.push("   " + url);
-    const summary = item.Summary || item.Snippet || item.content || "";
-    if (summary) lines.push("   " + String(summary).slice(0, 600));
-    lines.push("");
+/** 业务错误可能出现在两个位置，统一抽出来。 */
+function businessError(payload) {
+  if (!payload || typeof payload !== "object") {
+    return "";
   }
-  return lines.join("\n").slice(0, 8000);
-}
-
-function apiErrorMessage(payload) {
-  if (!payload || typeof payload !== "object") return "";
   if (payload.error) {
     const error = payload.error;
-    if (typeof error === "string") return error;
+    if (typeof error === "string") {
+      return error;
+    }
     const code = error.code !== undefined ? String(error.code) : "";
     const message = error.message || error.Message || "";
-    const hint = ERROR_HINTS[code] ? " (" + ERROR_HINTS[code] + ")" : "";
+    const hint = ERROR_HINTS[code] ? "（" + ERROR_HINTS[code] + "）" : "";
     return code ? code + " " + message + hint : message + hint;
   }
-  if (typeof payload.ResponseMetadata === "object" && payload.ResponseMetadata.Error) {
-    return payload.ResponseMetadata.Error.Message || JSON.stringify(payload.ResponseMetadata.Error);
+  if (payload.ResponseMetadata && payload.ResponseMetadata.Error) {
+    const error = payload.ResponseMetadata.Error;
+    return error.Message || JSON.stringify(error);
   }
   return "";
 }
 
-export default {
-  tools: [{
-    type: "function",
-    execution: "server",
-    function: {
-      name: "web_search",
-      description: "Search the live web through the Volcengine (Doubao) networked search API. Returns numbered results with title, source, URL and summary.",
-      parameters: {
-        type: "object",
-        properties: {
-          query: { type: "string", description: "Search query, 1-100 characters." }
-        },
-        required: ["query"]
-      }
-    }
-  }],
-
-  async onToolCall(ctx, call) {
-    if (call.name !== "web_search") return undefined;
-    const query = String(call.arguments.query || "").trim();
-    if (query.length === 0) {
-      throw new Error("web_search: query must not be empty");
-    }
-    if (query.length > 100) {
-      throw new Error("web_search: query must be at most 100 characters (got " + query.length + ")");
-    }
-    const apiKey = String(ctx.config.apiKey || "").trim();
-    if (apiKey.length === 0) {
-      throw new Error("web_search: set the API Key in the extension settings");
-    }
-
-    const body = {
-      Query: query,
-      SearchType: "web",
-      Count: clampCount(ctx.config.maxResults)
-    };
-    if (ctx.config.timeRange && ctx.config.timeRange !== "any") {
-      body.TimeRange = ctx.config.timeRange;
-    }
-    if (ctx.config.contentFormat && ctx.config.contentFormat !== "any") {
-      body.ContentFormats = ctx.config.contentFormat;
-    }
-
-    const response = await ctx.http.fetch("https://open.feedcoopapi.com/search_api/web_search", {
-      method: "POST",
-      headers: {
-        "Authorization": "Bearer " + apiKey,
-        "Content-Type": "application/json"
+export default defineExtension({
+  tools: [
+    searchTool({
+      name: "web_search_doubao",
+      title: "Web",
+      description:
+        "Search the live web through the Volcengine (Doubao) networked search API. Returns numbered results with title, source, URL and summary.",
+      // 该服务对查询长度有硬限制。
+      maxQueryLength: 100,
+      credential: { setting: "apiKey", label: "API Key", bearer: true },
+      request({ query, config }) {
+        const body = {
+          Query: query,
+          SearchType: "web",
+          Count: clampCount(config.maxResults, 5, 1, 50)
+        };
+        if (config.timeRange && config.timeRange !== "any") {
+          body.TimeRange = config.timeRange;
+        }
+        if (config.contentFormat && config.contentFormat !== "any") {
+          body.ContentFormats = config.contentFormat;
+        }
+        return { url: "https://open.feedcoopapi.com/search_api/web_search", method: "POST", body };
       },
-      body: JSON.stringify(body)
-    });
-
-    if (!response.ok) {
-      throw new Error("Volcengine networked search failed with HTTP " + response.status);
-    }
-    const payload = response.json();
-    if (!payload || typeof payload !== "object") {
-      throw new Error("Volcengine networked search returned a response that is not JSON");
-    }
-    const error = apiErrorMessage(payload);
-    if (error) {
-      throw new Error("Volcengine networked search error: " + error);
-    }
-
-    const results = extractResults(payload);
-    if (results.length === 0) {
-      return { content: "No web results found for: " + query };
-    }
-    return { content: formatResults(results, query) };
-  }
-};
+      parse(payload) {
+        const error = businessError(payload);
+        if (error) {
+          throw new Error("Volcengine 联网搜索错误：" + error);
+        }
+        const items = extractResults(payload);
+        return items.map((item) => ({
+          // 字段名大小写在不同版本间不一致，逐个兜底。
+          title: item.Title || item.title,
+          url: item.Url || item.url || item.link,
+          source: item.SiteName || item.media,
+          date: item.PublishTime || item.publish_date ? String(item.PublishTime || item.publish_date) : "",
+          meta: item.AuthInfoDes ? [collapseText(item.AuthInfoDes)] : undefined,
+          summary: String(item.Summary || item.Snippet || item.content || "").slice(0, 600)
+        }));
+      }
+    })
+  ]
+});

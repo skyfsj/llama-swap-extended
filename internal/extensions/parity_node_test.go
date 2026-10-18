@@ -89,6 +89,79 @@ func TestParity_NodeExecutorHookBasics(t *testing.T) {
 	}
 }
 
+// TestParity_NodeExecutorSeesConfig pins ctx.config across the two runtimes.
+// The goja worker derives it from the manifest and the declared settings; the
+// Node executor has no settings parser, so its request carries the finished map.
+// Without that field a debug run saw an empty ctx.config while production saw
+// the real one, which is the divergence this test exists to catch.
+func TestParity_NodeExecutorSeesConfig(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "cfgsync")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manifest := "id: cfgsync\nenabled: true\nconfig:\n  greeting: from-the-manifest\n"
+	if err := os.WriteFile(filepath.Join(dir, "manifest.yaml"), []byte(manifest), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	source := `export const settings = {
+  greeting: { type: "string", label: "Greeting" },
+  limit: { type: "number", label: "Limit", default: 7 }
+};
+export default {
+  onRequest(ctx, request) {
+    request.seen = { greeting: ctx.config.greeting, limit: ctx.config.limit };
+    return request;
+  }
+};`
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte(source), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m, err := NewManager(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, ok := m.Compiled("cfgsync")
+	if !ok {
+		t.Fatal("no compile")
+	}
+	req := workerRequest{Bundle: item.Bundle, Manifest: item.Manifest, Settings: item.Settings, Hook: "onRequest", Context: Context{ResolvedModel: "m"}, Input: json.RawMessage(`{"model":"m"}`)}
+
+	type seen struct {
+		Greeting any `json:"greeting"`
+		Limit    any `json:"limit"`
+	}
+	type output struct {
+		Seen seen `json:"seen"`
+	}
+	decode := func(t *testing.T, what string, response workerResponse) output {
+		t.Helper()
+		var decoded output
+		if err := json.Unmarshal(response.Output, &decoded); err != nil {
+			t.Fatalf("%s output %s: %v", what, string(response.Output), err)
+		}
+		return decoded
+	}
+
+	gojaResp, err := item.run(context.Background(), req, 10*time.Second)
+	if err != nil {
+		t.Fatalf("goja: %v", err)
+	}
+	nodeResp, err := runNodeTest(t, item, req)
+	if err != nil {
+		t.Fatalf("node: %v", err)
+	}
+	fromGoja := decode(t, "goja", gojaResp)
+	fromNode := decode(t, "node", nodeResp)
+
+	if fromGoja.Seen.Greeting != "from-the-manifest" || fromGoja.Seen.Limit != float64(7) {
+		t.Fatalf("goja saw %+v, want the manifest value and the declared default", fromGoja.Seen)
+	}
+	if fromNode != fromGoja {
+		t.Fatalf("parity drift:\n goja: %+v\n node: %+v", fromGoja, fromNode)
+	}
+}
+
 func TestParity_NodeExecutorSDKDispatch(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "sdkg")

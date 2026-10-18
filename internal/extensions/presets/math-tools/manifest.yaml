@@ -1,0 +1,11 @@
+id: math-tools
+name: Math Tools
+enabled: true
+description: "Offline, deterministic arithmetic and algebra - no network access and no API key. Installs two tools: calculator, which evaluates an expression or a short program exactly (integer arithmetic uses arbitrary-precision integers, so 2^200 and 100! come back digit for digit), and symbolic_math, which simplifies, expands, factors, differentiates, integrates and solves expressions. Unit and measurement conversion is a separate preset (unit-convert)."
+priority: 100
+match:
+  endpoints: [chat.completions, responses, anthropic.messages]
+permissions: {}
+timeout: 15s
+maxCpuMillis: 2000
+maxMemoryMiB: 256

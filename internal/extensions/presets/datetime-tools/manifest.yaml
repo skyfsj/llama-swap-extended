@@ -1,0 +1,11 @@
+id: datetime-tools
+name: Date & Time Tools
+enabled: true
+description: "Offline date and time tools: current time, strftime formatting, calendar arithmetic and timezone conversion. Ships an embedded IANA timezone table (599 names, 2022-2041, generated from the system tzdata with its real DST transitions), so it needs no network and no API key. Two tools: get_datetime and timezone_convert."
+priority: 100
+match:
+  endpoints: [chat.completions, responses, anthropic.messages]
+permissions: {}
+timeout: 10s
+maxCpuMillis: 1000
+maxMemoryMiB: 128

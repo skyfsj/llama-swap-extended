@@ -32,7 +32,7 @@ var presetFS embed.FS
 const storeMetaFile = "store.yaml"
 
 // presetCategoryOrder drives the order the store lists categories in.
-var presetCategoryOrder = []string{"search", "documents", "knowledge", "memory", "other"}
+var presetCategoryOrder = []string{"search", "documents", "knowledge", "memory", "media", "utilities", "other"}
 
 type storeMeta struct {
 	Category string   `json:"category" yaml:"category"`
@@ -198,14 +198,18 @@ func inspectTree(ctx context.Context, files map[string]string) (*Compiled, error
 // lands in a sensible group when it ships without a store.yaml.
 func presetCategory(id string) string {
 	switch {
-	case strings.HasPrefix(id, "web-search-"), id == "openai-web-search":
+	case strings.HasPrefix(id, "web-search-"), strings.HasPrefix(id, "web-render"), id == "openai-web-search":
 		return "search"
-	case strings.HasPrefix(id, "pdf-"):
+	case strings.HasPrefix(id, "pdf-"), strings.HasPrefix(id, "web-fetch"):
 		return "documents"
 	case strings.HasPrefix(id, "rag-"):
 		return "knowledge"
 	case strings.Contains(id, "memory"):
 		return "memory"
+	case strings.HasPrefix(id, "image-"):
+		return "media"
+	case strings.HasPrefix(id, "unit-"), strings.HasPrefix(id, "math-"), strings.Contains(id, "calc"), strings.Contains(id, "datetime"):
+		return "utilities"
 	default:
 		return "other"
 	}

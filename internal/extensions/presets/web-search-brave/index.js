@@ -1,16 +1,16 @@
-// Brave Search API (web endpoint).
+// Brave Search API（web 端点）。
 //
 //   GET https://api.search.brave.com/v1/web/search
 //       ?q=...&count=...&country=...&safesearch=...
-//   Headers: Accept: application/json
-//            X-Subscription-Token: <your-token>
+//   请求头：Accept: application/json
+//           X-Subscription-Token: <token>   ← 订阅令牌，放进设置，别写进代码
 //
-// Response: {query: {...}, web: {results: [{title, url, description, age,
-//            profile?...}]}}. Errors return 4xx/5xx with a JSON body holding
-// error information; they are surfaced with the status code.
+//   响应：{query: {...}, web: {results: [{title, url, description, age}]}}
+//   错误以 4xx/5xx 返回 JSON，SDK 会连状态码一起整形成可读信息。
 //
-// The subscription token belongs in the API Key setting below (declared
-// secret, no default); never hard-code it in this file.
+// 工具名带 brave 后缀，便于和其它搜索器同时启用。
+
+import { clampCount, defineExtension, searchTool } from "@llama-swap/extension";
 
 export const settings = {
   apiKey: {
@@ -32,93 +32,59 @@ export const settings = {
     type: "select",
     label: "Country",
     hint: "Two-letter country code that biases results.",
-    options: ["US", "GB", "DE", "FR", "JP", "IN", "BR", "AU", "CA"],
-    default: "US"
+    options: ["US", "GB", "DE", "FR", "JP", "IN", "BR", "AU", "CA", "CN"],
+    default: "CN"
   },
   safeSearch: {
     type: "select",
     label: "Safe search",
-    options: ["moderate", "strict", "off"]
+    options: ["moderate", "strict", "off"],
+    default: "moderate"
+  },
+  requestTimeoutMs: {
+    type: "number",
+    label: "HTTP timeout (ms)",
+    hint: "Per-request timeout for the search call.",
+    default: 15000,
+    min: 1000,
+    max: 20000
   }
 };
 
-function clampCount(value) {
-  const count = Math.floor(Number(value));
-  if (!isFinite(count) || count < 1) return 10;
-  if (count > 20) return 20;
-  return count;
-}
-
-function formatResults(results, query) {
-  const lines = ["Brave results for: " + query, ""];
-  for (let index = 0; index < results.length; index += 1) {
-    const item = results[index] || {};
-    lines.push((index + 1) + ". " + (item.title || "(untitled)"));
-    if (item.url) lines.push("   " + item.url);
-    if (item.age) lines.push("   " + item.age);
-    if (item.description) lines.push("   " + String(item.description));
-    lines.push("");
-  }
-  return lines.join("\n").slice(0, 8000);
-}
-
-export default {
-  tools: [{
-    type: "function",
-    execution: "server",
-    function: {
-      name: "web_search",
-      description: "Search the web with Brave Search and return numbered results with title, URL, age and description.",
-      parameters: {
-        type: "object",
-        properties: {
-          query: { type: "string", description: "Search query." }
-        },
-        required: ["query"]
+export default defineExtension({
+  tools: [
+    searchTool({
+      name: "web_search_brave",
+      title: "Brave",
+      description:
+        "Search the web with Brave Search and return numbered results with title, URL, age and description.",
+      maxQueryLength: 400,
+      credential: { setting: "apiKey", label: "Subscription Token", header: "X-Subscription-Token" },
+      request({ query, config }) {
+        // Brave 的查询参数叫 q，条数 count，安全过滤 safesearch。
+        const params = [
+          "q=" + encodeURIComponent(query),
+          "count=" + clampCount(config.maxResults, 10, 1, 20),
+          "safesearch=" + encodeURIComponent(config.safeSearch || "moderate")
+        ];
+        if (config.country) {
+          params.push("country=" + encodeURIComponent(config.country));
+        }
+        return {
+          url: "https://api.search.brave.com/v1/web/search?" + params.join("&"),
+          headers: { Accept: "application/json" }
+        };
+      },
+      parse(payload) {
+        const web = payload.web;
+        const items = web && Array.isArray(web.results) ? web.results : [];
+        return items.map((item) => ({
+          title: item.title,
+          url: item.url,
+          date: item.age,
+          snippet: item.description
+        }));
       }
-    }
-  }],
-
-  async onToolCall(ctx, call) {
-    if (call.name !== "web_search") return undefined;
-    const query = String(call.arguments.query || "").trim();
-    if (query.length === 0) {
-      throw new Error("web_search: query must not be empty");
-    }
-    const apiKey = String(ctx.config.apiKey || "").trim();
-    if (apiKey.length === 0) {
-      throw new Error("web_search: set the API Key in the extension settings");
-    }
-
-    const params = [
-      "q=" + encodeURIComponent(query),
-      "count=" + clampCount(ctx.config.maxResults),
-      "safesearch=" + encodeURIComponent(ctx.config.safeSearch || "moderate")
-    ];
-    if (ctx.config.country) {
-      params.push("country=" + encodeURIComponent(ctx.config.country));
-    }
-    const url = "https://api.search.brave.com/v1/web/search?" + params.join("&");
-
-    const response = await ctx.http.fetch(url, {
-      headers: {
-        "Accept": "application/json",
-        "X-Subscription-Token": apiKey
-      }
-    });
-    if (!response.ok) {
-      throw new Error("Brave search failed with HTTP " + response.status);
-    }
-    const payload = response.json();
-    if (!payload || typeof payload !== "object") {
-      throw new Error("Brave search returned a response that is not JSON");
-    }
-
-    const web = payload.web;
-    const results = web && Array.isArray(web.results) ? web.results : [];
-    if (results.length === 0) {
-      return { content: "No Brave results found for: " + query };
-    }
-    return { content: formatResults(results, query) };
-  }
-};
+    })
+  ]
+});
