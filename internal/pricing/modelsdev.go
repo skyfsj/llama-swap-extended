@@ -14,6 +14,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/mostlygeek/llama-swap/internal/netproxy"
 	"github.com/mostlygeek/llama-swap/internal/store"
 )
 
@@ -66,7 +67,11 @@ func (s *Syncer) Sync(ctx context.Context) (SyncResult, error) {
 	}
 	client := s.Client
 	if client == nil {
-		client = &http.Client{}
+		var clientErr error
+		client, clientErr = netproxy.Client(0)
+		if clientErr != nil {
+			return SyncResult{}, clientErr
+		}
 	} else {
 		copyClient := *client
 		client = &copyClient

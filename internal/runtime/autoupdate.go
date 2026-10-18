@@ -703,6 +703,12 @@ func (m *Manager) autoUpdateOne(ctx context.Context, name string, definition Def
 		// but that is installation work rather than a metadata check. Honor the
 		// same busy and minimum-idle gates used by Stage/Activate before calling
 		// the provider's side-effecting refresh method.
+		// Re-check the operator pin after the (potentially slow) provider check:
+		// a pin set while CheckForUpdate was in flight must stop this pass before
+		// anything is staged or activated.
+		if pinned := m.pinnedVersion(name); strings.TrimSpace(pinned) != "" {
+			return nil
+		}
 		idle, idleFor := m.observeIdle(name, now)
 		if !idle && !m.buildWhileBusyAllowed() {
 			status.State = StateWaitingForIdle
@@ -767,6 +773,12 @@ func (m *Manager) autoUpdateOne(ctx context.Context, name string, definition Def
 		return err
 	}
 
+	// Re-check the operator pin after the (potentially slow) provider check:
+	// a pin set while CheckForUpdate was in flight must stop this pass before
+	// anything is staged or activated.
+	if pinned := m.pinnedVersion(name); strings.TrimSpace(pinned) != "" {
+		return nil
+	}
 	idle, idleFor := m.observeIdle(name, now)
 	if !idle && !m.buildWhileBusyAllowed() {
 		status.State = StateWaitingForIdle
@@ -796,6 +808,9 @@ func (m *Manager) autoUpdateOne(ctx context.Context, name string, definition Def
 		return nil
 	}
 
+	if pinned := m.pinnedVersion(name); strings.TrimSpace(pinned) != "" {
+		return nil
+	}
 	if status.Staged != candidate.Version {
 		if _, err := m.Stage(ctx, candidate); err != nil {
 			m.emitProgress(name, "error", 0, "runtime update staging failed", err)
@@ -828,6 +843,10 @@ func (m *Manager) autoUpdateOne(ctx context.Context, name string, definition Def
 			return err
 		}
 		m.emitProgress(name, "waiting_for_idle", 0.5, status.LastError, nil)
+		return nil
+	}
+	// Final guard immediately before the serving-pointer switch.
+	if pinned := m.pinnedVersion(name); strings.TrimSpace(pinned) != "" {
 		return nil
 	}
 	if err := m.Activate(ctx, name, candidate.Version); err != nil {
@@ -881,6 +900,15 @@ func desiredDiff(current Manifest, candidate Spec) bool {
 		return true
 	}
 	return current.Version != candidate.Version || (candidate.Commit != "" && current.Commit != candidate.Commit) || (candidate.Ref != "" && current.Ref != candidate.Ref) || (candidate.Source != "" && current.Source != candidate.Source)
+}
+
+// pinnedVersion reads the operator pin under the manager lock.
+func (m *Manager) pinnedVersion(name string) string {
+	status, _, _, err := m.autoSnapshot(name)
+	if err != nil {
+		return ""
+	}
+	return status.Pinned
 }
 
 func (m *Manager) autoSnapshot(name string) (Status, persistedState, Manifest, error) {

@@ -7,7 +7,8 @@ import (
 
 var sectionLabels = map[string]string{
 	"advanced": "高级", "general": "常规", "integrations": "集成", "logging": "日志",
-	"modelFiles": "模型文件", "models": "模型", "observability": "可观测性", "peers": "节点",
+	"modelFiles": "模型文件", "models": "模型", "network": "网络代理",
+	"observability": "可观测性", "peers": "节点",
 	"performance": "性能", "routing": "路由", "runtimes": "运行时", "security": "安全",
 	"storage": "存储", "ui": "界面", "upstream": "上游",
 }
@@ -115,6 +116,21 @@ func Root() *Field {
 					field("enabled", KBool, "启用价格同步", "observability", CompSwitch, true),
 					field("refreshEvery", KDuration, "刷新间隔", "observability", CompDuration, "24h"),
 					field("url", KString, "数据地址", "observability", CompText, "https://models.dev/api.json"))),
+			objectField("network", "网络代理", "network", false,
+				field("proxy", KString, "代理地址", "network", CompText, ""),
+				field("noProxy", KStringList, "直连主机（不走代理）", "network", CompList, nil),
+				field("trustForwardedFor", KBool, "信任 X-Forwarded-For", "network", CompSwitch, false),
+				field("trustedProxies", KStringList, "可信上游代理（地址或 CIDR）", "network", CompList, nil)),
+			objectField("server", "HTTP 服务", "security", false,
+				bounded(field("maxHeaderBytes", KInt, "请求头大小上限（字节）", "security", CompNumber, 65536), 4096, 1048576),
+				field("readTimeout", KDuration, "请求读取超时（0 为不限）", "security", CompDuration, "0s"),
+				field("securityHeaders", KBool, "启用安全响应头", "security", CompSwitch, true)),
+			objectField("security", "安全防护", "security", false,
+				objectField("authRateLimit", "认证失败限速", "security", false,
+					field("disabled", KBool, "停用限速", "security", CompSwitch, false),
+					bounded(field("maxFailures", KInt, "窗口内允许失败次数", "security", CompNumber, 10), 1, 100000),
+					field("window", KDuration, "统计窗口", "security", CompDuration, "1m"),
+					field("blockFor", KDuration, "超限后封禁时长", "security", CompDuration, "5m"))),
 			objectField("audit", "审计记录", "observability", false,
 				field("enabled", KBool, "启用审计", "observability", CompSwitch, true),
 				field("retention", KDuration, "保留时间", "observability", CompDuration, "720h"),
@@ -127,12 +143,13 @@ func Root() *Field {
 					providerBacked(field("preload", KStringList, "预加载模型", "advanced", CompList, nil), "models"))),
 			anyField("macros", "宏定义", "advanced", CompMap),
 			objectField("extensions", "扩展", "advanced", false,
+				bounded(field("maxContinuationMiB", KInt, "工具续接轮次上限（MiB）", "advanced", CompNumber, 64), 0, 1024),
 				objectField("logging", "日志存储", "logging", false,
 					field("logMaxDiskMiB", KInt, "日志总容量（MiB）", "logging", CompNumber, 100),
 					field("logRetainDays", KInt, "保留天数", "logging", CompNumber, 7))),
 			legacyField("groups", "旧版模型组（保存时迁移）"),
 			legacyField("matrix", "旧版矩阵（保存时迁移）"),
-			sensitiveAnyField("apiKeys", "启动 API 密钥", "security", CompPassword),
+			sensitiveListField("apiKeys", "启动 API 密钥", "security"),
 		},
 	}
 	// Provider IDs are stable server-side contracts. The UI uses them to
@@ -221,10 +238,13 @@ func sensitiveField(name, desc, section string) *Field {
 	return &Field{Name: name, Kind: KString, Desc: desc, Sensitive: true, UI: UI{Section: section, Label: desc, Component: CompPassword}}
 }
 
-func sensitiveAnyField(name, desc, section, component string) *Field {
-	f := anyField(name, desc, section, component)
-	f.Sensitive = true
-	return f
+// sensitiveListField declares a sensitive sequence (apiKeys). The component is
+// a list, not a password: a scalar editor on a list value submits one string
+// and the loader rejects the save with "apiKeys must be a sequence of strings
+// or objects". The settings center masks the rows and sends index-scoped
+// operations so untouched secrets are never rewritten.
+func sensitiveListField(name, desc, section string) *Field {
+	return &Field{Name: name, Kind: KScalarOrObject, Desc: desc, Sensitive: true, UI: UI{Section: section, Label: desc, Component: CompList}}
 }
 
 func entityField(name, desc, section, editor string, advanced bool) *Field {
@@ -301,12 +321,23 @@ func schemaFor(f *Field) map[string]any {
 	case KStringMap, KIntMap, KStringListMap, KAnyMap, KEntityMap:
 		out["type"] = "object"
 		out["additionalProperties"] = schemaFor(f.Template)
-	case KObjectList, KScalarOrObject:
+	case KObjectList:
 		out["type"] = "array"
 		if f.Item != nil {
 			out["items"] = schemaFor(f.Item)
 		} else if f.Template != nil {
 			out["items"] = schemaFor(f.Template)
+		}
+	case KScalarOrObject:
+		// The loader accepts both forms in the same sequence (apiKeys), so the
+		// schema must not describe one and reject the other.
+		out["type"] = "array"
+		if f.Item != nil {
+			out["items"] = schemaFor(f.Item)
+		} else if f.Template != nil {
+			out["items"] = schemaFor(f.Template)
+		} else {
+			out["items"] = map[string]any{"type": []string{"string", "object"}}
 		}
 	case KObject:
 		out["type"] = "object"

@@ -90,15 +90,24 @@ type Manager struct {
 	logger    Logger
 	progress  func(swaputil.BackendProgressEvent)
 
-	mu      sync.Mutex
-	started bool
-	ctx     context.Context
-	cancel  context.CancelFunc
-	wake    chan struct{}
-	wg      sync.WaitGroup
-	active  map[string]context.CancelFunc
-	ownerID string
-	targets map[string]*sync.Mutex
+	mu        sync.Mutex
+	enqueueMu sync.Mutex
+	started   bool
+	ctx       context.Context
+	cancel    context.CancelFunc
+	wake      chan struct{}
+	wg        sync.WaitGroup
+	active    map[string]context.CancelFunc
+	ownerID   string
+	targets   map[string]*targetLock
+}
+
+// targetLock pairs a per-repository mutex with a waiter count so the table can
+// drop idle entries without ever handing two callers different mutexes for the
+// same repository.
+type targetLock struct {
+	mu   sync.Mutex
+	refs int
 }
 
 type downloadProvider struct {
@@ -175,7 +184,7 @@ func New(c Config) (*Manager, error) {
 		wake:      make(chan struct{}, 1),
 		active:    make(map[string]context.CancelFunc),
 		ownerID:   newID("queue"),
-		targets:   make(map[string]*sync.Mutex),
+		targets:   make(map[string]*targetLock),
 	}, nil
 }
 
@@ -545,6 +554,11 @@ func (m *Manager) Enqueue(ctx context.Context, request Request) (store.ModelDown
 		return store.ModelDownloadTask{}, false, err
 	}
 	request.SourceID = destination.ID
+	// Find-then-create must be atomic: two simultaneous enqueues of the same
+	// repository otherwise both miss and insert, leaving two live tasks that
+	// serialize only later on the file lock.
+	m.enqueueMu.Lock()
+	defer m.enqueueMu.Unlock()
 	active, found, err := m.store.FindActiveModelDownload(ctx, request.Provider, request.RepoID, request.Revision, request.SourceID, request.Include, request.Exclude)
 	if err != nil {
 		return store.ModelDownloadTask{}, false, err
@@ -728,12 +742,24 @@ func (m *Manager) lockTarget(task store.ModelDownloadTask) func() {
 	m.mu.Lock()
 	lock := m.targets[key]
 	if lock == nil {
-		lock = &sync.Mutex{}
+		lock = &targetLock{}
 		m.targets[key] = lock
 	}
+	lock.refs++
 	m.mu.Unlock()
-	lock.Lock()
-	return lock.Unlock
+
+	lock.mu.Lock()
+	return func() {
+		lock.mu.Unlock()
+		// The table entry is only dropped once nobody holds or waits for it,
+		// so a waiter can never be joined by a caller using a fresh mutex.
+		m.mu.Lock()
+		lock.refs--
+		if lock.refs == 0 {
+			delete(m.targets, key)
+		}
+		m.mu.Unlock()
+	}
 }
 
 func (m *Manager) provider(name string) (downloadProvider, error) {
@@ -1768,6 +1794,22 @@ func (m *Manager) downloadFile(ctx context.Context, provider downloadProvider, f
 		if response.StatusCode == http.StatusRequestedRangeNotSatisfiable {
 			response.Body.Close()
 			if expectedSize > 0 && partSize == expectedSize {
+				// Without a checksum, size alone cannot prove the bytes are
+				// real: a chunk download creates the .part with Truncate, and
+				// if its manifest was lost the file is full of NUL holes. A
+				// sparse file is therefore never accepted on size alone.
+				if expectedSHA == "" {
+					if holes, sparseErr := fileIsSparse(part); sparseErr == nil && holes {
+						m.warnf("download part %s is sparse and has no checksum; restarting the download", part)
+						if err := os.Remove(part); err != nil && !errors.Is(err, os.ErrNotExist) {
+							return 0, err
+						}
+						// Retry the same attempt with no Range header. The part
+						// is gone, so this rule cannot fire twice for one file.
+						attempt--
+						continue
+					}
+				}
 				if err := verifyFile(part, expectedSize, expectedSHA); err == nil {
 					if err := finalizePart(part, final); err != nil {
 						return 0, err
