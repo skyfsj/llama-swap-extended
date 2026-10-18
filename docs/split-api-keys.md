@@ -21,7 +21,7 @@ to revoke the last one), so the deployment cannot lock itself out.
 
 | Field | Meaning |
 | --- | --- |
-| `allowedIps` | Caller addresses or CIDR blocks the key may be used from. Empty means unrestricted. The check uses the same resolved address the access log prints (`X-Forwarded-For`, then `X-Real-IP`, then the connection address), so a rejected request names an address you can match against the log. |
+| `allowedIps` | Caller addresses or CIDR blocks the key may be used from. Empty means unrestricted. The check uses the same resolved address the access log prints: the connection's address by default, or the forwarding header when the operator opted into `network.trustForwardedFor` (optionally narrowed by `network.trustedProxies`). A rejected request names an address you can match against the log. |
 | `models` | Model allowlist, intersected with the parent's. A model the parent cannot reach stays unreachable, and a restriction with no overlap is rejected at write time instead of silently widening to "all models". Exact names and a single leading or trailing `*` are supported. |
 | `maxConcurrency` | Ceiling on simultaneous in-flight requests per key. Requests beyond the ceiling get `429 Too Many Requests`. A slot is held for the whole response, so a streaming request counts for its entire lifetime. `0` is unlimited. |
 | `group` | Free-form label used to group rows on the usage records page. |
@@ -34,6 +34,15 @@ child.
 
 An access key whose parent is missing, revoked, or expired fails closed and
 authenticates as invalid.
+
+An access key is a model credential, never a control-plane credential. It
+cannot mint another key: `POST /api/cc-switch/deeplink` with `createKey: true`
+is refused for one. A management key may use that flow (the UI's "auto key"
+option) even when it carries only the inference scope, and the generated key is
+created as an access key nested under it with the parent's `allowedIps`,
+`maxConcurrency`, `group` and `expiresAt` copied down. A key minted that way is
+therefore never more powerful or longer-lived than the credential that asked
+for it.
 
 ## Managing keys
 
@@ -51,6 +60,26 @@ PATCH  /api/keys/{id}                      # same fields; kind and parentId are 
 DELETE /api/keys/{id}                      # revokes nested access keys too
 POST   /api/keys/{id}/rotate               # new secret, same restrictions
 ```
+
+## Keys declared in the configuration file
+
+The `apiKeys` section of the configuration is the source of truth for the keys
+it declares. Saving the file (or saving the matching field in the settings
+center) adds and updates them, and **removing an entry revokes that key** — and
+every access key nested under it — on the same reload, without a restart. The
+control plane marks those rows as config-owned; keys created on the API keys
+page carry no such mark and are never touched by an edit to the file.
+
+Two consequences are worth knowing:
+
+- A key that exists in the file is re-asserted, so the panel shows config-owned
+  keys read-only and refuses to rotate or delete them: the next save would undo
+  it.
+- A deployment whose key table already holds rows always requires
+  authentication, so the file cannot remove the *last* management key that can
+  sign in. That save is rejected with `configuration would leave no management
+  key that can sign in` and the configuration is rolled back, exactly like the
+  panel refusing to delete the last key.
 
 ## Usage records
 

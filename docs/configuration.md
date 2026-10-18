@@ -483,6 +483,150 @@ also registered. Its outer `model` field is optional at the upstream protocol
 level; llama-swap infers it only when exactly one local model is configured and
 returns an explicit routing error when the choice would be ambiguous.
 
+## Outbound network proxy
+
+Everything the daemon sends to the internet — model downloads, pricing
+refreshes, runtime metadata, extension `ctx.http.fetch`, provider-gateway
+fallbacks, and the package managers runtime builds run (`pip`, `uv`, `npm`,
+`git`) — follows one policy:
+
+```yaml
+network:
+  proxy: http://proxy.example.com:3128   # or https://, socks5://, socks5h://
+  noProxy:
+    - localhost
+    - .corp.example.com
+```
+
+`proxy` accepts `http`, `https`, `socks5` and `socks5h` URLs (with optional
+`user:password`). `direct` (or `none`) forces direct connections even when the
+process environment defines a proxy. Leaving it empty keeps the historical
+behavior: whichever `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY`
+variables the daemon was started with.
+
+`noProxy` entries are matched the way `curl --noproxy` does: an exact host, a
+bare domain, or a leading-dot suffix all match that domain and its
+subdomains. A single `"*"` disables proxying entirely.
+
+Once a proxy is configured, traffic that a proxy cannot help with is always
+sent directly: loopback addresses (`127.0.0.1`, `::1`, `localhost`, and the
+model backends behind them), private, link-local and unique-local addresses
+(the LAN and the model containers), and single-label host names such as a
+container name. Only the public internet goes through the proxy, so local
+routing, peers and model traffic keep working exactly as before.
+
+The policy is applied when the configuration is loaded and again on every
+reload — clients that build their own HTTP transport follow the process
+default transport, which resolves the policy per request, so a change takes
+effect without a restart. A per-credential `proxy` on a provider still
+overrides it for that one upstream. Credentials in the URL are redacted from
+logs.
+
+Models launched as host commands inherit the same policy. A model that runs
+inside a container is different: its environment comes from `container.env`,
+so a proxy that must be visible inside needs an explicit entry there. Note that
+a proxy listening on the host's loopback is `127.0.0.1` only to the host — from
+inside a container that address is the container itself, so use
+`host.docker.internal` or host networking.
+
+## Caller address and reverse proxies
+
+The address llama-swap treats as "the caller" decides two things: which
+address the per-key `allowedIps` allowlist is checked against, and what the
+access log and audit rows record.
+
+By default that address is the **TCP peer** — the connection's own address.
+`X-Forwarded-For` and `X-Real-IP` are ignored, because a direct client can put
+any value in those headers and would otherwise be able to pick an address that
+passes an allowlist.
+
+When llama-swap sits behind a reverse proxy you control, opt in:
+
+```yaml
+network:
+  trustForwardedFor: true
+  trustedProxies:
+    - 127.0.0.1/32        # nginx / caddy on the same host
+    - 10.0.0.0/8          # an internal load balancer
+```
+
+With `trustForwardedFor: true` the caller is read from `X-Forwarded-For`
+(falling back to `X-Real-IP`).
+
+When `trustedProxies` is set, the chain is walked right to left and trusted
+hops are skipped, so the first untrusted address is reported; a request whose
+peer is not in the trusted list ignores its headers entirely.
+
+When `trustedProxies` is empty, **only the right-most hop is used** — the
+address the directly connected proxy wrote. That is the safe single-switch
+form: reverse proxies append by default (nginx's `$proxy_add_x_forwarded_for`,
+Caddy), so a client that pre-seeds `X-Forwarded-For` only affects entries to
+the left of the appended one. If your proxy overwrites the header instead of
+appending, the right-most and only hop is the client address, which is still
+correct.
+
+If the appended (right-most) segment is not a valid address — some proxies
+write `unknown` — llama-swap ignores the whole `X-Forwarded-For` value and uses
+the connection address. It never falls back to an entry further left, because
+everything to the left may have been supplied by the client.
+
+`X-Real-IP` is consulted only when `X-Forwarded-For` yields no usable address.
+A proxy must therefore **overwrite** `X-Real-IP` with the address it observed,
+not pass a client-supplied value through.
+
+`trustedProxies` requires `trustForwardedFor: true`; configuring the list alone
+is rejected at load time rather than silently doing nothing.
+
+## HTTP server, response headers and failed-login throttling
+
+```yaml
+server:
+  maxHeaderBytes: 65536   # request line + headers, 4 KiB - 1 MiB
+  readTimeout: 0s         # 0 disables it (large payloads on slow links)
+  securityHeaders: true   # X-Content-Type-Options, X-Frame-Options, CSP, ...
+```
+
+`maxHeaderBytes` defaults to 64 KiB, well below Go's 1 MiB default. A gateway
+never needs a megabyte of headers, and the cap stops one request from pinning
+that much memory before routing starts.
+
+`securityHeaders` adds `X-Content-Type-Options: nosniff`,
+`X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`,
+`Permissions-Policy`, and — for the embedded UI — a
+`Content-Security-Policy` that denies framing, plugins and cross-origin
+requests. The `/upstream` and `/comfyui` passthroughs are excluded because
+those responses belong to the proxied application.
+
+`readTimeout` is off by default: it bounds reading one complete request
+(headers and body), so a very large chat payload on a slow link would be cut
+off. Enable it when your clients are known to be fast.
+
+Failed credential checks are throttled per caller address:
+
+```yaml
+security:
+  authRateLimit:
+    disabled: false
+    maxFailures: 10   # inside one window
+    window: 1m
+    blockFor: 5m
+```
+
+A failed check is counted when the authentication layer rejects the presented
+credential. A valid credential that merely hits a scope or policy boundary
+keeps its normal `403` and is not penalised, and a `401` produced further
+downstream (a provider whose own key expired, a backend protected by
+`--api-key`) is never charged to the caller. Any accepted credential clears
+the counter, so mistyping a key a few times does not lock anyone out. A blocked
+caller receives `429` with a `Retry-After` header. The defaults are chosen so
+an operator who mistypes a key is never locked out while online guessing of
+weak YAML keys stays expensive.
+
+Both session endpoints participate: `POST /api/auth/session` submits a
+credential, and `GET /api/auth/session` reports whether the presented one is
+valid. The login screen's anonymous poll carries no credential and is never
+counted.
+
 ## LMCache (optional KV-cache accelerator)
 
 LMCache is an optional module that accelerates repeated vLLM prompts with a
@@ -932,3 +1076,21 @@ llama-swap supports many more features to customize how you want to manage your 
 ## Full Configuration Example
 
 Check [config.example.yaml](https://github.com/mostlygeek/llama-swap/blob/main/config.example.yaml) for the most up to date reference for all example configurations. It has grown quite complex but your favorite local LLM can help with a local configuration.
+
+#### Tool failure handling
+
+A tool that cannot run — an upstream search API out of quota, a provider
+timeout, a handler that throws — is reported to the model as that tool's
+result (`is_error` in the Anthropic shape) instead of failing the request. The
+model then decides what to do next: retry, fall back to another tool, or answer
+without it.
+
+Set `failOnToolError: true` in an extension's manifest to keep the strict
+behavior, where a failing tool handler aborts the request:
+
+```yaml
+# extension manifest.yaml
+id: web-search-doubao
+enabled: true
+failOnToolError: false   # default: report the failure to the model
+```
