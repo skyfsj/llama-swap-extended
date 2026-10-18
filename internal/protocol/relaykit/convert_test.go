@@ -5,9 +5,6 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
-
-	"github.com/QuantumNous/new-api/relaykit/relayconvert"
-	"github.com/QuantumNous/new-api/relaykit/relayconvert/convmeta"
 )
 
 func TestRouteForRequest(t *testing.T) {
@@ -36,8 +33,7 @@ func TestRouteForRequest(t *testing.T) {
 
 func TestHostedSearchIsLeftToExtensions(t *testing.T) {
 	body := []byte(`{"model":"m","input":"search this","tools":[{"type":"web_search"}]}`)
-	meta := NewMeta("m", false)
-	result, err := ConvertRequest(context.Background(), meta, OpenAIResponses, OpenAIChat, body, "m")
+	result, err := ConvertRequest(context.Background(), NewMeta("m", false), OpenAIResponses, OpenAIChat, body, "m")
 	if err != nil {
 		t.Fatalf("ConvertRequest: %v", err)
 	}
@@ -49,15 +45,11 @@ func TestHostedSearchIsLeftToExtensions(t *testing.T) {
 	if err := json.Unmarshal(encoded, &request); err != nil {
 		t.Fatal(err)
 	}
-	if tools, exists := request["tools"]; exists && tools != nil {
-		t.Fatalf("provider-native search tool reached Chat upstream: %v", tools)
+	if _, exists := request["tools"]; exists {
+		t.Fatalf("provider-native search tool reached Chat upstream: %v", request["tools"])
 	}
-	if len(result.Diagnostics) == 0 || result.Diagnostics[0].Code != "hosted_web_search_omitted" {
-		t.Fatalf("search omission diagnostics = %+v", result.Diagnostics)
-	}
-	encoding, err := meta.Options.WebSearch(convmeta.WebSearchCall{Source: OpenAIResponses, Target: OpenAIChat})
-	if err != nil || encoding == nil || !encoding.Omitted {
-		t.Fatalf("WebSearch encoder = %+v, %v", encoding, err)
+	if len(result.Diagnostics) == 0 {
+		t.Fatalf("hosted search omission must be reported: %+v", result.Diagnostics)
 	}
 }
 
@@ -109,6 +101,21 @@ func TestConvertRequestMatrix(t *testing.T) {
 				if err != nil || !json.Valid(encoded) {
 					t.Fatalf("converted request is invalid JSON: %s (%v)", encoded, err)
 				}
+				// The user's prompt must survive every conversion: a silently
+				// empty request is the failure mode this matrix guards against.
+				if !strings.Contains(string(encoded), "hi") {
+					t.Fatalf("prompt text lost converting %s -> %s: %s", source, target, encoded)
+				}
+				if target == Gemini {
+					// The Gemini dialect carries the model in the URL path, not
+					// in the body: assert the path builder keeps it.
+					path, perr := TargetPath(Gemini, "m", false)
+					if perr != nil || !strings.Contains(path, "/models/m:") {
+						t.Fatalf("model lost converting %s -> gemini: path = %q (%v)", source, path, perr)
+					}
+				} else if !strings.Contains(string(encoded), `"m"`) {
+					t.Fatalf("model lost converting %s -> %s: %s", source, target, encoded)
+				}
 			})
 		}
 	}
@@ -138,6 +145,9 @@ func TestConvertResponseMatrix(t *testing.T) {
 				if err != nil || !json.Valid(encoded) {
 					t.Fatalf("converted response is invalid JSON: %s (%v)", encoded, err)
 				}
+				if !strings.Contains(string(encoded), "hi") {
+					t.Fatalf("assistant text lost converting %s -> %s: %s", source, target, encoded)
+				}
 			})
 		}
 	}
@@ -156,7 +166,7 @@ func TestStreamResponseMatrix(t *testing.T) {
 				continue
 			}
 			t.Run(string(source)+"_to_"+string(target), func(t *testing.T) {
-				state, err := relayconvert.NewResponseStreamState(source, target, relayconvert.ResponseStreamOptions{Model: "m", IncludeUsage: true})
+				state, err := NewResponseStreamState(source, target, StreamOptions{Model: "m", IncludeUsage: true})
 				if err != nil {
 					t.Fatalf("NewResponseStreamState: %v", err)
 				}
@@ -164,14 +174,26 @@ func TestStreamResponseMatrix(t *testing.T) {
 				if err != nil {
 					t.Fatalf("DecodeStreamResponse: %v", err)
 				}
-				results, err := relayconvert.ConvertStreamResponseChunk(context.Background(), NewMeta("m", true), state, response)
+				results, err := ConvertStreamResponseChunk(context.Background(), NewMeta("m", true), state, response)
 				if err != nil {
 					t.Fatalf("ConvertStreamResponseChunk: %v", err)
 				}
+				tail, err := FinalizeStreamResponse(context.Background(), NewMeta("m", true), state)
+				if err != nil {
+					t.Fatalf("FinalizeStreamResponse: %v", err)
+				}
+				results = append(results, tail...)
+				encodedAll := ""
 				for _, result := range results {
-					if _, err := EncodeSSE(target, result.Value); err != nil {
+					encoded, err := EncodeSSE(target, result.Value)
+					if err != nil {
 						t.Fatalf("EncodeSSE: %v", err)
 					}
+					encodedAll += string(encoded)
+				}
+				// The delta text must reach the client in every dialect pair.
+				if !strings.Contains(encodedAll, "hi") {
+					t.Fatalf("stream delta lost converting %s -> %s: %s", source, target, encodedAll)
 				}
 			})
 		}

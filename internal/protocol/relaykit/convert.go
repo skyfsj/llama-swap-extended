@@ -1,3 +1,6 @@
+// Package relaykit adapts the MIT-licensed github.com/mostlygeek/llama-swap/pkg/dialect
+// module to the interfaces the server layer uses. It exists purely as a seam:
+// protocol knowledge lives in pkg/dialect, which has no server dependencies.
 package relaykit
 
 import (
@@ -7,355 +10,183 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/QuantumNous/new-api/relaykit/dto"
-	"github.com/QuantumNous/new-api/relaykit/relayconvert"
-	"github.com/QuantumNous/new-api/relaykit/relayconvert/convmeta"
-	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/mostlygeek/llama-swap/pkg/dialect"
 )
 
-type Format = types.RelayFormat
+// Format names a wire dialect.
+type Format = dialect.Format
 
 const (
-	OpenAIChat      = types.RelayFormatOpenAI
-	OpenAIResponses = types.RelayFormatOpenAIResponses
-	ClaudeMessages  = types.RelayFormatClaude
-	Gemini          = types.RelayFormatGemini
+	OpenAIChat      = dialect.OpenAIChat
+	OpenAIResponses = dialect.OpenAIResponses
+	ClaudeMessages  = dialect.ClaudeMessages
+	Gemini          = dialect.Gemini
+	// GeminiInteractions is Google's stateful Interactions dialect.
+	GeminiInteractions = dialect.GeminiInteractions
 )
 
-type Route struct {
-	Format Format
-	Model  string
-	Stream bool
-	Action string
+// Diagnostic is one conversion note.
+type Diagnostic = dialect.Diagnostic
+
+// Meta carries per-request conversion state.
+type Meta struct {
+	IsStream bool
+	// EstimatePromptTokens seeds dialects that report input usage up front.
+	EstimatePromptTokens int
 }
 
+// NewMeta builds the conversion metadata for one request.
+func NewMeta(model string, stream bool) *Meta {
+	return &Meta{IsStream: stream}
+}
+
+// Route describes a generation request recognised from its path.
+type Route = dialect.Route
+
 func RouteForRequest(method, path string) (Route, bool) {
-	if strings.ToUpper(method) != "POST" {
-		return Route{}, false
-	}
-	switch path {
-	case "/v1/chat/completions", "/v/chat/completions":
-		return Route{Format: OpenAIChat}, true
-	case "/v1/responses", "/v/responses":
-		return Route{Format: OpenAIResponses}, true
-	case "/v1/messages", "/v/messages":
-		return Route{Format: ClaudeMessages}, true
-	}
-	const prefix = "/v1beta/models/"
-	if !strings.HasPrefix(path, prefix) {
-		return Route{}, false
-	}
-	modelAction := strings.TrimPrefix(path, prefix)
-	for _, action := range []struct {
-		name   string
-		stream bool
-	}{{"streamGenerateContent", true}, {"generateContent", false}} {
-		suffix := ":" + action.name
-		if !strings.HasSuffix(modelAction, suffix) {
-			continue
-		}
-		model := strings.TrimSuffix(modelAction, suffix)
-		model = strings.Trim(model, "/")
-		if model == "" {
-			return Route{}, false
-		}
-		return Route{Format: Gemini, Model: model, Stream: action.stream, Action: action.name}, true
-	}
-	return Route{}, false
+	return dialect.RouteForRequest(method, path)
 }
 
 func RequestStreamed(route Route, body []byte) bool {
-	if route.Format == Gemini {
-		return route.Stream
-	}
-	var request struct {
-		Stream bool `json:"stream"`
-	}
-	return json.Unmarshal(body, &request) == nil && request.Stream
+	return dialect.RequestStreamed(route, body)
 }
 
 func TargetPath(format Format, model string, stream bool) (string, error) {
-	switch format {
-	case OpenAIChat:
-		return "/v1/chat/completions", nil
-	case OpenAIResponses:
-		return "/v1/responses", nil
-	case ClaudeMessages:
-		return "/v1/messages", nil
-	case Gemini:
-		model = strings.Trim(model, "/")
-		if model == "" {
-			return "", errors.New("gemini target requires a model")
-		}
-		action := "generateContent"
-		if stream {
-			action = "streamGenerateContent"
-		}
-		return "/v1beta/models/" + model + ":" + action, nil
-	default:
-		return "", fmt.Errorf("unsupported relaykit format %q", format)
-	}
+	return dialect.TargetPath(format, model, stream)
 }
 
 func TargetPathForRequest(format Format, model string, stream bool, publicPath string) (string, error) {
-	path, err := TargetPath(format, model, stream)
-	if err != nil || format == Gemini || !strings.HasPrefix(publicPath, "/v/") {
-		return path, err
-	}
-	return "/v" + strings.TrimPrefix(path, "/v1"), nil
+	return dialect.TargetPathForRequest(format, model, stream, publicPath)
 }
 
-func NewMeta(model string, stream bool) *convmeta.Values {
-	return &convmeta.Values{
-		OriginModelName:   model,
-		UpstreamModelName: model,
-		IsStream:          stream,
-		Options: &convmeta.Options{
-			Claude: convmeta.ClaudeOptions{
-				DefaultMaxTokens: func(string) int { return 4096 },
-			},
-			WebSearch: func(convmeta.WebSearchCall) (*convmeta.WebSearchEncoding, error) {
-				return &convmeta.WebSearchEncoding{Omitted: true}, nil
-			},
-		},
-	}
+// RequestStep describes one hop of a multi-step conversion.
+type RequestStep struct {
+	From Format
+	To   Format
 }
 
+// RequestResult is a converted request.
+type RequestResult struct {
+	Value       any
+	From        Format
+	To          Format
+	Converter   string
+	Quality     string
+	Steps       []RequestStep
+	Diagnostics []Diagnostic
+}
+
+// ResponseResult is a converted response or one converted stream frame.
+type ResponseResult struct {
+	Value       any
+	From        Format
+	To          Format
+	Converter   string
+	Quality     string
+	Diagnostics []Diagnostic
+}
+
+// ConvertRequest converts a request body from source to target.
+func ConvertRequest(ctx context.Context, meta *Meta, source, target Format, body []byte, model string) (*RequestResult, error) {
+	if source == target {
+		return &RequestResult{Value: append([]byte(nil), body...), From: source, To: target, Converter: "identity", Quality: "exact"}, nil
+	}
+	options := dialect.ConvertOptions{Model: model}
+	if meta != nil && meta.IsStream {
+		stream := true
+		options.Stream = &stream
+	}
+	// Decode once, then encode: the canonical request is also what seeds the
+	// Anthropic message_start estimate, so no second parse is needed.
+	request, diagnostics, err := dialect.DecodeRequest(source, body)
+	if err != nil {
+		return nil, err
+	}
+	if request.Model == "" {
+		request.Model = model
+	}
+	if meta != nil && meta.EstimatePromptTokens == 0 && meta.IsStream {
+		// Seed Anthropic message_start usage; the real counts arrive in the
+		// final message_delta. Only a stream needs the estimate because a
+		// whole response carries the upstream's usage object.
+		meta.EstimatePromptTokens = dialect.EstimateRequestTokens(request)
+	}
+	converted, encodeDiagnostics, err := dialect.EncodeRequest(request, target, options)
+	if err != nil {
+		return nil, err
+	}
+	diagnostics = append(diagnostics, encodeDiagnostics...)
+	return &RequestResult{
+		Value: converted, From: source, To: target, Converter: string(source) + "->" + string(target),
+		Quality: qualityOf(diagnostics), Diagnostics: diagnostics,
+	}, nil
+}
+
+// ConvertResponse converts a whole response body from source to target.
+func ConvertResponse(ctx context.Context, meta *Meta, source, target Format, body []byte) (*ResponseResult, error) {
+	if source == target {
+		return &ResponseResult{Value: append([]byte(nil), body...), From: source, To: target, Converter: "identity", Quality: "exact"}, nil
+	}
+	converted, diagnostics, err := dialect.ConvertResponse(source, target, body)
+	if err != nil {
+		return nil, err
+	}
+	return &ResponseResult{
+		Value: converted, From: source, To: target, Converter: string(source) + "->" + string(target),
+		Quality: qualityOf(diagnostics), Diagnostics: diagnostics,
+	}, nil
+}
+
+func qualityOf(diagnostics []Diagnostic) string {
+	if len(diagnostics) > 0 {
+		return "lossy"
+	}
+	return "exact"
+}
+
+// StripHostedSearchTools removes provider-native search tools.
 func StripHostedSearchTools(body []byte, format Format) ([]byte, bool, error) {
-	var request map[string]any
-	if err := json.Unmarshal(body, &request); err != nil {
-		return nil, false, fmt.Errorf("decode %s request: %w", format, err)
-	}
-	changed := false
-	if format == OpenAIChat {
-		if _, exists := request["web_search_options"]; exists {
-			delete(request, "web_search_options")
-			changed = true
-		}
-	}
-	tools, ok := request["tools"].([]any)
-	if ok {
-		filtered := make([]any, 0, len(tools))
-		for _, raw := range tools {
-			if hostedSearchTool(format, raw) {
-				changed = true
-				continue
-			}
-			filtered = append(filtered, raw)
-		}
-		if changed {
-			request["tools"] = filtered
-		}
-	}
-	if !changed {
-		return body, false, nil
-	}
-	encoded, err := json.Marshal(request)
-	if err != nil {
-		return nil, false, fmt.Errorf("encode %s request: %w", format, err)
-	}
-	return encoded, true, nil
+	return dialect.StripHostedSearchTools(body, format)
 }
 
-func hostedSearchTool(format Format, raw any) bool {
-	tool, ok := raw.(map[string]any)
-	if !ok {
-		return false
-	}
-	typeName, _ := tool["type"].(string)
-	switch format {
-	case OpenAIChat, OpenAIResponses:
-		return strings.HasPrefix(typeName, "web_search")
-	case ClaudeMessages:
-		return typeName == "web_search" || strings.HasPrefix(typeName, "web_search_")
-	case Gemini:
-		_, hasCamel := tool["googleSearch"]
-		_, hasSnake := tool["google_search"]
-		return hasCamel || hasSnake
-	default:
-		return false
-	}
+// SSEFrame is one encoded stream frame carried through ResponseResult.Value.
+type SSEFrame struct {
+	Event string
+	Data  []byte
 }
 
-func DecodeRequest(format Format, body []byte) (any, error) {
-	var request any
-	switch format {
-	case OpenAIChat:
-		request = &dto.GeneralOpenAIRequest{}
-	case OpenAIResponses:
-		request = &dto.OpenAIResponsesRequest{}
-	case ClaudeMessages:
-		request = &dto.ClaudeRequest{}
-	case Gemini:
-		request = &dto.GeminiChatRequest{}
-	default:
-		return nil, fmt.Errorf("unsupported relaykit request format %q", format)
-	}
-	if err := json.Unmarshal(body, request); err != nil {
-		return nil, fmt.Errorf("decode %s request: %w", format, err)
-	}
-	return request, nil
-}
-
-func ConvertRequest(ctx context.Context, meta convmeta.Meta, source, target Format, body []byte, model string) (*relayconvert.RequestResult, error) {
-	request, err := DecodeRequest(source, body)
-	if err != nil {
-		return nil, err
-	}
-	switch typed := request.(type) {
-	case *dto.GeneralOpenAIRequest:
-		if typed.Model == "" {
-			typed.Model = model
-		}
-	case *dto.OpenAIResponsesRequest:
-		if typed.Model == "" {
-			typed.Model = model
-		}
-	case *dto.ClaudeRequest:
-		if typed.Model == "" {
-			typed.Model = model
-		}
-	}
-	if source == Gemini && target == OpenAIResponses {
-		chat, err := relayconvert.ConvertRequest(ctx, meta, OpenAIChat, request)
-		if err != nil {
-			return nil, err
-		}
-		chatRequest, ok := chat.Value.(*dto.GeneralOpenAIRequest)
-		if !ok {
-			return nil, fmt.Errorf("gemini-to-chat converter returned %T", chat.Value)
-		}
-		setRequestModel(chatRequest, model)
-		result, err := relayconvert.ConvertRequest(ctx, meta, OpenAIResponses, chatRequest)
-		if err != nil {
-			return nil, err
-		}
-		result.From = Gemini
-		setRequestModel(result.Value, model)
-		result.Steps = append(append([]relayconvert.RequestStep(nil), chat.Steps...), result.Steps...)
-		result.Diagnostics = append(append([]types.ConversionDiagnostic(nil), chat.Diagnostics...), result.Diagnostics...)
-		return result, nil
-	}
-	result, err := relayconvert.ConvertRequest(ctx, meta, target, request)
-	if err != nil {
-		return nil, err
-	}
-	setRequestModel(result.Value, model)
-	return result, nil
-}
-
-func setRequestModel(request any, model string) {
-	switch typed := request.(type) {
-	case *dto.GeneralOpenAIRequest:
-		if typed.Model == "" {
-			typed.Model = model
-		}
-	case *dto.OpenAIResponsesRequest:
-		if typed.Model == "" {
-			typed.Model = model
-		}
-	case *dto.ClaudeRequest:
-		if typed.Model == "" {
-			typed.Model = model
-		}
-	}
-}
-
-func DecodeResponse(format Format, body []byte) (any, error) {
-	var response any
-	switch format {
-	case OpenAIChat:
-		response = &dto.OpenAITextResponse{}
-	case OpenAIResponses:
-		response = &dto.OpenAIResponsesResponse{}
-	case ClaudeMessages:
-		response = &dto.ClaudeResponse{}
-	case Gemini:
-		response = &dto.GeminiChatResponse{}
-	default:
-		return nil, fmt.Errorf("unsupported relaykit response format %q", format)
-	}
-	if err := json.Unmarshal(body, response); err != nil {
-		return nil, fmt.Errorf("decode %s response: %w", format, err)
-	}
-	return response, nil
-}
-
-func ConvertResponse(ctx context.Context, meta convmeta.Meta, source, target Format, body []byte) (*relayconvert.ResponseResult, error) {
-	response, err := DecodeResponse(source, body)
-	if err != nil {
-		return nil, err
-	}
-	result, err := relayconvert.ConvertResponse(ctx, meta, target, response)
-	if err != nil {
-		return nil, err
-	}
-	if target == OpenAIResponses && source != OpenAIResponses {
-		if converted, ok := result.Value.(*dto.OpenAIResponsesResponse); ok && converted.ID != "" && !strings.HasPrefix(converted.ID, "resp_") {
-			converted.ID = "resp_" + converted.ID
-		}
-	}
-	return result, nil
-}
-
+// DecodeStreamResponse parses one upstream SSE data payload.
 func DecodeStreamResponse(format Format, body []byte) (any, error) {
-	var response any
-	switch format {
-	case OpenAIChat:
-		response = &dto.ChatCompletionsStreamResponse{}
-	case OpenAIResponses:
-		response = &dto.ResponsesStreamResponse{}
-	case ClaudeMessages:
-		response = &dto.ClaudeResponse{}
-	case Gemini:
-		response = &dto.GeminiChatResponse{}
-	default:
-		return nil, fmt.Errorf("unsupported relaykit stream format %q", format)
+	if !json.Valid(body) {
+		return nil, fmt.Errorf("%s stream event is not valid JSON", format)
 	}
-	if err := json.Unmarshal(body, response); err != nil {
-		return nil, fmt.Errorf("decode %s stream event: %w", format, err)
-	}
-	return response, nil
+	return &SSEFrame{Data: append([]byte(nil), body...)}, nil
 }
 
+// EncodeSSE renders one converted frame in the client dialect.
 func EncodeSSE(format Format, response any) ([]byte, error) {
-	if format == OpenAIResponses {
-		switch event := response.(type) {
-		case relayconvert.ChatToResponsesStreamEvent:
-			return encodeTypedSSE(event.Type, event.Payload)
-		case *relayconvert.ChatToResponsesStreamEvent:
-			if event != nil {
-				return encodeTypedSSE(event.Type, event.Payload)
-			}
+	value, ok := response.(*SSEFrame)
+	if !ok {
+		// A converted whole object (non-stream) can still be encoded.
+		encoded, err := Marshal(response)
+		if err != nil {
+			return nil, err
 		}
+		value = &SSEFrame{Data: encoded}
 	}
-	data, err := json.Marshal(response)
-	if err != nil {
-		return nil, fmt.Errorf("encode %s stream event: %w", format, err)
+	if value.Event != "" {
+		if strings.ContainsAny(value.Event, "\r\n") {
+			return nil, fmt.Errorf("invalid stream event type %q", value.Event)
+		}
+		return []byte("event: " + value.Event + "\ndata: " + string(value.Data) + "\n\n"), nil
 	}
-	if format == OpenAIChat || format == Gemini {
-		return []byte("data: " + string(data) + "\n\n"), nil
+	if string(value.Data) == "[DONE]" {
+		return []byte("data: [DONE]\n\n"), nil
 	}
-	var event struct {
-		Type string `json:"type"`
-	}
-	if err := json.Unmarshal(data, &event); err != nil || event.Type == "" {
-		return nil, fmt.Errorf("%s stream event has no type", format)
-	}
-	return encodeTypedSSE(event.Type, json.RawMessage(data))
+	return []byte("data: " + string(value.Data) + "\n\n"), nil
 }
 
-func encodeTypedSSE(event string, response any) ([]byte, error) {
-	data, err := json.Marshal(response)
-	if err != nil {
-		return nil, fmt.Errorf("encode typed stream event: %w", err)
-	}
-	if strings.ContainsAny(event, "\r\n") || event == "" {
-		return nil, fmt.Errorf("invalid stream event type %q", event)
-	}
-	return []byte("event: " + event + "\ndata: " + string(data) + "\n\n"), nil
-}
-
+// DoneSSE returns the client-dialect end-of-stream sentinel.
 func DoneSSE(format Format) []byte {
 	if format == OpenAIChat {
 		return []byte("data: [DONE]\n\n")
@@ -363,19 +194,43 @@ func DoneSSE(format Format) []byte {
 	return nil
 }
 
+// StreamResponseID extracts the response id from one upstream frame so a
+// lazily-created Responses stream can be seeded with it.
 func StreamResponseID(format Format, response any) string {
-	var id string
-	switch typed := response.(type) {
-	case *dto.ChatCompletionsStreamResponse:
-		id = typed.Id
-	case *dto.ClaudeResponse:
-		id = typed.Id
-		if id == "" && typed.Message != nil {
-			id = typed.Message.Id
-		}
-	case *dto.OpenAIResponsesResponse:
-		id = typed.ID
+	frame, ok := response.(*SSEFrame)
+	if !ok {
+		return ""
 	}
+	var object map[string]json.RawMessage
+	if json.Unmarshal(frame.Data, &object) != nil {
+		return ""
+	}
+	if raw, exists := object["id"]; exists {
+		var id string
+		if json.Unmarshal(raw, &id) == nil {
+			return cleanResponseID(id)
+		}
+	}
+	if raw, exists := object["message"]; exists {
+		var message struct {
+			ID string `json:"id"`
+		}
+		if json.Unmarshal(raw, &message) == nil && message.ID != "" {
+			return cleanResponseID(message.ID)
+		}
+	}
+	if raw, exists := object["response"]; exists {
+		var nested struct {
+			ID string `json:"id"`
+		}
+		if json.Unmarshal(raw, &nested) == nil && nested.ID != "" {
+			return cleanResponseID(nested.ID)
+		}
+	}
+	return ""
+}
+
+func cleanResponseID(id string) string {
 	id = strings.TrimSpace(id)
 	if id == "" || strings.HasPrefix(id, "resp_") {
 		return id
@@ -383,10 +238,105 @@ func StreamResponseID(format Format, response any) string {
 	return "resp_" + id
 }
 
+// Marshal encodes a converted value. Converters already hand back JSON bytes;
+// any other value is encoded as JSON.
 func Marshal(value any) ([]byte, error) {
-	data, err := json.Marshal(value)
-	if err != nil {
-		return nil, fmt.Errorf("encode converted request: %w", err)
+	switch typed := value.(type) {
+	case []byte:
+		return append([]byte(nil), typed...), nil
+	case json.RawMessage:
+		return append([]byte(nil), typed...), nil
+	case nil:
+		return nil, errors.New("cannot marshal a nil conversion result")
 	}
-	return data, nil
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return nil, fmt.Errorf("encode converted value: %w", err)
+	}
+	return encoded, nil
+}
+
+// StreamOptions configures a stream conversion. It mirrors the previous
+// conversion library's options so call sites keep their shape.
+type StreamOptions struct {
+	Model               string
+	ID                  string
+	Created             int64
+	IncludeUsage        bool
+	EstimateInputTokens int
+}
+
+// ResponseStreamState is one in-flight stream conversion.
+type ResponseStreamState struct {
+	converter *dialect.StreamConverter
+}
+
+// NewResponseStreamState builds a stream converter for source -> target.
+func NewResponseStreamState(source, target Format, options StreamOptions) (*ResponseStreamState, error) {
+	estimate := options.EstimateInputTokens
+	converter, err := dialect.NewStreamConverter(source, target, dialect.StreamOptions{
+		Model:               options.Model,
+		ID:                  options.ID,
+		Created:             options.Created,
+		IncludeUsage:        options.IncludeUsage,
+		EstimateInputTokens: estimate,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &ResponseStreamState{converter: converter}, nil
+}
+
+// ConvertStreamResponseChunk converts one upstream frame.
+func ConvertStreamResponseChunk(ctx context.Context, meta *Meta, state *ResponseStreamState, response any) ([]ResponseResult, error) {
+	if state == nil || state.converter == nil {
+		return nil, errors.New("stream state is required")
+	}
+	frame, ok := response.(*SSEFrame)
+	if !ok {
+		return nil, fmt.Errorf("unexpected stream response type %T", response)
+	}
+	frames, err := state.converter.Feed(frame.Data)
+	if err != nil {
+		return nil, err
+	}
+	return wrapFrames(frames), nil
+}
+
+// FinalizeStreamResponse flushes the terminal frames.
+func FinalizeStreamResponse(ctx context.Context, meta *Meta, state *ResponseStreamState) ([]ResponseResult, error) {
+	if state == nil || state.converter == nil {
+		return nil, errors.New("stream state is required")
+	}
+	frames, err := state.converter.Finish()
+	if err != nil {
+		return nil, err
+	}
+	return wrapFrames(frames), nil
+}
+
+// Diagnostics reports the conversion notes gathered for a stream.
+func (s *ResponseStreamState) Diagnostics() []Diagnostic {
+	if s == nil || s.converter == nil {
+		return nil
+	}
+	return s.converter.Diagnostics()
+}
+
+func wrapFrames(frames []dialect.Frame) []ResponseResult {
+	results := make([]ResponseResult, 0, len(frames))
+	for _, item := range frames {
+		results = append(results, ResponseResult{Value: &SSEFrame{Event: item.Event, Data: item.Data}})
+	}
+	return results
+}
+
+// ResponseFailed reports whether a whole upstream response says it failed.
+func ResponseFailed(source Format, body []byte) bool {
+	return dialect.ResponseFailed(source, body)
+}
+
+// ErrorEnvelope renders an upstream error body in the client dialect.
+func ErrorEnvelope(body []byte, target Format, status int) []byte {
+	return dialect.ErrorEnvelope(body, target, status)
 }
