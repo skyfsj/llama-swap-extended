@@ -231,14 +231,20 @@ func TestGateway_StickyTableClearCredential(t *testing.T) {
 	}
 }
 
-func TestGateway_SessionHashExplicitHeaderWins(t *testing.T) {
+func TestGateway_SessionHashExplicitHeaderIsScopedToCaller(t *testing.T) {
 	explicit := SessionHash("sess-123", "1.2.3.4", "key1", "body")
 	fallback := SessionHash("", "1.2.3.4", "key1", "body")
 	if explicit == fallback {
 		t.Fatal("explicit header value must produce a different hash than the content fallback")
 	}
-	if SessionHash("sess-123", "9.9.9.9", "other", "zzz") != explicit {
-		t.Fatal("same explicit value must hash identically regardless of client identity")
+	// An explicit session header still identifies one conversation, but the
+	// sticky binding must not be shared across callers: otherwise two tenants
+	// presenting the same header pin to one upstream credential.
+	if SessionHash("sess-123", "9.9.9.9", "key2", "zzz") == explicit {
+		t.Fatal("different callers presenting the same header must not share a sticky binding")
+	}
+	if SessionHash("sess-123", "1.2.3.4", "key1", "other-body") != explicit {
+		t.Fatal("same caller and header must be stable regardless of the body")
 	}
 	// content fallback mixes identity
 	a := SessionHash("", "1.2.3.4", "key1", "body")

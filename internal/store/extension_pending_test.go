@@ -77,3 +77,38 @@ func TestStore_ExtensionPendingClaimRecoveryAndPrune(t *testing.T) {
 		t.Fatalf("pruned lookup=%v", err)
 	}
 }
+
+// A second round keyed by the same call id supersedes the older, unconsumed one
+// instead of failing the save: Gemini pairs calls by tool name, so two mixed
+// rounds can legitimately carry the same key.
+func TestStore_ExtensionPendingCallIDReuseSupersedes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	st, err := New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	base := time.Now().Add(time.Hour)
+	first := ExtensionPending{ID: "round-1", IdentityID: "key-1", ModelID: "m", Endpoint: "gemini.generateContent", Payload: []byte(`{"calls":[]}`), CallIDs: []string{"Read"}, ExpiresAt: base}
+	if err := st.SaveExtensionPending(context.Background(), first); err != nil {
+		t.Fatalf("first save: %v", err)
+	}
+	second := ExtensionPending{ID: "round-2", IdentityID: "key-1", ModelID: "m", Endpoint: "gemini.generateContent", Payload: []byte(`{"calls":[{"name":"Read","kind":"client"}]}`), CallIDs: []string{"Read"}, ExpiresAt: base}
+	if err := st.SaveExtensionPending(context.Background(), second); err != nil {
+		t.Fatalf("second save with the same call id: %v", err)
+	}
+	record, err := st.LookupExtensionPending(context.Background(), "Read")
+	if err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+	if record.ID != "round-2" {
+		t.Fatalf("lookup returned %q, want the newest round", record.ID)
+	}
+	// The superseded record is gone, not merely unreachable through its call id.
+	if err := st.DeleteExtensionPending(context.Background(), "round-2"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.LookupExtensionPending(context.Background(), "Read"); !errors.Is(err, ErrExtensionPendingNotFound) {
+		t.Fatalf("after delete: %v", err)
+	}
+}

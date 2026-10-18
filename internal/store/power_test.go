@@ -31,6 +31,12 @@ func TestStore_PowerReportAttributionAndBaseline(t *testing.T) {
 	defer s.Close()
 	ctx := context.Background()
 
+	// The report buckets power by local day; an hour-long fixture started just
+	// before midnight would land in "yesterday" and read as zero.
+	if now, base := time.Now(), time.Now().Add(-time.Hour); base.Day() != now.Day() {
+		t.Skip("fixture window crosses the local day boundary")
+	}
+
 	// Baseline: two idle minutes at 100 W before the model runs.
 	base := time.Now().Add(-time.Hour).Truncate(time.Minute)
 	rows := []PowerSampleRow{
@@ -236,5 +242,77 @@ func TestStore_PowerUnavailableWithoutData(t *testing.T) {
 	}
 	if len(report.Series) != 0 || len(report.Models) != 0 {
 		t.Errorf("empty store should produce empty series/models: %+v", report)
+	}
+}
+
+func TestStore_PowerReportModelAllowlist(t *testing.T) {
+	s, err := New("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	base := time.Now().Add(-10 * time.Minute).Truncate(time.Minute)
+	if err := s.InsertPowerSamples(ctx, []PowerSampleRow{
+		powerTestRow(base, "GPU-a", 100, 0.5),
+		powerTestRow(base.Add(time.Minute), "GPU-a", 300, 0.5),
+	}); err != nil {
+		t.Fatalf("insert power samples: %v", err)
+	}
+	if err := s.OpenModelGpuInterval(ctx, ModelGpuIntervalRow{
+		ModelID: "local-model", GpuUUID: "GPU-a", Started: base.Add(time.Minute),
+	}); err != nil {
+		t.Fatalf("open interval: %v", err)
+	}
+	// One request each for a local model, a provider-routed model and a name
+	// that is not configured at all: only the local one may produce a row.
+	for _, model := range []string{"local-model", "glm-5.1", "does-not-exist"} {
+		if _, err := s.InsertActivity(ctx, ActivityLogEntry{
+			Timestamp: base.Add(time.Minute), Model: model, DurationMs: 30000,
+		}); err != nil {
+			t.Fatalf("insert activity %s: %v", model, err)
+		}
+	}
+
+	report, err := s.PowerReport(ctx, PowerReportQuery{
+		Start: base.Add(-time.Minute), End: base.Add(5 * time.Minute),
+		// What the activity page passes: the locally served models.
+		Models: []string{"local-model"},
+	})
+	if err != nil {
+		t.Fatalf("power report: %v", err)
+	}
+	if len(report.Models) != 1 || report.Models[0].ModelID != "local-model" {
+		t.Fatalf("models = %+v, want only the local model", report.Models)
+	}
+	if report.Models[0].Requests != 1 {
+		t.Fatalf("local model requests = %d, want 1", report.Models[0].Requests)
+	}
+
+	// An empty allowlist is "no local models", never "no filter": a deployment
+	// without local models must not list every requested name.
+	empty, err := s.PowerReport(ctx, PowerReportQuery{
+		Start: base.Add(-time.Minute), End: base.Add(5 * time.Minute),
+		Models: []string{},
+	})
+	if err != nil {
+		t.Fatalf("power report (empty allowlist): %v", err)
+	}
+	for _, model := range empty.Models {
+		if model.ModelID == "glm-5.1" || model.ModelID == "does-not-exist" {
+			t.Fatalf("empty allowlist still reported %q", model.ModelID)
+		}
+	}
+
+	// nil leaves the report unfiltered for callers that want the raw view.
+	unfiltered, err := s.PowerReport(ctx, PowerReportQuery{
+		Start: base.Add(-time.Minute), End: base.Add(5 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("power report (unfiltered): %v", err)
+	}
+	if len(unfiltered.Models) != 3 {
+		t.Fatalf("unfiltered models = %+v, want 3 rows", unfiltered.Models)
 	}
 }

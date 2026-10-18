@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -278,6 +279,12 @@ type PowerReportQuery struct {
 	// ModelID restricts model attribution and filters the models list; the
 	// power series always covers all sources.
 	ModelID string
+	// Models, when non-nil, is the complete set of models the report may
+	// attribute: a request recorded under any other name (a provider-routed
+	// model, a name that is not configured at all) draws no local GPU time and
+	// gets no row. Callers pass the locally served models; nil leaves the
+	// report unfiltered.
+	Models []string
 	// BucketSeconds forces the time series bucket width. Values <= 0 select
 	// the width from the requested span.
 	BucketSeconds int
@@ -291,6 +298,21 @@ const (
 	maxPowerBucketSeconds = 24 * 60 * 60
 	maxPowerPoints        = 240
 )
+
+// modelAllowlistClause builds an IN (...) condition for the given column. An
+// empty allowlist becomes an always-false clause so "no models allowed" can
+// never degrade into "no filter".
+func modelAllowlistClause(column string, models []string) (string, []any) {
+	if len(models) == 0 {
+		return " AND 0", nil
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(models)), ",")
+	args := make([]any, 0, len(models))
+	for _, model := range models {
+		args = append(args, model)
+	}
+	return " AND " + column + " IN (" + placeholders + ")", args
+}
 
 func autoPowerBucketSeconds(span time.Duration) int {
 	seconds := int(span.Seconds()) / maxPowerPoints
@@ -350,6 +372,11 @@ func (s *Store) PowerReport(ctx context.Context, query PowerReportQuery) (PowerR
 	if query.ModelID != "" {
 		intervalQuery += ` AND model_id = ?`
 		intervalArgs = append(intervalArgs, query.ModelID)
+	}
+	if query.Models != nil {
+		clause, args := modelAllowlistClause("model_id", query.Models)
+		intervalQuery += clause
+		intervalArgs = append(intervalArgs, args...)
 	}
 	rows, err := s.db.QueryContext(ctx, intervalQuery, intervalArgs...)
 	if err != nil {
@@ -578,6 +605,11 @@ func (s *Store) PowerReport(ctx context.Context, query PowerReportQuery) (PowerR
 	if query.ModelID != "" {
 		activityQuery += ` AND model_id = ?`
 		activityArgs = append(activityArgs, query.ModelID)
+	}
+	if query.Models != nil {
+		clause, args := modelAllowlistClause("model_id", query.Models)
+		activityQuery += clause
+		activityArgs = append(activityArgs, args...)
 	}
 	activityQuery += ` GROUP BY model_id`
 	rows, err = s.db.QueryContext(ctx, activityQuery, activityArgs...)

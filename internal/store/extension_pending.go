@@ -37,6 +37,19 @@ func (s *Store) SaveExtensionPending(ctx context.Context, record ExtensionPendin
 	if _, err := tx.ExecContext(ctx, `DELETE FROM extension_pending WHERE expires_at < ?`, time.Now().Unix()); err != nil {
 		return err
 	}
+	// A call id identifies one round. Most surfaces mint a random public id per
+	// caller call, but Gemini pairs by tool name, so a later round can carry a
+	// key an older, unconsumed round still owns. The newest round supersedes it:
+	// drop those rows first rather than failing the save with a primary key
+	// violation (and losing the round to a 502).
+	for _, id := range record.CallIDs {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM extension_pending_calls WHERE call_id=?`, id); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM extension_pending WHERE id NOT IN (SELECT pending_id FROM extension_pending_calls)`); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO extension_pending (id,identity_id,model_id,profile,endpoint,payload,expires_at) VALUES (?,?,?,?,?,?,?)`, record.ID, record.IdentityID, record.ModelID, record.Profile, record.Endpoint, record.Payload, record.ExpiresAt.Unix()); err != nil {
 		return err
 	}

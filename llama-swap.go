@@ -219,6 +219,13 @@ func main() {
 		// responses.
 		ReadHeaderTimeout: 30 * time.Second,
 		IdleTimeout:       120 * time.Second,
+		// A gateway never needs a megabyte of headers; the default keeps one
+		// request from pinning that much memory before routing even starts.
+		MaxHeaderBytes: cfg.Server.Effective().MaxHeaderBytes,
+		// ReadTimeout is off by default because it would cut a large payload
+		// arriving over a slow link; operators who know their clients can opt
+		// into it.
+		ReadTimeout: cfg.Server.ReadTimeout,
 	}
 
 	reload := func() {

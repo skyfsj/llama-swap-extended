@@ -46,7 +46,7 @@ func TestStore_ControlMethodsAcceptNilContext(t *testing.T) {
 	if _, found, err := s.FindAPIKeyBySecret(nilStoreContext(), "nil-secret"); err != nil || !found {
 		t.Fatalf("FindAPIKeyBySecret: found=%v err=%v", found, err)
 	}
-	if err := s.TouchAPIKey(nilStoreContext(), "nil-key", now); err != nil {
+	if err := s.TouchAPIKey(nilStoreContext(), "nil-key", now, ""); err != nil {
 		t.Fatalf("TouchAPIKey: %v", err)
 	}
 
@@ -938,7 +938,7 @@ func TestStore_APIKeyMethodsOnNilStoreReturnErrors(t *testing.T) {
 	if _, _, err := s.GetAPIKeySecret(ctx, "key"); err == nil {
 		t.Fatal("GetAPIKeySecret on nil store unexpectedly succeeded")
 	}
-	if err := s.TouchAPIKey(ctx, "key", time.Now()); err == nil {
+	if err := s.TouchAPIKey(ctx, "key", time.Now(), ""); err == nil {
 		t.Fatal("TouchAPIKey on nil store unexpectedly succeeded")
 	}
 	if err := s.RevokeAPIKey(ctx, "key", time.Now()); err == nil {
@@ -1030,4 +1030,25 @@ func slicesEqual(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// TestAPIKeyIDReservedSentinels pins both halves of the policy: the helper
+// identifies sentinel ids, but validateAPIKeyID must keep accepting them so
+// rows written by an older build can still be looked up, revoked and rotated.
+// Rejecting them there turned an upgrade into a startup failure.
+func TestAPIKeyIDReservedSentinels(t *testing.T) {
+	for _, id := range []string{"anonymous", "Anonymous", " anonymous "} {
+		if !IsReservedAPIKeyID(id) {
+			t.Errorf("reserved id %q not detected", id)
+		}
+		if err := validateAPIKeyID(id); err != nil {
+			t.Errorf("existing reserved id %q must remain addressable: %v", id, err)
+		}
+	}
+	if IsReservedAPIKeyID("startup-abc") {
+		t.Error("ordinary id reported as reserved")
+	}
+	if err := validateAPIKeyID("startup-abc"); err != nil {
+		t.Errorf("ordinary id rejected: %v", err)
+	}
 }

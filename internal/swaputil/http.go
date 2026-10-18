@@ -221,7 +221,13 @@ func SendError(w http.ResponseWriter, r *http.Request, err error) {
 	case errors.Is(err, ErrRequestBodyTooLarge):
 		SendResponse(w, r, http.StatusRequestEntityTooLarge, err.Error())
 	case errors.Is(err, ErrNoRouterFound):
-		SendResponse(w, r, http.StatusNotFound, "no router for requested model")
+		// The dispatcher usually names the model it could not route; without
+		// that detail the caller has nothing to search for.
+		message := "no router for requested model"
+		if detail := strings.TrimSpace(strings.TrimPrefix(err.Error(), ErrNoRouterFound.Error())); detail != "" {
+			message = "no router for requested model: " + strings.TrimSpace(strings.TrimPrefix(detail, ":"))
+		}
+		SendResponse(w, r, http.StatusNotFound, message)
 	default:
 		SendResponse(w, r, http.StatusInternalServerError, fmt.Sprintf("unspecific error: %v", err))
 	}
@@ -484,10 +490,25 @@ func invalidateRequestContext(r *http.Request) *http.Request {
 }
 
 func replaceRequestBody(r *http.Request, body []byte) {
+	ReplaceRequestBody(r, body)
+}
+
+// ReplaceRequestBody installs a replayable copy of body on r. It updates
+// GetBody as well: every later consumer (gateway retries, session
+// fingerprinting, audit middleware) prefers GetBody over the live stream, so a
+// body replaced without it would resurrect the pre-rewrite payload.
+func ReplaceRequestBody(r *http.Request, body []byte) {
+	if r == nil {
+		return
+	}
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	r.Header.Del("Transfer-Encoding")
 	r.Header.Set("Content-Length", strconv.Itoa(len(body)))
 	r.ContentLength = int64(len(body))
+	snapshot := append([]byte(nil), body...)
+	r.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(snapshot)), nil
+	}
 }
 
 // bufferRequestBodyForRewrite gives form-based model rewrites the same hard

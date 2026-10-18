@@ -36,8 +36,8 @@ type Monitor struct {
 	stopCtx    context.Context
 	stopCancel context.CancelFunc
 
-	sysListeners map[chan SysStat]struct{}
-	gpuListeners map[chan []GpuStat]struct{}
+	sysListeners  map[chan SysStat]struct{}
+	gpuListeners  map[chan []GpuStat]struct{}
 	nodeListeners map[chan NodeStat]struct{}
 }
 
@@ -61,16 +61,16 @@ func New(c config.PerformanceConfig, power config.PowerConfig, logger *logmon.Mo
 
 	capacity := ringCapacity(c)
 	return &Monitor{
-		conf:         c,
-		power:        power,
-		log:          logger,
-		sysRing:      ring.NewBuffer[SysStat](capacity),
-		gpuRing:      ring.NewBuffer[[]GpuStat](capacity),
-		nodeRing:     ring.NewBuffer[NodeStat](nodeRingCapacity()),
-		gpuEnergy:    make(map[string]*energyAccumulator),
-		nodeEnergy:   &energyAccumulator{name: "node"},
-		sysListeners: make(map[chan SysStat]struct{}),
-		gpuListeners: make(map[chan []GpuStat]struct{}),
+		conf:          c,
+		power:         power,
+		log:           logger,
+		sysRing:       ring.NewBuffer[SysStat](capacity),
+		gpuRing:       ring.NewBuffer[[]GpuStat](capacity),
+		nodeRing:      ring.NewBuffer[NodeStat](nodeRingCapacity()),
+		gpuEnergy:     make(map[string]*energyAccumulator),
+		nodeEnergy:    &energyAccumulator{name: "node"},
+		sysListeners:  make(map[chan SysStat]struct{}),
+		gpuListeners:  make(map[chan []GpuStat]struct{}),
 		nodeListeners: make(map[chan NodeStat]struct{}),
 	}, nil
 }
@@ -151,14 +151,21 @@ func (m *Monitor) Start() {
 		return
 	}
 
-	m.stopCtx, m.stopCancel = context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
+	m.stopCtx, m.stopCancel = ctx, cancel
+	// Snapshot the configuration while the mutex is held: the loops below must
+	// not read m.conf/m.power after UpdateConfig starts rewriting them, and
+	// they receive ctx as an argument so a Stop/Start swap can never leave
+	// one of them parked on the new context.
+	every := m.conf.Every
+	ipmi := m.power.Ipmi
 
-	go func() {
-		tick := time.NewTicker(m.conf.Every)
+	go func(ctx context.Context) {
+		tick := time.NewTicker(every)
 		defer tick.Stop()
 		for {
 			select {
-			case <-m.stopCtx.Done():
+			case <-ctx.Done():
 				return
 			case <-tick.C:
 				s, err := ReadSysStats()
@@ -179,10 +186,10 @@ func (m *Monitor) Start() {
 				m.mutex.Unlock()
 			}
 		}
-	}()
+	}(ctx)
 
-	go func() {
-		gpuCh, err := getGpuStats(m.stopCtx, m.conf.Every, m.log)
+	go func(ctx context.Context) {
+		gpuCh, err := getGpuStats(ctx, every, m.log)
 		if err != nil {
 			if errors.Is(err, ErrNotImplemented) || errors.Is(err, ErrNoGpuTool) {
 				m.log.Infof("GPU monitoring not available: %s", err.Error())
@@ -194,7 +201,7 @@ func (m *Monitor) Start() {
 
 		for {
 			select {
-			case <-m.stopCtx.Done():
+			case <-ctx.Done():
 				return
 			case g, ok := <-gpuCh:
 				if !ok {
@@ -213,14 +220,14 @@ func (m *Monitor) Start() {
 				m.mutex.Unlock()
 			}
 		}
-	}()
+	}(ctx)
 
-	if m.power.Ipmi.Disabled {
+	if ipmi.Disabled {
 		return
 	}
 
-	go func() {
-		nodeCh, err := collectNodePower(m.stopCtx, m.power.Ipmi.Command, m.log)
+	go func(ctx context.Context) {
+		nodeCh, err := collectNodePower(ctx, ipmi.Command, m.log)
 		if err != nil {
 			if errors.Is(err, ErrNoNodePowerTool) {
 				m.log.Infof("node power monitoring not available: %s", err.Error())
@@ -232,7 +239,7 @@ func (m *Monitor) Start() {
 
 		for {
 			select {
-			case <-m.stopCtx.Done():
+			case <-ctx.Done():
 				return
 			case n, ok := <-nodeCh:
 				if !ok {
@@ -253,7 +260,7 @@ func (m *Monitor) Start() {
 				m.mutex.Unlock()
 			}
 		}
-	}()
+	}(ctx)
 }
 
 // integrateGpuEnergyLocked folds one batch of GPU samples into the energy

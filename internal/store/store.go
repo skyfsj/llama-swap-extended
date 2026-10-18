@@ -52,6 +52,17 @@ type ActivityLogEntry struct {
 	CacheCreationRatio  float64      `json:"cache_creation_ratio,omitempty"`
 	RepairApplied       bool         `json:"repair_applied,omitempty"`
 	PrefixHash          string       `json:"prefix_hash,omitempty"`
+	// Provider is the upstream that actually produced the answer, empty for a
+	// locally hosted model. Adapter names the provider's API surface when it
+	// has more than one: the surface is what the client's dialect selected, so
+	// a provider ID alone would not say which upstream endpoint was used.
+	Provider string `json:"provider,omitempty"`
+	Adapter  string `json:"provider_adapter,omitempty"`
+	// ProviderLocal marks a row served by a locally hosted model. Without it an
+	// empty Provider means both "ran here" and "no upstream ever answered" (a
+	// provider request that failed before a route produced an answer), and the
+	// second must not be reported as the first.
+	ProviderLocal bool `json:"provider_local,omitempty"`
 	// ClientIP is the originating caller address. The usage records page shows
 	// and filters by it, and it is the value an access key's IP allowlist is
 	// checked against.
@@ -337,8 +348,8 @@ func (s *Store) InsertActivity(ctx context.Context, entry ActivityLogEntry) (Act
 			prompt_per_second, tokens_per_second, duration_ms, first_token_ms, error_msg, metadata_json,
 			cache_creation_tokens, reasoning_tokens, estimated_cost, cost_estimated,
 			cache_hit_ratio, cache_creation_ratio, repair_applied, prefix_hash, client_ip,
-			decode_ms, speed_timeline
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			decode_ms, speed_timeline, provider_id, provider_adapter, provider_local
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		entry.Timestamp.Unix(),
 		entry.Model,
 		entry.KeyID,
@@ -368,6 +379,9 @@ func (s *Store) InsertActivity(ctx context.Context, entry ActivityLogEntry) (Act
 		entry.ClientIP,
 		normalizeDecodeMs(entry.DecodeMs),
 		entry.SpeedTimeline,
+		entry.Provider,
+		entry.Adapter,
+		boolInt(entry.ProviderLocal),
 	)
 	if err != nil {
 		return ActivityLogEntry{}, fmt.Errorf("insert activity: %w", err)
@@ -410,7 +424,7 @@ func (s *Store) ListActivity(ctx context.Context, query ActivityQuery) (Activity
 			prompt_per_second, tokens_per_second, duration_ms, first_token_ms, error_msg, metadata_json,
 			cache_creation_tokens, reasoning_tokens, estimated_cost, cost_estimated,
 			cache_hit_ratio, cache_creation_ratio, repair_applied, prefix_hash, client_ip,
-			decode_ms, speed_timeline,
+			decode_ms, speed_timeline, provider_id, provider_adapter, provider_local,
 			`+s.hasAuditColumn()+`
 		FROM activity`+where+activityOrderBy(query)+`
 		LIMIT ? OFFSET ?`,
@@ -808,7 +822,7 @@ func scanActivity(scanner activityScanner) (ActivityLogEntry, error) {
 	var entry ActivityLogEntry
 	var ts int64
 	var metadataJSON string
-	var costEstimated, repairApplied, hasAudit int
+	var costEstimated, repairApplied, hasAudit, providerLocal int
 	if err := scanner.Scan(
 		&entry.ID,
 		&ts,
@@ -840,6 +854,9 @@ func scanActivity(scanner activityScanner) (ActivityLogEntry, error) {
 		&entry.ClientIP,
 		&entry.DecodeMs,
 		&entry.SpeedTimeline,
+		&entry.Provider,
+		&entry.Adapter,
+		&providerLocal,
 		&hasAudit,
 	); err != nil {
 		return ActivityLogEntry{}, fmt.Errorf("scan activity: %w", err)
@@ -854,6 +871,7 @@ func scanActivity(scanner activityScanner) (ActivityLogEntry, error) {
 	}
 	entry.RepairApplied = repairApplied != 0
 	entry.HasAudit = hasAudit != 0
+	entry.ProviderLocal = providerLocal != 0
 	if metadataJSON != "" {
 		if err := json.Unmarshal([]byte(metadataJSON), &entry.Metadata); err != nil {
 			return ActivityLogEntry{}, fmt.Errorf("unmarshal activity metadata: %w", err)

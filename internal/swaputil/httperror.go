@@ -12,7 +12,12 @@ const (
 	ErrorTypeInvalidRequest = "invalid_request_error"
 	ErrorTypeAuthentication = "authentication_error"
 	ErrorTypeRateLimit      = "rate_limit_error"
-	ErrorTypeServer         = "server_error"
+	// ErrorTypeInsufficientQuota marks a billing/quota failure (HTTP 402).
+	// Upstreams often label these as invalid_request_error, which makes clients
+	// treat an account problem as a malformed request; the envelope says what it
+	// really is.
+	ErrorTypeInsufficientQuota = "insufficient_quota"
+	ErrorTypeServer            = "server_error"
 )
 
 // ErrorDetail is the object-valued "error" field of an OpenAI-compatible error
@@ -80,6 +85,8 @@ func errorTypeForStatus(status int) (errType string, code string) {
 		return ErrorTypeInvalidRequest, "not_found"
 	case http.StatusConflict:
 		return ErrorTypeInvalidRequest, "conflict"
+	case http.StatusPaymentRequired:
+		return ErrorTypeInsufficientQuota, "insufficient_quota"
 	case http.StatusTooManyRequests:
 		return ErrorTypeRateLimit, "rate_limit_exceeded"
 	case http.StatusBadGateway:

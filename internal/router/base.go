@@ -1626,7 +1626,14 @@ func (b *baseRouter) handleShutdown(req shutdownReq) {
 		select {
 		case <-done:
 		case <-time.After(req.timeout):
-			<-done
+			// A wedged child (uninterruptible IO, stuck reaper) must not block
+			// daemon shutdown forever: the timeout is the operator's bound, so
+			// cancel the run loops, report it and move on instead of waiting
+			// indefinitely.
+			b.logger.Warnf("%s graceful shutdown exceeded %s, giving up on the remaining processes", b.name, req.timeout)
+			b.procCancel()
+			req.respond <- fmt.Errorf("shutdown timed out after %s with processes still stopping", req.timeout)
+			return
 		}
 	} else {
 		<-done

@@ -46,6 +46,15 @@ type Credential struct {
 	authUntil      time.Time // 401/403
 	rateLimitUntil time.Time // 429
 	transientUntil time.Time // 5xx/network
+	// quotaUntil parks the credential when quota enforcement decides a usage
+	// window is full. It is set by the quota refresher, not by upstream
+	// errors, and cleared when a window frees up or enforcement is disabled.
+	quotaUntil time.Time
+	// authFailureAt is when the last 401/402 was recorded. A single 401 is
+	// often a transient upstream hiccup, so the first one only benches the
+	// credential briefly; repeated failures escalate to the configured auth
+	// cooldown (see applyFailure).
+	authFailureAt time.Time
 
 	// LastError/LastUsed surface in the status API.
 	LastError   string
@@ -70,7 +79,7 @@ func (c *Credential) available(now time.Time) bool {
 	if c.Disabled || c.Value == "" {
 		return false
 	}
-	if now.Before(c.authUntil) || now.Before(c.rateLimitUntil) || now.Before(c.transientUntil) {
+	if now.Before(c.authUntil) || now.Before(c.rateLimitUntil) || now.Before(c.transientUntil) || now.Before(c.quotaUntil) {
 		return false
 	}
 	if c.MaxConcurrent > 0 && c.inflight >= c.MaxConcurrent {
@@ -115,6 +124,7 @@ func (c *Credential) cooldown(now time.Time, class CooldownClass, until time.Tim
 		if until.After(c.authUntil) {
 			c.authUntil = until
 		}
+		c.authFailureAt = now
 	case CooldownRateLimit:
 		if until.After(c.rateLimitUntil) {
 			c.rateLimitUntil = until
@@ -128,6 +138,14 @@ func (c *Credential) cooldown(now time.Time, class CooldownClass, until time.Tim
 	c.LastErrorAt = now
 }
 
+// RecentAuthFailure reports whether an auth failure was recorded within the
+// escalation window, i.e. whether the upstream keeps rejecting the credential.
+func (c *Credential) RecentAuthFailure(now time.Time) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return !c.authFailureAt.IsZero() && now.Sub(c.authFailureAt) < authEscalationWindow
+}
+
 // ClearCooldowns removes any active cooldowns (operator action from the UI).
 func (c *Credential) ClearCooldowns() {
 	c.mu.Lock()
@@ -135,6 +153,31 @@ func (c *Credential) ClearCooldowns() {
 	c.authUntil = time.Time{}
 	c.rateLimitUntil = time.Time{}
 	c.transientUntil = time.Time{}
+	c.quotaUntil = time.Time{}
+}
+
+// SetQuotaCooldown parks the credential until the given time (quota
+// enforcement). It never shortens an existing park.
+func (c *Credential) SetQuotaCooldown(until time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if until.After(c.quotaUntil) {
+		c.quotaUntil = until
+	}
+}
+
+// ClearQuotaCooldown releases a quota park (window freed or enforcement off).
+func (c *Credential) ClearQuotaCooldown() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.quotaUntil = time.Time{}
+}
+
+// QuotaCooldownUntil reports the current quota park expiry (zero when none).
+func (c *Credential) QuotaCooldownUntil() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.quotaUntil
 }
 
 // CooldownForTest applies a cooldown from another package's tests.
@@ -155,7 +198,11 @@ func (c *Credential) noteError(reason string) {
 type CooldownClass int
 
 const (
-	CooldownAuth CooldownClass = iota
+	// CooldownUnclassified is the zero value on purpose: an attempt that did
+	// not implicate the credential (a read error or a truncated response) must
+	// never be mistaken for an auth failure when it lands in applyFailure.
+	CooldownUnclassified CooldownClass = iota
+	CooldownAuth
 	CooldownRateLimit
 	CooldownTransient
 )
@@ -170,9 +217,11 @@ type CooldownStatus struct {
 	AuthUntil      time.Time `json:"authCooldownUntil,omitempty"`
 	RateLimitUntil time.Time `json:"rateLimitCooldownUntil,omitempty"`
 	TransientUntil time.Time `json:"transientCooldownUntil,omitempty"`
-	LastError      string    `json:"lastError,omitempty"`
-	LastErrorAt    time.Time `json:"lastErrorAt,omitempty"`
-	LastUsed       time.Time `json:"lastUsed,omitempty"`
+	// QuotaUntil is set by quota enforcement, not by upstream errors.
+	QuotaUntil  time.Time `json:"quotaCooldownUntil,omitempty"`
+	LastError   string    `json:"lastError,omitempty"`
+	LastErrorAt time.Time `json:"lastErrorAt,omitempty"`
+	LastUsed    time.Time `json:"lastUsed,omitempty"`
 }
 
 // Status snapshots the credential state.
@@ -188,6 +237,7 @@ func (c *Credential) Status() CooldownStatus {
 		AuthUntil:      c.authUntil,
 		RateLimitUntil: c.rateLimitUntil,
 		TransientUntil: c.transientUntil,
+		QuotaUntil:     c.quotaUntil,
 		LastError:      c.LastError,
 		LastErrorAt:    c.LastErrorAt,
 		LastUsed:       c.LastUsed,
@@ -217,6 +267,30 @@ func newScheduler(members []*Credential) *scheduler {
 // priority tier present, then weighted-random within the tier. lastID
 // rotation breaks ties so a shrinking candidate set does not starve members
 // (the rotation remembers the last selected ID, not an index).
+// hasCandidate reports whether any credential would be returned by pick right
+// now: not excluded and not unavailable. It lets a caller decide which routes
+// are worth comparing before spending a pick on them.
+func (s *scheduler) hasCandidate(exclude map[string]struct{}) bool {
+	if s == nil {
+		// A route assembled by hand (or one whose members failed to resolve)
+		// has no scheduler; reporting "nothing to pick" lets the caller try
+		// the next route instead of panicking on it.
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	for _, c := range s.members {
+		if _, skipped := exclude[c.ID]; skipped {
+			continue
+		}
+		if c.available(now) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *scheduler) pick(now time.Time, exclude map[string]struct{}) *Credential {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -361,12 +435,14 @@ func (t *stickyTable) clearCredential(credentialID string) {
 	}
 }
 
-// SessionHash derives a sticky session key. Explicit headers win; the
-// fallback mixes client identity into the content hash so different callers
-// sharing identical message prefixes do not collide onto one credential.
+// SessionHash derives a sticky session key. Explicit headers win; both
+// branches mix the authenticated key id in so two callers presenting the
+// same session header (or identical prompt prefixes) never share one
+// credential binding. The upstream-facing session id (Session.ID) keeps the
+// caller's raw value; only the affinity key is scoped per caller.
 func SessionHash(headerValue, clientIP, keyID, bodyFingerprint string) string {
 	if v := trimSpace(headerValue); v != "" {
-		return "h:" + hashString(v)
+		return "h:" + hashString(v+"\x00"+keyID)
 	}
 	return "c:" + hashString(clientIP+"\x00"+keyID+"\x00"+bodyFingerprint)
 }

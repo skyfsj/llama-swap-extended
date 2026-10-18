@@ -23,6 +23,11 @@ import (
 // other callers distinguish a missing resource from a database failure.
 var ErrAPIKeyNotFound = errors.New("api key not found")
 
+// KeySourceConfig marks an api_keys row seeded from the configuration file's
+// apiKeys section. Rows created through the control plane carry no source, so a
+// config edit can revoke what it owns without touching them.
+const KeySourceConfig = "config"
+
 type APIKeyRecord struct {
 	ID      string `json:"id"`
 	Name    string `json:"name"`
@@ -35,10 +40,15 @@ type APIKeyRecord struct {
 	// Kind is either auth.KeyKindManagement (control-plane credential) or
 	// auth.KeyKindAccess (model-access credential nested under a management
 	// key). Existing rows are migrated to the management kind.
-	Kind     string   `json:"kind"`
-	ParentID string   `json:"parentId,omitempty"`
-	Scopes   []string `json:"scopes"`
-	Models   []string `json:"models,omitempty"`
+	Kind     string `json:"kind"`
+	ParentID string `json:"parentId,omitempty"`
+	// Source records where the row came from: KeySourceConfig for a key the
+	// configuration file declares, empty for one the control plane created.
+	// The configuration reconcile revokes only its own rows, so an operator's
+	// keys survive any edit to the file.
+	Source string   `json:"source,omitempty"`
+	Scopes []string `json:"scopes"`
+	Models []string `json:"models,omitempty"`
 	// AllowedIPs restricts the caller addresses an access key may be used
 	// from. An empty list is unrestricted.
 	AllowedIPs []string `json:"allowedIps,omitempty"`
@@ -50,7 +60,12 @@ type APIKeyRecord struct {
 	ExpiresAt            *time.Time `json:"expiresAt,omitempty"`
 	CreatedAt            time.Time  `json:"createdAt"`
 	LastUsedAt           *time.Time `json:"lastUsedAt,omitempty"`
-	RevokedAt            *time.Time `json:"revokedAt,omitempty"`
+	// LastIP is the caller address of the most recent request made with this
+	// key. It is audit data: it answers whether a credential is being used
+	// from a machine the operator recognizes, and for an access key it is the
+	// address the IP allowlist is checked against.
+	LastIP    string     `json:"lastIp,omitempty"`
+	RevokedAt *time.Time `json:"revokedAt,omitempty"`
 	// ActiveRequests is not persisted. It is a live in-flight count the control
 	// plane fills in so the UI can show an access key's concurrency against
 	// its ceiling. It is always emitted (no omitempty) because a key that is
@@ -126,11 +141,15 @@ type AuditConversationPage struct {
 }
 
 type ResponseAffinity struct {
-	ResponseID string    `json:"responseId"`
-	Model      string    `json:"model"`
-	Backend    string    `json:"backend,omitempty"`
-	Status     string    `json:"status,omitempty"`
-	Response   []byte    `json:"response,omitempty"`
+	ResponseID string `json:"responseId"`
+	Model      string `json:"model"`
+	Backend    string `json:"backend,omitempty"`
+	Status     string `json:"status,omitempty"`
+	Response   []byte `json:"response,omitempty"`
+	// IdentityID names the credential that created the row. It scopes reads
+	// and writes so one API key cannot read another key's stored response.
+	// Empty means a row written before the column existed (model-scoped).
+	IdentityID string    `json:"identityId,omitempty"`
 	ExpiresAt  time.Time `json:"expiresAt"`
 	CreatedAt  time.Time `json:"createdAt"`
 	UpdatedAt  time.Time `json:"updatedAt"`
@@ -243,6 +262,10 @@ func normalizeAPIKeyRecord(record APIKeyRecord) (APIKeyRecord, error) {
 	}
 	record.Kind = kind
 
+	// Source is a server-side marker, not operator input; trimming it keeps a
+	// hand-written database value from creating a second config-owned spelling.
+	record.Source = strings.TrimSpace(record.Source)
+
 	parentID := strings.TrimSpace(record.ParentID)
 	if parentID != "" {
 		if err := validateAPIKeyID(parentID); err != nil {
@@ -298,6 +321,29 @@ func normalizeAPIKeyKind(kind string) (string, error) {
 	default:
 		return "", errors.New("unknown api key kind: " + kind)
 	}
+}
+
+// reservedAPIKeyIDs are values the authentication layer uses as sentinels for
+// "no credential". A newly created row must not use them, or the credential
+// would be indistinguishable from the keyless state.
+//
+// This is deliberately advisory at the store boundary: validateAPIKeyID still
+// accepts these ids so lookups, revocation and rotation of rows written by an
+// older build keep working. Rejecting them there would make an existing
+// deployment fail to start (stale config-owned rows are revoked during
+// startup) and would leave a credential nothing in the product could delete.
+// The two real entry points enforce it instead: the configuration seeder
+// remaps a reserved id, and the API-key creator generates random ids.
+var reservedAPIKeyIDs = map[string]struct{}{
+	"anonymous": {},
+}
+
+// IsReservedAPIKeyID reports whether id collides with an authentication
+// sentinel. Callers that load operator-supplied ids should remap rather than
+// reject, so an existing deployment keeps starting.
+func IsReservedAPIKeyID(id string) bool {
+	_, reserved := reservedAPIKeyIDs[strings.ToLower(strings.TrimSpace(id))]
+	return reserved
 }
 
 func validateAPIKeyID(id string) error {
@@ -361,16 +407,17 @@ func (s *Store) UpsertAPIKey(ctx context.Context, record APIKeyRecord) error {
 		return err
 	}
 	_, err = s.db.ExecContext(ctx, `
-		INSERT INTO api_keys(id,name,key_hash,key_salt,key_secret,scopes_json,models_json,allow_management_login,expires_at,created_at,last_used_at,revoked_at,kind,parent_id,access_ips_json,max_concurrency,group_name)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		INSERT INTO api_keys(id,name,key_hash,key_salt,key_secret,scopes_json,models_json,allow_management_login,expires_at,created_at,last_used_at,revoked_at,kind,parent_id,access_ips_json,max_concurrency,group_name,source)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET name=excluded.name, key_hash=excluded.key_hash, key_salt=excluded.key_salt, scopes_json=excluded.scopes_json,
 		key_secret=CASE WHEN excluded.key_secret <> '' THEN excluded.key_secret ELSE api_keys.key_secret END,
 		models_json=excluded.models_json, allow_management_login=excluded.allow_management_login, expires_at=excluded.expires_at,
 		revoked_at=excluded.revoked_at, kind=excluded.kind, parent_id=excluded.parent_id,
-		access_ips_json=excluded.access_ips_json, max_concurrency=excluded.max_concurrency, group_name=excluded.group_name`,
+		access_ips_json=excluded.access_ips_json, max_concurrency=excluded.max_concurrency, group_name=excluded.group_name,
+		source=excluded.source`,
 		record.ID, record.Name, record.KeyHash, salt, record.KeySecret, string(scopes), string(models), record.AllowManagementLogin, expires,
 		record.CreatedAt.Unix(), nullableTime(record.LastUsedAt), nullableTime(record.RevokedAt),
-		record.Kind, record.ParentID, string(accessIPs), record.MaxConcurrency, record.Group)
+		record.Kind, record.ParentID, string(accessIPs), record.MaxConcurrency, record.Group, record.Source)
 	if err != nil {
 		return fmt.Errorf("upsert api key: %w", err)
 	}
@@ -388,7 +435,7 @@ func nullableTime(t *time.Time) any {
 // column cannot be added to one query and silently missing from another. The
 // retained secret is deliberately excluded: it stays reachable only through
 // GetAPIKeySecret, which requires an explicitly authorized caller.
-const apiKeyColumns = `SELECT id,name,key_hash,key_salt,scopes_json,models_json,allow_management_login,expires_at,created_at,last_used_at,revoked_at,kind,parent_id,access_ips_json,max_concurrency,group_name FROM api_keys`
+const apiKeyColumns = `SELECT id,name,key_hash,key_salt,scopes_json,models_json,allow_management_login,expires_at,created_at,last_used_at,revoked_at,kind,parent_id,access_ips_json,max_concurrency,group_name,source,last_ip FROM api_keys`
 
 func (s *Store) ListAPIKeys(ctx context.Context, includeRevoked bool) ([]APIKeyRecord, error) {
 	ctx = normalizeContext(ctx)
@@ -422,14 +469,15 @@ func (s *Store) ListAPIKeys(ctx context.Context, includeRevoked bool) ([]APIKeyR
 // need it go through GetAPIKeySecret.
 func scanAPIKey(rows *sql.Rows) (APIKeyRecord, error) {
 	var r APIKeyRecord
-	var scopes, models, accessIPs, kind, parentID, group string
+	var scopes, models, accessIPs, kind, parentID, group, source string
 	var salt []byte
 	var maxConcurrency sql.NullInt64
 	var expires, created, last, revoked sql.NullInt64
 	if err := rows.Scan(&r.ID, &r.Name, &r.KeyHash, &salt, &scopes, &models, &r.AllowManagementLogin,
-		&expires, &created, &last, &revoked, &kind, &parentID, &accessIPs, &maxConcurrency, &group); err != nil {
+		&expires, &created, &last, &revoked, &kind, &parentID, &accessIPs, &maxConcurrency, &group, &source, &r.LastIP); err != nil {
 		return APIKeyRecord{}, err
 	}
+	r.Source = source
 	r.KeySalt = append([]byte(nil), salt...)
 	r.Kind = kind
 	r.ParentID = parentID
@@ -477,13 +525,13 @@ func (s *Store) FindAPIKeyByHash(ctx context.Context, hash string) (APIKeyRecord
 		return APIKeyRecord{}, false, nil
 	}
 	var r APIKeyRecord
-	var scopes, models, accessIPs, kind, parentID, group string
+	var scopes, models, accessIPs, kind, parentID, group, source string
 	var salt []byte
 	var maxConcurrency sql.NullInt64
 	var expires, created, last, revoked sql.NullInt64
 	err := s.db.QueryRowContext(ctx, apiKeyColumns+` WHERE key_hash=?`, hash).
 		Scan(&r.ID, &r.Name, &r.KeyHash, &salt, &scopes, &models, &r.AllowManagementLogin,
-			&expires, &created, &last, &revoked, &kind, &parentID, &accessIPs, &maxConcurrency, &group)
+			&expires, &created, &last, &revoked, &kind, &parentID, &accessIPs, &maxConcurrency, &group, &source, &r.LastIP)
 	if errors.Is(err, sql.ErrNoRows) {
 		return APIKeyRecord{}, false, nil
 	}
@@ -494,6 +542,7 @@ func (s *Store) FindAPIKeyByHash(ctx context.Context, hash string) (APIKeyRecord
 	r.Kind = kind
 	r.ParentID = parentID
 	r.Group = group
+	r.Source = source
 	r.MaxConcurrency = int(maxConcurrency.Int64)
 	if err := json.Unmarshal([]byte(scopes), &r.Scopes); err != nil {
 		return APIKeyRecord{}, false, err
@@ -591,7 +640,11 @@ func (s *Store) FindAPIKeyBySecret(ctx context.Context, secret string) (APIKeyRe
 	return APIKeyRecord{}, false, nil
 }
 
-func (s *Store) TouchAPIKey(ctx context.Context, id string, when time.Time) error {
+// TouchAPIKey records that a key was just used, and from where. The address is
+// stored only when the caller supplies one: a touch that carries no address
+// (an internal caller, an embedder) must not erase the address a real request
+// recorded.
+func (s *Store) TouchAPIKey(ctx context.Context, id string, when time.Time, clientIP string) error {
 	ctx = normalizeContext(ctx)
 	if s == nil || s.db == nil {
 		return errors.New("store is unavailable")
@@ -600,7 +653,12 @@ func (s *Store) TouchAPIKey(ctx context.Context, id string, when time.Time) erro
 	if id == "" {
 		return errors.New("api key id is required")
 	}
-	_, err := s.db.ExecContext(ctx, `UPDATE api_keys SET last_used_at=? WHERE id=?`, when.Unix(), id)
+	clientIP = strings.TrimSpace(clientIP)
+	if clientIP == "" {
+		_, err := s.db.ExecContext(ctx, `UPDATE api_keys SET last_used_at=? WHERE id=?`, when.Unix(), id)
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE api_keys SET last_used_at=?, last_ip=? WHERE id=?`, when.Unix(), clientIP, id)
 	return err
 }
 
@@ -783,11 +841,11 @@ func (s *Store) RotateAPIKey(ctx context.Context, oldID string, replacement APIK
 		return fmt.Errorf("active api key %q was not found: %w", oldID, ErrAPIKeyNotFound)
 	}
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO api_keys(id,name,key_hash,key_salt,key_secret,scopes_json,models_json,allow_management_login,expires_at,created_at,last_used_at,revoked_at,kind,parent_id,access_ips_json,max_concurrency,group_name)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		INSERT INTO api_keys(id,name,key_hash,key_salt,key_secret,scopes_json,models_json,allow_management_login,expires_at,created_at,last_used_at,revoked_at,kind,parent_id,access_ips_json,max_concurrency,group_name,source)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		replacement.ID, replacement.Name, replacement.KeyHash, salt, replacement.KeySecret, string(scopes), string(models), replacement.AllowManagementLogin, expires,
 		replacement.CreatedAt.Unix(), nullableTime(replacement.LastUsedAt), nullableTime(replacement.RevokedAt),
-		replacement.Kind, replacement.ParentID, string(accessIPs), replacement.MaxConcurrency, replacement.Group)
+		replacement.Kind, replacement.ParentID, string(accessIPs), replacement.MaxConcurrency, replacement.Group, replacement.Source)
 	if err != nil {
 		return fmt.Errorf("insert replacement api key: %w", err)
 	}
@@ -1352,7 +1410,7 @@ func (s *Store) UpsertResponseAffinity(ctx context.Context, a ResponseAffinity) 
 	if a.ExpiresAt.IsZero() {
 		a.ExpiresAt = now.Add(defaultResponseAffinityRetention)
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO response_affinity(response_id,model_id,backend,status,response_json,expires_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(response_id) DO UPDATE SET model_id=excluded.model_id,backend=excluded.backend,status=excluded.status,response_json=excluded.response_json,expires_at=excluded.expires_at,updated_at=excluded.updated_at`, a.ResponseID, a.Model, a.Backend, a.Status, nonNilBytes(a.Response), a.ExpiresAt.Unix(), a.CreatedAt.Unix(), a.UpdatedAt.Unix())
+	_, err := s.db.ExecContext(ctx, `INSERT INTO response_affinity(response_id,model_id,backend,status,response_json,identity_id,expires_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(response_id) DO UPDATE SET model_id=excluded.model_id,backend=excluded.backend,status=excluded.status,response_json=excluded.response_json,identity_id=excluded.identity_id,expires_at=excluded.expires_at,updated_at=excluded.updated_at`, a.ResponseID, a.Model, a.Backend, a.Status, nonNilBytes(a.Response), a.IdentityID, a.ExpiresAt.Unix(), a.CreatedAt.Unix(), a.UpdatedAt.Unix())
 	return err
 }
 
@@ -1369,7 +1427,7 @@ func (s *Store) GetResponseAffinity(ctx context.Context, id string, now time.Tim
 	}
 	var a ResponseAffinity
 	var expires, created, updated int64
-	err := s.db.QueryRowContext(ctx, `SELECT response_id,model_id,backend,status,response_json,expires_at,created_at,updated_at FROM response_affinity WHERE response_id=?`, id).Scan(&a.ResponseID, &a.Model, &a.Backend, &a.Status, &a.Response, &expires, &created, &updated)
+	err := s.db.QueryRowContext(ctx, `SELECT response_id,model_id,backend,status,response_json,identity_id,expires_at,created_at,updated_at FROM response_affinity WHERE response_id=?`, id).Scan(&a.ResponseID, &a.Model, &a.Backend, &a.Status, &a.Response, &a.IdentityID, &expires, &created, &updated)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ResponseAffinity{}, false, nil
 	}

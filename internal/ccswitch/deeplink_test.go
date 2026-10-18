@@ -123,3 +123,104 @@ func TestBuildProviderRejectsInvisibleProviderFields(t *testing.T) {
 		t.Fatalf("ordinary ASCII spaces should remain valid in display/model fields: %v", err)
 	}
 }
+
+func TestBuildProviderResolvesEndpointPerApp(t *testing.T) {
+	// Each application appends its own request path to the configured base:
+	// Claude Code posts to {base}/v1/messages and the Gemini CLI to
+	// {base}/v1beta/models/..., while Codex posts to {base}/responses and the
+	// AI-SDK clients to {base}/chat/completions. The historical OpenAI-style
+	// /v1 endpoint is accepted as input for either shape.
+	for _, testCase := range []struct {
+		app      string
+		endpoint string
+		want     string
+	}{
+		{"claude", "https://local.example:9292/v1", "https://local.example:9292"},
+		{"claude", "https://local.example:9292", "https://local.example:9292"},
+		{"gemini", "https://local.example:9292/v1", "https://local.example:9292"},
+		{"codex", "https://local.example:9292", "https://local.example:9292/v1"},
+		{"codex", "https://local.example:9292/v1", "https://local.example:9292/v1"},
+		{"opencode", "https://local.example:9292", "https://local.example:9292/v1"},
+		{"openclaw", "https://local.example:9292/v1", "https://local.example:9292/v1"},
+		{"hermes", "https://local.example:9292", "https://local.example:9292/v1"},
+		{"pi", "https://local.example:9292", "https://local.example:9292/v1"},
+		{"grokbuild", "https://local.example:9292", "https://local.example:9292/v1"},
+	} {
+		link, err := BuildProvider(Provider{App: testCase.app, Name: "local", Endpoint: testCase.endpoint, Model: "m"})
+		if err != nil {
+			t.Fatalf("%s: %v", testCase.app, err)
+		}
+		u, err := url.Parse(link)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := u.Query().Get("endpoint"); got != testCase.want {
+			t.Fatalf("%s endpoint from %q = %q, want %q", testCase.app, testCase.endpoint, got, testCase.want)
+		}
+	}
+}
+
+func TestBuildProviderDeclaresSupportedApiFormats(t *testing.T) {
+	// CC Switch validates apiFormat against each application's supported set;
+	// declaring a format it rejects makes the whole import fail. llama-swap
+	// always declares the target application's native format because it
+	// converts between client surfaces itself, so a declared non-native format
+	// would additionally force CC Switch's local router on.
+	for _, app := range Apps {
+		link, err := BuildProvider(Provider{App: app, Name: "local", Endpoint: "https://x/v1", Model: "m"})
+		if err != nil {
+			t.Fatalf("%s: %v", app, err)
+		}
+		u, err := url.Parse(link)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := u.Query().Get("apiFormat"), NativeFormat(app); got != want {
+			t.Fatalf("%s default apiFormat=%q, want %q", app, got, want)
+		}
+		// Re-declaring the native format stays valid so callers may be explicit.
+		if _, err := BuildProvider(Provider{
+			App: app, ApiFormat: NativeFormat(app), Name: "local", Endpoint: "https://x/v1", Model: "m",
+		}); err != nil {
+			t.Fatalf("%s explicit native apiFormat: %v", app, err)
+		}
+	}
+
+	for _, testCase := range []struct {
+		app       string
+		apiFormat string
+	}{
+		{"claude", "openai_chat"},
+		{"codex", "anthropic"},
+		{"gemini", "anthropic"},
+		{"opencode", "gemini_native"},
+		{"pi", "openai_responses"},
+		{"claude", "bogus"},
+	} {
+		if _, err := BuildProvider(Provider{
+			App: testCase.app, ApiFormat: testCase.apiFormat, Name: "local",
+			Endpoint: "https://x/v1", Model: "m",
+		}); err == nil {
+			t.Fatalf("%s/%s was accepted, want an error", testCase.app, testCase.apiFormat)
+		}
+	}
+}
+
+func TestBuildProviderRequiresModelForPi(t *testing.T) {
+	// CC Switch rejects Pi imports without a model because the imported node
+	// would expose no selectable model.
+	if _, err := BuildProvider(Provider{App: "pi", Name: "local", Endpoint: "https://x/v1"}); err == nil {
+		t.Fatal("Pi import without a model was accepted")
+	}
+	if _, err := BuildProvider(Provider{App: "pi", Name: "local", Endpoint: "https://x/v1", Model: "m"}); err != nil {
+		t.Fatalf("Pi import with a model: %v", err)
+	}
+}
+
+func TestEndpointForAppRejectsMalformedEndpoints(t *testing.T) {
+	for _, endpoint := range []string{"", "   ", "ftp://x", "https://a/v1,https://b/v1", "https://user:pass@x/y"} {
+		if _, err := EndpointForApp("codex", endpoint); err == nil {
+			t.Fatalf("endpoint %q was accepted", endpoint)
+		}
+	}
+}

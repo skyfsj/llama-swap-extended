@@ -1059,7 +1059,39 @@ func (p *ProcessCommand) killProcess(cmd *exec.Cmd, cancel context.CancelFunc, c
 		// ignored or outlived the graceful signal is force-terminated too.
 		_ = killProcessTree(cmd)
 	}
-	<-cmdDone
+	if !waitProcessDone(cmdDone, processKillWaitTimeout) {
+		// A process stuck in uninterruptible IO cannot be reaped even after
+		// SIGKILL. Blocking here forever would wedge the run loop and every
+		// Stop/Run/WaitReady caller with it, so abandon the wait and report
+		// the condition; the cmdDone watcher below still reaps it if it ever
+		// exits.
+		p.processLogger.Errorf("<%s> process did not exit within %s after SIGKILL; abandoning the wait (likely stuck in uninterruptible IO)", p.id, processKillWaitTimeout)
+	}
+}
+
+// processKillWaitTimeout bounds the post-SIGKILL wait. The graceful timeout is
+// operator-configurable, but this one is not: it exists so a single unkillable
+// child can never hang the daemon.
+const processKillWaitTimeout = 30 * time.Second
+
+// waitProcessDone waits for done to close and reports whether it did within
+// timeout. A non-positive timeout waits indefinitely.
+func waitProcessDone(done <-chan struct{}, timeout time.Duration) bool {
+	if done == nil {
+		return true
+	}
+	if timeout <= 0 {
+		<-done
+		return true
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
 }
 
 func (p *ProcessCommand) ID() string {

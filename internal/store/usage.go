@@ -125,6 +125,10 @@ type UsageRecord struct {
 	CostEstimated       bool      `json:"costEstimated"`
 	DurationMs          int       `json:"durationMs"`
 	FirstTokenMs        int       `json:"firstTokenMs"`
+	// Provider 是实际应答的上游供应商，Adapter 是它的 API 表面（多适配器
+	// 供应商才有值）；本地托管模型两者均为空。
+	Provider string `json:"provider"`
+	Adapter  string `json:"providerAdapter"`
 }
 
 type UsageRecordPage struct {
@@ -361,7 +365,8 @@ func (s *Store) UsageRecords(ctx context.Context, query UsageQuery) (UsageRecord
 			activity.key_id, COALESCE(NULLIF(api_keys.name,''),''), COALESCE(NULLIF(api_keys.kind,''),''), COALESCE(NULLIF(api_keys.group_name,''),''),
 			activity.req_path, activity.client_ip, activity.resp_status_code,
 			activity.input_tokens, activity.output_tokens, activity.cache_tokens, activity.cache_creation_tokens, activity.reasoning_tokens,
-			activity.estimated_cost, activity.cost_estimated, activity.duration_ms, activity.first_token_ms
+			activity.estimated_cost, activity.cost_estimated, activity.duration_ms, activity.first_token_ms,
+			activity.provider_id, activity.provider_adapter
 		FROM activity
 		LEFT JOIN api_keys ON api_keys.id = activity.key_id` + where + usageRecordOrder(query) + `
 		LIMIT ? OFFSET ?`
@@ -380,7 +385,8 @@ func (s *Store) UsageRecords(ctx context.Context, query UsageQuery) (UsageRecord
 			&record.KeyID, &record.KeyName, &record.KeyKind, &record.KeyGroup,
 			&record.Endpoint, &record.ClientIP, &record.RespStatusCode,
 			&record.InputTokens, &record.OutputTokens, &record.CachedTokens, &record.CacheCreationTokens, &record.ReasoningTokens,
-			&record.EstimatedCost, &costEstimated, &record.DurationMs, &firstToken); err != nil {
+			&record.EstimatedCost, &costEstimated, &record.DurationMs, &firstToken,
+			&record.Provider, &record.Adapter); err != nil {
 			return UsageRecordPage{}, fmt.Errorf("usage record row: %w", err)
 		}
 		record.Timestamp = time.Unix(timestamp, 0).UTC()

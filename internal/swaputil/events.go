@@ -76,11 +76,23 @@ func (e InFlightRequestsEvent) Type() uint32 {
 }
 
 type InflightRequestEntry struct {
-	ID           string    `json:"id"`
-	Timestamp    time.Time `json:"timestamp"`
-	Model        string    `json:"model"`
-	Phase        string    `json:"phase"`
-	PhaseMessage string    `json:"phase_message,omitempty"`
+	ID        string    `json:"id"`
+	Timestamp time.Time `json:"timestamp"`
+	Model     string    `json:"model"`
+	// Provider is the upstream serving the request, empty for a locally hosted
+	// model. Adapter names the provider's API surface when it has more than
+	// one. A provider-served row learns its route when the gateway picks one;
+	// a local row is resolved by the middleware that created it.
+	//
+	// RouteResolved separates "resolved to no provider" (local) from "not
+	// decided yet": without it a table reading the empty string as "local"
+	// would mislabel a provider request that is still waiting for its first
+	// attempt.
+	Provider      string `json:"provider,omitempty"`
+	Adapter       string `json:"provider_adapter,omitempty"`
+	RouteResolved bool   `json:"route_resolved,omitempty"`
+	Phase         string `json:"phase"`
+	PhaseMessage  string `json:"phase_message,omitempty"`
 	// OutputPreview is a bounded, in-memory view of the latest streamed text.
 	// It is intentionally separate from captures/audit bodies and is omitted
 	// when the upstream has not produced recognizable text yet.
