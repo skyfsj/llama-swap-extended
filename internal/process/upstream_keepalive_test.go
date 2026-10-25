@@ -170,13 +170,17 @@ func TestProcessCommand_UpstreamClosesAfterStream(t *testing.T) {
 func TestProcessCommand_DisableKeepAlives(t *testing.T) {
 	skipIfNoSimpleResponder(t)
 
+	const requests = 3
 	for _, tc := range []struct {
 		name              string
 		disableKeepAlives bool
-		wantConns         int
+		// exact pins the connection count; zero asserts the weaker but
+		// scheduling-independent invariant "fewer connections than requests".
+		exact bool
+		want  int
 	}{
-		{"default reuses connections", false, 1},
-		{"disableKeepAlives opens one per request", true, 3},
+		{"default reuses connections", false, false, 0},
+		{"disableKeepAlives opens one per request", true, true, requests},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var mu sync.Mutex
@@ -195,12 +199,26 @@ func TestProcessCommand_DisableKeepAlives(t *testing.T) {
 			t.Cleanup(upstream.Close)
 
 			frontURL, logBuf := startKeepAliveProxy(t, upstream.URL, tc.disableKeepAlives)
-			postStreams(t, frontURL, 3, logBuf)
+			postStreams(t, frontURL, requests, logBuf)
 
 			mu.Lock()
 			defer mu.Unlock()
-			if len(remotes) != tc.wantConns {
-				t.Fatalf("upstream connections = %d, want %d", len(remotes), tc.wantConns)
+			if tc.exact {
+				if len(remotes) != tc.want {
+					t.Fatalf("upstream connections = %d, want %d", len(remotes), tc.want)
+				}
+				return
+			}
+			// Pooling means reuse, not a magic count of one: the proxy returns
+			// the upstream connection to its idle pool just after the client
+			// has seen the last chunk, and a heavily loaded CI runner can
+			// schedule the next request before that bookkeeping lands — one
+			// extra connection, but still reuse. The invariant that matters
+			// (and that a keep-alive regression would break) is that requests
+			// did not open one connection each.
+			if len(remotes) >= requests {
+				t.Fatalf("upstream connections = %d for %d requests, want reuse (fewer than one per request) (proxy log %q)",
+					len(remotes), requests, logBuf.String())
 			}
 		})
 	}

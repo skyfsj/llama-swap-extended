@@ -6,6 +6,6 @@ priority: 100
 match:
   endpoints: [chat.completions, responses, anthropic.messages]
 permissions: {}
-timeout: 10s
-maxCpuMillis: 1000
+timeout: 30s
+maxCpuMillis: 8000
 maxMemoryMiB: 128
