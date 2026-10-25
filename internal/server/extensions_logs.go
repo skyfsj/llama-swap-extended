@@ -244,8 +244,11 @@ func (r *extensionLogRotation) prune() {
 		}
 		total += info.Size()
 		if info.ModTime().Before(cutoff) {
-			_ = os.Remove(filepath.Join(r.dir, entry.Name()))
+			// Drop the cached handle before unlinking: Windows refuses to
+			// delete a file that is still open, and the remove error is
+			// otherwise swallowed here.
 			r.dropLocked(entry.Name())
+			_ = os.Remove(filepath.Join(r.dir, entry.Name()))
 			continue
 		}
 		infos = append(infos, entryInfo{filepath.Join(r.dir, entry.Name()), info.ModTime(), info.Size()})

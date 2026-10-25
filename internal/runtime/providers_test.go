@@ -40,12 +40,18 @@ func writeTestVLLMEntrypoints(t *testing.T, directory string) {
 }
 
 func TestRuntime_SourcePathAcceptsLocalFileURL(t *testing.T) {
-	path, ok := runtimeSourcePath("file:///var/lib/llama-swap/runtime%20source")
-	if !ok || path != filepath.FromSlash("/var/lib/llama-swap/runtime source") {
-		t.Fatalf("file URL = %q, ok=%v", path, ok)
+	if stdruntime.GOOS != "windows" {
+		// A file:/// URL with a POSIX path parses to a local path on unix
+		// hosts; Windows local paths carry drive letters, which this helper
+		// does not produce, so the URL branch is exercised where it exists.
+		path, ok := runtimeSourcePath("file:///var/lib/llama-swap/runtime%20source")
+		if !ok || path != filepath.FromSlash("/var/lib/llama-swap/runtime source") {
+			t.Fatalf("file URL = %q, ok=%v", path, ok)
+		}
 	}
-	path, ok = runtimeSourcePath("/var/lib/llama-swap/runtime")
-	if !ok || path != "/var/lib/llama-swap/runtime" {
+	local := filepath.Join(t.TempDir(), "runtime")
+	path, ok := runtimeSourcePath(local)
+	if !ok || path != filepath.Clean(local) {
 		t.Fatalf("absolute path = %q, ok=%v", path, ok)
 	}
 }
@@ -961,6 +967,12 @@ func TestRuntime_ProviderStageRequiresAndValidatesInferredGitRefs(t *testing.T) 
 }
 
 func TestRuntime_ValidGitSourceAcceptsAllowlistedFileURLOnly(t *testing.T) {
+	if stdruntime.GOOS == "windows" {
+		// file:// source parsing follows unix-host semantics; the drive-
+		// letter form Windows would produce ("file://C:/...") parses as a
+		// URL host and is rejected by design.
+		t.Skip("file:// git sources parse with unix path semantics")
+	}
 	root := t.TempDir()
 	gitDir := filepath.Join(root, "llama.git")
 	if err := os.Mkdir(gitDir, 0o750); err != nil {
@@ -2095,6 +2107,11 @@ func TestRuntime_ExtractArchiveAcceptsLibrarySymlinkChain(t *testing.T) {
 // the executable bits or the materialized llama-server fails with a clear
 // "not executable" error. Regular data files keep a non-executable mode.
 func TestRuntime_ExtractArchivePreservesExecutableBit(t *testing.T) {
+	if stdruntime.GOOS == "windows" {
+		// NTFS has no execute bit; extracted files get a generic mode and
+		// Windows decides executability by extension instead.
+		t.Skip("archive modes are unix semantics")
+	}
 	root := t.TempDir()
 	archivePath := filepath.Join(root, "source.tar.gz")
 	file, err := os.Create(archivePath)

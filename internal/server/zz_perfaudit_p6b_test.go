@@ -4,6 +4,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -107,6 +108,12 @@ func TestExtensionLogRotation_ConcurrentAppendsKeepEveryRecord(t *testing.T) {
 // a file removed by prune must be reopened (and recreated) by the next append,
 // and the cached descriptor for it must not be reused.
 func TestExtensionLogRotation_PruneReopensTheFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// The rotation keeps the append handle open, and Windows refuses to
+		// unlink an open file — the externally-removed scenario this pins
+		// cannot be staged there.
+		t.Skip("unlinking an open log is unix semantics")
+	}
 	dir := t.TempDir()
 	cfg := testExtensionsConfig()
 	rotation := newExtensionLogRotation(dir, cfg)
@@ -187,7 +194,8 @@ func TestExtensionLogRegistry_RotationIsSharedAndRebuilt(t *testing.T) {
 	if second == first {
 		t.Fatal("a changed log root must rebuild the rotation")
 	}
-	if filepath.Base(second.dir) != "extensions" || filepath.Dir(second.dir) != "/tmp/logs-two" {
+	// The rotation cleans the configured root, so compare in host syntax.
+	if filepath.Base(second.dir) != "extensions" || filepath.Dir(second.dir) != filepath.Clean("/tmp/logs-two") {
 		t.Fatalf("rotation dir = %q, want the new root", second.dir)
 	}
 }

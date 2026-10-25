@@ -1717,7 +1717,9 @@ func TestRuntime_ManagerPinAndUnpinRollbackOnPersistenceFailure(t *testing.T) {
 	if err := os.WriteFile(outside, nil, 0o640); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Remove(filepath.Join(root, ".manager.lock")); err != nil {
+	// The Windows lock shim never creates the file, so absence is fine —
+	// what matters is that the symlink below can be planted.
+	if err := os.Remove(filepath.Join(root, ".manager.lock")); err != nil && !os.IsNotExist(err) {
 		t.Fatal(err)
 	}
 	if err := os.Symlink(outside, filepath.Join(root, ".manager.lock")); err != nil {
@@ -1782,7 +1784,9 @@ func TestRuntime_AutoUpdateReportsCheckPersistenceFailure(t *testing.T) {
 	if err := os.WriteFile(outside, nil, 0o640); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Remove(filepath.Join(root, ".manager.lock")); err != nil {
+	// The Windows lock shim never creates the file, so absence is fine —
+	// what matters is that the symlink below can be planted.
+	if err := os.Remove(filepath.Join(root, ".manager.lock")); err != nil && !os.IsNotExist(err) {
 		t.Fatal(err)
 	}
 	if err := os.Symlink(outside, filepath.Join(root, ".manager.lock")); err != nil {

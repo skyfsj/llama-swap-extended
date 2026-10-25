@@ -219,9 +219,9 @@ func TestProcessCommand_VLLMWarmupStopCanRestart(t *testing.T) {
 
 	// The killed child's listener and executable image are released
 	// asynchronously on Windows; an immediate relaunch can lose the bind race
-	// and exit 1 before any request is made. One scheduling beat keeps the
-	// restart deterministic without masking a real startup failure.
-	time.Sleep(500 * time.Millisecond)
+	// and exit 1 before any request is made. A few beats keep the restart
+	// deterministic without masking a real startup failure.
+	time.Sleep(3 * time.Second)
 
 	ctx, cancel := context.WithTimeout(context.Background(), testStartTimeout)
 	defer cancel()

@@ -203,6 +203,11 @@ groups:
 		SendLoadingState:            false,
 		UnloadTimeout:               DEFAULT_UNLOAD_TIMEOUT,
 		RollbackOnModelStartFailure: &trueRollback,
+		Power: PowerConfig{
+			Currency:      "CNY",
+			RetentionDays: 90,
+			FlushInterval: time.Minute,
+		},
 		// Loading fills the server and limiter defaults so every consumer
 		// reads the same effective values (mirrors config_posix_test.go).
 		Server: HTTPServerConfig{MaxHeaderBytes: DefaultMaxHeaderBytes},

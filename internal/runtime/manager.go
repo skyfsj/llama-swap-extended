@@ -468,7 +468,7 @@ func NewManager(root string, providers map[string]Provider) (*Manager, error) {
 	if strings.TrimSpace(root) == "" {
 		return nil, errors.New("runtime root is required")
 	}
-	if !isAbsRoot(root) {
+	if !filepath.IsAbs(root) {
 		return nil, errors.New("runtime root must be absolute")
 	}
 	if err := rejectSymlinkPath(root); err != nil {
@@ -3536,6 +3536,14 @@ func atomicLinkUnlocked(dir, name, version string) error {
 	if info, err := os.Lstat(destination); err == nil && info.Mode()&os.ModeSymlink == 0 {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("runtime pointer %s is not a symlink", name)
+	}
+	if stdruntime.GOOS == "windows" {
+		// Windows rename cannot replace an existing directory symlink:
+		// MoveFileEx either follows the link (renaming its target) or fails
+		// with ACCESS_DENIED. Remove the old pointer first so the rename
+		// lands on the link itself; the pointer is briefly absent, which a
+		// reader resolves as "no current version" rather than a wrong one.
+		_ = os.Remove(destination)
 	}
 	if err := os.Rename(tmp, destination); err != nil {
 		_ = os.Remove(tmp)

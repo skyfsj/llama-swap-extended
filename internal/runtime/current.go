@@ -164,7 +164,7 @@ func ManifestForVersion(root, name, kind, version string) (Manifest, error) {
 
 func managedContainerRuntimeDir(root, name, kind string) (string, string, error) {
 	root = strings.TrimSpace(root)
-	if root == "" || !isAbsRoot(root) || strings.ContainsRune(root, '\x00') {
+	if root == "" || !filepath.IsAbs(root) || strings.ContainsRune(root, '\x00') {
 		return "", "", errors.New("managed runtime root must be an absolute path")
 	}
 	if err := validateName(name); err != nil {

@@ -2826,7 +2826,11 @@ func extractRuntimeArchive(ctx context.Context, archivePath, destination string,
 // an absolute or tree-escaping link would let a crafted archive plant a
 // pointer outside the manager-owned directory.
 func safeArchiveSymlink(destination, name, linkname string) error {
-	if linkname == "" || filepath.IsAbs(linkname) {
+	// Both path syntaxes are rejected on every host: an archive is
+	// host-agnostic, so a "/etc/passwd" target is just as absolute as a
+	// "C:\..." one regardless of where it is extracted (filepath.IsAbs
+	// alone follows the host and would let the other spelling through).
+	if linkname == "" || filepath.IsAbs(linkname) || strings.HasPrefix(linkname, "/") || strings.HasPrefix(linkname, `\`) {
 		return fmt.Errorf("archive symlink %q has an unsafe target %q", name, linkname)
 	}
 	entry := filepath.Join(destination, filepath.FromSlash(name))

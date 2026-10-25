@@ -504,22 +504,27 @@ func TestServer_BindManagedRuntimeLaunchConfigRejectsUnsafeFallbacks(t *testing.
 
 func TestServer_PrependManagedRuntimePathPreservesInput(t *testing.T) {
 	input := []string{"A=1", "PATH=/custom/bin", "B=2"}
-	got := prependManagedRuntimePath(input, "/runtime/bin")
+	// The prepend normalises the runtime bin (filepath.Clean), so the
+	// expectation is built from the same normalisation to stay host-neutral.
+	bin := filepath.Clean("/runtime/bin")
+	got := prependManagedRuntimePath(input, bin)
 	if strings.Join(input, "\n") != "A=1\nPATH=/custom/bin\nB=2" {
 		t.Fatalf("input mutated: %q", input)
 	}
-	if want := "PATH=/runtime/bin" + string(filepath.ListSeparator) + "/custom/bin"; !strings.Contains(strings.Join(got, "\n"), want) {
+	if want := "PATH=" + bin + string(filepath.ListSeparator) + "/custom/bin"; !strings.Contains(strings.Join(got, "\n"), want) {
 		t.Fatalf("PATH not prepended: %q", got)
 	}
 }
 
 func TestServer_PrependManagedRuntimeLibraryPathPreservesInput(t *testing.T) {
 	input := []string{"A=1", "LD_LIBRARY_PATH=/operator/lib", "B=2"}
-	got := prependManagedRuntimeLibraryPath(input, []string{"/runtime/bin", "/runtime/build/bin", "/runtime/bin"})
+	bin := filepath.Clean("/runtime/bin")
+	buildBin := filepath.Clean("/runtime/build/bin")
+	got := prependManagedRuntimeLibraryPath(input, []string{bin, buildBin, bin})
 	if strings.Join(input, "\n") != "A=1\nLD_LIBRARY_PATH=/operator/lib\nB=2" {
 		t.Fatalf("input mutated: %q", input)
 	}
-	want := "LD_LIBRARY_PATH=/runtime/bin" + string(filepath.ListSeparator) + "/runtime/build/bin" + string(filepath.ListSeparator) + "/operator/lib"
+	want := "LD_LIBRARY_PATH=" + bin + string(filepath.ListSeparator) + buildBin + string(filepath.ListSeparator) + "/operator/lib"
 	if !strings.Contains(strings.Join(got, "\n"), want) {
 		t.Fatalf("LD_LIBRARY_PATH not prepended: %q", got)
 	}

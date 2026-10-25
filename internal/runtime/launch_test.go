@@ -9,7 +9,9 @@ import (
 )
 
 func TestRuntime_CurrentLaunchBindingResolvesNativeEntrypoints(t *testing.T) {
-	root := filepath.FromSlash("/var/lib/llama-swap/runtimes")
+	// Any absolute root works: this resolves names, it does not touch disk.
+	// t.TempDir keeps the fixture host-native on every platform.
+	root := t.TempDir()
 
 	t.Run("vllm", func(t *testing.T) {
 		binding, err := CurrentLaunchBinding(root, "vllm-cuda", "vllm", "vllm")
