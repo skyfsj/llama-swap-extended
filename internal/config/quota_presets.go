@@ -77,6 +77,8 @@ func (p *QuotaPreset) normalize(file string) error {
 	if p.Name == "" {
 		p.Name = p.ID
 	}
+	p.Description = strings.TrimSpace(p.Description)
+	p.Category = strings.TrimSpace(p.Category)
 	// Validate the mapping without a preset reference, and without touching
 	// the caller's enforce section (none in a preset).
 	candidate := QuotaConfig{
@@ -85,8 +87,10 @@ func (p *QuotaPreset) normalize(file string) error {
 		Auth:           p.Auth,
 		Headers:        p.Headers,
 		TimeoutSeconds: p.TimeoutSeconds,
+		DivideBy:       p.DivideBy,
 		Windows:        p.Windows,
 		Extras:         p.Extras,
+		Script:         p.Script,
 	}
 	if err := candidate.normalize(); err != nil {
 		return err
@@ -94,7 +98,69 @@ func (p *QuotaPreset) normalize(file string) error {
 	p.Endpoint, p.Method, p.Auth = candidate.Endpoint, candidate.Method, candidate.Auth
 	p.Headers, p.TimeoutSeconds = candidate.Headers, candidate.TimeoutSeconds
 	p.Windows, p.Extras = candidate.Windows, candidate.Extras
+	p.DivideBy = candidate.DivideBy
+	p.Script = candidate.Script
 	return nil
+}
+
+// QuotaPresetSummary is the metadata the UI needs to offer a preset in its
+// dropdown: the id it stores, the label it shows, and what the mapping does.
+type QuotaPresetSummary struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Category    string `json:"category,omitempty"`
+	Endpoint    string `json:"endpoint,omitempty"`
+	// NeedsBase marks an endpoint expressed as "{base}/path": the effective
+	// URL comes from the provider's own endpoint.
+	NeedsBase bool `json:"needsBase,omitempty"`
+	// HasScript marks a preset driven by JavaScript: the editor offers to
+	// load that script so it can be adapted per provider.
+	HasScript bool `json:"hasScript,omitempty"`
+	Windows   int  `json:"windows"`
+	Extras    int  `json:"extras"`
+}
+
+// QuotaPresetDetail is a preset including its script source.
+type QuotaPresetDetail struct {
+	QuotaPresetSummary
+	Script string `json:"script,omitempty"`
+}
+
+// QuotaPresetSummaries lists the built-in presets for the control API.
+func QuotaPresetSummaries() []QuotaPresetSummary {
+	presets, err := QuotaPresets()
+	if err != nil {
+		return nil
+	}
+	out := make([]QuotaPresetSummary, 0, len(presets))
+	for _, preset := range presets {
+		out = append(out, summarizeQuotaPreset(preset))
+	}
+	return out
+}
+
+// QuotaPresetDetailByID returns one preset with its script source.
+func QuotaPresetDetailByID(id string) (QuotaPresetDetail, bool) {
+	preset, ok := QuotaPresetByID(id)
+	if !ok {
+		return QuotaPresetDetail{}, false
+	}
+	return QuotaPresetDetail{QuotaPresetSummary: summarizeQuotaPreset(preset), Script: preset.Script}, true
+}
+
+func summarizeQuotaPreset(preset QuotaPreset) QuotaPresetSummary {
+	return QuotaPresetSummary{
+		ID:          preset.ID,
+		Name:        preset.Name,
+		Description: preset.Description,
+		Category:    preset.Category,
+		Endpoint:    preset.Endpoint,
+		NeedsBase:   strings.HasPrefix(preset.Endpoint, QuotaBasePlaceholder),
+		HasScript:   strings.TrimSpace(preset.Script) != "",
+		Windows:     len(preset.Windows),
+		Extras:      len(preset.Extras),
+	}
 }
 
 func validHeaderName(name string) bool {

@@ -7,6 +7,7 @@
   import ConfirmDialog from "../components/ConfirmDialog.svelte";
   import { fetchPlaygroundModels, playgroundModels } from "../stores/api";
   import { translate } from "../lib/i18n";
+  import { toast } from "../lib/toast";
   import ModelMultiSelect from "../components/ModelMultiSelect.svelte";
   import { ipMatchesEntry } from "../lib/ipMatch";
   import {
@@ -233,7 +234,8 @@
         expiresAt: expiry,
       };
       let secret = "";
-      if (createDialogOpen) {
+      const creating = createDialogOpen;
+      if (creating) {
         const created =
           dialogKind === "management"
             ? await createAPIKey({ ...common, kind: "management", allowManagementLogin: draft.allowManagementLogin })
@@ -261,6 +263,7 @@
       editDialogOpen = false;
       editing = null;
       await load();
+      toast.success($translate(creating ? "controlPlane.keyCreated" : "controlPlane.keyUpdated", { name: common.name }));
       if (secret) {
         newlyCreated = secret;
         secretDialogOpen = true;
@@ -288,6 +291,7 @@
       if (action.kind === "delete") await revokeAPIKey(action.id);
       pendingAction = null;
       await load();
+      toast.success($translate(action.kind === "delete" ? "controlPlane.keyRevoked" : "controlPlane.keyRotated", { name: action.name }));
       if (secret) {
         newlyCreated = secret;
         secretDialogOpen = true;

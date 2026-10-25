@@ -2,10 +2,12 @@
   import { onMount } from "svelte";
   import ConfirmDialog from "../components/ConfirmDialog.svelte";
   import { translate } from "../lib/i18n";
+  import { toast } from "../lib/toast";
   import { errorMessageFromPayload } from "../lib/apiError";
   import { formatFileSize } from "../lib/format";
   import { backendProgress } from "../stores/api";
   import type { BackendStatus, ResourceStatus } from "../lib/types";
+import { apiUrl } from "../lib/apiPath";
 
   let backends = $state<BackendStatus[]>([]);
   let resources = $state<ResourceStatus | null>(null);
@@ -37,12 +39,12 @@
     loading = true;
     error = "";
     try {
-      const response = await fetch("/api/backends");
+      const response = await fetch(apiUrl("/api/backends"));
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(errorMessageFromPayload(payload, `HTTP ${response.status}`));
       backends = Array.isArray(payload?.data) ? payload.data : [];
       try {
-        const resourceResponse = await fetch("/api/resources");
+        const resourceResponse = await fetch(apiUrl("/api/resources"));
         const resourcePayload = await resourceResponse.json().catch(() => ({}));
         resources = resourceResponse.ok && resourcePayload ? resourcePayload as ResourceStatus : null;
       } catch {
@@ -82,10 +84,15 @@
     busy = `${model}:${path}`;
     error = "";
     try {
-      const response = await fetch(`/api/backends/${encodeURIComponent(model)}/${path}`, { method: "POST" });
+      const response = await fetch(apiUrl(`/api/backends/${encodeURIComponent(model)}/${path}`), { method: "POST" });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(errorMessageFromPayload(payload, `HTTP ${response.status}`));
       await load();
+      // The confirm dialog closes and the row re-renders, but the action is
+      // async on the backend: name what was requested so the row's unchanged
+      // state is not read as "nothing happened".
+      const doneKey = path === "sleep" ? "backendSleepDone" : path === "wake" ? "backendWakeDone" : "backendResetDone";
+      toast.success($translate(`controlPlane.${doneKey}`, { model }));
     } catch (cause) {
       error = errorMessage(cause);
     } finally {

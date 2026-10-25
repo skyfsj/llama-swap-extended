@@ -100,10 +100,18 @@ func NewPeer(cfg config.Config, logger *logmon.Monitor) (*Peer, error) {
 			Rewrite: func(r *httputil.ProxyRequest) {
 				r.SetURL(peer.ProxyURL)
 				r.Out.Host = r.Out.URL.Host
+				// The peer is a server-to-server hop. Some APIs (Anthropic)
+				// reject requests carrying a browser Origin; see issue #1214.
+				swaputil.StripBrowserRequestHeaders(r.Out.Header)
 			},
 		}
 
 		reverseProxy.ModifyResponse = func(resp *http.Response) error {
+			// The peer is another llama-swap that already applied its own CORS
+			// policy. ReverseProxy adds rather than replaces headers, so keep
+			// only this instance's; see issue #85.
+			swaputil.StripUpstreamCORSHeaders(resp.Header)
+
 			if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
 				resp.Header.Set("X-Accel-Buffering", "no")
 			}

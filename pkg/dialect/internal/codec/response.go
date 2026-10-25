@@ -35,16 +35,24 @@ func DecodeResponse(format Format, body []byte) (*Response, []Diagnostic, error)
 
 // EncodeResponse renders the canonical response in the target dialect.
 func EncodeResponse(response *Response, target Format) ([]byte, []Diagnostic, error) {
+	return EncodeResponseWithRequest(response, target, nil)
+}
+
+// EncodeResponseWithRequest is EncodeResponse with the canonical request the
+// response answers, which supplies the tool state a Responses target needs to
+// restore namespaces and echo the request's tool policy.
+func EncodeResponseWithRequest(response *Response, target Format, request *Request) ([]byte, []Diagnostic, error) {
 	if response == nil {
 		return nil, nil, conversionErrorf("invalid_response", "response is nil")
 	}
 	var diagnostics []Diagnostic
+	diagnosePartSignatures(response.Parts, target, &diagnostics)
 	var out map[string]any
 	switch target {
 	case OpenAIChat:
 		out = encodeChatResponse(response, &diagnostics)
 	case OpenAIResponses:
-		out = encodeResponsesResponse(response, &diagnostics)
+		out = encodeResponsesResponse(response, request, &diagnostics)
 	case ClaudeMessages:
 		out = encodeClaudeResponse(response, &diagnostics)
 	case Gemini:
@@ -239,22 +247,34 @@ func usageToClaude(usage Usage) map[string]any {
 	return out
 }
 
+// Gemini counts thinking tokens separately from visible candidate tokens,
+// while every other dialect includes reasoning inside its output count. The
+// canonical Usage follows the majority convention (OutputTokens includes
+// ReasoningTokens) and the Gemini boundary converts.
 func usageFromGemini(object map[string]any) Usage {
+	candidates := intValue(object, "candidatesTokenCount")
+	thoughts := intValue(object, "thoughtsTokenCount")
 	usage := Usage{
 		InputTokens:     intValue(object, "promptTokenCount"),
-		OutputTokens:    intValue(object, "candidatesTokenCount"),
+		OutputTokens:    candidates + thoughts,
 		TotalTokens:     intValue(object, "totalTokenCount"),
 		CachedTokens:    intValue(object, "cachedContentTokenCount"),
-		ReasoningTokens: intValue(object, "thoughtsTokenCount"),
+		ReasoningTokens: thoughts,
 	}
 	usage.Normalize()
 	return usage
 }
 
 func usageToGemini(usage Usage) map[string]any {
+	// Gemini reports the visible answer and the thinking separately, so the
+	// reasoning portion is subtracted from the canonical output count.
+	candidates := usage.OutputTokens - usage.ReasoningTokens
+	if candidates < 0 {
+		candidates = 0
+	}
 	out := map[string]any{
 		"promptTokenCount":     usage.InputTokens,
-		"candidatesTokenCount": usage.OutputTokens,
+		"candidatesTokenCount": candidates,
 		"totalTokenCount":      usage.TotalTokens,
 	}
 	if usage.CachedTokens > 0 {
@@ -292,6 +312,27 @@ func usageToResponses(usage Usage) map[string]any {
 	}
 }
 
+// chatErrorResponse reads an OpenAI-compatible error envelope. Compatible
+// upstreams answer HTTP 200 with {"error": {...}}; treating that as an empty
+// successful answer hides the failure from the client entirely.
+func chatErrorResponse(object map[string]any) *Response {
+	errorObject := objectAt(object, "error")
+	if errorObject == nil {
+		return nil
+	}
+	streamError := &StreamError{
+		Type:    stringAt(errorObject, "type"),
+		Code:    stringAt(errorObject, "code"),
+		Message: stringAt(errorObject, "message"),
+		Status:  stringAt(errorObject, "status"),
+	}
+	if streamError.Message == "" && streamError.Type == "" && streamError.Code == "" {
+		// An empty error object is not a failure report.
+		return nil
+	}
+	return &Response{Status: "failed", Error: streamError, FinishReason: FinishOther}
+}
+
 func intValue(object map[string]any, key string) int {
 	if value, ok := intAt(object, key); ok {
 		return value
@@ -306,6 +347,9 @@ func decodeChatResponse(body []byte, diagnostics *[]Diagnostic) (*Response, erro
 	object, err := decodeObject(body)
 	if err != nil {
 		return nil, err
+	}
+	if response := chatErrorResponse(object); response != nil {
+		return response, nil
 	}
 	response := &Response{
 		ID:      stringAt(object, "id"),
@@ -534,12 +578,23 @@ func encodeGeminiOutputParts(parts []Part, diagnostics *[]Diagnostic) []any {
 	for _, part := range parts {
 		switch part.Kind {
 		case PartText:
-			if part.Text != "" {
-				out = append(out, map[string]any{"text": part.Text})
+			if part.Text != "" || part.ThoughtSignature != "" {
+				entry := map[string]any{"text": part.Text}
+				if part.ThoughtSignature != "" {
+					entry["thoughtSignature"] = part.ThoughtSignature
+				}
+				out = append(out, entry)
 			}
 		case PartReasoning:
-			if part.Text != "" {
-				out = append(out, map[string]any{"text": part.Text, "thought": true})
+			if part.Text != "" || part.ThoughtSignature != "" {
+				entry := map[string]any{"text": part.Text, "thought": true}
+				// Gemini 3 requires its opaque signature to come back verbatim
+				// on the next turn; dropping it on the response path made the
+				// follow-up request invalid.
+				if part.ThoughtSignature != "" {
+					entry["thoughtSignature"] = part.ThoughtSignature
+				}
+				out = append(out, entry)
 			}
 		case PartToolCall:
 			args := part.Arguments
@@ -550,9 +605,16 @@ func encodeGeminiOutputParts(parts []Part, diagnostics *[]Diagnostic) []any {
 			if json.Unmarshal(args, &decoded) != nil {
 				decoded = map[string]any{}
 			}
-			out = append(out, map[string]any{
+			entry := map[string]any{
 				"functionCall": map[string]any{"name": part.ToolName, "args": decoded},
-			})
+			}
+			if part.ToolCallID != "" {
+				entry["functionCall"].(map[string]any)["id"] = part.ToolCallID
+			}
+			if part.ThoughtSignature != "" {
+				entry["thoughtSignature"] = part.ThoughtSignature
+			}
+			out = append(out, entry)
 		case PartRefusal:
 			if part.Text != "" {
 				out = append(out, map[string]any{"text": part.Text})
@@ -604,8 +666,18 @@ func decodeResponsesResponse(body []byte, diagnostics *[]Diagnostic) (*Response,
 			hasToolCall = true
 			response.Parts = append(response.Parts, Part{
 				Kind: PartToolCall, ToolCallID: stringAt(item, "call_id"), ToolName: stringAt(item, "name"),
+				ToolNamespace: stringAt(item, "namespace"),
 				ArgumentsText: stringAt(item, "arguments"),
 				Arguments:     parseArguments(stringAt(item, "arguments"), diagnostics, itemPath+".arguments"),
+			})
+		case "custom_tool_call":
+			hasToolCall = true
+			input, _ := item["input"].(string)
+			arguments := marshalCustomToolInput(input)
+			response.Parts = append(response.Parts, Part{
+				Kind: PartToolCall, ToolCallID: stringAt(item, "call_id"), ToolName: stringAt(item, "name"),
+				ToolNamespace: stringAt(item, "namespace"), ToolKind: ToolKindCustom,
+				Arguments: arguments, ArgumentsText: string(arguments),
 			})
 		case "reasoning":
 			response.Parts = append(response.Parts, decodeResponsesReasoning(item, diagnostics, itemPath)...)
@@ -630,7 +702,7 @@ func decodeResponsesResponse(body []byte, diagnostics *[]Diagnostic) (*Response,
 	return response, nil
 }
 
-func encodeResponsesResponse(response *Response, diagnostics *[]Diagnostic) map[string]any {
+func encodeResponsesResponse(response *Response, request *Request, diagnostics *[]Diagnostic) map[string]any {
 	id := normalizeResponsesID(response.ID)
 	if id == "" {
 		id = newResponseID(response.Created)
@@ -648,14 +720,33 @@ func encodeResponsesResponse(response *Response, diagnostics *[]Diagnostic) map[
 	if responseIsFailed(response) {
 		status = "failed"
 	}
-	output := encodeResponsesOutputItems(response.Parts, diagnostics)
+	toolState := response.ToolState
+	if toolState == nil && request != nil {
+		toolState = request.ToolState
+	}
+	output := encodeResponsesOutputItems(response.Parts, id, toolState, diagnostics)
 	out := map[string]any{
 		"id": id, "object": "response", "created_at": response.Created,
 		"status": status, "incomplete_details": incomplete,
 		"model": response.Model, "output": output,
-		"parallel_tool_calls": true, "tool_choice": "auto", "tools": []any{},
 		"text":       map[string]any{"format": map[string]any{"type": "text"}},
 		"truncation": "disabled",
+	}
+	// Echo the request's tool policy rather than inventing one: a client that
+	// reads these fields back would otherwise see a policy it never sent.
+	out["parallel_tool_calls"] = true
+	out["tool_choice"] = "auto"
+	out["tools"] = []any{}
+	if request != nil {
+		if request.ParallelTools != nil {
+			out["parallel_tool_calls"] = *request.ParallelTools
+		}
+		if choice := encodeResponsesToolChoice(request.ToolChoice); choice != nil {
+			out["tool_choice"] = choice
+		}
+		if len(request.Tools) > 0 {
+			out["tools"] = encodeResponsesTools(request.Tools)
+		}
 	}
 	if responseIsFailed(response) {
 		errorObject := map[string]any{"code": "", "message": "", "type": ""}
@@ -677,7 +768,56 @@ func encodeResponsesResponse(response *Response, diagnostics *[]Diagnostic) map[
 	return out
 }
 
-func encodeResponsesOutputItems(parts []Part, diagnostics *[]Diagnostic) []any {
+// synthesizedCallID mints a stable call id for a tool call that arrived
+// without one. callIDs lets the id be reused when the same function was
+// rendered before (stream and whole-response paths share the rule).
+func synthesizedCallID(responseID string, index int, callIDs map[string]struct{}) string {
+	candidate := fmt.Sprintf("%s_call_%d", responseID, index)
+	for suffix := 1; ; suffix++ {
+		if _, taken := callIDs[candidate]; !taken {
+			if callIDs != nil {
+				callIDs[candidate] = struct{}{}
+			}
+			return candidate
+		}
+		candidate = fmt.Sprintf("%s_call_%d_%d", responseID, index, suffix)
+	}
+}
+
+// marshalCustomToolInput wraps a freeform tool input in the single "input"
+// argument a function-calling target receives, so the canonical part is a
+// valid JSON argument object.
+func marshalCustomToolInput(input string) json.RawMessage {
+	encoded, err := marshalJSON(map[string]any{"input": input})
+	if err != nil {
+		return json.RawMessage(`{"input":""}`)
+	}
+	return encoded
+}
+
+// customToolInputFromArguments unwraps a custom tool input from the arguments
+// a Chat function call carries. Arguments of any other shape are returned
+// unchanged so the model's output is never dropped.
+func customToolInputFromArguments(arguments string) string {
+	var value map[string]any
+	if err := json.Unmarshal([]byte(arguments), &value); err != nil {
+		return arguments
+	}
+	input, ok := value["input"]
+	if !ok {
+		return arguments
+	}
+	if text, ok := input.(string); ok {
+		return text
+	}
+	encoded, err := marshalJSON(input)
+	if err != nil {
+		return arguments
+	}
+	return string(encoded)
+}
+
+func encodeResponsesOutputItems(parts []Part, responseID string, state *ToolState, diagnostics *[]Diagnostic) []any {
 	var items []any
 	var content []any
 	flush := func() {
@@ -712,10 +852,36 @@ func encodeResponsesOutputItems(parts []Part, diagnostics *[]Diagnostic) []any {
 			})
 		case PartToolCall:
 			flush()
-			items = append(items, map[string]any{
-				"id": fmt.Sprintf("fc_%d", len(items)), "type": "function_call", "status": "completed",
-				"call_id": part.ToolCallID, "name": part.ToolName, "arguments": argumentsText(part.Arguments),
-			})
+			itemID := fmt.Sprintf("fc_%d", len(items))
+			namespace, name, kind := part.ToolNamespace, part.ToolName, part.ToolKind
+			if binding, ok := state.Binding(part.ToolName); ok {
+				// The binding is authoritative: it is what the request
+				// declared, and the call name is the flattened upstream name.
+				namespace, name, kind = binding.Namespace, strings.TrimPrefix(part.ToolName, binding.Namespace+"__"), binding.Kind
+				if binding.Namespace == "" || binding.Namespace == defaultToolNamespace {
+					name = part.ToolName
+				}
+			}
+			callID := part.ToolCallID
+			if callID == "" {
+				callID = fmt.Sprintf("%s_call_%d", responseID, len(items))
+				appendDiagnostic(diagnostics, "tool_call_id_synthesized",
+					"the upstream tool call carried no id; a stable response-scoped id was synthesized", "output")
+			}
+			entry := map[string]any{
+				"id": itemID, "status": "completed", "call_id": callID, "name": name,
+			}
+			if namespace != "" {
+				entry["namespace"] = namespace
+			}
+			if kind == ToolKindCustom {
+				entry["type"] = "custom_tool_call"
+				entry["input"] = customToolInputFromArguments(argumentsText(part.Arguments))
+			} else {
+				entry["type"] = "function_call"
+				entry["arguments"] = argumentsText(part.Arguments)
+			}
+			items = append(items, entry)
 		case PartImage, PartDocument, PartAudio, PartVideo:
 			appendDiagnostic(diagnostics, "assistant_media_dropped",
 				"assistant media has no Responses output representation", "output")

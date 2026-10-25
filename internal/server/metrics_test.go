@@ -52,7 +52,7 @@ func TestMetricsMonitor_PricingReconfigureInvalidatesCache(t *testing.T) {
 		model: {Backend: config.BackendConfig{Pricing: pricingRef}},
 	}}
 	mm.configurePricing(mm.store, cfg)
-	first, ok := mm.lookupPrice(model)
+	first, ok := mm.lookupPrice(model, "")
 	if !ok || first.Input != 1 {
 		t.Fatalf("initial lookup = %+v, found=%v", first, ok)
 	}
@@ -63,14 +63,256 @@ func TestMetricsMonitor_PricingReconfigureInvalidatesCache(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	uncleared, ok := mm.lookupPrice(model)
+	uncleared, ok := mm.lookupPrice(model, "")
 	if !ok || uncleared.Input != 1 {
 		t.Fatalf("cached lookup = %+v, found=%v, want old value before reconfigure", uncleared, ok)
 	}
 	mm.configurePricing(mm.store, cfg)
-	refreshed, ok := mm.lookupPrice(model)
+	refreshed, ok := mm.lookupPrice(model, "")
 	if !ok || refreshed.Input != 2 {
 		t.Fatalf("refreshed lookup = %+v, found=%v, want new value", refreshed, ok)
+	}
+}
+
+func TestResolveAmbiguousPrice(t *testing.T) {
+	oneNonZero := []store.Price{
+		{Provider: "hetzner", Model: "Qwen/Qwen3.6-35B-A3B-FP8"},
+		{Provider: "nearai", Model: "Qwen/Qwen3.6-35B-A3B-FP8", Input: 0.17, Output: 1.1},
+	}
+	zeroRows := []store.Price{
+		{Provider: "plan-a", Model: "glm-5.2"},
+		{Provider: "plan-b", Model: "glm-5.2"},
+	}
+	several := []store.Price{
+		{Provider: "nearai", Model: "glm-5.2", Input: 0.17, Output: 1.1},
+		{Provider: "venice", Model: "glm-5.2", Input: 2.5, Output: 12.5},
+	}
+	expensive := []store.Price{
+		{Provider: "aaa", Model: "glm-5.2", Input: 2, Output: 8},
+		{Provider: "zzz", Model: "glm-5.2", Input: 1, Output: 4},
+	}
+	// gemini-4-argon as production sees it: ten resellers, none of them the
+	// serving provider (opencode-go is not in the catalog for this model).
+	argon := []store.Price{
+		{Provider: "302ai", Model: "gemini-4-argon", Input: 4, Output: 10},
+		{Provider: "google", Model: "gemini-4-argon", Input: 2, Output: 10},
+		{Provider: "venice", Model: "gemini-4-argon", Input: 2.5, Output: 12.5},
+	}
+	resolve := func(rows []store.Price, resolution priceResolution) (store.Price, bool) {
+		return resolveAmbiguousPrice(rows, resolution)
+	}
+
+	t.Run("strict never guesses", func(t *testing.T) {
+		if _, ok := resolve(oneNonZero, priceResolution{attribution: "nearai", policy: priceAmbiguityStrict}); ok {
+			t.Fatal("strict resolved an ambiguous match")
+		}
+	})
+
+	t.Run("a lone operator row wins even under strict", func(t *testing.T) {
+		edited := append([]store.Price{}, argon...)
+		edited = append(edited, store.Price{Provider: "opencode-go", Model: "gemini-4-argon", Input: 9, Source: "operator"})
+		price, ok := resolve(edited, priceResolution{attribution: "opencode-go", policy: priceAmbiguityStrict})
+		if !ok || price.Provider != "opencode-go" || price.Input != 9 {
+			t.Fatalf("price = %+v found=%v, want the operator row", price, ok)
+		}
+	})
+
+	t.Run("provider-first takes the serving provider case-insensitively", func(t *testing.T) {
+		price, ok := resolve(several, priceResolution{attribution: "NearAI", policy: priceAmbiguityProviderFirst})
+		if !ok || price.Provider != "nearai" {
+			t.Fatalf("price = %+v found=%v, want nearai", price, ok)
+		}
+	})
+
+	t.Run("the official vendor wins over the serving provider", func(t *testing.T) {
+		price, ok := resolve(argon, priceResolution{
+			model: "gemini-4-argon", attribution: "opencode-go",
+			vendors: map[string]string{"gemini": "google"}, policy: priceAmbiguityProviderFirst,
+		})
+		if !ok || price.Provider != "google" {
+			t.Fatalf("price = %+v found=%v, want google", price, ok)
+		}
+	})
+
+	t.Run("a vendor miss falls through to the attribution", func(t *testing.T) {
+		price, ok := resolve(several, priceResolution{
+			model: "glm-5.2", attribution: "venice",
+			vendors: map[string]string{"glm": "zhipuai"}, policy: priceAmbiguityProviderFirst,
+		})
+		if !ok || price.Provider != "venice" {
+			t.Fatalf("price = %+v found=%v, want venice", price, ok)
+		}
+	})
+
+	t.Run("the longest matching prefix decides", func(t *testing.T) {
+		vendors := map[string]string{"step": "stepfun", "stepfun": "stepfun-ai"}
+		vendor, ok := config.VendorForModel(vendors, "stepfun-chat")
+		if !ok || vendor != "stepfun-ai" {
+			t.Fatalf("vendor = %q ok=%v, want stepfun-ai", vendor, ok)
+		}
+		vendor, ok = config.VendorForModel(vendors, "step-5-preview")
+		if !ok || vendor != "stepfun" {
+			t.Fatalf("vendor = %q ok=%v, want stepfun", vendor, ok)
+		}
+	})
+
+	t.Run("provider-first falls back to the only non-zero row", func(t *testing.T) {
+		price, ok := resolve(oneNonZero, priceResolution{policy: priceAmbiguityProviderFirst})
+		if !ok || price.Provider != "nearai" {
+			t.Fatalf("price = %+v found=%v, want nearai", price, ok)
+		}
+	})
+
+	t.Run("provider-first gives up when several rows are priced", func(t *testing.T) {
+		if _, ok := resolve(expensive, priceResolution{policy: priceAmbiguityProviderFirst}); ok {
+			t.Fatal("resolved without a policy that allows guessing")
+		}
+	})
+
+	t.Run("zero-priced rows alone never estimate", func(t *testing.T) {
+		if _, ok := resolve(zeroRows, priceResolution{policy: priceAmbiguityLowest}); ok {
+			t.Fatal("all-zero rows produced an estimate")
+		}
+	})
+
+	t.Run("lowest picks the cheapest remaining row with a stable tie-break", func(t *testing.T) {
+		price, ok := resolve(expensive, priceResolution{policy: priceAmbiguityLowest})
+		if !ok || price.Provider != "zzz" {
+			t.Fatalf("price = %+v found=%v, want zzz (output 4 beats input 2)", price, ok)
+		}
+		tie := []store.Price{
+			{Provider: "beta", Model: "m", Input: 1, Output: 4},
+			{Provider: "alpha", Model: "m", Input: 1, Output: 4},
+		}
+		price, ok = resolve(tie, priceResolution{policy: priceAmbiguityLowest})
+		if !ok || price.Provider != "alpha" {
+			t.Fatalf("tie price = %+v found=%v, want alpha", price, ok)
+		}
+	})
+}
+
+func TestMetricsMonitor_LookupPriceAttributionSteersAmbiguity(t *testing.T) {
+	mm := newTestMetricsMonitor(t, logmon.NewWriter(io.Discard), 10)
+	// A name no vendor table claims: the serving provider is the only signal.
+	for _, price := range []store.Price{
+		{Provider: "302ai", Model: "reseller-model", Input: 1.4, Output: 4.4},
+		{Provider: "opencode-go", Model: "reseller-model", Input: 1.4, Output: 4.4},
+	} {
+		if err := mm.store.UpsertPrice(context.Background(), price); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mm.configurePricing(mm.store, config.Config{})
+
+	attributed, ok := mm.lookupPrice("reseller-model", "opencode-go")
+	if !ok || attributed.Provider != "opencode-go" {
+		t.Fatalf("attributed lookup = %+v found=%v, want opencode-go", attributed, ok)
+	}
+	plain, ok := mm.lookupPrice("reseller-model", "")
+	if ok {
+		t.Fatalf("unattributed lookup = %+v, want no guess", plain)
+	}
+	// The two answers live under different cache keys: asking again must not
+	// leak one attribution's result into the other.
+	attributed, ok = mm.lookupPrice("reseller-model", "opencode-go")
+	if !ok || attributed.Provider != "opencode-go" {
+		t.Fatalf("cached attributed lookup = %+v found=%v, want opencode-go", attributed, ok)
+	}
+}
+
+func TestMetricsMonitor_VendorTablePricesAtTheOfficialRate(t *testing.T) {
+	mm := newTestMetricsMonitor(t, logmon.NewWriter(io.Discard), 10)
+	// Production shapes: glm is claimed by the default vendor table
+	// (zhipuai), gemini-4-argon by google, even though both are served
+	// through opencode-go and resellers quote different rates.
+	for _, price := range []store.Price{
+		{Provider: "302ai", Model: "glm-5.2", Input: 1.4, Output: 4.4},
+		{Provider: "opencode-go", Model: "glm-5.2", Input: 1.4, Output: 4.4},
+		{Provider: "zhipuai", Model: "glm-5.2", Input: 1.19516, Output: 4.18306},
+		{Provider: "302ai", Model: "gemini-4-argon", Input: 4, Output: 10},
+		{Provider: "google", Model: "gemini-4-argon", Input: 2, Output: 10},
+	} {
+		if err := mm.store.UpsertPrice(context.Background(), price); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := config.Config{}
+	effective := cfg.EffectivePricing()
+	effective.ModelsDev.Vendors = map[string]string{"gemini": "302ai"}
+	cfg.Pricing = effective
+	mm.configurePricing(mm.store, cfg)
+
+	price, ok := mm.lookupPrice("glm-5.2", "opencode-go")
+	if !ok || price.Provider != "zhipuai" {
+		t.Fatalf("glm-5.2 = %+v found=%v, want the official zhipuai rate", price, ok)
+	}
+	// A user entry overrides the built-in prefix mapping.
+	price, ok = mm.lookupPrice("gemini-4-argon", "opencode-go")
+	if !ok || price.Provider != "302ai" {
+		t.Fatalf("gemini-4-argon = %+v found=%v, want the configured vendor", price, ok)
+	}
+}
+
+func TestMetricsMonitor_ProviderModelsResolveCatalogRefs(t *testing.T) {
+	mm := newTestMetricsMonitor(t, logmon.NewWriter(io.Discard), 10)
+	for _, price := range []store.Price{
+		{Provider: "deepseek", Model: "deepseek-flash", Input: 0.15, Output: 0.6},
+		{Provider: "zhipuai", Model: "glm-5.2", Input: 1.19516, Output: 4.18306},
+	} {
+		if err := mm.store.UpsertPrice(context.Background(), price); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := config.Config{
+		Providers: config.ProviderDictionaryConfig{
+			"DeepSeek": {
+				Type: config.ProviderTypeOpenAI, Endpoint: "https://api.deepseek.com",
+				Models: []config.ProviderModel{{Local: "deepseek-flash", Remote: "deepseek-flash"}},
+			},
+			"opencode-go": {
+				Type: config.ProviderTypeOpenAI, Endpoint: "https://example.invalid",
+				ModelPrefix: "opencode-go/",
+				Models: []config.ProviderModel{{
+					Local: "glm-5.1", Remote: "glm-5.1",
+					Pricing: config.PricingRef{Provider: "zhipuai", Model: "glm-5.2"},
+				}},
+			},
+		},
+	}
+	mm.configurePricing(mm.store, cfg)
+
+	// A provider named DeepSeek prices its models against models.dev's
+	// deepseek entries without any per-model configuration.
+	price, ok := mm.lookupPrice("deepseek-flash", "")
+	if !ok || price.Provider != "deepseek" {
+		t.Fatalf("bare provider lookup = %+v found=%v, want deepseek", price, ok)
+	}
+	// Every callable spelling of a provider model carries the ref.
+	for _, name := range []string{"deepseek-flash", "DeepSeek/deepseek-flash"} {
+		if _, exists := mm.priceRefs[name]; !exists {
+			t.Errorf("priceRefs missing %q", name)
+		}
+	}
+	// The prefixed form and the explicit per-model ref both resolve.
+	if ref, exists := mm.priceRefs["opencode-go/glm-5.1"]; !exists || ref.Provider != "zhipuai" || ref.Model != "glm-5.2" {
+		t.Errorf("prefixed ref = %+v exists=%v, want zhipuai/glm-5.2", ref, exists)
+	}
+	price, ok = mm.lookupPrice("opencode-go/glm-5.1", "")
+	if !ok || price.Provider != "zhipuai" {
+		t.Fatalf("explicit ref lookup = %+v found=%v, want zhipuai", price, ok)
+	}
+	// A ref that misses the catalog falls through to the bare-name path.
+	if err := mm.store.UpsertPrice(context.Background(), store.Price{
+		Provider: "somewhere", Model: "broken-ref-model", Input: 3,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mm.priceMu.Lock()
+	mm.priceRefs["broken-ref-model"] = config.PricingRef{Provider: "missing-provider", Model: "missing-model"}
+	mm.priceMu.Unlock()
+	price, ok = mm.lookupPrice("broken-ref-model", "")
+	if !ok || price.Provider != "somewhere" {
+		t.Fatalf("ref-miss fallback = %+v found=%v, want somewhere", price, ok)
 	}
 }
 
@@ -89,6 +331,78 @@ func TestServer_ParseMetrics_Timings(t *testing.T) {
 	}
 	if entry.DurationMs != 1450 {
 		t.Fatalf("DurationMs = %d, want 1450", entry.DurationMs)
+	}
+}
+
+// TabbyAPI and oMLX put throughput in the usage block instead of timings or
+// vLLM response metrics. Those rates are the base values; an explicit timings
+// or metrics block still wins.
+func TestServer_ParseMetrics_UsageRates(t *testing.T) {
+	tests := []struct {
+		name         string
+		rates        string
+		extra        string
+		wantPrompt   float64
+		wantGenerate float64
+	}{
+		{"TabbyAPI", `,"prompt_tokens_per_sec":35.17,"completion_tokens_per_sec":17.11,"total_time":13.63`, "", 35.17, 17.11},
+		{"oMLX", `,"prompt_tokens_per_second":63.74,"generation_tokens_per_second":66.38`, "", 63.74, 66.38},
+		{"zero", `,"prompt_tokens_per_second":0,"generation_tokens_per_second":0`, "", 0, 0},
+		{"null", `,"prompt_tokens_per_second":null,"generation_tokens_per_second":null`, "", -1, -1},
+		{"missing", "", "", -1, -1},
+		{"numeric strings", `,"prompt_tokens_per_second":"63.74","generation_tokens_per_second":"66.38"`, "", 63.74, 66.38},
+		{"non-numeric string", `,"prompt_tokens_per_second":"unknown","generation_tokens_per_second":false`, "", -1, -1},
+		{"short suffix wins", `,"prompt_tokens_per_sec":35.17,"completion_tokens_per_sec":17.11,"prompt_tokens_per_second":63.74,"generation_tokens_per_second":66.38`, "", 35.17, 17.11},
+		{"short suffix null falls back", `,"prompt_tokens_per_sec":null,"completion_tokens_per_sec":null,"prompt_tokens_per_second":63.74,"generation_tokens_per_second":66.38`, "", 63.74, 66.38},
+		{"timings wins", `,"prompt_tokens_per_second":63.74,"generation_tokens_per_second":66.38`,
+			`,"timings":{"prompt_n":56,"predicted_n":8,"cache_n":16,"prompt_per_second":100,"predicted_per_second":40}`, 100, 40},
+		{"vLLM metrics wins", `,"prompt_tokens_per_second":63.74,"generation_tokens_per_second":66.38`,
+			`,"metrics":{"time_to_first_token_ms":200,"mean_itl_ms":10}`, 200, 100},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body := `{"usage":{"prompt_tokens":56,"completion_tokens":8,"prompt_tokens_details":{"cached_tokens":16}` + test.rates + `}` + test.extra + `}`
+			for _, streaming := range []bool{false, true} {
+				name := "JSON"
+				if streaming {
+					name = "SSE"
+				}
+				t.Run(name, func(t *testing.T) {
+					var entry ActivityLogEntry
+					var err error
+					if streaming {
+						stream := "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n" + "data: " + body + "\n\ndata: [DONE]\n\n"
+						entry, err = processStreamingResponse("m", time.Now(), []byte(stream))
+					} else {
+						parsed := gjson.Parse(body)
+						entry, err = parseMetrics("m", time.Now(), parsed.Get("usage"), parsed.Get("timings"), parsed.Get("metrics"))
+					}
+					if err != nil {
+						t.Fatalf("parse metrics: %v", err)
+					}
+					if entry.Tokens.InputTokens != 56 || entry.Tokens.OutputTokens != 8 || entry.Tokens.CachedTokens != 16 {
+						t.Fatalf("tokens = %+v", entry.Tokens)
+					}
+					if entry.Tokens.PromptPerSecond != test.wantPrompt || entry.Tokens.TokensPerSecond != test.wantGenerate {
+						t.Fatalf("rates = %+v, want prompt %v, generation %v", entry.Tokens, test.wantPrompt, test.wantGenerate)
+					}
+				})
+			}
+		})
+	}
+}
+
+// A usage.total_time lower bound keeps buffering from making the recorded
+// duration look shorter than the backend's own measurement.
+func TestServer_ParseMetrics_TabbyAPITotalTime(t *testing.T) {
+	body := `{"usage":{"prompt_tokens":83,"completion_tokens":192,"total_time":13.63}}`
+	parsed := gjson.Parse(body)
+	entry, err := parseMetrics("m", time.Now(), parsed.Get("usage"), parsed.Get("timings"), parsed.Get("metrics"))
+	if err != nil {
+		t.Fatalf("parseMetrics: %v", err)
+	}
+	if entry.DurationMs != 13630 {
+		t.Fatalf("DurationMs = %d, want 13630", entry.DurationMs)
 	}
 }
 

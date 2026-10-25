@@ -26,6 +26,7 @@
     cooldownPolicyOf,
     fetchConfigSnapshot,
     fetchProviderQuotas,
+    fetchQuotaPreset,
     distributeModels,
     fetchProvidersStatus,
     listProviderTemplates,
@@ -35,14 +36,17 @@
     refreshProviderQuotas,
     saveProvidersSection,
     setProviderDisabled,
+    testQuotaScript,
     normalizeProvidersSection,
     type ConfigSnapshot,
     type CredentialQuota,
     type ProviderAdapterUI,
+    type ProviderKeyStatus,
     type ProviderTemplateSummary,
     type ProviderConfigUI,
     type ProviderModelEntry,
     type ProvidersStatusResponse,
+    type QuotaPresetSummary,
     normalizeProviderModels,
   } from "../../lib/providersApi";
 
@@ -85,6 +89,35 @@
   let quotas = $state<Record<string, CredentialQuota>>({});
   let quotaExpanded = $state<Record<string, boolean>>({});
   let quotaBusy = $state<Record<string, boolean>>({});
+  // Quota script editor: the draft script is tested against the first stored
+  // credential before anything is saved.
+  let scriptTestBusy = $state(false);
+  let scriptTestResult = $state("");
+  let scriptTestError = $state("");
+
+  /**
+   * Proxy editing is three explicit modes rather than a free-text box: the
+   * `direct` sentinel is easy to mistype and invisible in an empty-looking
+   * field, and "inherit" has to stay expressible as an empty value.
+   */
+  function proxyMode(proxy: string | undefined): "inherit" | "direct" | "custom" {
+    const value = (proxy ?? "").trim();
+    if (value === "") return "inherit";
+    if (value === "direct") return "direct";
+    return "custom";
+  }
+
+  function proxyValueFor(mode: string, current: string | undefined): string {
+    switch (mode) {
+      case "direct":
+        return "direct";
+      case "custom":
+        // Keep the address the operator already typed when switching back.
+        return current && current !== "direct" ? current : "";
+      default:
+        return "";
+    }
+  }
 
   function emptyAdapter(): ProviderAdapterUI {
     return { name: "", type: "openai", endpoint: "", models: [] };
@@ -230,6 +263,86 @@
     draft.quota = { ...(draft.quota ?? {}), ...patch };
   }
 
+  /**
+   * Applies a preset picked from the dropdown.
+   *
+   * Inline mapping fields are dropped on selection: inline values win over the
+   * preset at merge time, so keeping a leftover endpoint (or windows from an
+   * earlier custom mapping) would silently defeat the pick. Clearing the
+   * selection keeps an inline mapping when one is complete, and removes the
+   * block otherwise — refreshInterval/enforce alone cannot form a valid quota.
+   */
+  function selectQuotaPreset(presetID: string): void {
+    const quota = draft.quota ?? {};
+    if (presetID === "") {
+      const rest = { ...quota };
+      delete rest.preset;
+      // A script is a complete mapping on its own; an inline endpoint needs
+      // windows/extras to be a valid block.
+      const hasOwnMapping =
+        (typeof rest.script === "string" && rest.script.trim() !== "") ||
+        ((typeof rest.endpoint === "string" && rest.endpoint !== "") &&
+          ((Array.isArray(rest.windows) && rest.windows.length > 0) ||
+            (Array.isArray(rest.extras) && rest.extras.length > 0)));
+      draft.quota = hasOwnMapping ? rest : undefined;
+      return;
+    }
+    draft.quota = {
+      preset: presetID,
+      refreshInterval: quota.refreshInterval,
+      enforce: quota.enforce,
+    };
+    scriptTestResult = "";
+    scriptTestError = "";
+  }
+
+  function quotaEndpointPlaceholder(): string {
+    if (selectedQuotaPreset?.endpoint) return selectedQuotaPreset.endpoint;
+    return $translate("providers.quota.endpointPlaceholder");
+  }
+
+  /** Copies a script preset's source into the inline field for adaptation. */
+  async function loadPresetScript(): Promise<void> {
+    const presetID = draft.quota?.preset;
+    if (!presetID) return;
+    try {
+      const detail = await fetchQuotaPreset(presetID);
+      if (detail.script) updateQuota({ script: detail.script });
+    } catch (cause) {
+      toast.error(errorMessageFromPayload(cause, cause instanceof Error ? cause.message : String(cause)));
+    }
+  }
+
+  /**
+   * Runs the draft script (or the selected preset's) against the first stored
+   * credential. The provider has to exist already: the endpoint resolves the
+   * credential and the provider's base URL from the live config.
+   */
+  async function runQuotaScriptTest(): Promise<void> {
+    if (!editingID) {
+      scriptTestError = $translate("providers.quota.scriptSaveFirst");
+      return;
+    }
+    scriptTestBusy = true;
+    scriptTestError = "";
+    scriptTestResult = "";
+    try {
+      const inlineScript = (draft.quota?.script ?? "").trim();
+      const result = await testQuotaScript({
+        providerID: editingID,
+        ...(inlineScript !== ""
+          ? { script: inlineScript }
+          : { preset: draft.quota?.preset }),
+      });
+      if (result.error) scriptTestError = result.error;
+      scriptTestResult = JSON.stringify(result.snapshot, null, 2);
+    } catch (cause) {
+      scriptTestError = errorMessageFromPayload(cause, cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      scriptTestBusy = false;
+    }
+  }
+
   function updateQuotaEnforce(patch: NonNullable<NonNullable<ProviderConfigUI["quota"]>["enforce"]>): void {
     const quota = draft.quota ?? {};
     draft.quota = { ...quota, enforce: { ...(quota.enforce ?? {}), ...patch } };
@@ -300,6 +413,13 @@
 
   /** Credential ids of one provider, deduplicated across its routes. */
   function providerKeyIDs(providerID: string): string[] {
+    // The provider-level list is authoritative: it includes keys disabled in
+    // configuration, whose quota is exactly what an operator disabling a key
+    // wants to keep watching.
+    const provider = status?.providers.find((entry) => entry.id === providerID);
+    if (provider?.keys && provider.keys.length > 0) {
+      return provider.keys.map((key) => key.id);
+    }
     const route = status?.routes.find((entry) => entry.providerID === providerID);
     if (!route) return [];
     const ids: string[] = [];
@@ -307,6 +427,16 @@
       if (!ids.includes(key.id)) ids.push(key.id);
     }
     return ids;
+  }
+
+  /** Runtime state of one credential (disabled badge, cooldowns). */
+  function providerKeyStatus(providerID: string, keyID: string): ProviderKeyStatus | undefined {
+    const provider = status?.providers.find((entry) => entry.id === providerID);
+    const fromProvider = provider?.keys?.find((key) => key.id === keyID);
+    if (fromProvider) return fromProvider;
+    return status?.routes
+      .find((entry) => entry.providerID === providerID)
+      ?.keys.find((key) => key.id === keyID);
   }
 
   function quotaBusyFor(keyID: string): boolean {
@@ -351,7 +481,14 @@
     void load();
     void refreshStatus();
     void refreshQuotas();
-    statusTimer = setInterval(() => void refreshStatus(), 5000);
+    // The status payload carries every provider, route and key, so polling it
+    // while the tab is in the background spends bandwidth on a screen nobody is
+    // looking at. The interval keeps running (a hidden tab that becomes visible
+    // again must not wait for a stale snapshot) but skips the fetch.
+    statusTimer = setInterval(() => {
+      if (typeof document !== "undefined" && document.hidden) return;
+      void refreshStatus();
+    }, 5000);
     return () => {
       loadRequestID++;
       if (statusTimer !== null) clearInterval(statusTimer);
@@ -717,11 +854,13 @@
   /** Runtime summary for one provider from the live status feed. */
   function keySummary(providerID: string): { ok: number; total: number; cooling: number } {
     const route = status?.routes.find((r) => r.providerID === providerID);
-    if (!route) return { ok: 0, total: 0, cooling: 0 };
+    const provider = status?.providers.find((entry) => entry.id === providerID);
+    const keys = provider?.keys ?? route?.keys ?? [];
+    if (keys.length === 0) return { ok: 0, total: 0, cooling: 0 };
     const now = Date.now();
     let ok = 0;
     let cooling = 0;
-    for (const key of route.keys) {
+    for (const key of keys) {
       const coolingNow =
         (key.authCooldownUntil && new Date(key.authCooldownUntil).getTime() > now) ||
         (key.rateLimitCooldownUntil && new Date(key.rateLimitCooldownUntil).getTime() > now) ||
@@ -733,11 +872,34 @@
         ok++;
       }
     }
-    return { ok, total: route.keys.length, cooling };
+    return { ok, total: keys.length, cooling };
   }
 
   const providerIDs = $derived(Object.keys(providers).sort((a, b) => a.localeCompare(b)));
   const knownQuotaPresets = $derived(status?.quotaPresets ?? []);
+  const selectedQuotaPreset = $derived(
+    knownQuotaPresets.find((preset) => preset.id === draft.quota?.preset) ?? null,
+  );
+  // Grouped for the dropdown: the list grows as presets accumulate, and
+  // "official balance" vs "self-hosted relay" is the split operators care
+  // about.
+  const quotaPresetGroups = $derived.by(() => {
+    const groups = new Map<string, QuotaPresetSummary[]>();
+    for (const preset of knownQuotaPresets) {
+      const key = preset.category ?? "";
+      const list = groups.get(key);
+      if (list) list.push(preset);
+      else groups.set(key, [preset]);
+    }
+    return [...groups.entries()].map(([category, presets]) => ({ category, presets }));
+  });
+
+  function quotaCategoryLabel(category: string): string {
+    if (category === "") return $translate("providers.quota.categories.other");
+    const key = `providers.quota.categories.${category}`;
+    const translated = $translate(key);
+    return translated === key || translated === "" ? category : translated;
+  }
 </script>
 
 <div class="flex flex-col gap-4">
@@ -901,14 +1063,22 @@
               <div class="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
                 {#each providerKeyIDs(id) as keyID (keyID)}
                   {@const snapshot = quotas[keyID]}
+                  {@const keyState = providerKeyStatus(id, keyID)}
                   <div class="rounded-lg border p-3">
                     <div class="flex items-center justify-between gap-2">
                       <span class="truncate text-xs font-medium" title={keyID}>{keyID}</span>
-                      {#if snapshot?.enforced}
-                        <span class="rounded bg-destructive/15 px-1.5 py-0.5 text-xs text-destructive">
-                          {$translate("providers.quota.enforced")}
-                        </span>
-                      {/if}
+                      <span class="flex shrink-0 items-center gap-1">
+                        {#if keyState?.disabled}
+                          <span class="rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
+                            {$translate("providers.quota.keyDisabled")}
+                          </span>
+                        {/if}
+                        {#if snapshot?.enforced}
+                          <span class="rounded bg-destructive/15 px-1.5 py-0.5 text-xs text-destructive">
+                            {$translate("providers.quota.enforced")}
+                          </span>
+                        {/if}
+                      </span>
                     </div>
                     {#if snapshot?.error}
                       <p class="mt-1 text-xs text-destructive">{snapshot.error}</p>
@@ -921,6 +1091,8 @@
                             <span class="text-muted-foreground">
                               {#if window.status === "missing"}
                                 {$translate("providers.quota.missing")}
+                              {:else if window.status === "unlimited"}
+                                {$translate("providers.quota.unlimited")}
                               {:else}
                                 {$translate("providers.quota.remaining", { percent: window.remainingPercent })}
                               {/if}
@@ -932,9 +1104,17 @@
                               style={`width: ${Math.min(100, Math.max(0, window.percent))}%`}
                             ></div>
                           </div>
-                          {#if window.status || window.resetsAt}
+                          {#if window.status || window.resetsAt || window.limit}
                             <div class="flex items-baseline justify-between text-xs text-muted-foreground">
-                              <span>{window.status ?? ""}</span>
+                              <span>
+                                {#if window.limit}
+                                  <!-- 金额窗口（new-api/sub2api）的值是绝对用量，
+                                       百分比条旁边直接给出 used/limit 更有用。 -->
+                                  {window.used ?? 0} / {window.limit}
+                                {:else}
+                                  {window.status ?? ""}
+                                {/if}
+                              </span>
                               <span>
                                 {#if window.resetsAt}
                                   {$translate("providers.quota.resets")} {formatReset(window.resetsAt)}
@@ -952,7 +1132,9 @@
                       {#each snapshot?.extras ?? [] as extra (extra.id)}
                         <div class="flex items-baseline justify-between text-xs">
                           <span>{extra.label}</span>
-                          <span class="text-muted-foreground">{formatExtraValue(extra.value)}</span>
+                          <span class="text-muted-foreground">
+                            {formatExtraValue(extra.value)}{extra.suffix ?? ""}
+                          </span>
                         </div>
                       {/each}
                     </div>
@@ -1058,6 +1240,15 @@
               onchange={(e) => (draft.modelPrefix = e.currentTarget.value.trim() || undefined)}
             />
             <span class="text-xs text-muted-foreground">{$translate("providers.fields.modelPrefixHint")}</span>
+          </label>
+          <label class="flex flex-col gap-1.5">
+            <span class="text-sm font-medium">{$translate("providers.fields.pricingProvider")}</span>
+            <Input
+              value={draft.pricingProvider ?? ""}
+              placeholder={$translate("providers.fields.pricingProviderPlaceholder")}
+              onchange={(e) => (draft.pricingProvider = e.currentTarget.value.trim() || undefined)}
+            />
+            <span class="text-xs text-muted-foreground">{$translate("providers.fields.pricingProviderHint")}</span>
           </label>
         </div>
 
@@ -1264,7 +1455,19 @@
         <div class="grid grid-cols-1 gap-4 sm:grid-cols-3">
           <label class="flex flex-col gap-1.5">
             <span class="text-sm font-medium">{$translate("providers.fields.proxy")}</span>
-            <Input bind:value={draft.proxy} placeholder="http://..." />
+            <select
+              class="h-9 rounded-md border bg-transparent px-3 text-sm"
+              value={proxyMode(draft.proxy)}
+              onchange={(e) => (draft.proxy = proxyValueFor(e.currentTarget.value, draft.proxy))}
+            >
+              <option value="inherit">{$translate("providers.fields.proxyInherit")}</option>
+              <option value="direct">{$translate("providers.fields.proxyDirect")}</option>
+              <option value="custom">{$translate("providers.fields.proxyCustom")}</option>
+            </select>
+            {#if proxyMode(draft.proxy) === "custom"}
+              <Input bind:value={draft.proxy} placeholder="socks5://127.0.0.1:1080" />
+            {/if}
+            <span class="text-xs text-muted-foreground">{$translate("providers.fields.proxyHint")}</span>
           </label>
           <label class="flex flex-col gap-1.5">
             <span class="text-sm font-medium">{$translate("providers.fields.priority")}</span>
@@ -1287,6 +1490,7 @@
           <label class="flex flex-col gap-1.5">
             <span class="text-sm font-medium">{$translate("providers.fields.maxRetries")}</span>
             <Input type="number" min="0" bind:value={draft.maxRetries} />
+            <span class="text-xs text-muted-foreground">{$translate("providers.fields.maxRetriesHint")}</span>
           </label>
         </div>
 
@@ -1336,12 +1540,31 @@
           <div class="grid grid-cols-1 items-end gap-3 sm:grid-cols-3">
             <label class="flex flex-col gap-1.5">
               <span class="text-sm font-medium">{$translate("providers.quota.preset")}</span>
-              <Input
-                list="providers-quota-presets"
+              <!-- A real select, not a datalist: the presets are a closed set
+                   served by the control API, and a free-text box let an
+                   unknown id through to a save-time validation error. -->
+              <select
+                class="h-9 rounded-md border bg-transparent px-3 text-sm"
                 value={draft.quota?.preset ?? ""}
-                placeholder="opencode-go"
-                onchange={(e) => updateQuota({ preset: e.currentTarget.value.trim() || undefined })}
-              />
+                onchange={(e) => selectQuotaPreset(e.currentTarget.value)}
+              >
+                <option value="">{$translate("providers.quota.presetNone")}</option>
+                {#each quotaPresetGroups as group (group.category)}
+                  <optgroup label={quotaCategoryLabel(group.category)}>
+                    {#each group.presets as preset (preset.id)}
+                      <option value={preset.id}>
+                        {preset.name} ({preset.id}){preset.hasScript ? " · JS" : ""}
+                      </option>
+                    {/each}
+                  </optgroup>
+                {/each}
+                {#if draft.quota?.preset && !knownQuotaPresets.some((preset) => preset.id === draft.quota?.preset)}
+                  <!-- A preset id that is no longer built in must stay
+                       selectable, otherwise saving the form would silently
+                       drop it. -->
+                  <option value={draft.quota.preset}>{draft.quota.preset}</option>
+                {/if}
+              </select>
             </label>
             <label class="flex flex-col gap-1.5">
               <span class="text-sm font-medium">{$translate("providers.quota.refreshInterval")}</span>
@@ -1375,13 +1598,93 @@
               {/if}
             </div>
           </div>
-          {#if knownQuotaPresets.length > 0}
-            <datalist id="providers-quota-presets">
-              {#each knownQuotaPresets as presetID (presetID)}
-                <option value={presetID}></option>
-              {/each}
-            </datalist>
-          {/if}
+          <div class="mt-3 flex flex-col gap-1.5">
+            <label class="flex flex-col gap-1.5">
+              <span class="text-sm font-medium">{$translate("providers.quota.endpoint")}</span>
+              <Input
+                value={draft.quota?.endpoint ?? ""}
+                placeholder={quotaEndpointPlaceholder()}
+                onchange={(e) => updateQuota({ endpoint: e.currentTarget.value.trim() || undefined })}
+              />
+            </label>
+            {#if selectedQuotaPreset}
+              <p class="text-xs text-muted-foreground">
+                {selectedQuotaPreset.description}
+                {#if selectedQuotaPreset.endpoint}
+                  <span class="block">
+                    {$translate("providers.quota.presetEndpoint")}
+                    <code class="rounded bg-muted px-1 py-0.5">{selectedQuotaPreset.endpoint}</code>
+                  </span>
+                {/if}
+              </p>
+            {/if}
+          </div>
+
+          <div class="mt-3 rounded-md border border-dashed p-2">
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <div class="min-w-0">
+                <span class="text-sm font-medium">{$translate("providers.quota.script")}</span>
+                <p class="text-xs text-muted-foreground">{$translate("providers.quota.scriptHint")}</p>
+              </div>
+              <div class="flex shrink-0 items-center gap-1">
+                {#if selectedQuotaPreset?.hasScript && !(draft.quota?.script ?? "").trim()}
+                  <Button variant="outline" size="sm" onclick={() => void loadPresetScript()}>
+                    {$translate("providers.quota.scriptLoadPreset")}
+                  </Button>
+                {/if}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onclick={() => void runQuotaScriptTest()}
+                  disabled={scriptTestBusy}
+                >
+                  {#if scriptTestBusy}
+                    <LoaderCircle class="size-3.5 animate-spin" aria-hidden="true" />
+                  {:else}
+                    <FlaskConical class="size-3.5" aria-hidden="true" />
+                  {/if}
+                  {$translate("providers.quota.scriptTest")}
+                </Button>
+                {#if (draft.quota?.script ?? "").trim()}
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onclick={() => {
+                      updateQuota({ script: undefined });
+                      scriptTestResult = "";
+                      scriptTestError = "";
+                    }}
+                  >
+                    {$translate("providers.quota.scriptClear")}
+                  </Button>
+                {/if}
+              </div>
+            </div>
+            <textarea
+              class="mt-2 min-h-36 w-full rounded-md border bg-transparent p-2 font-mono text-xs leading-relaxed"
+              spellcheck="false"
+              aria-label={$translate("providers.quota.script")}
+              placeholder={$translate("providers.quota.scriptPlaceholder")}
+              value={draft.quota?.script ?? ""}
+              oninput={(e) => updateQuota({ script: e.currentTarget.value })}
+            ></textarea>
+            {#if (draft.quota?.script ?? "").trim()}
+              <p class="mt-1 text-xs text-muted-foreground">
+                {$translate("providers.quota.scriptOverridesMapping")}
+              </p>
+            {:else if selectedQuotaPreset?.hasScript}
+              <p class="mt-1 text-xs text-muted-foreground">
+                {$translate("providers.quota.scriptPresetHint")}
+              </p>
+            {/if}
+            {#if scriptTestError}
+              <p class="mt-2 break-words text-xs text-destructive">{scriptTestError}</p>
+            {/if}
+            {#if scriptTestResult}
+              <pre
+                class="mt-2 max-h-52 overflow-auto rounded bg-muted p-2 text-xs whitespace-pre-wrap break-words">{scriptTestResult}</pre>
+            {/if}
+          </div>
         </div>
 
         <label class="flex flex-col gap-1.5">

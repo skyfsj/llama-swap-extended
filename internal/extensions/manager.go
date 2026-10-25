@@ -23,10 +23,12 @@ import (
 )
 
 type Compiled struct {
-	Manifest Manifest
-	Bundle   string
-	ETag     string
-	Tools    []Tool
+	NativeHook     func(context.Context, string, Context, json.RawMessage) (json.RawMessage, []string, error)
+	NativeApproval bool
+	Manifest       Manifest
+	Bundle         string
+	ETag           string
+	Tools          []Tool
 	// ToolHandlers lists the tools whose calls the worker dispatches straight
 	// to their SDK-bound handler instead of the onToolCall hook.
 	ToolHandlers []string
@@ -69,24 +71,29 @@ func (c *Compiled) WithRuntime(kind runtimeKind) *Compiled {
 		return c
 	}
 	return &Compiled{
-		Manifest:     c.Manifest,
-		Bundle:       c.Bundle,
-		ETag:         c.ETag,
-		Tools:        c.Tools,
-		ToolHandlers: c.ToolHandlers,
-		Directories:  c.Directories,
-		Hooks:        c.Hooks,
-		Settings:     c.Settings,
-		LogSink:      c.LogSink,
-		network:      c.network,
-		runtime:      kind,
-		poolSlots:    c.poolSlots,
-		lastError:    c.lastError,
+		Manifest:       c.Manifest,
+		NativeHook:     c.NativeHook,
+		NativeApproval: c.NativeApproval,
+		Bundle:         c.Bundle,
+		ETag:           c.ETag,
+		Tools:          c.Tools,
+		ToolHandlers:   c.ToolHandlers,
+		Directories:    c.Directories,
+		Hooks:          c.Hooks,
+		Settings:       c.Settings,
+		LogSink:        c.LogSink,
+		network:        c.network,
+		runtime:        kind,
+		poolSlots:      c.poolSlots,
+		lastError:      c.lastError,
 	}
 }
 
 // Invoke dispatches one hook to the configured executor.
 func (c *Compiled) Invoke(ctx context.Context, hook string, meta Context, input json.RawMessage) (json.RawMessage, []string, error) {
+	if c.NativeHook != nil {
+		return c.NativeHook(ctx, hook, meta, input)
+	}
 	room := c.HookInputRoom()
 	if err := CheckHookInputFor(c.Manifest.ID, hook, room, meta, input); err != nil {
 		c.setLastError(err)

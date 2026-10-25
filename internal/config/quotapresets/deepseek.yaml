@@ -14,6 +14,8 @@
 # 该接口免费且不占用搜索/抓取的 QPS，因此适合放进额度卡片随时刷新。
 id: deepseek
 name: DeepSeek
+category: official
+description: DeepSeek 账户余额：可调用状态、总余额、赠金与充值余额。接口免费，适合随时刷新。
 endpoint: https://api.deepseek.com/user/balance
 method: GET
 auth:

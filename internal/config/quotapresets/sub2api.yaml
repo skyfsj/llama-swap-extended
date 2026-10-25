@@ -1,0 +1,78 @@
+# Sub2API 自建中转站。
+#
+#   GET {base}/v1/usage
+#   Authorization: Bearer sk-...
+#
+# 端点用 API 密钥鉴权，金额单位为 USD。返回形状取决于密钥的计费模式：
+#
+#   quota_limited（密钥配了额度/限速）:
+#     {"mode":"quota_limited","status":"active",
+#      "quota":{"limit":10,"used":1.5,"remaining":8.5,"unit":"USD"},
+#      "remaining":8.5,"unit":"USD"}
+#   订阅:
+#     {"mode":"unrestricted","planName":"...","remaining":3.2,"unit":"USD",
+#      "subscription":{"daily_usage_usd":1,"daily_limit_usd":5,
+#                      "weekly_usage_usd":2,"weekly_limit_usd":20,
+#                      "monthly_usage_usd":3,"monthly_limit_usd":80}}
+#   钱包:
+#     {"mode":"unrestricted","planName":"钱包余额","remaining":12.5,
+#      "balance":12.5,"unit":"USD"}
+#
+# 三种形态只有部分字段重合，所以订阅窗口都标 optional：字段缺席说明当前
+# 密钥不是该模式，不是映射写错了。
+id: sub2api
+name: Sub2API
+category: self-hosted
+description: 自建 Sub2API：读取密钥剩余额度（钱包/订阅/限额三种模式），订阅模式额外显示日/周/月用量条。
+endpoint: "{base}/v1/usage"
+method: GET
+auth:
+  style: bearer
+timeoutSeconds: 15
+windows:
+  - id: quota
+    label: 额度
+    path: quota
+    percent: used
+    limit: limit
+    optional: true
+  - id: daily
+    label: 每日
+    path: subscription
+    percent: daily_usage_usd
+    limit: daily_limit_usd
+    optional: true
+  - id: weekly
+    label: 每周
+    path: subscription
+    percent: weekly_usage_usd
+    limit: weekly_limit_usd
+    resetsAt: weekly_window_start
+    optional: true
+  - id: monthly
+    label: 每月
+    path: subscription
+    percent: monthly_usage_usd
+    limit: monthly_limit_usd
+    optional: true
+extras:
+  - id: remaining
+    label: 剩余额度
+    path: remaining
+    suffix: " USD"
+  - id: balance
+    label: 钱包余额
+    path: balance
+    suffix: " USD"
+  - id: plan
+    label: 套餐
+    path: planName
+  - id: mode
+    label: 计费模式
+    path: mode
+  - id: unit
+    label: 币种
+    path: unit
+  - id: expires_at
+    label: 到期时间
+    path: subscription.expires_at

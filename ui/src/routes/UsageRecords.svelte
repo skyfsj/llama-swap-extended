@@ -86,21 +86,31 @@
     loading = true;
     error = "";
     try {
-      const [analyticsResult, optionsResult] = await Promise.all([
+      // The analytics and the record page both depend on the filter, so they are
+      // issued together. The filter vocabulary (options) does not: it lists which
+      // keys, models, groups and endpoints exist, which changes when a
+      // configuration is edited, not when a filter is picked. It is loaded once
+      // on mount so changing a filter costs two requests instead of three.
+      const [analyticsResult, page] = await Promise.all([
         fetchUsageAnalytics(filters),
-        fetchUsageFilterOptions(filters),
+        fetchUsageRecords(filters, 200, 0),
       ]);
       if (id !== requestID) return;
       analytics = analyticsResult;
-      options = optionsResult;
-      const page = await fetchUsageRecords(filters, 200, 0);
-      if (id !== requestID) return;
       records = page.data;
       recordTotal = page.total;
     } catch (cause) {
       if (id === requestID) error = cause instanceof Error ? cause.message : String(cause);
     } finally {
       if (id === requestID) loading = false;
+    }
+  }
+
+  async function loadOptions(): Promise<void> {
+    try {
+      options = await fetchUsageFilterOptions(filters);
+    } catch (cause) {
+      if (error === "") error = cause instanceof Error ? cause.message : String(cause);
     }
   }
 
@@ -169,6 +179,7 @@
 
   onMount(() => {
     applyRangePreset("30d");
+    void loadOptions();
     void load();
   });
 </script>

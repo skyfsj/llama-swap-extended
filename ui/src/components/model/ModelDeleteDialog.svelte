@@ -6,10 +6,12 @@
   import * as Dialog from "$lib/components/ui/dialog/index.js";
   import { Button } from "$lib/components/ui/button/index.js";
   import { translate } from "../../lib/i18n";
+  import { toast } from "../../lib/toast";
   import { getModelFiles } from "../../lib/modelFiles";
   import { deleteModelConfig, ModelConfigRequestError } from "../../lib/modelConfigApi";
   import { routingBlockNamesFor } from "../../lib/routerReferences";
   import type { ModelFile } from "../../lib/types";
+import { apiUrl } from "../../lib/apiPath";
 
   interface Props {
     modelId: string;
@@ -84,7 +86,7 @@
     filesError = "";
     (async () => {
       try {
-        const response = await fetch("/api/config");
+        const response = await fetch(apiUrl("/api/config"));
         const payload = await response.json().catch(() => ({}));
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         if (!active) return;
@@ -124,6 +126,7 @@
       await deleteModelConfig(modelId, etag, deleteModelFile);
       open = false;
       deleteModelFile = false;
+      toast.success($translate("models.deleted", { id: modelId }));
       onDeleted(modelId);
     } catch (cause) {
       if (cause instanceof ModelConfigRequestError && cause.status === 409) {

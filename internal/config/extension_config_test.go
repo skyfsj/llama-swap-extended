@@ -419,3 +419,237 @@ func TestBackendConfigRejectsProtocolTargetsOtherThanChat(t *testing.T) {
 		}
 	}
 }
+
+// TestModelsDevEnabled_DistinguishesUnsetFromFalse pins the switch's three
+// states. A plain bool collapses "absent" and "explicitly off", which is what
+// silently disabled synchronization for anyone who configured a URL or a refresh
+// interval without restating the switch — and what made an explicit
+// `enabled: false` impossible to honor.
+func TestModelsDevEnabled_DistinguishesUnsetFromFalse(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		yaml string
+		want bool
+	}{
+		{"section absent", "models:\n  a:\n    cmd: srv\n    proxy: \"http://127.0.0.1:9000\"\n", true},
+		{"empty block", "pricing:\n  modelsDev: {}\n", true},
+		{"url only", "pricing:\n  modelsDev:\n    url: https://mirror.example/api.json\n", true},
+		{"refreshEvery only", "pricing:\n  modelsDev:\n    refreshEvery: 1h\n", true},
+		{"explicitly on", "pricing:\n  modelsDev:\n    enabled: true\n", true},
+		{"explicitly off", "pricing:\n  modelsDev:\n    enabled: false\n", false},
+		{"explicitly off alongside a url", "pricing:\n  modelsDev:\n    enabled: false\n    url: https://mirror.example/api.json\n", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := LoadConfigFromReader(strings.NewReader(tc.yaml))
+			if err != nil {
+				t.Fatalf("load: %v", err)
+			}
+			modelsDev := cfg.EffectivePricing().ModelsDev
+			if got := modelsDev.ModelsDevEnabled(); got != tc.want {
+				t.Fatalf("ModelsDevEnabled()=%v want %v", got, tc.want)
+			}
+			// The defaults have to hold regardless of the switch, so an operator
+			// who only sets the interval still gets a working source.
+			if modelsDev.URL == "" {
+				t.Error("EffectivePricing left the URL empty")
+			}
+			if modelsDev.RefreshEvery <= 0 {
+				t.Errorf("EffectivePricing left RefreshEvery at %v", modelsDev.RefreshEvery)
+			}
+		})
+	}
+}
+
+// TestEffectivePricing_KeepsConfiguredValues pins that the effective view does
+// not overwrite what the operator wrote.
+func TestEffectivePricing_KeepsConfiguredValues(t *testing.T) {
+	cfg, err := LoadConfigFromReader(strings.NewReader(`
+pricing:
+  modelsDev:
+    enabled: false
+    refreshEvery: 6h
+    url: https://mirror.example/api.json
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	modelsDev := cfg.EffectivePricing().ModelsDev
+	if modelsDev.URL != "https://mirror.example/api.json" {
+		t.Errorf("URL=%q want the configured mirror", modelsDev.URL)
+	}
+	if modelsDev.RefreshEvery != 6*time.Hour {
+		t.Errorf("RefreshEvery=%v want 6h", modelsDev.RefreshEvery)
+	}
+	if modelsDev.ModelsDevEnabled() {
+		t.Error("ModelsDevEnabled()=true want false")
+	}
+}
+
+// TestEffectivePricing_AmbiguityDefaultAndValidation pins the ambiguity knob:
+// absent reads as provider-first, a chosen policy is kept, and a typo fails at
+// load time instead of silently reading as the default.
+func TestEffectivePricing_AmbiguityDefaultAndValidation(t *testing.T) {
+	t.Run("absent defaults to provider-first", func(t *testing.T) {
+		cfg, err := LoadConfigFromReader(strings.NewReader("models:\n  a:\n    cmd: srv\n    proxy: \"http://127.0.0.1:9000\"\n"))
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		if got := cfg.EffectivePricing().ModelsDev.Ambiguity; got != PricingAmbiguityProviderFirst {
+			t.Fatalf("Ambiguity=%q want %q", got, PricingAmbiguityProviderFirst)
+		}
+	})
+
+	for _, policy := range []string{PricingAmbiguityStrict, PricingAmbiguityProviderFirst, PricingAmbiguityLowest} {
+		t.Run("accepts "+policy, func(t *testing.T) {
+			yaml := "pricing:\n  modelsDev:\n    ambiguity: " + policy + "\n"
+			cfg, err := LoadConfigFromReader(strings.NewReader(yaml))
+			if err != nil {
+				t.Fatalf("load: %v", err)
+			}
+			if got := cfg.EffectivePricing().ModelsDev.Ambiguity; got != policy {
+				t.Fatalf("Ambiguity=%q want %q", got, policy)
+			}
+		})
+	}
+
+	t.Run("rejects an unknown policy", func(t *testing.T) {
+		yaml := "pricing:\n  modelsDev:\n    ambiguity: cheapest\n"
+		if _, err := LoadConfigFromReader(strings.NewReader(yaml)); err == nil {
+			t.Fatal("load accepted ambiguity: cheapest")
+		} else if !strings.Contains(err.Error(), "ambiguity") {
+			t.Fatalf("error %q does not mention ambiguity", err)
+		}
+	})
+}
+
+// TestProviderPricingRefs_Parse pins the provider-side pricing surface: a
+// provider-level catalog id and per-model refs survive the loader, and absent
+// fields stay empty so the lookup falls back to the provider name.
+func TestProviderPricingRefs_Parse(t *testing.T) {
+	cfg, err := LoadConfigFromReader(strings.NewReader(`
+providers:
+  DeepSeek:
+    type: openai
+    endpoint: https://api.deepseek.com
+    apiKeys: [sk-test]
+    models:
+      - local: deepseek-flash
+        remote: deepseek-flash
+  opencode-go:
+    type: openai
+    endpoint: https://relay.example
+    apiKeys: [sk-test]
+    pricingProvider: zhipuai
+    models:
+      - local: glm-5.1
+        remote: glm-5.1
+        pricing:
+          provider: opencode
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	deepseek := cfg.Providers["DeepSeek"]
+	if deepseek.PricingProvider != "" {
+		t.Errorf("PricingProvider=%q want empty (falls back to the provider id)", deepseek.PricingProvider)
+	}
+	if got := deepseek.Models[0].Pricing; got != (PricingRef{}) {
+		t.Errorf("unconfigured pricing = %+v want zero", got)
+	}
+
+	relay := cfg.Providers["opencode-go"]
+	if relay.PricingProvider != "zhipuai" {
+		t.Errorf("PricingProvider=%q want zhipuai", relay.PricingProvider)
+	}
+	if got := relay.Models[0].Pricing; got.Provider != "opencode" || got.Model != "" {
+		t.Errorf("model pricing = %+v want provider=opencode with empty model", got)
+	}
+}
+
+// TestPricingVendors_ParseAndValidate pins the vendor override surface: entries
+// survive the loader and merge over the built-in table at lookup time, and an
+// empty prefix or vendor fails at load.
+func TestPricingVendors_ParseAndValidate(t *testing.T) {
+	t.Run("entries parse", func(t *testing.T) {
+		cfg, err := LoadConfigFromReader(strings.NewReader(`
+pricing:
+  modelsDev:
+    vendors:
+      gemini: google
+      qwen: alibaba
+`))
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		vendors := cfg.Pricing.ModelsDev.Vendors
+		if vendors["gemini"] != "google" || vendors["qwen"] != "alibaba" {
+			t.Fatalf("vendors = %v, want gemini->google and qwen->alibaba", vendors)
+		}
+	})
+
+	t.Run("empty prefix is rejected", func(t *testing.T) {
+		yaml := "pricing:\n  modelsDev:\n    vendors:\n      \"\": google\n"
+		if _, err := LoadConfigFromReader(strings.NewReader(yaml)); err == nil {
+			t.Fatal("load accepted an empty vendor prefix")
+		}
+	})
+
+	t.Run("empty vendor is rejected", func(t *testing.T) {
+		yaml := "pricing:\n  modelsDev:\n    vendors:\n      gemini: \"\"\n"
+		if _, err := LoadConfigFromReader(strings.NewReader(yaml)); err == nil {
+			t.Fatal("load accepted an empty vendor")
+		}
+	})
+
+	t.Run("built-in table covers the majors", func(t *testing.T) {
+		for model, want := range map[string]string{
+			// Production inventory: every name the vendors themselves list.
+			"gemini-4-argon":           "google",
+			"Qwen/Qwen3.6-35B-A3B-FP8": "alibaba",
+			"qwen3.8-max":              "alibaba",
+			"qvq-max":                  "alibaba",
+			"qwq-plus":                 "alibaba",
+			"glm-5.2":                  "zhipuai",
+			"deepseek-flash":           "deepseek",
+			"gpt-6-luna":               "openai",
+			"gpt-5.6-terra":            "openai",
+			"o3-mini":                  "openai",
+			"o4-mini":                  "openai",
+			"claude-haiku-5-5":         "anthropic",
+			"kimi-k3":                  "moonshotai",
+			"minimax-m3":               "minimax",
+			"grok-4.7":                 "xai",
+			"mimo-v2.6-flash":          "xiaomi",
+			"step-5-preview":           "stepfun",
+			"mistral-large-4":          "mistral",
+			"codestral-latest":         "mistral",
+			"ministral-8b-latest":      "mistral",
+			"devstral-medium-latest":   "mistral",
+			"pixtral-12b":              "mistral",
+			"magistral-medium-latest":  "mistral",
+			"voxtral-small-latest":     "mistral",
+			"doubao-seed-2-0-pro":      "volcengine",
+			"command-a-plus-05-2026":   "cohere",
+			"sonar-pro":                "perplexity",
+			"muse-spark-1.2":           "meta",
+			"phi-4":                    "azure",
+			// The prefix still resolves even when the vendor spells it with a
+			// namespace; the exact row may or may not exist.
+			"Qwen3.8-27B-Uncensored": "alibaba",
+		} {
+			vendor, ok := VendorForModel(PricingVendorTable(nil), model)
+			if !ok || vendor != want {
+				t.Errorf("%s -> %q ok=%v, want %q", model, vendor, ok, want)
+			}
+		}
+	})
+
+	t.Run("families without an official catalog entry stay unmapped", func(t *testing.T) {
+		for _, model := range []string{"HY-MT2-1.8B", "nova-pro", "gemma-3-27b", "llama-4-maverick", "ernie-5.0"} {
+			if vendor, ok := VendorForModel(PricingVendorTable(nil), model); ok {
+				t.Errorf("%s unexpectedly resolved to %q", model, vendor)
+			}
+		}
+	})
+}

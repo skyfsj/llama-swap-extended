@@ -14,6 +14,7 @@ import (
 
 	"github.com/mostlygeek/llama-swap/internal/auth"
 	"github.com/mostlygeek/llama-swap/internal/extensions"
+	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
 // extensionHost executes host functions requested by extension hooks during
@@ -213,6 +214,7 @@ func (h *extensionHost) execForward(ctx context.Context, args json.RawMessage) (
 		return nil, err
 	}
 	ctx = context.WithValue(ctx, extensionSkipKey{}, true)
+	ctx = swaputil.WithoutUpstreamHooks(ctx)
 	ctx = context.WithValue(ctx, extensionForwardDepthKey{}, h.depth+1)
 	inner, err := http.NewRequestWithContext(ctx, http.MethodPost, "/v1/chat/completions", strings.NewReader(string(encoded)))
 	if err != nil {

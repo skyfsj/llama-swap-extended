@@ -108,7 +108,7 @@ func TestFilterDefinition(t *testing.T) {
 			// back into the configuration document.
 			if _, err := Compile([]Definition{{Name: "set", DSL: filtered.DSL}}, func(ident string) (string, bool) {
 				return ident, !strings.HasPrefix(ident, "gone")
-			}); err != nil {
+			}, nil); err != nil {
 				t.Errorf("filtered %q does not compile: %v", filtered.DSL, err)
 			}
 		})
@@ -130,7 +130,7 @@ func TestFilterDefinition_PreservesMeaning(t *testing.T) {
 	}
 	program, err := Compile([]Definition{{Name: "set", DSL: filtered.DSL}}, func(ident string) (string, bool) {
 		return ident, keep(ident)
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("compile filtered expression: %v", err)
 	}

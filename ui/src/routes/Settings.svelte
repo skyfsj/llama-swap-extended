@@ -48,6 +48,7 @@
     type SettingsSnapshot,
   } from "../lib/settingsApi";
   import { translate } from "../lib/i18n";
+  import { toast } from "../lib/toast";
 
   let schema = $state<SettingsSchema | null>(null);
   let snapshot = $state<SettingsSnapshot | null>(null);
@@ -339,6 +340,7 @@
       listChanges = {};
       preview = result.preview;
       previewOpen = false;
+      toast.success($translate("settingsCenter.committed"));
     } catch (cause) {
       const status = (cause as { status?: number }).status;
       if (status === 412) {

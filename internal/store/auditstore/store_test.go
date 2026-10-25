@@ -3,7 +3,12 @@ package auditstore
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -241,6 +246,10 @@ func TestStore_CompactionReclaimsUnreferencedBlocks(t *testing.T) {
 	if err := store.Clear(ctx); err != nil {
 		t.Fatal(err)
 	}
+	// Unreferenced blocks younger than blockInsertGrace are kept: an insert in
+	// flight may still be about to reference them. Aging past the grace makes
+	// them reclaimable.
+	time.Sleep(blockInsertGrace + time.Second)
 	reclaimed, dropped, err := store.CompactSegments(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -272,5 +281,316 @@ func TestStore_HasActivityProbe(t *testing.T) {
 	}
 	if !found[7] || found[8] {
 		t.Fatalf("probe = %v, want only 7", found)
+	}
+}
+
+// rawBody returns a payload planBody classifies as a single raw block, so
+// tests can reason about one body = one block = one frame.
+func rawBody(tag string) []byte {
+	return []byte("raw audit body " + tag + " " + strings.Repeat(tag+" ", 200))
+}
+
+// Compaction moves surviving blocks to new offsets. The database is the
+// authoritative index a restart reloads, so the new offsets must be persisted
+// before the pass returns — skipping that turned every moved block into a
+// "decode audit block: invalid input: magic number mismatch" failure after the
+// next restart.
+func TestStore_CompactionOffsetsSurviveRestart(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	first, err := store.Insert(ctx, Record{ID: "1", ActivityID: 1, Timestamp: time.Now(), RequestBody: rawBody("first"), SizeBytes: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = first
+	second, err := store.Insert(ctx, Record{ID: "2", ActivityID: 2, Timestamp: time.Now(), RequestBody: rawBody("second"), SizeBytes: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	// Delete the first conversation: compaction drops its block and moves the
+	// second one to the front of the file. Blocks deleted inside the insert
+	// grace are kept, so age past it first.
+	if err := store.Delete(ctx, "1"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(blockInsertGrace + time.Second)
+	if _, _, err := store.CompactSegments(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate the restart the in-memory index does not survive.
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The reloaded index comes from the database, so the new offset must have
+	// been persisted during compaction. Asserting the row — not the read — is
+	// what pins this: the repair scanner would silently fix a stale offset on
+	// first read, and the persistence regression would hide behind it.
+	var storedOffset int64
+	if err := store.db.QueryRow(`SELECT offset FROM blocks WHERE hash = ?`, second.RequestBodyRef).Scan(&storedOffset); err != nil {
+		t.Fatal(err)
+	}
+	if storedOffset != 0 {
+		t.Fatalf("compacted block offset = %d in the database, want 0; offsets were not persisted", storedOffset)
+	}
+
+	got, err := store.Materialize(second.RequestBodyRef)
+	if err != nil {
+		t.Fatalf("materialize after compaction + restart: %v", err)
+	}
+	if !bytes.Equal(got, rawBody("second")) {
+		t.Fatalf("body corrupted across compaction + restart: %q", got[:40])
+	}
+}
+
+// The repair scanner rebuilds stale offsets from the segment frames themselves.
+// This simulates the state older builds left behind: a compaction rewrote the
+// file but the database kept the pre-rewrite offsets.
+func TestStore_RepairRecoversStaleIndex(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	// Three raw bodies, one block each: filler, recoverable, and one whose
+	// bytes are destroyed outright.
+	filler, err := store.Insert(ctx, Record{ID: "1", ActivityID: 1, Timestamp: time.Now(), RequestBody: rawBody("filler"), SizeBytes: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	kept, err := store.Insert(ctx, Record{ID: "2", ActivityID: 2, Timestamp: time.Now(), RequestBody: rawBody("kept"), SizeBytes: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lost, err := store.Insert(ctx, Record{ID: "3", ActivityID: 3, Timestamp: time.Now(), RequestBody: rawBody("lost"), SizeBytes: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Record the true layout, then simulate a compaction that dropped the
+	// filler and crashed before persisting: the file loses the filler's frame
+	// and shifts everything after it forward, while the database rows — and
+	// therefore a fresh process — still point at the old positions.
+	var fillerOffset, fillerLength int64
+	if err := store.db.QueryRow(`SELECT offset, length FROM blocks WHERE hash = ?`, filler.RequestBodyRef).Scan(&fillerOffset, &fillerLength); err != nil {
+		t.Fatal(err)
+	}
+	segmentFile := filepath.Join(dir, "segments", segmentName(time.Now())+".seg")
+	raw, err := os.ReadFile(segmentFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spliced := append(append([]byte{}, raw[:fillerOffset]...), raw[fillerOffset+fillerLength:]...)
+	if err := os.WriteFile(segmentFile, spliced, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	// The stale index points kept at the filler's old position, so the first
+	// read fails to decode and the repair scanner rebuilds the offsets in the
+	// same call — recovery is transparent to the reader.
+	got, err := store.Materialize(kept.RequestBodyRef)
+	if err != nil {
+		t.Fatalf("repair did not recover the shifted block: %v", err)
+	}
+	if !bytes.Equal(got, rawBody("kept")) {
+		t.Fatal("repaired block has wrong content")
+	}
+	gotLost, err := store.Materialize(lost.RequestBodyRef)
+	if err != nil {
+		t.Fatalf("surviving block after the lost one was not recovered: %v", err)
+	}
+	if !bytes.Equal(gotLost, rawBody("lost")) {
+		t.Fatal("recovered trailing block has wrong content")
+	}
+
+	// The rebuilt offsets are persisted: a fresh process reads without repair.
+	var repairedOffset int64
+	if err := store.db.QueryRow(`SELECT offset FROM blocks WHERE hash = ?`, kept.RequestBodyRef).Scan(&repairedOffset); err != nil {
+		t.Fatal(err)
+	}
+	if repairedOffset != 0 {
+		t.Fatalf("repaired offset = %d, want 0 (the filler's frame was spliced out)", repairedOffset)
+	}
+
+	// The filler's bytes are provably absent from the whole file: its row must
+	// be gone so reads report a clean miss instead of a decode error.
+	if _, err := store.Materialize(filler.RequestBodyRef); !errors.Is(err, ErrBlockNotFound) {
+		t.Fatalf("provably missing block: want ErrBlockNotFound, got %v", err)
+	}
+	var count int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM blocks WHERE hash = ?`, filler.RequestBodyRef).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatal("index kept a row whose bytes no longer exist")
+	}
+}
+
+// Compaction rewrites segment files while the request path keeps appending.
+// The append gate must hold: bytes written during a rewrite used to be
+// stranded by the rename, leaving rows that pointed into the void.
+func TestStore_ConcurrentAppendsDuringCompaction(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+
+	const conversations = 60
+	type saved struct {
+		ref  string
+		body []byte
+	}
+	bodies := make(map[string]saved)
+	var bodiesMu sync.Mutex
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, 2)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < conversations; i++ {
+			id := fmt.Sprintf("c%03d", i)
+			body := rawBody(id)
+			record, err := store.Insert(ctx, Record{ID: id, ActivityID: i + 1, Timestamp: time.Now(), RequestBody: body, SizeBytes: 1})
+			if err != nil {
+				errCh <- err
+				return
+			}
+			bodiesMu.Lock()
+			bodies[id] = saved{ref: record.RequestBodyRef, body: body}
+			bodiesMu.Unlock()
+			// Delete every third conversation so compaction always has dead
+			// blocks to move and rewrite. Blocks deleted inside the insert
+			// grace stay put; ones from earlier iterations age out during the
+			// run, so rewrites keep happening alongside the appends.
+			if i%3 == 0 {
+				if err := store.Delete(ctx, id); err != nil {
+					errCh <- err
+					return
+				}
+				bodiesMu.Lock()
+				delete(bodies, id)
+				bodiesMu.Unlock()
+			}
+			time.Sleep(30 * time.Millisecond)
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 12; i++ {
+			if _, _, err := store.CompactSegments(ctx); err != nil {
+				errCh <- err
+				return
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+	}()
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+	bodiesMu.Lock()
+	defer bodiesMu.Unlock()
+
+	if _, _, err := store.CompactSegments(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for id, want := range bodies {
+		got, err := store.Materialize(want.ref)
+		if err != nil {
+			t.Fatalf("conversation %s unreadable after concurrent compaction: %v", id, err)
+		}
+		if !bytes.Equal(got, want.body) {
+			t.Fatalf("conversation %s corrupted by concurrent compaction", id)
+		}
+	}
+}
+
+// The append gate is what makes compaction safe: a put targeting a segment
+// under rewrite must block until the pass releases the segment, because the
+// rename would otherwise strand bytes the writer already recorded. This pins
+// the blocking behavior directly — the stress test above cannot hit the
+// sub-millisecond window reliably.
+func TestStore_AppendWaitsForCompactionGate(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+
+	if _, err := store.Insert(ctx, Record{ID: "1", ActivityID: 1, Timestamp: time.Now(), RequestBody: rawBody("seed"), SizeBytes: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	segment := segmentName(time.Now())
+	store.segments.mu.Lock()
+	store.segments.compacting[segment] = true
+	store.segments.mu.Unlock()
+
+	var gatedRef string
+	blocked := make(chan struct{}, 1)
+	go func() {
+		record, err := store.Insert(ctx, Record{ID: "2", ActivityID: 2, Timestamp: time.Now(), RequestBody: rawBody("gated"), SizeBytes: 1})
+		if err != nil {
+			t.Error(err)
+		}
+		gatedRef = record.RequestBodyRef
+		blocked <- struct{}{}
+	}()
+
+	select {
+	case <-blocked:
+		t.Fatal("put completed while its segment was being compacted; the append gate did not hold")
+	case <-time.After(150 * time.Millisecond):
+		// Still waiting: the gate is holding the append.
+	}
+
+	store.segments.mu.Lock()
+	delete(store.segments.compacting, segment)
+	store.segments.appendGate.Broadcast()
+	store.segments.mu.Unlock()
+
+	select {
+	case <-blocked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("put never completed after the gate released")
+	}
+
+	got, err := store.Materialize(gatedRef)
+	if err != nil {
+		t.Fatalf("gated body unreadable after compaction released: %v", err)
+	}
+	if !bytes.Equal(got, rawBody("gated")) {
+		t.Fatal("gated body corrupted")
 	}
 }

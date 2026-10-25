@@ -17,11 +17,17 @@ import (
 )
 
 type extensionStreamWriter struct {
-	client           http.ResponseWriter
-	request          *http.Request
-	state            *extensionRequestState
-	header           http.Header
-	status           int
+	client  http.ResponseWriter
+	request *http.Request
+	state   *extensionRequestState
+	header  http.Header
+	status  int
+	// failedStatus is a status a handler tried to report after the response
+	// had already started streaming. The status line can no longer carry it,
+	// so the body (a protocol error document, never an SSE frame) is held in
+	// raw and Finish reports the failure in-band instead of appending it to
+	// the stream, where the client silently discarded it.
+	failedStatus     int
 	committed        bool
 	pending          []byte
 	raw              bytes.Buffer
@@ -94,6 +100,10 @@ func (w *extensionStreamWriter) Header() http.Header { return w.header }
 func (w *extensionStreamWriter) WriteHeader(status int) {
 	if w.status == 0 {
 		w.status = status
+		return
+	}
+	if status >= 400 {
+		w.failedStatus = status
 	}
 }
 func (w *extensionStreamWriter) Flush() {
@@ -106,7 +116,7 @@ func (w *extensionStreamWriter) Write(p []byte) (int, error) {
 	if w.status == 0 {
 		w.status = http.StatusOK
 	}
-	if w.status >= 400 {
+	if w.status >= 400 || w.failedStatus != 0 {
 		if w.raw.Len()+len(p) <= backendTransformBodyLimit {
 			_, _ = w.raw.Write(p)
 		}
@@ -425,7 +435,11 @@ func (w *extensionStreamWriter) consumeGemini(payload map[string]any) error {
 			// The part itself is kept: it may carry a thought signature the
 			// continuation has to echo back.
 			key := len(w.callOrder)
-			w.callsByIndex[key] = &extensionCall{ID: geminiCallID(key), Name: name, Arguments: string(arguments), RawPart: part}
+			id, _ := entry["id"].(string)
+			if id == "" {
+				id = geminiCallID(key)
+			}
+			w.callsByIndex[key] = &extensionCall{ID: id, Name: name, Arguments: string(arguments), RawPart: part}
 			w.callOrder = append(w.callOrder, key)
 			continue
 		}
@@ -767,13 +781,20 @@ func (w *extensionStreamWriter) ContinueResponse() map[string]any {
 }
 
 func (w *extensionStreamWriter) Finish() error {
-	if w.status >= 400 {
+	if w.status >= 400 || (w.failedStatus != 0 && !w.committed) {
 		if !w.committed {
+			status := w.status
+			if status < 400 {
+				status = w.failedStatus
+			}
 			copyHeaders(w.client.Header(), w.header)
-			w.client.WriteHeader(w.status)
+			w.client.WriteHeader(status)
 			_, _ = w.client.Write(w.raw.Bytes())
 		}
 		return nil
+	}
+	if w.failedStatus != 0 {
+		return w.failInBand()
 	}
 	if w.endpoint == "chat.completions" {
 		if w.finish != nil {
@@ -1065,16 +1086,62 @@ func (w *extensionStreamWriter) FinishClientCalls(calls []extensionCall) error {
 }
 
 func (w *extensionStreamWriter) Fail(err error) {
+	var approval *mcpApprovalRequired
+	if w.committed && errors.As(err, &approval) {
+		details := mcpWaitDetails(approval, err)
+		payload, _ := json.Marshal(map[string]any{"type": "error", "message": err.Error(), "error": details})
+		_, _ = fmt.Fprintf(w.client, "event: error\ndata: %s\n\n", payload)
+		w.Flush()
+		return
+	}
 	if !w.committed {
+		if mcpErrorResponse(w.client, nil, err) {
+			return
+		}
 		http.Error(w.client, err.Error(), http.StatusBadGateway)
 		return
 	}
 	if w.endpoint == "anthropic.messages" {
 		_, _ = fmt.Fprintf(w.client, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":%q}}\n\n", err.Error())
 	} else {
-		_, _ = fmt.Fprintf(w.client, "event: error\ndata: {\"error\":%q}\n\n", err.Error())
+		_, _ = fmt.Fprintf(w.client, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"tool_execution_error\",\"message\":%q},\"message\":%q}\n\n", err.Error(), err.Error())
 	}
 	w.Flush()
+}
+
+// failureMessage names the error a failed round reported: the message of the
+// protocol error document a handler wrote, or the HTTP status when it wrote
+// none.
+func (w *extensionStreamWriter) failureMessage() string {
+	var envelope struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(w.raw.Bytes(), &envelope) == nil && envelope.Error.Message != "" {
+		return envelope.Error.Message
+	}
+	status := w.failedStatus
+	if status == 0 {
+		status = w.status
+	}
+	return fmt.Sprintf("upstream returned HTTP %d", status)
+}
+
+// failInBand reports a failure that arrived after the stream started. The body
+// the handler wrote for it is a protocol error document, not an SSE frame, so
+// it is decoded and re-framed: appending it verbatim left the client parsing
+// it as a malformed event and treating the turn as a clean end.
+func (w *extensionStreamWriter) failInBand() error {
+	message := w.failureMessage()
+	if w.endpoint == "anthropic.messages" {
+		_, err := fmt.Fprintf(w.client, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":%q}}\n\n", message)
+		w.Flush()
+		return err
+	}
+	_, err := fmt.Fprintf(w.client, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":%q},\"message\":%q}\n\n", message, message)
+	w.Flush()
+	return err
 }
 
 func serveExtensionStream(s *Server, w http.ResponseWriter, r *http.Request, next http.Handler, cfg config.Config, state *extensionRequestState, request map[string]any) bool {
@@ -1101,8 +1168,8 @@ func serveExtensionStream(s *Server, w http.ResponseWriter, r *http.Request, nex
 		roundRequest = markInjectedHostedTools(roundRequest, request, state)
 		stream := newExtensionStreamWriter(w, roundRequest, state)
 		next.ServeHTTP(stream, roundRequest)
-		if stream.status >= 400 {
-			notifyExtensionsError(r.Context(), state, fmt.Sprintf("upstream returned HTTP %d", stream.status))
+		if stream.status >= 400 || stream.failedStatus != 0 {
+			notifyExtensionsError(r.Context(), state, stream.failureMessage())
 			_ = stream.Finish()
 			return false
 		}
@@ -1112,6 +1179,10 @@ func serveExtensionStream(s *Server, w http.ResponseWriter, r *http.Request, nex
 		calls := stream.Calls()
 		serverCalls, clientCalls, err := classifyExtensionCalls(r.Context(), state, calls)
 		if err != nil {
+			stream.Fail(err)
+			return false
+		}
+		if err := prepareMCPApprovals(r.Context(), state, request, stream.ContinueResponse(), serverCalls, state.meta.Endpoint); err != nil {
 			stream.Fail(err)
 			return false
 		}

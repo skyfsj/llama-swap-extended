@@ -8,6 +8,7 @@
   import { defaultForSchema, resolveSchema, schemaFieldLabel, topLevelSchema, type SchemaNode } from "../../lib/configSchema";
   import { pointerToken, record, summarizeChanges, type ConfigChange } from "../../lib/modelConfig";
   import SchemaField from "./SchemaField.svelte";
+import { apiUrl } from "../../lib/apiPath";
 
   interface ConfigSource { path: string; writable: boolean; managed?: boolean; }
   interface ConfigSnapshot {
@@ -161,7 +162,7 @@
   async function validatePatch(patch: unknown[]): Promise<void> {
     saving = true;
     try {
-      const response = await fetch("/api/config/validate", {
+      const response = await fetch(apiUrl("/api/config/validate"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(patch),
@@ -191,7 +192,7 @@
     saving = true;
     error = "";
     try {
-      const response = await fetch("/api/config", {
+      const response = await fetch(apiUrl("/api/config"), {
         method: "PATCH",
         headers: { "Content-Type": "application/json", "If-Match": pendingETag },
         body: JSON.stringify(pendingPatch),

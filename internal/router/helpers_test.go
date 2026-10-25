@@ -91,6 +91,26 @@ type fakeProcess struct {
 	// every fake one throwaway monitor so log-monitor plumbing can be exercised
 	// without each call allocating a new one.
 	logger *logmon.Monitor
+
+	// lifecycleUpdates records every ApplyLifecycleConfig call so tests can
+	// prove a lifecycle-only config edit reached the live process object
+	// instead of being turned into a restart.
+	lifecycleUpdates []config.ModelConfig
+}
+
+// ApplyLifecycleConfig implements process.LifecycleConfigApplier.
+func (f *fakeProcess) ApplyLifecycleConfig(conf config.ModelConfig) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lifecycleUpdates = append(f.lifecycleUpdates, conf)
+}
+
+// lifecycleUpdateCount reports how many lifecycle configs were pushed into
+// this fake.
+func (f *fakeProcess) lifecycleUpdateCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.lifecycleUpdates)
 }
 
 func newFakeProcess(id string) *fakeProcess {

@@ -3,6 +3,7 @@ package core
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // Diagnostic reports something a conversion could not carry. Diagnostics are
@@ -62,6 +63,7 @@ type Part struct {
 	// MediaType and Base64 carry inline media (image/document).
 	MediaType string
 	Base64    string
+	Filename  string
 	// URL addresses media hosted elsewhere.
 	URL string
 
@@ -71,6 +73,13 @@ type Part struct {
 	ToolName      string
 	Arguments     json.RawMessage
 	ArgumentsText string
+	// ToolNamespace is the Responses namespace the call was declared in. The
+	// canonical ToolName is the flattened name a function-calling dialect
+	// sees; the namespace is restored when rendering Responses output.
+	ToolNamespace string
+	// ToolKind distinguishes an ordinary JSON function call from a Responses
+	// custom (freeform) tool call.
+	ToolKind ToolKind
 
 	// IsError marks a tool result as a failure report.
 	IsError bool
@@ -99,12 +108,102 @@ type Message struct {
 	Name  string
 }
 
+// ToolKind discriminates the way a tool is invoked.
+type ToolKind string
+
+const (
+	// ToolKindFunction is a JSON-schema function tool.
+	ToolKindFunction ToolKind = "function"
+	// ToolKindCustom is a Responses custom (freeform) tool. A function-calling
+	// target receives it as a function with one string "input" argument.
+	ToolKindCustom ToolKind = "custom"
+)
+
 // Tool describes a callable function.
 type Tool struct {
 	Name        string
 	Description string
 	Parameters  json.RawMessage
 	Strict      *bool
+	// Namespace is the Responses tool namespace the tool was declared in.
+	// Tool.Name is the flattened upstream name.
+	Namespace string
+	// Kind defaults to ToolKindFunction when empty.
+	Kind ToolKind
+	// Format preserves a custom tool's grammar so Responses output can be
+	// rendered faithfully.
+	Format json.RawMessage
+	// DeferLoading preserves the Responses defer_loading hint.
+	DeferLoading *bool
+}
+
+// ToolBinding records how one flattened function name was derived from a
+// Responses tool declaration.
+type ToolBinding struct {
+	Namespace string
+	Kind      ToolKind
+}
+
+// ToolState maps flattened upstream function names back to the Responses
+// namespace and kind they came from, so a response can restore the call.
+type ToolState struct {
+	Bindings map[string]ToolBinding
+}
+
+// NewToolState returns an empty tool state.
+func NewToolState() *ToolState {
+	return &ToolState{Bindings: map[string]ToolBinding{}}
+}
+
+// Binding reports how an upstream function name was declared.
+func (s *ToolState) Binding(name string) (ToolBinding, bool) {
+	if s == nil {
+		return ToolBinding{}, false
+	}
+	binding, ok := s.Bindings[name]
+	return binding, ok
+}
+
+// Set records how an upstream function name was declared.
+func (s *ToolState) Set(name string, binding ToolBinding) {
+	if s == nil || name == "" {
+		return
+	}
+	if s.Bindings == nil {
+		s.Bindings = map[string]ToolBinding{}
+	}
+	s.Bindings[name] = binding
+}
+
+// Empty reports whether the state carries nothing to restore.
+func (s *ToolState) Empty() bool { return s == nil || len(s.Bindings) == 0 }
+
+// DefaultToolNamespace is the Responses namespace Codex declares its ordinary
+// tools in. Tools there stay at their bare names upstream.
+const DefaultToolNamespace = "functions"
+
+// FlattenToolName returns the upstream function name of a tool declared in a
+// Responses namespace: "<namespace>__<name>", or the bare name for the default
+// namespace.
+func FlattenToolName(namespace, name string) string {
+	if namespace == "" || namespace == DefaultToolNamespace {
+		return name
+	}
+	return namespace + "__" + name
+}
+
+// SplitToolName restores the namespace of a flattened upstream function name.
+// A name that was not flattened returns an empty namespace.
+func SplitToolName(state *ToolState, upstreamName string) (namespace, name string, kind ToolKind) {
+	binding, ok := state.Binding(upstreamName)
+	if !ok {
+		return "", upstreamName, ""
+	}
+	name = upstreamName
+	if binding.Namespace != "" && binding.Namespace != DefaultToolNamespace {
+		name = strings.TrimPrefix(upstreamName, binding.Namespace+"__")
+	}
+	return binding.Namespace, name, binding.Kind
 }
 
 // ToolChoiceMode is the canonical tool-selection policy.
@@ -122,6 +221,16 @@ type ToolChoice struct {
 	Mode ToolChoiceMode
 	// Name is set when Mode is ToolChoiceTool.
 	Name string
+	// Namespace is the Responses tool namespace Name was declared in. Name is
+	// always the flattened upstream name.
+	Namespace string
+	// AllowedNames is the closed set of tools a Responses allowed_tools policy
+	// permits. It is independent of Mode: mode auto with one allowed tool is
+	// not a forced call, and mode required with several tools stays required.
+	// An encoder that cannot express the policy natively must restrict the
+	// tool list to this set, otherwise the model may call a tool the client
+	// never allowed.
+	AllowedNames []string
 	// DisableParallel is honored by dialects that support it.
 	DisableParallel *bool
 }
@@ -149,6 +258,10 @@ type ReasoningConfig struct {
 	// Effort is one of minimal, low, medium, high, xhigh, max (dialect
 	// dependent).
 	Effort string
+	// Level is Gemini's model-native thinkingLevel. It is kept apart from
+	// Effort because a Gemini target must receive it verbatim instead of a
+	// synthesized token budget.
+	Level string
 	// BudgetTokens is the Anthropic-style thinking budget.
 	BudgetTokens *int
 	// Summary asks for a reasoning summary (Responses).
@@ -188,6 +301,11 @@ type Request struct {
 	// Extra preserves dialect-specific fields that have a canonical-ish
 	// meaning and can be forwarded when the target understands them.
 	Extra map[string]json.RawMessage
+
+	// ToolState records flattened Responses tool names. The request side
+	// fills it; the response side uses it to restore namespaces and custom
+	// tool calls.
+	ToolState *ToolState
 }
 
 // Usage is the canonical token accounting.
@@ -273,6 +391,10 @@ type Response struct {
 	Error *StreamError
 	// Metadata is copied from the request when the source exposes it.
 	Metadata map[string]string
+	// ToolState restores flattened Responses tool names and custom kinds.
+	// A source that already speaks Responses fills it while decoding; a
+	// converted response inherits it from the request.
+	ToolState *ToolState
 }
 
 // StreamError is the canonical mid-stream/whole-response error payload.
@@ -281,6 +403,7 @@ type StreamError struct {
 	Code    string
 	Message string
 	Status  string
+	Details map[string]any
 }
 
 // EventKind discriminates a canonical stream event.
@@ -301,6 +424,7 @@ const (
 	EventToolCallDelta
 	// EventToolCallEnd closes the tool call at Index.
 	EventToolCallEnd
+	EventToolExecution
 	// EventUsage reports token accounting.
 	EventUsage
 	// EventFinish closes the response with a canonical finish reason.
@@ -313,12 +437,16 @@ const (
 
 // Event is one canonical stream event.
 type Event struct {
-	Kind           EventKind
-	Text           string
-	Index          int
-	ToolCallID     string
-	ToolName       string
+	Kind       EventKind
+	Text       string
+	Index      int
+	ToolCallID string
+	ToolName   string
+	// ToolNamespace and ToolKind mirror Part's fields for a starting call.
+	ToolNamespace  string
+	ToolKind       ToolKind
 	ArgumentsDelta string
+	Parts          []Part
 	// ThoughtSignature carries Google's opaque signature for the tool call or
 	// reasoning delta it belongs to (Gemini 3 must receive it back verbatim).
 	ThoughtSignature string
@@ -356,6 +484,9 @@ type StreamOptions struct {
 	// EstimateInputTokens seeds source dialects that report input usage in
 	// their first frame (Anthropic message_start).
 	EstimateInputTokens int
+	// Request is the canonical request this stream answers. Responses output
+	// uses it to restore tool namespaces and echo the request's tool policy.
+	Request *Request
 }
 
 // ConvertOptions configures request/response conversion.
@@ -366,6 +497,10 @@ type ConvertOptions struct {
 	Stream *bool
 	// UpstreamFormat is informational, for diagnostics.
 	UpstreamFormat Format
+	// Request is the canonical request this conversion answers. A response
+	// encoder reads its tool state to restore Responses namespaces and its
+	// tool policy to echo it back.
+	Request *Request
 }
 
 // ConversionError is a hard conversion failure (the request cannot be

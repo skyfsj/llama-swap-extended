@@ -3,6 +3,7 @@ import remarkParse from "remark-parse";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import remarkRehype from "remark-rehype";
+import rehypeRaw from "rehype-raw";
 import rehypeKatex from "rehype-katex";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import rehypeStringify from "rehype-stringify";
@@ -139,14 +140,21 @@ export function escapeHtml(text: string): string {
 }
 
 // Sanitizer schema: model output is untrusted (prompt injection can carry
-// markup), so raw HTML and scripts never reach the DOM. The sanitizer runs
-// BEFORE KaTeX and the syntax highlighter. remark-math's intermediate nodes
-// arrive as `code` elements carrying `language-math`/`math-display` classes,
-// which defaultSchema already permits, so no schema extension is needed —
-// and none is added: `className` stays closed on arbitrary elements so model
-// output cannot inject utility classes (UI redressing). KaTeX output itself
-// is not re-sanitized — KaTeX is designed for untrusted input and its
-// `trust` option is off — and highlight.js inserts trusted escaped markup.
+// markup), so scripts, frames, event handlers and javascript:/data: URLs never
+// reach the DOM. rehype-raw parses raw HTML (from remark-rehype's
+// allowDangerousHtml) into real elements BEFORE the sanitizer: without it,
+// hast-util-sanitize has no handling for raw nodes and drops them whole —
+// text included — which made block-wrapped messages like
+// `<system-reminder>…</system-reminder>` render as nothing. With it, allowed
+// elements survive sanitization and unknown tags are stripped while their
+// text stays visible. The sanitizer runs BEFORE KaTeX and the syntax
+// highlighter. remark-math's intermediate nodes arrive as `code` elements
+// carrying `language-math`/`math-display` classes, which defaultSchema already
+// permits, so no schema extension is needed — and none is added: `className`
+// stays closed on arbitrary elements so model output cannot inject utility
+// classes (UI redressing). KaTeX output itself is not re-sanitized — KaTeX is
+// designed for untrusted input and its `trust` option is off — and
+// highlight.js inserts trusted escaped markup.
 const sanitizeSchema = { ...defaultSchema };
 
 // Create the unified processor
@@ -155,6 +163,7 @@ const processor = unified()
   .use(remarkGfm)
   .use(remarkMath)
   .use(remarkRehype, { allowDangerousHtml: true })
+  .use(rehypeRaw)
   .use(rehypeSanitize, sanitizeSchema)
   .use(rehypeKatex)
   .use(rehypeHighlight)

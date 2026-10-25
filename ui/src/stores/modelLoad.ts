@@ -1,5 +1,7 @@
 import { writable } from "svelte/store";
 import { loadModel, unloadSingleModel } from "./api";
+import { t } from "../lib/i18n";
+import { toast } from "../lib/toast";
 import type { Model } from "../lib/types";
 
 export const pendingLoads = writable<Record<string, boolean>>({});
@@ -13,8 +15,12 @@ export async function handleLoadModel(id: string): Promise<void> {
   pendingLoads.update((p) => ({ ...p, [id]: true }));
   try {
     await loadModel(id, controller.signal);
+    // loadModel swallows an abort and resolves, so the only way to tell a
+    // cancelled start from an accepted one is to ask the controller.
+    if (controller.signal.aborted) return;
+    toast.success(t("models.loadStarted", { model: id }));
   } catch (e) {
-    console.error(e);
+    toast.error(t("models.loadFailed", { model: id, message: e instanceof Error ? e.message : String(e) }));
   } finally {
     loadControllers.delete(id);
     pendingLoads.update((p) => {
@@ -46,8 +52,15 @@ export function onToggleLoad(m: Model): void {
   } else if (m.state === "stopped") {
     void handleLoadModel(m.id);
   } else if (m.state === "ready" || m.state === "sleeping") {
-    void unloadSingleModel(m.id);
+    unloadModel(m);
   }
+}
+
+function unloadModel(m: Model): void {
+  void unloadSingleModel(m.id).then(
+    () => toast.success(t("models.unloaded", { model: m.name || m.id })),
+    (error) => toast.error(t("models.unloadFailed", { model: m.name || m.id, message: error instanceof Error ? error.message : String(error) })),
+  );
 }
 
 export function statusDotColor(m: Model | undefined): string {

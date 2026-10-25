@@ -10,3 +10,12 @@
 
 RelayKit is distributed as an unmodified Go module dependency. Its source and
 license are available from the links above.
+
+## Model Context Protocol Go SDK
+
+- Module: `github.com/modelcontextprotocol/go-sdk`
+- Version: `v1.8.0`
+- Code licenses: Apache-2.0 and MIT during the upstream licensing transition.
+- Documentation license: CC-BY-4.0.
+- Source: <https://github.com/modelcontextprotocol/go-sdk/tree/v1.8.0>
+- License text: [upstream license](docs/licenses/modelcontextprotocol-go-sdk.md).

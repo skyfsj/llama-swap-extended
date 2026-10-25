@@ -3,6 +3,7 @@
   import { getModelLoadConflicts, sleepModel, unloadSingleModel, wakeModel } from "../stores/api";
   import { handleLoadModel, isPending, pendingLoads, onToggleLoad } from "../stores/modelLoad";
   import { translate } from "../lib/i18n";
+  import { toast } from "../lib/toast";
   import { Moon, Play, PowerOff, Loader2, Square, Sun } from "@lucide/svelte";
   import ConfirmDialog from "./ConfirmDialog.svelte";
   import * as Dialog from "$lib/components/ui/dialog/index.js";
@@ -133,6 +134,7 @@
     try {
       if (model.state === "sleeping") await wakeModel(model.id);
       else await sleepModel(model.id);
+      toast.success($translate(model.state === "sleeping" ? "models.wakeRequested" : "models.sleepRequested", { model: model.name || model.id }));
     } catch (error) {
       sleepError = error instanceof Error ? error.message : String(error);
     } finally {

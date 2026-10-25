@@ -97,6 +97,10 @@ type HooksConfig struct {
 
 type HookOnStartup struct {
 	Preload []string `yaml:"preload"`
+
+	// Profile is the profile activated on startup and after a configuration
+	// reload. An empty value starts with no profile active.
+	Profile string `yaml:"profile"`
 }
 
 type Store struct {
@@ -163,18 +167,23 @@ func (c *ProfileConfig) UnmarshalYAML(value *yaml.Node) error {
 }
 
 type Config struct {
-	HealthCheckTimeout int               `yaml:"healthCheckTimeout"`
-	LogRequests        bool              `yaml:"logRequests"`
-	LogLevel           string            `yaml:"logLevel"`
-	LogTimeFormat      string            `yaml:"logTimeFormat"`
-	LogToStdout        string            `yaml:"logToStdout"`
-	LogStorage         LogStorageConfig  `yaml:"logStorage"`
-	MetricsMaxInMemory int               `yaml:"metricsMaxInMemory"`
-	Store              *Store            `yaml:"store"`
-	UI                 UIConfig          `yaml:"ui"`
-	Performance        PerformanceConfig `yaml:"performance"`
-	GlobalTTL          int               `yaml:"globalTTL"`
-	UnloadTimeout      int               `yaml:"unloadTimeout"`
+	ProtocolRuntime    ProtocolRuntimeConfig `yaml:"protocolRuntime" json:"protocolRuntime"`
+	HealthCheckTimeout int                   `yaml:"healthCheckTimeout"`
+	LogRequests        bool                  `yaml:"logRequests"`
+	LogLevel           string                `yaml:"logLevel"`
+	LogTimeFormat      string                `yaml:"logTimeFormat"`
+	LogToStdout        string                `yaml:"logToStdout"`
+	LogStorage         LogStorageConfig      `yaml:"logStorage"`
+	MetricsMaxInMemory int                   `yaml:"metricsMaxInMemory"`
+	Store              *Store                `yaml:"store"`
+	UI                 UIConfig              `yaml:"ui"`
+	Performance        PerformanceConfig     `yaml:"performance"`
+	GlobalTTL          int                   `yaml:"globalTTL"`
+	UnloadTimeout      int                   `yaml:"unloadTimeout"`
+
+	// GlobalConcurrencyLimit caps the number of inference requests served at
+	// once across all models. 0 (default) means no limit. See issue #1086.
+	GlobalConcurrencyLimit int `yaml:"globalConcurrencyLimit"`
 
 	// RollbackOnModelStartFailure decides what happens when a model fails to
 	// start with a newly applied configuration. nil (the default) means true,

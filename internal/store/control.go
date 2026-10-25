@@ -146,6 +146,7 @@ type ResponseAffinity struct {
 	Backend    string `json:"backend,omitempty"`
 	Status     string `json:"status,omitempty"`
 	Response   []byte `json:"response,omitempty"`
+	Request    []byte `json:"-"`
 	// IdentityID names the credential that created the row. It scopes reads
 	// and writes so one API key cannot read another key's stored response.
 	// Empty means a row written before the column existed (model-scoped).
@@ -164,12 +165,22 @@ type Price struct {
 	CacheWrite float64   `json:"cacheWrite"`
 	Reasoning  float64   `json:"reasoning"`
 	SyncedAt   time.Time `json:"syncedAt"`
+	// Source distinguishes rows the models.dev sync owns ("catalog") from rows
+	// an operator created or corrected by hand ("operator"). A refresh replaces
+	// only catalog rows; operator rows survive it and shadow a catalog row with
+	// the same identity.
+	Source string `json:"source,omitempty"`
 }
 
 type PricingMeta struct {
 	ETag     string
 	SyncedAt time.Time
 	Source   string
+	// LastError records why the most recent synchronization attempt failed. A
+	// background failure used to reach only the daemon log — and nothing at all
+	// when logToStdout was "none" — so the catalog silently aged while the UI
+	// reported an old timestamp with no explanation.
+	LastError string
 }
 
 const maxPriceIdentityBytes = 512
@@ -1054,11 +1065,10 @@ func (s *Store) ListAuditConversationsPage(ctx context.Context, q AuditQuery) (A
 		}
 		records := make([]AuditConversation, 0, len(page.Data))
 		for _, record := range page.Data {
-			conversation := auditConversation(record)
-			if err := s.attachActivityPhases(normalizeContext(ctx), &conversation); err != nil {
-				return AuditConversationPage{}, err
-			}
-			records = append(records, conversation)
+			records = append(records, auditConversation(record))
+		}
+		if err := s.attachActivityPhasesBatch(normalizeContext(ctx), records); err != nil {
+			return AuditConversationPage{}, err
 		}
 		return AuditConversationPage{
 			Data: records, Page: page.Page, Limit: page.Limit, Total: page.Total, TotalPages: page.TotalPages,
@@ -1397,7 +1407,7 @@ func (s *Store) UpsertResponseAffinity(ctx context.Context, a ResponseAffinity) 
 	if a.ResponseID == "" || a.Model == "" {
 		return errors.New("response affinity requires response id and model")
 	}
-	if len(a.Response) > maxResponseAffinityBytes {
+	if len(a.Response)+len(a.Request) > maxResponseAffinityBytes {
 		return fmt.Errorf("response affinity response exceeds %d bytes", maxResponseAffinityBytes)
 	}
 	now := time.Now()
@@ -1410,8 +1420,16 @@ func (s *Store) UpsertResponseAffinity(ctx context.Context, a ResponseAffinity) 
 	if a.ExpiresAt.IsZero() {
 		a.ExpiresAt = now.Add(defaultResponseAffinityRetention)
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO response_affinity(response_id,model_id,backend,status,response_json,identity_id,expires_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(response_id) DO UPDATE SET model_id=excluded.model_id,backend=excluded.backend,status=excluded.status,response_json=excluded.response_json,identity_id=excluded.identity_id,expires_at=excluded.expires_at,updated_at=excluded.updated_at`, a.ResponseID, a.Model, a.Backend, a.Status, nonNilBytes(a.Response), a.IdentityID, a.ExpiresAt.Unix(), a.CreatedAt.Unix(), a.UpdatedAt.Unix())
-	return err
+	result, err := s.db.ExecContext(ctx, `INSERT INTO response_affinity(response_id,model_id,backend,status,response_json,request_json,identity_id,expires_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(response_id) DO UPDATE SET request_json=CASE WHEN length(excluded.request_json)>0 OR response_affinity.model_id<>excluded.model_id OR response_affinity.identity_id<>excluded.identity_id THEN excluded.request_json ELSE response_affinity.request_json END,model_id=excluded.model_id,backend=excluded.backend,status=excluded.status,response_json=excluded.response_json,identity_id=excluded.identity_id,expires_at=excluded.expires_at,updated_at=excluded.updated_at WHERE length(excluded.response_json)+CASE WHEN length(excluded.request_json)>0 OR response_affinity.model_id<>excluded.model_id OR response_affinity.identity_id<>excluded.identity_id THEN length(excluded.request_json) ELSE length(response_affinity.request_json) END<=?`, a.ResponseID, a.Model, a.Backend, a.Status, nonNilBytes(a.Response), nonNilBytes(a.Request), a.IdentityID, a.ExpiresAt.Unix(), a.CreatedAt.Unix(), a.UpdatedAt.Unix(), maxResponseAffinityBytes)
+	if err != nil {
+		return err
+	}
+	if count, err := result.RowsAffected(); err != nil {
+		return err
+	} else if count == 0 {
+		return fmt.Errorf("response affinity response exceeds %d bytes", maxResponseAffinityBytes)
+	}
+	return nil
 }
 
 func (s *Store) GetResponseAffinity(ctx context.Context, id string, now time.Time) (ResponseAffinity, bool, error) {
@@ -1427,7 +1445,7 @@ func (s *Store) GetResponseAffinity(ctx context.Context, id string, now time.Tim
 	}
 	var a ResponseAffinity
 	var expires, created, updated int64
-	err := s.db.QueryRowContext(ctx, `SELECT response_id,model_id,backend,status,response_json,identity_id,expires_at,created_at,updated_at FROM response_affinity WHERE response_id=?`, id).Scan(&a.ResponseID, &a.Model, &a.Backend, &a.Status, &a.Response, &a.IdentityID, &expires, &created, &updated)
+	err := s.db.QueryRowContext(ctx, `SELECT response_id,model_id,backend,status,response_json,request_json,identity_id,expires_at,created_at,updated_at FROM response_affinity WHERE response_id=?`, id).Scan(&a.ResponseID, &a.Model, &a.Backend, &a.Status, &a.Response, &a.Request, &a.IdentityID, &expires, &created, &updated)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ResponseAffinity{}, false, nil
 	}
@@ -1538,6 +1556,12 @@ func (s *Store) ListRuntimeOperations(ctx context.Context, runtimeName string, l
 // UpsertPrice stores one exact provider/model price. Rates are expressed in
 // currency units per million tokens. A NULL rate is represented as zero by the
 // public type and means that component is unavailable for estimation.
+//
+// The row always lands with source='operator': a manual row is how an operator
+// prices a model the catalog does not list, or corrects a rate the catalog gets
+// wrong, so it wins over whatever a previous sync stored under the same
+// identity and the next refresh leaves it alone. The ETag stays valid — catalog
+// rows are unchanged by this edit, and an operator row is never "restored" over.
 func (s *Store) UpsertPrice(ctx context.Context, price Price) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -1551,21 +1575,35 @@ func (s *Store) UpsertPrice(ctx context.Context, price Price) error {
 	if price.SyncedAt.IsZero() {
 		price.SyncedAt = time.Now()
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO pricing_catalog
-		(provider,model,input_per_million,output_per_million,cache_read_per_million,cache_write_per_million,reasoning_per_million,synced_at)
-		VALUES(?,?,?,?,?,?,?,?)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin price upsert: %w", err)
+	}
+	rollback := func(cause error) error {
+		_ = tx.Rollback()
+		return cause
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO pricing_catalog
+		(provider,model,input_per_million,output_per_million,cache_read_per_million,cache_write_per_million,reasoning_per_million,synced_at,source)
+		VALUES(?,?,?,?,?,?,?,?,'operator')
 		ON CONFLICT(provider,model) DO UPDATE SET input_per_million=excluded.input_per_million,
 		output_per_million=excluded.output_per_million,cache_read_per_million=excluded.cache_read_per_million,
 		cache_write_per_million=excluded.cache_write_per_million,reasoning_per_million=excluded.reasoning_per_million,
-		synced_at=excluded.synced_at`, price.Provider, price.Model, price.Input, price.Output,
-		price.CacheRead, price.CacheWrite, price.Reasoning, price.SyncedAt.Unix())
-	return err
+		synced_at=excluded.synced_at,source='operator'`, price.Provider, price.Model, price.Input, price.Output,
+		price.CacheRead, price.CacheWrite, price.Reasoning, price.SyncedAt.Unix()); err != nil {
+		return rollback(err)
+	}
+	return tx.Commit()
 }
 
 // ReplacePricingSnapshot atomically replaces the models.dev catalog and its
 // ETag metadata. Keeping the delete, inserts, and metadata update in one
 // transaction means a cancelled or failed sync leaves the last successful
 // snapshot intact instead of exposing a partially refreshed price table.
+//
+// Only catalog rows are replaced: rows an operator wrote by hand survive the
+// refresh, and a catalog entry whose identity an operator row already holds is
+// skipped rather than overwriting the operator's rate.
 func (s *Store) ReplacePricingSnapshot(ctx context.Context, prices []Price, meta PricingMeta) error {
 	if s == nil || s.db == nil {
 		return errors.New("store is not initialized")
@@ -1584,12 +1622,13 @@ func (s *Store) ReplacePricingSnapshot(ctx context.Context, prices []Price, meta
 		_ = tx.Rollback()
 		return cause
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM pricing_catalog`); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM pricing_catalog WHERE source='catalog'`); err != nil {
 		return rollback(fmt.Errorf("clear pricing catalog: %w", err))
 	}
 	stmt, err := tx.PrepareContext(ctx, `INSERT INTO pricing_catalog
-		(provider,model,input_per_million,output_per_million,cache_read_per_million,cache_write_per_million,reasoning_per_million,synced_at)
-		VALUES(?,?,?,?,?,?,?,?)`)
+		(provider,model,input_per_million,output_per_million,cache_read_per_million,cache_write_per_million,reasoning_per_million,synced_at,source)
+		VALUES(?,?,?,?,?,?,?,?,'catalog')
+		ON CONFLICT(provider,model) DO NOTHING`)
 	if err != nil {
 		return rollback(fmt.Errorf("prepare pricing snapshot: %w", err))
 	}
@@ -1609,7 +1648,7 @@ func (s *Store) ReplacePricingSnapshot(ctx context.Context, prices []Price, meta
 	if err := stmt.Close(); err != nil {
 		return rollback(fmt.Errorf("close pricing snapshot: %w", err))
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO pricing_meta(id,etag,synced_at,source) VALUES(1,?,?,?) ON CONFLICT(id) DO UPDATE SET etag=excluded.etag,synced_at=excluded.synced_at,source=excluded.source`, meta.ETag, meta.SyncedAt.Unix(), meta.Source); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO pricing_meta(id,etag,synced_at,source,last_error) VALUES(1,?,?,?,?) ON CONFLICT(id) DO UPDATE SET etag=excluded.etag,synced_at=excluded.synced_at,source=excluded.source,last_error=excluded.last_error`, meta.ETag, meta.SyncedAt.Unix(), meta.Source, meta.LastError); err != nil {
 		return rollback(fmt.Errorf("update pricing metadata: %w", err))
 	}
 	if err := tx.Commit(); err != nil {
@@ -1677,7 +1716,7 @@ func (s *Store) GetPricingMeta(ctx context.Context) (PricingMeta, error) {
 	}
 	var meta PricingMeta
 	var synced int64
-	err := s.db.QueryRowContext(ctx, `SELECT etag,synced_at,source FROM pricing_meta WHERE id=1`).Scan(&meta.ETag, &synced, &meta.Source)
+	err := s.db.QueryRowContext(ctx, `SELECT etag,synced_at,source,last_error FROM pricing_meta WHERE id=1`).Scan(&meta.ETag, &synced, &meta.Source, &meta.LastError)
 	if errors.Is(err, sql.ErrNoRows) {
 		return meta, nil
 	}
@@ -1697,7 +1736,7 @@ func (s *Store) SetPricingMeta(ctx context.Context, meta PricingMeta) error {
 	if err := s.ensureDB(); err != nil {
 		return err
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO pricing_meta(id,etag,synced_at,source) VALUES(1,?,?,?) ON CONFLICT(id) DO UPDATE SET etag=excluded.etag,synced_at=excluded.synced_at,source=excluded.source`, meta.ETag, meta.SyncedAt.Unix(), meta.Source)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO pricing_meta(id,etag,synced_at,source,last_error) VALUES(1,?,?,?,?) ON CONFLICT(id) DO UPDATE SET etag=excluded.etag,synced_at=excluded.synced_at,source=excluded.source,last_error=excluded.last_error`, meta.ETag, meta.SyncedAt.Unix(), meta.Source, meta.LastError)
 	return err
 }
 
@@ -1718,7 +1757,7 @@ func (s *Store) FindPrices(ctx context.Context, provider, model string) ([]Price
 		where += " AND model=?"
 		args = append(args, model)
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT provider,model,input_per_million,output_per_million,cache_read_per_million,cache_write_per_million,reasoning_per_million,synced_at FROM pricing_catalog WHERE `+where+` ORDER BY provider,model`, args...)
+	rows, err := s.db.QueryContext(ctx, `SELECT provider,model,input_per_million,output_per_million,cache_read_per_million,cache_write_per_million,reasoning_per_million,synced_at,source FROM pricing_catalog WHERE `+where+` ORDER BY provider,model`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1727,7 +1766,7 @@ func (s *Store) FindPrices(ctx context.Context, provider, model string) ([]Price
 	for rows.Next() {
 		var p Price
 		var synced int64
-		if err := rows.Scan(&p.Provider, &p.Model, &p.Input, &p.Output, &p.CacheRead, &p.CacheWrite, &p.Reasoning, &synced); err != nil {
+		if err := rows.Scan(&p.Provider, &p.Model, &p.Input, &p.Output, &p.CacheRead, &p.CacheWrite, &p.Reasoning, &synced, &p.Source); err != nil {
 			return nil, err
 		}
 		p.SyncedAt = time.Unix(synced, 0)
@@ -1742,6 +1781,13 @@ func (s *Store) UsageSummary(ctx context.Context, filter ActivityFilter) (UsageS
 	ctx = normalizeContext(ctx)
 	if err := s.ensureDB(); err != nil {
 		return UsageSummary{}, err
+	}
+	if rollupQuery, ok := rollupFilterFor(filter); ok && s.rollupReady(ctx) {
+		if folded, rollupErr := s.rollupAggregates(ctx, rollupQuery); rollupErr == nil {
+			summary := usageSummaryFromAggregate(folded.total)
+			summary.ByModel = modelUsageRows(folded.byModel)
+			return summary, nil
+		}
 	}
 	where, args := activityWhere(filter)
 	aggregates, err := s.aggregateActivity(ctx, where, args)
@@ -1781,6 +1827,19 @@ type activityAggregate struct {
 	ReasoningTokens     int
 	EstimatedCost       float64
 	CostEstimated       bool
+
+	// Duration and first-token sums with their counts, so the average stays
+	// exact instead of being averaged from averages. Averages of averages drift
+	// as buckets are folded together; sums and counts do not.
+	DurationMsSum   int
+	DurationCount   int
+	FirstTokenMsSum int
+	FirstTokenCount int
+	// Speed sums with counts for the same reason.
+	PromptSpeedSum       float64
+	PromptSpeedCount     int
+	GenerationSpeedSum   float64
+	GenerationSpeedCount int
 }
 
 type activityAggregates struct {

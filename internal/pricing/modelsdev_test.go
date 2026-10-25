@@ -309,3 +309,80 @@ func (r *repeatingPricingReader) Read(p []byte) (int, error) {
 	r.remaining -= n
 	return int(n), nil
 }
+
+// TestSyncRecordsAndClearsLastError pins the failure an operator can actually
+// see. A background failure used to land only in the daemon log — and nowhere at
+// all when logToStdout was "none" — so the catalog aged silently while the panel
+// reported an old timestamp with no explanation.
+func TestSyncRecordsAndClearsLastError(t *testing.T) {
+	st, err := store.New("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer srv.Close()
+	s := &Syncer{Store: st, URL: srv.URL}
+
+	if _, err := s.Sync(ctx); err == nil {
+		t.Fatal("a 502 upstream must fail the sync")
+	}
+	meta, err := st.GetPricingMeta(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.LastError == "" {
+		t.Fatal("LastError is empty; the operator has no way to learn why the catalog is stale")
+	}
+
+	// A later success has to clear it, or the panel would keep reporting a
+	// failure that no longer applies.
+	ok := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"v1"`)
+		_, _ = w.Write([]byte(`{"provider":{"models":{"m":{"cost":{"input":1,"output":2}}}}}`))
+	}))
+	defer ok.Close()
+	s.URL = ok.URL
+	if _, err := s.Sync(ctx); err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+	meta, err = st.GetPricingMeta(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.LastError != "" {
+		t.Errorf("LastError=%q want empty after a successful sync", meta.LastError)
+	}
+}
+
+// TestSyncBoundsTheRecordedError pins that a verbose transport error cannot be
+// stored in full. Proxy and certificate failures embed URLs and chains that the
+// panel has no room for.
+func TestSyncBoundsTheRecordedError(t *testing.T) {
+	st, err := store.New("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+
+	// An unroutable address produces a long dial error.
+	s := &Syncer{Store: st, URL: "http://127.0.0.1:1/"}
+	if _, err := s.Sync(ctx); err == nil {
+		t.Fatal("dialing a closed port must fail")
+	}
+	meta, err := st.GetPricingMeta(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(meta.LastError) > maxPricingErrorBytes {
+		t.Errorf("LastError is %d bytes, want at most %d", len(meta.LastError), maxPricingErrorBytes)
+	}
+	if meta.LastError == "" {
+		t.Error("LastError is empty")
+	}
+}

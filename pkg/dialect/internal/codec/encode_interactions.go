@@ -225,6 +225,9 @@ func encodeInteractionsAssistantSteps(parts []Part, diagnostics *[]Diagnostic) [
 			if part.ToolCallID != "" {
 				step["id"] = part.ToolCallID
 			}
+			if part.ThoughtSignature != "" {
+				step["signature"] = part.ThoughtSignature
+			}
 			steps = append(steps, step)
 		case PartImage, PartDocument, PartAudio, PartVideo:
 			media := encodeInteractionsMedia(part)
@@ -424,6 +427,7 @@ func decodeInteractionsResponse(body []byte, diagnostics *[]Diagnostic) (*Respon
 			response.Parts = append(response.Parts, Part{
 				Kind: PartToolCall, ToolCallID: stringAt(step, "id"), ToolName: stringAt(step, "name"),
 				Arguments: arguments, ArgumentsText: string(arguments),
+				ThoughtSignature: stringAt(step, "signature"),
 			})
 		case "function_result":
 			// A result the provider executed itself (server-side tool).

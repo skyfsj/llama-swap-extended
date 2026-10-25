@@ -1,0 +1,31 @@
+# 硅基流动 SiliconFlow 账户余额。
+#
+#   GET https://api.siliconflow.cn/v1/user/info
+#   Authorization: Bearer <API Key>
+#
+#   {"code":20000,"status":true,"message":"OK","data":{
+#     "balance":"12.34","chargeBalance":"10.00","totalBalance":"12.34", ...}}
+#
+# 返回的是字符串，卡片按原样显示；金额单位为人民币（CNY）。
+id: siliconflow
+name: SiliconFlow
+category: official
+description: 硅基流动 SiliconFlow：总余额、充值余额与赠送余额（CNY，接口返回字符串）。
+endpoint: https://api.siliconflow.cn/v1/user/info
+method: GET
+auth:
+  style: bearer
+timeoutSeconds: 15
+extras:
+  - id: total
+    label: 总余额
+    path: data.totalBalance
+    suffix: " CNY"
+  - id: charge
+    label: 充值余额
+    path: data.chargeBalance
+    suffix: " CNY"
+  - id: balance
+    label: 赠送余额
+    path: data.balance
+    suffix: " CNY"

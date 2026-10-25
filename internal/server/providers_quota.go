@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -31,6 +31,9 @@ const (
 	// quotaMissingStatus marks a window whose path was absent from the
 	// response, so a wrong mapping is visible instead of silently reading 0%.
 	quotaMissingStatus = "missing"
+	// quotaUnlimitedStatus marks an amount window whose limit is zero: the key
+	// has no allowance cap, so a used share does not exist.
+	quotaUnlimitedStatus = "unlimited"
 )
 
 // quotaWindowSnapshot is one usage window of a credential.
@@ -43,6 +46,11 @@ type quotaWindowSnapshot struct {
 	RemainingPercent int    `json:"remainingPercent"`
 	Status           string `json:"status,omitempty"`
 	ResetsAt         string `json:"resetsAt,omitempty"`
+	// Used and Limit carry the absolute amounts of an amount window, so the
+	// card can show "1.25 / 5 USD" next to the bar instead of a bare
+	// percentage. Both are zero for percentage windows.
+	Used  float64 `json:"used,omitempty"`
+	Limit float64 `json:"limit,omitempty"`
 }
 
 // quotaExtraSnapshot is one extra scalar row (credit balance, counters).
@@ -50,6 +58,8 @@ type quotaExtraSnapshot struct {
 	ID    string `json:"id"`
 	Label string `json:"label"`
 	Value any    `json:"value"`
+	// Suffix is appended to the rendered value (" USD", "%", ...).
+	Suffix string `json:"suffix,omitempty"`
 }
 
 // credentialQuota is the display snapshot for one credential.
@@ -133,8 +143,11 @@ type credentialTarget struct {
 }
 
 // quotaTargets lists the distinct credentials of a provider (optionally just
-// one key). A provider's credentials appear on every route; adapters may add
-// their own, so the result is de-duplicated by credential id.
+// one key). It reads the gateway's per-provider credential set rather than the
+// routes: a key disabled in configuration never becomes a route member, yet
+// its subscription still exists and its balance is exactly what an operator
+// wants to watch before re-enabling it. The same holds for a provider that is
+// switched off entirely.
 func (s *Server) quotaTargets(providerID, keyID string) []credentialTarget {
 	gw := s.currentGateway()
 	if gw == nil {
@@ -145,24 +158,14 @@ func (s *Server) quotaTargets(providerID, keyID string) []credentialTarget {
 	if !ok || provider.Quota == nil {
 		return nil
 	}
-	seen := make(map[string]struct{})
-	targets := make([]credentialTarget, 0, len(provider.ApiKeys))
-	for _, route := range gw.AllRoutes() {
-		if route.ProviderID != providerID {
+	credentials := gw.ProviderCredentials(providerID)
+	targets := make([]credentialTarget, 0, len(credentials))
+	for _, cred := range credentials {
+		if keyID != "" && cred.ID != keyID {
 			continue
 		}
-		for _, cred := range route.Credentials() {
-			if keyID != "" && cred.ID != keyID {
-				continue
-			}
-			if _, duplicate := seen[cred.ID]; duplicate {
-				continue
-			}
-			seen[cred.ID] = struct{}{}
-			targets = append(targets, credentialTarget{providerID: providerID, provider: provider, cred: cred})
-		}
+		targets = append(targets, credentialTarget{providerID: providerID, provider: provider, cred: cred})
 	}
-	sort.Slice(targets, func(i, j int) bool { return targets[i].cred.ID < targets[j].cred.ID })
 	return targets
 }
 
@@ -212,7 +215,18 @@ func (s *Server) handleAPIProvidersQuotasRefresh(w http.ResponseWriter, r *http.
 	}
 	targets := s.quotaTargets(providerID, strings.TrimSpace(req.KeyID))
 	if len(targets) == 0 {
-		swaputil.SendResponse(w, r, http.StatusNotFound, fmt.Sprintf("provider %s has quota refresh disabled or no matching credential", providerID))
+		// The three ways to get here are worth distinguishing: an operator
+		// staring at "no matching credential" cannot tell a missing quota
+		// block from a typo in the key id.
+		provider, exists := s.currentConfig().Providers[providerID]
+		switch {
+		case !exists:
+			swaputil.SendResponse(w, r, http.StatusNotFound, fmt.Sprintf("unknown provider %s", providerID))
+		case provider.Quota == nil:
+			swaputil.SendResponse(w, r, http.StatusNotFound, fmt.Sprintf("provider %s has no quota mapping configured", providerID))
+		default:
+			swaputil.SendResponse(w, r, http.StatusNotFound, fmt.Sprintf("provider %s has no configured credential with id %q", providerID, strings.TrimSpace(req.KeyID)))
+		}
 		return
 	}
 
@@ -269,10 +283,23 @@ func (s *Server) fetchCredentialQuota(ctx context.Context, target credentialTarg
 		return snapshot, fmt.Errorf("credential has no usable value (unset environment variable)")
 	}
 
+	if quota.HasScript() {
+		outcome, err := s.runQuotaScript(ctx, target, quota.Script)
+		if err != nil {
+			return snapshot, err
+		}
+		snapshot.Windows = outcome.windows
+		snapshot.Extras = outcome.extras
+		snapshot.Error = outcome.invalidMessage
+		snapshot.FetchedAt = time.Now()
+		return snapshot, nil
+	}
+
 	ctx, cancel := context.WithTimeout(ctx, quota.Timeout())
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, quota.Endpoint, nil)
+	endpoint := quota.EndpointFor(quotaBaseURL(target.provider))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return snapshot, fmt.Errorf("invalid quota endpoint: %w", err)
 	}
@@ -319,32 +346,78 @@ func (s *Server) fetchCredentialQuota(ctx context.Context, target credentialTarg
 		return snapshot, fmt.Errorf("quota endpoint returned status %d: %s", resp.StatusCode, snippet)
 	}
 
-	windows, err := parseQuotaWindows(quota, body)
+	windows, matchedWindows, err := parseQuotaWindows(quota, body)
 	if err != nil {
 		return snapshot, err
 	}
+	extras := parseQuotaExtras(quota, body)
+	if matchedWindows == 0 && len(extras) == 0 && (len(quota.Windows) > 0 || len(quota.Extras) > 0) {
+		// A response that matched nothing at all means the mapping and the
+		// endpoint disagree (or the endpoint answered with an error envelope
+		// under HTTP 200). Reporting it beats rendering an empty card.
+		return snapshot, fmt.Errorf("quota response contained none of the configured fields (%s)", describeQuotaPaths(quota))
+	}
 	snapshot.Windows = windows
-	snapshot.Extras = parseQuotaExtras(quota, body)
+	snapshot.Extras = extras
 	snapshot.FetchedAt = time.Now()
 	return snapshot, nil
 }
 
+// quotaBaseURL is the provider's own base URL: the first adapter endpoint, or
+// the single-adapter shorthand. A provider has at least one of the two, and
+// configuration validation already proved it is absolute.
+func quotaBaseURL(provider config.ProviderConfig) string {
+	adapters := provider.EffectiveAdapters()
+	if len(adapters) > 0 {
+		return adapters[0].Endpoint
+	}
+	return provider.Endpoint
+}
+
+// describeQuotaPaths lists the configured paths for the "nothing matched"
+// error, so a broken mapping is diagnosable from the card.
+func describeQuotaPaths(quota *config.QuotaConfig) string {
+	paths := make([]string, 0, len(quota.Windows)+len(quota.Extras))
+	for _, window := range quota.Windows {
+		paths = append(paths, window.Path)
+	}
+	for _, extra := range quota.Extras {
+		paths = append(paths, extra.Path)
+	}
+	return strings.Join(paths, ", ")
+}
+
 // parseQuotaWindows extracts the configured windows from a quota response.
-func parseQuotaWindows(quota *config.QuotaConfig, body []byte) ([]quotaWindowSnapshot, error) {
+// matched counts the windows whose mapping actually resolved, which is what
+// distinguishes "this response has nothing for this mapping" from a response
+// whose fields are simply zero.
+func parseQuotaWindows(quota *config.QuotaConfig, body []byte) ([]quotaWindowSnapshot, int, error) {
 	windows := make([]quotaWindowSnapshot, 0, len(quota.Windows))
 	matched := 0
 	for _, spec := range quota.Windows {
 		window := quotaWindowSnapshot{ID: spec.ID, Label: spec.Label}
 		result := gjson.GetBytes(body, spec.Path)
 		if !result.Exists() {
+			if spec.Optional {
+				// The upstream is in another mode (wallet vs subscription);
+				// the field is expected to be absent, so showing "missing"
+				// would report a fault that is not there.
+				continue
+			}
 			window.Status = quotaMissingStatus
 			windows = append(windows, window)
 			continue
 		}
 		matched++
-		percent := int(result.Get(spec.Percent).Int())
-		if spec.PercentMode == "remaining" {
-			percent = 100 - percent
+
+		var percent int
+		if spec.Limit != "" {
+			percent = applyAmountWindow(quota, spec, result, &window)
+		} else {
+			percent = int(result.Get(spec.Percent).Int())
+			if spec.PercentMode == "remaining" {
+				percent = 100 - percent
+			}
 		}
 		switch {
 		case percent < 0:
@@ -362,23 +435,28 @@ func parseQuotaWindows(quota *config.QuotaConfig, body []byte) ([]quotaWindowSna
 		}
 		windows = append(windows, window)
 	}
-	if matched == 0 {
-		// A balance-style mapping declares extras only: there is no window to
-		// match, and that is a success rather than a mapping error.
-		if len(quota.Windows) == 0 {
-			return windows, nil
-		}
-		return nil, fmt.Errorf("quota response contained none of the configured windows (%s)", strings.Join(windowPaths(quota), ", "))
-	}
-	return windows, nil
+	return windows, matched, nil
 }
 
-func windowPaths(quota *config.QuotaConfig) []string {
-	paths := make([]string, 0, len(quota.Windows))
-	for _, spec := range quota.Windows {
-		paths = append(paths, spec.Path)
+// applyAmountWindow fills an amount window from its used/limit counters and
+// returns the used share. Aggregators (new-api, sub2api) publish absolute
+// amounts rather than a percentage, so the ratio has to be computed here.
+func applyAmountWindow(quota *config.QuotaConfig, spec config.QuotaWindow, result gjson.Result, window *quotaWindowSnapshot) int {
+	limit := result.Get(spec.Limit).Float()
+	used := result.Get(spec.Percent).Float()
+	if quota.DivideBy > 0 {
+		limit /= quota.DivideBy
+		used /= quota.DivideBy
 	}
-	return paths
+	window.Used = used
+	window.Limit = limit
+	if limit <= 0 {
+		// No cap configured: an "unlimited" key is not a 0%-used key, and
+		// dividing by zero would report 100% used.
+		window.Status = quotaUnlimitedStatus
+		return 0
+	}
+	return int(math.Round(used / limit * 100))
 }
 
 func parseQuotaExtras(quota *config.QuotaConfig, body []byte) []quotaExtraSnapshot {
@@ -391,7 +469,29 @@ func parseQuotaExtras(quota *config.QuotaConfig, body []byte) []quotaExtraSnapsh
 		if !result.Exists() {
 			continue
 		}
-		extras = append(extras, quotaExtraSnapshot{ID: spec.ID, Label: spec.Label, Value: result.Value()})
+		value := result.Value()
+		if spec.Format == "unix" || spec.Format == "unixMs" {
+			seconds := result.Int()
+			if spec.Format == "unixMs" {
+				seconds /= 1000
+			}
+			if seconds <= 0 {
+				// Timestamp zero means "never expires", which is not a date;
+				// printing 1970 would only confuse the card.
+				continue
+			}
+			value = time.Unix(seconds, 0).UTC().Format(time.RFC3339)
+		}
+		divideBy := spec.DivideBy
+		if divideBy == 0 {
+			divideBy = quota.DivideBy
+		}
+		extras = append(extras, quotaExtraSnapshot{
+			ID:     spec.ID,
+			Label:  spec.Label,
+			Value:  config.ScaleQuotaValue(value, divideBy),
+			Suffix: spec.Suffix,
+		})
 	}
 	return extras
 }
@@ -401,7 +501,9 @@ func parseQuotaExtras(quota *config.QuotaConfig, body []byte) []quotaExtraSnapsh
 // its reset (or a fallback cooldown). Disabled enforcement always releases.
 func (s *Server) applyQuotaEnforcement(target credentialTarget, snapshot credentialQuota) {
 	quota := target.provider.Quota
-	if quota == nil || !quota.Enforce.Enabled {
+	if quota == nil || !quota.Enforce.Enabled || target.cred.Disabled {
+		// A disabled key is not schedulable, so a park would only show up as
+		// "额度已满" on a card whose key is off anyway.
 		target.cred.ClearQuotaCooldown()
 		return
 	}
@@ -492,4 +594,134 @@ func (s *Server) refreshDueQuotas() {
 		}
 	}
 	s.quota.prune(valid)
+}
+
+// handleAPIProvidersQuotasTest runs one usage script without caching the
+// result or touching enforcement. It backs the editor's "test script" button,
+// so a draft can be exercised before it is saved (and before the provider even
+// has a quota block).
+func (s *Server) handleAPIProvidersQuotasTest(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<16))
+	if err != nil {
+		swaputil.SendResponse(w, r, http.StatusBadRequest, "could not read request body")
+		return
+	}
+	var req struct {
+		ProviderID string `json:"providerID"`
+		KeyID      string `json:"keyID,omitempty"`
+		Script     string `json:"script,omitempty"`
+		Preset     string `json:"preset,omitempty"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		swaputil.SendResponse(w, r, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	providerID := strings.TrimSpace(req.ProviderID)
+	if providerID == "" {
+		swaputil.SendResponse(w, r, http.StatusBadRequest, "providerID is required")
+		return
+	}
+	provider, ok := s.currentConfig().Providers[providerID]
+	if !ok {
+		swaputil.SendResponse(w, r, http.StatusNotFound, fmt.Sprintf("unknown provider %s", providerID))
+		return
+	}
+
+	script := strings.TrimSpace(req.Script)
+	if script == "" && strings.TrimSpace(req.Preset) != "" {
+		preset, ok := config.QuotaPresetByID(strings.TrimSpace(req.Preset))
+		if !ok {
+			swaputil.SendResponse(w, r, http.StatusNotFound, fmt.Sprintf("unknown quota preset %q", req.Preset))
+			return
+		}
+		script = preset.Script
+	}
+	if script == "" && provider.Quota != nil {
+		script = provider.Quota.Script
+	}
+	if strings.TrimSpace(script) == "" {
+		swaputil.SendResponse(w, r, http.StatusBadRequest, "no script to run")
+		return
+	}
+
+	gw := s.currentGateway()
+	if gw == nil {
+		swaputil.SendResponse(w, r, http.StatusServiceUnavailable, "no provider gateway active")
+		return
+	}
+	keyID := strings.TrimSpace(req.KeyID)
+	var credential *gateway.Credential
+	for _, cred := range gw.ProviderCredentials(providerID) {
+		if keyID == "" || cred.ID == keyID {
+			credential = cred
+			break
+		}
+	}
+	if credential == nil {
+		swaputil.SendResponse(w, r, http.StatusNotFound, fmt.Sprintf("provider %s has no configured credential with id %q", providerID, keyID))
+		return
+	}
+
+	// A draft may exist before the quota block does; the script still needs a
+	// timeout and the provider's base URL, so run against a copy.
+	quota := config.QuotaConfig{Script: script, TimeoutSeconds: config.QuotaDefaultTimeoutSeconds}
+	if provider.Quota != nil {
+		quota = *provider.Quota
+		quota.Script = script
+	}
+	provider.Quota = &quota
+	target := credentialTarget{providerID: providerID, provider: provider, cred: credential}
+
+	outcome, runErr := s.runQuotaScript(r.Context(), target, script)
+	snapshot := credentialQuota{
+		ProviderID: providerID,
+		KeyID:      credential.ID,
+		Windows:    outcome.windows,
+		Extras:     outcome.extras,
+		Error:      outcome.invalidMessage,
+		FetchedAt:  time.Now(),
+	}
+	if runErr != nil {
+		snapshot.Error = runErr.Error()
+		snapshot.FetchedAt = time.Time{}
+	}
+	writeJSON(w, struct {
+		Snapshot credentialQuota     `json:"snapshot"`
+		Request  *quotaScriptRequest `json:"request,omitempty"`
+		Error    string              `json:"error,omitempty"`
+	}{
+		Snapshot: snapshot,
+		Request:  maskQuotaScriptRequest(outcome.request),
+		Error:    snapshot.Error,
+	})
+}
+
+// handleAPIProviderQuotaPreset returns one built-in preset including its
+// script, so the editor can load a script preset's source for adaptation.
+func (s *Server) handleAPIProviderQuotaPreset(w http.ResponseWriter, r *http.Request) {
+	detail, ok := config.QuotaPresetDetailByID(r.PathValue("id"))
+	if !ok {
+		swaputil.SendResponse(w, r, http.StatusNotFound, fmt.Sprintf("unknown quota preset %q", r.PathValue("id")))
+		return
+	}
+	writeJSON(w, detail)
+}
+
+// maskQuotaScriptRequest hides credential material from the test panel's
+// request echo.
+func maskQuotaScriptRequest(request *quotaScriptRequest) *quotaScriptRequest {
+	if request == nil {
+		return nil
+	}
+	masked := *request
+	masked.Headers = make(map[string]string, len(request.Headers))
+	for name, value := range request.Headers {
+		switch strings.ToLower(name) {
+		case "authorization", "x-api-key", "x-goog-api-key", "api-key", "cookie":
+			masked.Headers[name] = "[redacted]"
+		default:
+			masked.Headers[name] = value
+		}
+	}
+	return &masked
 }

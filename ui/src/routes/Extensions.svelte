@@ -175,24 +175,38 @@
     busy = true;
     error = "";
     const targetState = batchActionType === "enable";
+    const failed: string[] = [];
+    let attempted = 0;
     try {
       for (const item of items) {
         if (item.manifest.enabled !== targetState && item.etag) {
+          attempted++;
           try {
             const current = await getExtension(item.manifest.id);
             current.manifest.enabled = targetState;
             await saveExtension(current);
-          } catch {
-            // continue with others
+          } catch (cause) {
+            // Keep going so one stale entry cannot block the rest, but never
+            // report the whole batch as done when some entries failed.
+            failed.push(`${item.manifest.id}: ${cause instanceof Error ? cause.message : String(cause)}`);
           }
         }
       }
       await refresh();
-      toast.success(
-        targetState
-          ? $translate("extensions.workspace.batchEnable")
-          : $translate("extensions.workspace.batchDisable"),
-      );
+      if (failed.length > 0) {
+        error = $translate("extensions.workspace.batchFailed", {
+          failed: failed.length,
+          total: attempted,
+          details: failed.join("; "),
+        });
+        toast.warning($translate("extensions.workspace.batchPartial", { failed: failed.length, total: attempted }));
+      } else {
+        toast.success(
+          targetState
+            ? $translate("extensions.workspace.batchEnable")
+            : $translate("extensions.workspace.batchDisable"),
+        );
+      }
     } catch (cause) {
       error = String(cause);
     } finally {
@@ -224,6 +238,7 @@
     try {
       const result = await duplicateExtension(duplicateTarget.manifest.id, duplicateId.trim());
       duplicateOpen = false;
+      toast.success($translate("extensions.duplicatedToast", { id: result.manifest.id }));
       await push(`/extensions/${encodeURIComponent(result.manifest.id)}/editor`);
     } catch (cause) {
       error = String(cause);
@@ -1099,6 +1114,11 @@
       {#if settingsLoading}
         <p role="status" class="p-8 text-center text-sm text-muted-foreground">{$translate("common.loading")}</p>
       {:else if settingsDraft}
+        {#if settingsError}
+          <!-- A save failure lands here: the draft survives, so the error must
+               not be hidden behind the form the way a load failure would be. -->
+          <p role="alert" class="mb-3 rounded-md bg-destructive/10 p-3 text-sm text-destructive">{settingsError}</p>
+        {/if}
         <ExtensionConfiguration
           bind:draft={settingsDraft}
           errors={settingsErrors}

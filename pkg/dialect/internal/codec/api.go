@@ -1,8 +1,11 @@
 package codec
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 )
 
@@ -15,12 +18,49 @@ func ConvertRequest(source, target Format, body []byte, options ConvertOptions) 
 	if request.Model == "" {
 		request.Model = options.Model
 	}
+	if source != target && request.N != nil && *request.N > 1 && (request.Stream || options.Stream != nil && *options.Stream) {
+		return nil, diagnostics, conversionErrorf("n_unsupported", "cross-dialect streaming supports one candidate per request")
+	}
+	if err := rejectUnrepresentableCandidates(source, target, request); err != nil {
+		return nil, diagnostics, err
+	}
 	encoded, encodeDiagnostics, err := EncodeRequest(request, target, options)
 	diagnostics = append(diagnostics, encodeDiagnostics...)
 	if err != nil {
 		return nil, diagnostics, err
 	}
 	return encoded, diagnostics, nil
+}
+
+// rejectUnrepresentableCandidates fails a multi-candidate request when the
+// target cannot return them all. Chat and Gemini both produce several
+// candidates, so a conversion between them keeps n. A target that returns one
+// answer would otherwise make the upstream generate candidates that are
+// discarded after the fact.
+func rejectUnrepresentableCandidates(source, target Format, request *Request) error {
+	if request == nil || request.N == nil || *request.N <= 1 {
+		return nil
+	}
+	if multiCandidateTarget(target) && multiCandidateSource(source) {
+		return nil
+	}
+	if !multiCandidateTarget(target) {
+		return conversionErrorf("n_unsupported",
+			"n=%d asks for multiple candidates, but %s returns exactly one; send one request per candidate instead",
+			*request.N, target)
+	}
+	return nil
+}
+
+// multiCandidateTarget reports whether a dialect can return several answers.
+func multiCandidateTarget(format Format) bool {
+	return format == OpenAIChat || format == Gemini
+}
+
+// multiCandidateSource reports whether a dialect's canonical decode can carry
+// several answers. Only these sources reach a multi-candidate target intact.
+func multiCandidateSource(format Format) bool {
+	return format == OpenAIChat || format == Gemini
 }
 
 // ResponseFailed reports whether a decoded response body represents a failure.
@@ -50,11 +90,74 @@ func responseIsFailed(response *Response) bool {
 
 // ConvertResponse decodes a whole response in source and renders it in target.
 func ConvertResponse(source, target Format, body []byte) ([]byte, []Diagnostic, error) {
+	return ConvertResponseWithRequest(source, target, body, nil)
+}
+
+// ConvertResponseWithRequest is ConvertResponse with the canonical request the
+// response answers. A Responses target uses it to restore tool namespaces and
+// to echo the request's tool policy.
+func ConvertResponseWithRequest(source, target Format, body []byte, request *Request) ([]byte, []Diagnostic, error) {
+	if source != target && multiCandidateSource(source) && multiCandidateTarget(target) {
+		object, err := decodeObject(body)
+		if err != nil {
+			return nil, nil, err
+		}
+		sourceKey, targetKey := "choices", "candidates"
+		if source == Gemini {
+			sourceKey, targetKey = targetKey, sourceKey
+		}
+		if choices := arrayAt(object, sourceKey); len(choices) > 1 {
+			var output map[string]any
+			var convertedChoices []any
+			var diagnostics []Diagnostic
+			for index, choice := range choices {
+				object[sourceKey] = []any{choice}
+				input, err := marshalJSON(object)
+				if err != nil {
+					return nil, diagnostics, err
+				}
+				converted, notes, err := ConvertResponseWithRequest(source, target, input, request)
+				diagnostics = append(diagnostics, notes...)
+				if err != nil {
+					return nil, diagnostics, err
+				}
+				result, err := decodeObject(converted)
+				if err != nil {
+					return nil, diagnostics, err
+				}
+				if output == nil {
+					output = result
+				}
+				for _, raw := range arrayAt(result, targetKey) {
+					item, ok := raw.(map[string]any)
+					if !ok {
+						continue
+					}
+					item["index"] = index
+					if original, ok := choice.(map[string]any); ok {
+						if originalIndex, ok := intAt(original, "index"); ok {
+							item["index"] = originalIndex
+						}
+					}
+					convertedChoices = append(convertedChoices, item)
+				}
+			}
+			output[targetKey] = convertedChoices
+			converted, err := marshalJSON(output)
+			return converted, diagnostics, err
+		}
+	}
 	response, diagnostics, err := DecodeResponse(source, body)
 	if err != nil {
 		return nil, diagnostics, err
 	}
-	encoded, encodeDiagnostics, err := EncodeResponse(response, target)
+	if source == OpenAIResponses && target == GeminiInteractions {
+		diagnostics, err = restoreGatewayToolExecutions(body, response, diagnostics)
+		if err != nil {
+			return nil, diagnostics, err
+		}
+	}
+	encoded, encodeDiagnostics, err := EncodeResponseWithRequest(response, target, request)
 	diagnostics = append(diagnostics, encodeDiagnostics...)
 	if err != nil {
 		return nil, diagnostics, err
@@ -62,10 +165,87 @@ func ConvertResponse(source, target Format, body []byte) ([]byte, []Diagnostic, 
 	return encoded, diagnostics, nil
 }
 
+// hostedSearchKeyLiterals lists the JSON key fragments whose presence can make
+// StripHostedSearchTools rewrite a body. A body containing none of them cannot
+// be rewritten, so the expensive generic decode can be skipped. The check is
+// deliberately conservative: a fragment that only appears inside a string value
+// still routes the body through the decoder, which is correct (it only costs a
+// decode). The reverse — skipping a body that does need a rewrite — is not.
+var hostedSearchKeyLiterals = map[Format][]string{
+	OpenAIChat:      {"web_search_options", "web_search"},
+	OpenAIResponses: {"web_search"},
+	ClaudeMessages:  {"web_search"},
+	Gemini:          {"googleSearch", "google_search", "googleSearchRetrieval", "google_search_retrieval"},
+}
+
+// bodyMayCarryHostedSearchTools reports whether the body could contain a hosted
+// search tool. It never decides that a body is clean when it might not be: a
+// JSON body may spell any character with a \u escape, so a body that contains a
+// backslash escape at all is always treated as suspicious.
+func bodyMayCarryHostedSearchTools(body []byte, format Format) bool {
+	if bytes.Contains(body, []byte("\\")) {
+		return true
+	}
+	for _, literal := range hostedSearchKeyLiterals[format] {
+		if bytes.Contains(body, []byte(literal)) {
+			return true
+		}
+	}
+	return false
+}
+
+// validateObjectBody reproduces the errors decodeObject raises for a body that
+// is not a JSON object, without building the decoded map. A body the pre-scan
+// cleared must fail exactly the way the decoding path failed, so a caller that
+// relies on the rejection (a 400 for a malformed request) still sees it.
+func validateObjectBody(body []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	var probe json.RawMessage
+	if err := decoder.Decode(&probe); err != nil {
+		return err
+	}
+	if string(bytes.TrimSpace(probe)) == "null" {
+		return errors.New("body is not a JSON object")
+	}
+	if probe[0] != '{' {
+		return &json.UnmarshalTypeError{Value: jsonValueKind(probe), Type: reflect.TypeOf(map[string]any{})}
+	}
+	return nil
+}
+
+// jsonValueKind names the JSON kind of a raw value for an UnmarshalTypeError,
+// matching what encoding/json reports when decoding into a map.
+func jsonValueKind(probe json.RawMessage) string {
+	trimmed := bytes.TrimSpace(probe)
+	if len(trimmed) == 0 {
+		return "invalid"
+	}
+	switch trimmed[0] {
+	case '[':
+		return "array"
+	case '"':
+		return "string"
+	case 't', 'f':
+		return "bool"
+	case '{':
+		return "object"
+	}
+	return "number"
+}
+
 // StripHostedSearchTools removes provider-native hosted search tools, which no
 // function-calling upstream can execute. It also removes the matching search
 // option fields. changed reports whether the body was rewritten.
 func StripHostedSearchTools(body []byte, format Format) (out []byte, changed bool, err error) {
+	if !bodyMayCarryHostedSearchTools(body, format) {
+		// Nothing to strip, but the decoding path still rejected a body that is
+		// not a JSON object, so that rejection is reproduced here.
+		if err := validateObjectBody(body); err != nil {
+			return nil, false, fmt.Errorf("decode %s request: %w", format, err)
+		}
+		return body, false, nil
+	}
 	object, err := decodeObject(body)
 	if err != nil {
 		return nil, false, fmt.Errorf("decode %s request: %w", format, err)

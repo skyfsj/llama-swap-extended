@@ -1,4 +1,5 @@
 import { errorMessageFromPayload } from "./apiError";
+import { apiUrl } from "./apiPath";
 
 // HttpApiError carries the HTTP status and the parsed payload of a failed API
 // call, so callers can branch on status (409 conflicts, 403 scopes, 423 etag
@@ -21,7 +22,7 @@ export class HttpApiError extends Error {
 // message derived from the payload envelope. Client modules wrap it to attach
 // their own error types or payload diagnostics.
 export async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, { credentials: "same-origin", ...init });
+  const response = await fetch(apiUrl(url), { credentials: "same-origin", ...init });
   const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
   if (!response.ok) {
     throw new HttpApiError(

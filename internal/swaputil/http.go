@@ -511,6 +511,24 @@ func ReplaceRequestBody(r *http.Request, body []byte) {
 	}
 }
 
+// AdoptRequestBody installs body on r without copying it. It is for a caller
+// that has just read the whole stream into a slice it owns and will not touch
+// again: the snapshot ReplaceRequestBody takes would double the memory of every
+// request body for no gain. GetBody still replays those exact bytes, so the
+// replay contract downstream consumers rely on is unchanged.
+func AdoptRequestBody(r *http.Request, body []byte) {
+	if r == nil {
+		return
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	r.Header.Del("Transfer-Encoding")
+	r.Header.Set("Content-Length", strconv.Itoa(len(body)))
+	r.ContentLength = int64(len(body))
+	r.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(body)), nil
+	}
+}
+
 // bufferRequestBodyForRewrite gives form-based model rewrites the same hard
 // request-size boundary as JSON extraction. The /upstream/<model>/... path
 // intentionally derives the model from the URL and therefore bypasses the
@@ -709,7 +727,9 @@ func extractContext(r *http.Request) (ReqContextData, error) {
 	}
 
 	var bodyBytes []byte
-	if r.Body != nil && r.Body != http.NoBody {
+	original := r.Body
+	bodyless := original == nil || original == http.NoBody
+	if !bodyless {
 		var readErr error
 		bodyBytes, readErr = io.ReadAll(io.LimitReader(r.Body, MaxRequestBodySize+1))
 		if readErr != nil {
@@ -722,7 +742,15 @@ func extractContext(r *http.Request) (ReqContextData, error) {
 			return ReqContextData{}, fmt.Errorf("%w: request body exceeds %d bytes", ErrRequestBodyTooLarge, MaxRequestBodySize)
 		}
 	}
+	// Restore exactly the body shape that arrived. Handing a bodyless request
+	// an empty non-nil reader makes net/http frame the follow-up POST as
+	// chunked with a lone terminating chunk, which a peer that does not decode
+	// chunked requests reads as a second, malformed request on the connection.
 	defer func() {
+		if bodyless {
+			r.Body = original
+			return
+		}
 		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	}()
 
@@ -746,8 +774,14 @@ func extractContext(r *http.Request) (ReqContextData, error) {
 
 	// Form parsers read from r.Body, so feed them a fresh reader over the
 	// buffered bytes. The deferred restore above will reset r.Body again
-	// after parsing.
-	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+	// after parsing. A bodyless request gets http.NoBody rather than a reader
+	// over zero bytes: it is what the parsers expect, and the original shape
+	// comes back when this function returns.
+	if bodyless {
+		r.Body = http.NoBody
+	} else {
+		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+	}
 	if strings.Contains(contentType, "multipart/form-data") {
 		if err := r.ParseMultipartForm(MaxMultiPartSize); err != nil {
 			return ReqContextData{}, fmt.Errorf("error parsing multipart form: %w", err)

@@ -344,7 +344,7 @@ func TestServer_CORSGuardsCrossOriginManagementWrites(t *testing.T) {
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
-	handler := chain.New(CreateCORSMiddleware()).Then(next)
+	handler := chain.New(CreateCORSMiddleware(config.Config{})).Then(next)
 
 	tests := []struct {
 		name   string

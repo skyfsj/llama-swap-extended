@@ -250,7 +250,10 @@ func (s *Server) visibleIncidentLogEntries(archive *logarchive.Store, items []lo
 			visible = append(visible, entry)
 			continue
 		}
-		data, _, err := archive.Read(entry.Name)
+		// Only the head is needed: the request line the classification reads is
+		// written first, and an archive can hold up to MaxEntryBytes of body.
+		// Reading it in full made every listing cost every retained archive.
+		data, err := archive.ReadHead(entry.Name, incidentArchiveHeadBytes)
 		if err != nil {
 			s.warnIncidentLog("read request error archive", err)
 			continue
@@ -301,3 +304,8 @@ func (s *Server) handleAPIIncidentLog(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", entry.Name))
 	_, _ = w.Write(data)
 }
+
+// incidentArchiveHeadBytes bounds how much of a request-error archive is read to
+// classify it. The request line is the first line written, so a small head is
+// enough; the constant keeps that from silently depending on the writer's order.
+const incidentArchiveHeadBytes = 8 << 10

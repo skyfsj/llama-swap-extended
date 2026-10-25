@@ -1,5 +1,6 @@
 <script lang="ts">
   import { translate } from "../../lib/i18n";
+  import { toast } from "../../lib/toast";
   import { installPreset, type ExtensionPreset } from "../../lib/extensionsApi";
 
   interface Props {
@@ -41,6 +42,7 @@
     error = "";
     try {
       await installPreset(preset.id, targetFor(preset));
+      toast.success($translate("extensions.presets.installedToast", { id: targetFor(preset) }));
       onInstalled(targetFor(preset));
     } catch (cause) {
       error = String(cause);

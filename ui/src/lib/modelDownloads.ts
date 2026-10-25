@@ -1,4 +1,5 @@
 import type { ModelDownload, ModelDownloadsResponse, ModelFileSource } from "./types";
+import { apiUrl } from "./apiPath";
 
 export type ModelDownloadProvider = "huggingface" | "modelscope";
 
@@ -72,13 +73,13 @@ export function defaultDownloadSourceID(sources: ModelFileSource[], provider: Mo
 }
 
 export async function getModelDownloads(): Promise<ModelDownloadsResponse> {
-  const response = await fetch("/api/model-downloads?limit=100");
+  const response = await fetch(apiUrl("/api/model-downloads?limit=100"));
   if (!response.ok) throw await readError(response, "Unable to load model downloads");
   return (await response.json()) as ModelDownloadsResponse;
 }
 
 export async function enqueueModelDownload(input: ModelDownloadInput): Promise<{ task: ModelDownload; duplicate: boolean }> {
-  const response = await fetch("/api/model-downloads", {
+  const response = await fetch(apiUrl("/api/model-downloads"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(input),
@@ -91,12 +92,12 @@ export async function enqueueModelDownload(input: ModelDownloadInput): Promise<{
 }
 
 export async function deleteModelDownload(id: string): Promise<void> {
-  const response = await fetch(`/api/model-downloads/${encodeURIComponent(id)}`, { method: "DELETE" });
+  const response = await fetch(apiUrl(`/api/model-downloads/${encodeURIComponent(id)}`), { method: "DELETE" });
   if (!response.ok) throw await readError(response, "Unable to delete model download");
 }
 
 export async function getModelDownloadCredentials(): Promise<ModelDownloadCredentials> {
-  const response = await fetch("/api/model-download-credentials");
+  const response = await fetch(apiUrl("/api/model-download-credentials"));
   if (!response.ok) throw await readError(response, "Unable to load model download credentials");
   return (await response.json()) as ModelDownloadCredentials;
 }
@@ -105,7 +106,7 @@ export async function updateModelDownloadCredentials(
   patch: ModelDownloadCredentialsPatch,
   etag: string,
 ): Promise<ModelDownloadCredentials> {
-  const response = await fetch("/api/model-download-credentials", {
+  const response = await fetch(apiUrl("/api/model-download-credentials"), {
     method: "PATCH",
     headers: { "Content-Type": "application/json", "If-Match": etag },
     body: JSON.stringify(patch),
@@ -123,7 +124,7 @@ export async function retryModelDownload(id: string): Promise<ModelDownload> {
 }
 
 async function mutateModelDownload(id: string, action: "cancel" | "retry"): Promise<ModelDownload> {
-  const response = await fetch(`/api/model-downloads/${encodeURIComponent(id)}/${action}`, { method: "POST" });
+  const response = await fetch(apiUrl(`/api/model-downloads/${encodeURIComponent(id)}/${action}`), { method: "POST" });
   if (!response.ok) throw await readError(response, `Unable to ${action} model download`);
   const payload = (await response.json()) as { task: ModelDownload };
   return payload.task;

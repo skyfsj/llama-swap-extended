@@ -67,7 +67,7 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if strings.Contains(r.Header.Get("Accept"), "text/html") {
-		http.Redirect(w, r, "/ui/", http.StatusFound)
+		redirectRelative(w, "ui/", http.StatusFound)
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain")

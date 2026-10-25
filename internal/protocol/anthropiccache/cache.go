@@ -60,19 +60,26 @@ type Result struct {
 	Changed    bool              `json:"changed"`
 }
 
-// DetectClaudeCode requires both a recognizable client signal and Claude
-// shaped request fields. Generic Anthropic SDK requests are left untouched.
-func DetectClaudeCode(headers http.Header, body map[string]any) bool {
+// hasClaudeCodeHeaderSignal reports whether the request headers name a Claude
+// Code client. DetectClaudeCode requires this in addition to Claude-shaped
+// fields; Apply checks it first so a request from any other client never pays
+// for decoding its body.
+func hasClaudeCodeHeaderSignal(headers http.Header) bool {
 	userAgent := headerValue(headers, "user-agent")
 	xClaudeCode := headerValue(headers, "x-claude-code")
 	xApp := headerValue(headers, "x-app")
-	signal := strings.Contains(strings.ToLower(userAgent), "claude-code") ||
+	return strings.Contains(strings.ToLower(userAgent), "claude-code") ||
 		strings.EqualFold(strings.TrimSpace(xClaudeCode), "true") ||
 		strings.Contains(strings.ToLower(xApp), "claude-code") ||
 		strings.TrimSpace(headerValue(headers, "x-claude-code-version")) != "" ||
 		strings.TrimSpace(headerValue(headers, "x-claude-code-session-id")) != "" ||
 		strings.TrimSpace(headerValue(headers, "x-claude-session-id")) != ""
-	if !signal {
+}
+
+// DetectClaudeCode requires both a recognizable client signal and Claude
+// shaped request fields. Generic Anthropic SDK requests are left untouched.
+func DetectClaudeCode(headers http.Header, body map[string]any) bool {
+	if !hasClaudeCodeHeaderSignal(headers) {
 		return false
 	}
 	if messageCount(body["messages"]) == 0 {
@@ -152,6 +159,13 @@ func Apply(input []byte, headers http.Header, options Options) (Result, error) {
 	// payloads or malformed requests and must still receive the original bytes.
 	if options.Mode == ModeOff {
 		return Result{Body: append([]byte(nil), input...), Transforms: skippedAll("disabled")}, nil
+	}
+	// Auto mode only rewrites a request that identifies itself as Claude Code,
+	// and that identification lives entirely in the headers. Checking it before
+	// the decode leaves every other client's body untouched and unparsed: the
+	// result below is exactly what the decoded path returned for them.
+	if options.Mode == ModeAuto && !hasClaudeCodeHeaderSignal(headers) {
+		return Result{Body: append([]byte(nil), input...), Transforms: skippedAll("client-not-confirmed")}, nil
 	}
 	var body map[string]any
 	if err := json.Unmarshal(input, &body); err != nil {
@@ -1101,6 +1115,35 @@ type Usage struct {
 	// total and cache partitions and must be recomputed after merging
 	// streaming snapshots.
 	explicitUncached bool
+}
+
+// ExtractUsageFrames folds the cache partitions of already scanned frames. A
+// frame is one JSON document, or the whole body when it is a single JSON
+// document rather than a stream: the server splits a captured body once and
+// hands the same frames here, so this body is not walked again.
+func ExtractUsageFrames(frames [][]byte) Usage {
+	var total Usage
+	found := false
+	for _, frame := range frames {
+		frame = bytes.TrimSpace(frame)
+		if len(frame) == 0 || bytes.Equal(frame, []byte("[DONE]")) {
+			continue
+		}
+		var event map[string]any
+		if json.Unmarshal(frame, &event) != nil || event == nil {
+			continue
+		}
+		usage, ok := usageMap(event)
+		if !ok {
+			continue
+		}
+		found = true
+		total = mergeUsage(total, usageFromMap(usage))
+	}
+	if !found {
+		return Usage{}
+	}
+	return finalizeUsage(total)
 }
 
 func ExtractUsage(body []byte) Usage {

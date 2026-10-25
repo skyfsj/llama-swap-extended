@@ -29,9 +29,12 @@ test-dev:
 test:
 	go test -short -count=1 ./...
 
-# for CI - full test (takes longer)
+# for CI - full test (takes longer). The race detector makes the protocol and
+# extension suites several times slower, which pushes internal/server past
+# go test's 10m default timeout; the raised budget keeps the run honest instead
+# of aborting it half way.
 test-all:
-	go test -race -count=1 ./...
+	go test -race -timeout 30m -count=1 ./...
 
 ui/node_modules:
 	cd ui && npm install

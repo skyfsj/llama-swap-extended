@@ -41,6 +41,7 @@
   let error = $state("");
   let requestID = 0;
   let pollTimer: ReturnType<typeof setInterval> | null = null;
+  let revisionRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 
   let currency = $derived(report?.currency ?? "");
 
@@ -174,6 +175,11 @@
     };
   });
 
+  // Live traffic should show up without a manual refresh, but a busy window must
+  // not turn into one request per activity event: the revision counter advances
+  // on every completed request, and the energy report aggregates samples that
+  // only change on a flush interval anyway. The events are coalesced into one
+  // reload, which is also how the speed panel behaves.
   let seenRevision = $activityRevision;
   $effect(() => {
     if ($connectionState !== "connected") return;
@@ -181,8 +187,18 @@
     untrack(() => {
       if (revision === seenRevision) return;
       seenRevision = revision;
-      void load();
+      if (revisionRefreshTimer !== null) clearTimeout(revisionRefreshTimer);
+      revisionRefreshTimer = setTimeout(() => {
+        revisionRefreshTimer = null;
+        void load();
+      }, 10_000);
     });
+  });
+
+  $effect(() => {
+    return () => {
+      if (revisionRefreshTimer !== null) clearTimeout(revisionRefreshTimer);
+    };
   });
 
   function setWindow(key: PowerWindowKey): void {

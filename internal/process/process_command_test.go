@@ -929,8 +929,9 @@ func TestProcessCommand_TTL_IgnoresWebsocket(t *testing.T) {
 	}
 }
 
-// TestProcessCommand_TTL_ZeroDisables verifies that UnloadAfter=0 does not
-// spawn a TTL goroutine — the process stays ready until explicitly stopped.
+// TestProcessCommand_TTL_ZeroDisables verifies that UnloadAfter=0 keeps the
+// process ready until explicitly stopped — the TTL watcher runs but skips
+// every tick while the hot lifecycle snapshot reports no TTL.
 func TestProcessCommand_TTL_ZeroDisables(t *testing.T) {
 	skipIfNoSimpleResponder(t)
 
@@ -966,8 +967,8 @@ func TestProcessCommand_TTL_ZeroDisables(t *testing.T) {
 		t.Errorf("expected 200 after request, got %d", rr.Code)
 	}
 
-	// No TTL goroutine is spawned when UnloadAfter=0, so a brief sleep is
-	// enough to confirm the process remains ready.
+	// The TTL watcher skips every tick while the TTL is 0, so a brief sleep
+	// is enough to confirm the process remains ready.
 	time.Sleep(100 * time.Millisecond)
 
 	if got := p.State(); got != StateReady {
@@ -1262,5 +1263,133 @@ func TestProcessCommand_PreStartHookUsesStartContext(t *testing.T) {
 	}
 	if got := p.State(); got != StateStopped {
 		t.Fatalf("state after bounded pre-start failure = %s, want stopped", got)
+	}
+}
+
+// TestProcessCommand_TTL_HotEnable verifies that a lifecycle hot-update can
+// enable the TTL on a process that started with it disabled: the watcher is
+// running unconditionally and picks the new value up on its next tick.
+func TestProcessCommand_TTL_HotEnable(t *testing.T) {
+	skipIfNoSimpleResponder(t)
+
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(mock.Close)
+
+	cmd, _ := simpleResponderCmd(t, "-silent")
+	p := newProcessCommand(t, config.ModelConfig{
+		Cmd:                cmd,
+		Proxy:              mock.URL,
+		CheckEndpoint:      "/health",
+		HealthCheckTimeout: 10,
+		UnloadAfter:        0, // disabled at start
+	})
+
+	runErr := runAsync(t, p)
+	defer func() {
+		if p.State() == StateReady {
+			p.Stop(testStopTimeout)
+		}
+	}()
+
+	req := httptest.NewRequest("GET", "/", nil)
+	rr := httptest.NewRecorder()
+	p.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 to prime last-use, got %d", rr.Code)
+	}
+
+	// Enable the TTL on the live process: 1s idle, plain unload (no vLLM
+	// sleep mode on this backend type).
+	p.ApplyLifecycleConfig(config.ModelConfig{UnloadAfter: 1})
+
+	deadline := time.Now().Add(5 * time.Second)
+	for p.State() != StateStopped && time.Now().Before(deadline) {
+		time.Sleep(testPollInterval)
+	}
+	if got := p.State(); got != StateStopped {
+		t.Fatalf("hot-enabled TTL did not stop the process; state=%s", got)
+	}
+	select {
+	case err := <-runErr:
+		if err != nil {
+			t.Errorf("Run() after hot-enabled TTL stop: expected nil, got %v", err)
+		}
+	case <-time.After(testReturnTimeout):
+		t.Fatal("Run() did not return after hot-enabled TTL stop")
+	}
+}
+
+// TestProcessCommand_TTL_HotUpdateSleepLevel verifies that a sleep-level edit
+// reaches the TTL watcher without a restart: the process was configured with
+// level 1, the hot-update raises it to 2, and the sleep request must carry
+// the new level.
+func TestProcessCommand_TTL_HotUpdateSleepLevel(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("vLLM lifecycle test requires a POSIX runtime")
+	}
+
+	var sleepLevels atomic.Int64
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			w.WriteHeader(http.StatusOK)
+		case "/sleep":
+			if r.Method != http.MethodPost {
+				http.Error(w, "invalid sleep request", http.StatusBadRequest)
+				return
+			}
+			var level int64
+			if _, err := fmt.Sscanf(r.URL.Query().Get("level"), "%d", &level); err != nil {
+				http.Error(w, "missing level", http.StatusBadRequest)
+				return
+			}
+			sleepLevels.Store(level)
+			w.WriteHeader(http.StatusOK)
+		default:
+			_, _ = w.Write([]byte("awake"))
+		}
+	}))
+	t.Cleanup(backend.Close)
+
+	p := newProcessCommand(t, config.ModelConfig{
+		Cmd:                "sh -c 'sleep 30'",
+		Proxy:              backend.URL,
+		CheckEndpoint:      "/health",
+		HealthCheckTimeout: 3,
+		UnloadAfter:        1,
+		Backend: config.BackendConfig{
+			Type: "vllm",
+			Lifecycle: config.LifecycleConfig{
+				Mode:       "sleep",
+				SleepLevel: 1,
+			},
+		},
+	})
+	t.Cleanup(func() { _ = p.Stop(testStopTimeout) })
+	runAsync(t, p)
+
+	// Raise the sleep level before the TTL watcher fires.
+	p.ApplyLifecycleConfig(config.ModelConfig{
+		UnloadAfter: 1,
+		Backend: config.BackendConfig{
+			Type: "vllm",
+			Lifecycle: config.LifecycleConfig{
+				Mode:       "sleep",
+				SleepLevel: 2,
+			},
+		},
+	})
+
+	deadline := time.Now().Add(5 * time.Second)
+	for sleepLevels.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(testPollInterval)
+	}
+	if got := sleepLevels.Load(); got != 2 {
+		t.Fatalf("sleep level after hot-update = %d, want 2", got)
+	}
+	if !p.sleeping.Load() || p.State() != StateReady {
+		t.Fatalf("after TTL: sleeping=%v state=%s, want sleeping=true state=%s", p.sleeping.Load(), p.State(), StateReady)
 	}
 }

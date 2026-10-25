@@ -72,14 +72,31 @@ cmd: |
   --port ${PORT}
 ```
 
+eSpeak-ng is built from source and linked into both audio.cpp binaries
+(`AUDIOCPP_STATIC_ESPEAK=ON`). Kokoro, SanoTTS and Inflect use it as their
+phonemizer; without it they fail at load time with "Could not load
+eSpeak-ng". Its phoneme data is installed at
+`/usr/local/bin/espeak-ng-data`, next to the executable, rather than as the
+packed `espeak-ng-data.bin`: the packed form is unpacked into `$HOME/.cache`
+on first use, which fails when `HOME` is not writable (the non-root image, or a
+read-only root filesystem). The GPL-licensed eSpeak-ng `COPYING` file and the
+source archive it was built from ship in
+`/usr/local/share/audiocpp/licenses/espeak-ng`.
+
 ### GPU support
 
-The CUDA image compiles SASS for compute capabilities `60;61;75;86;89`, so
-Pascal (P100, GTX 10xx, P40) and newer NVIDIA GPUs are supported. Architectures
-between and above those entries — Volta (70), Ampere (80), Hopper (90) and
-Blackwell (100 on datacenter parts, 120 on GeForce and RTX PRO) — run by
-JIT-compiling the nearest lower PTX, which costs time on first load. Add the
-number to `CMAKE_CUDA_ARCHITECTURES` in the Dockerfile to compile one of them
+The CUDA image compiles SASS for compute capabilities `60;61;70;75;86;89`, so
+Pascal (P100, GTX 10xx, P40), Volta (V100) and newer NVIDIA GPUs through Ada
+are supported. Architectures between and above those entries — Ampere (80),
+Hopper (90) and Blackwell (100 on datacenter parts, 120 on GeForce and RTX
+PRO) — run by JIT-compiling the nearest lower PTX, which costs time on first
+load.
+
+Volta is compiled natively rather than left to that JIT fallback: ik_llama.cpp
+picks its WMMA flash-attention kernel from the device's compute capability, and
+the only device code a V100 can reach by JIT is the sm_61 PTX, which has no
+WMMA kernel — ik-llama-server aborts on the first flash-attention call. Add
+further numbers to `CMAKE_CUDA_ARCHITECTURES` in the Dockerfile to compile them
 natively; the list is shared with llama.cpp, whisper.cpp, stable-diffusion.cpp
 and ik_llama.cpp, so each addition lengthens every build.
 

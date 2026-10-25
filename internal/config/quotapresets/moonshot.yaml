@@ -1,0 +1,31 @@
+# Moonshot / Kimi 开放平台账户余额。
+#
+#   GET https://api.moonshot.cn/v1/users/me/balance
+#   Authorization: Bearer <API Key>
+#
+#   {"code":0,"status":true,"data":{
+#     "available_balance":12.34,"voucher_balance":0,"cash_balance":12.34}}
+#
+# 金额单位为人民币（CNY），不是美元。
+id: moonshot
+name: Moonshot (Kimi)
+category: official
+description: Moonshot / Kimi 开放平台：可用余额、现金余额与代金券余额（CNY）。
+endpoint: https://api.moonshot.cn/v1/users/me/balance
+method: GET
+auth:
+  style: bearer
+timeoutSeconds: 15
+extras:
+  - id: available
+    label: 可用余额
+    path: data.available_balance
+    suffix: " CNY"
+  - id: cash
+    label: 现金余额
+    path: data.cash_balance
+    suffix: " CNY"
+  - id: voucher
+    label: 代金券
+    path: data.voucher_balance
+    suffix: " CNY"

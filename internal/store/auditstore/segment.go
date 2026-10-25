@@ -77,6 +77,14 @@ type SegmentStore struct {
 
 	refs map[string]blockRef
 
+	// Compaction rewrites segment files in place, so appends to the segment
+	// under rewrite must wait out the pass: bytes landing in the old file
+	// while the temp is being built would be stranded by the rename, leaving
+	// a block row that points at data that no longer exists.
+	compactMu  sync.Mutex
+	compacting map[string]bool
+	appendGate *sync.Cond
+
 	encoder *zstd.Encoder
 	decoder *zstd.Decoder
 }
@@ -97,7 +105,10 @@ func openSegmentStore(root string) (*SegmentStore, error) {
 		encoder.Close()
 		return nil, fmt.Errorf("create zstd decoder: %w", err)
 	}
-	return &SegmentStore{dir: dir, refs: make(map[string]blockRef), encoder: encoder, decoder: decoder}, nil
+	store := &SegmentStore{dir: dir, refs: make(map[string]blockRef), encoder: encoder, decoder: decoder}
+	store.compacting = make(map[string]bool)
+	store.appendGate = sync.NewCond(&store.mu)
+	return store, nil
 }
 
 func (s *SegmentStore) close() error {
@@ -150,6 +161,11 @@ func (s *SegmentStore) put(data []byte, segment string) (blockRef, bool, error) 
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// A segment under compaction is being rewritten: wait out the pass before
+	// appending to it.
+	for s.compacting[segment] {
+		s.appendGate.Wait()
+	}
 	// Re-check under the lock: a concurrent writer may have stored it.
 	if ref, ok := s.refs[hash]; ok {
 		return ref, false, nil
@@ -311,129 +327,196 @@ func (s *SegmentStore) Bytes() (int64, error) {
 	return total, nil
 }
 
-// compact rewrites each segment keeping only the supplied live blocks, then
-// removes segments that became empty. It returns the number of bytes reclaimed
-// and the number of dropped blocks. Compaction is the only operation that
-// physically shrinks a segment, so it runs on the maintenance cadence rather
-// than per delete.
-func (s *SegmentStore) compact(live map[string]bool) (int64, int, error) {
+// compact rewrites each segment keeping only the blocks the caller's keep
+// predicate admits, then removes segments that became empty. It returns the
+// references that moved to a new offset — the caller must persist them,
+// because the database is the authoritative index a restart loads. Compaction
+// is the only operation that physically shrinks a segment, so it runs on the
+// maintenance cadence rather than per delete.
+func (s *SegmentStore) compact(keep func(hash string) bool) ([]blockRef, int64, int, error) {
+	s.compactMu.Lock()
+	defer s.compactMu.Unlock()
 	if err := s.sync(); err != nil {
-		return 0, 0, err
+		return nil, 0, 0, err
 	}
 	s.mu.Lock()
 	if s.writer != nil {
 		if err := s.writer.Close(); err != nil {
 			s.mu.Unlock()
-			return 0, 0, fmt.Errorf("close audit segment: %w", err)
+			return nil, 0, 0, fmt.Errorf("close audit segment: %w", err)
 		}
 		s.writer = nil
 		s.writing = ""
 	}
 	s.mu.Unlock()
 
+	s.removeStaleCompactionTemps()
+
 	names, err := s.segments()
 	if err != nil {
-		return 0, 0, err
+		return nil, 0, 0, err
 	}
+	var updates []blockRef
 	var reclaimed int64
 	dropped := 0
 	for _, name := range names {
-		path := s.segmentPath(name)
-		info, err := os.Stat(path)
+		moved, freed, droppedBlocks, err := s.compactSegment(name, keep)
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				continue
-			}
-			return reclaimed, dropped, fmt.Errorf("stat audit segment: %w", err)
+			return updates, reclaimed, dropped, err
 		}
+		updates = append(updates, moved...)
+		reclaimed += freed
+		dropped += droppedBlocks
+	}
+	return updates, reclaimed, dropped, nil
+}
 
-		s.mu.Lock()
-		refs := make([]blockRef, 0, 64)
-		for _, ref := range s.refs {
-			if ref.Segment == name {
-				refs = append(refs, ref)
-			}
+// compactSegment rewrites one segment without the blocks keep rejects.
+// Appends to the segment are gated out for the duration, so the refs snapshot
+// stays stable until the rename lands. The returned references carry the new
+// offsets.
+func (s *SegmentStore) compactSegment(name string, keepFn func(hash string) bool) ([]blockRef, int64, int, error) {
+	path := s.segmentPath(name)
+	info, err := os.Stat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, 0, 0, nil
 		}
+		return nil, 0, 0, fmt.Errorf("stat audit segment: %w", err)
+	}
+
+	s.mu.Lock()
+	refs := make([]blockRef, 0, 64)
+	for _, ref := range s.refs {
+		if ref.Segment == name {
+			refs = append(refs, ref)
+		}
+	}
+	// Rewriting in file order keeps the segment's frame sequence stable across
+	// passes: the repair scanner locates frames by walking that order.
+	sort.Slice(refs, func(i, j int) bool { return refs[i].Offset < refs[j].Offset })
+	keep := refs[:0]
+	for _, ref := range refs {
+		if keepFn(ref.Hash) {
+			keep = append(keep, ref)
+		}
+	}
+	if len(keep) == len(refs) {
 		s.mu.Unlock()
-		sort.Slice(refs, func(i, j int) bool { return refs[i].Offset < refs[j].Offset })
+		return nil, 0, 0, nil
+	}
+	s.compacting[name] = true
+	// The open writer may hold the very file being replaced; its bytes are all
+	// registered in refs already, so closing just drops the handle.
+	if s.writing == name {
+		if err := s.writer.Sync(); err != nil {
+			delete(s.compacting, name)
+			s.mu.Unlock()
+			return nil, 0, 0, fmt.Errorf("sync audit segment: %w", err)
+		}
+		if err := s.writer.Close(); err != nil {
+			delete(s.compacting, name)
+			s.mu.Unlock()
+			return nil, 0, 0, fmt.Errorf("close audit segment: %w", err)
+		}
+		s.writer = nil
+		s.writing = ""
+	}
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		delete(s.compacting, name)
+		s.appendGate.Broadcast()
+		s.mu.Unlock()
+	}()
 
-		keep := refs[:0]
-		for _, ref := range refs {
-			if live[ref.Hash] {
-				keep = append(keep, ref)
-			}
-		}
-		if len(keep) == len(refs) {
-			continue
-		}
-
-		source, err := os.Open(path)
-		if err != nil {
-			return reclaimed, dropped, fmt.Errorf("open audit segment for compaction: %w", err)
-		}
-		temp, err := os.CreateTemp(s.dir, "."+name+".compact-*")
-		if err != nil {
-			source.Close()
-			return reclaimed, dropped, fmt.Errorf("create compaction temp: %w", err)
-		}
-
-		updates := make([]blockRef, 0, len(keep))
-		var offset int64
-		for _, ref := range keep {
-			compressed := make([]byte, ref.Length)
-			if _, err := source.ReadAt(compressed, ref.Offset); err != nil {
-				source.Close()
-				temp.Close()
-				os.Remove(temp.Name())
-				return reclaimed, dropped, fmt.Errorf("read audit block for compaction: %w", err)
-			}
-			if _, err := temp.Write(compressed); err != nil {
-				source.Close()
-				temp.Close()
-				os.Remove(temp.Name())
-				return reclaimed, dropped, fmt.Errorf("write compacted audit segment: %w", err)
-			}
-			moved := ref
-			moved.Offset = offset
-			updates = append(updates, moved)
-			offset += int64(len(compressed))
-		}
+	source, err := os.Open(path)
+	if err != nil {
+		return nil, 0, 0, fmt.Errorf("open audit segment for compaction: %w", err)
+	}
+	temp, err := os.CreateTemp(s.dir, "."+name+".compact-*")
+	if err != nil {
 		source.Close()
-		if err := temp.Sync(); err != nil {
+		return nil, 0, 0, fmt.Errorf("create compaction temp: %w", err)
+	}
+
+	updates := make([]blockRef, 0, len(keep))
+	var offset int64
+	for _, ref := range keep {
+		compressed := make([]byte, ref.Length)
+		if _, err := source.ReadAt(compressed, ref.Offset); err != nil {
+			source.Close()
 			temp.Close()
 			os.Remove(temp.Name())
-			return reclaimed, dropped, fmt.Errorf("sync compacted audit segment: %w", err)
+			return nil, 0, 0, fmt.Errorf("read audit block for compaction: %w", err)
 		}
-		if err := temp.Close(); err != nil {
+		if _, err := temp.Write(compressed); err != nil {
+			source.Close()
+			temp.Close()
 			os.Remove(temp.Name())
-			return reclaimed, dropped, fmt.Errorf("close compacted audit segment: %w", err)
+			return nil, 0, 0, fmt.Errorf("write compacted audit segment: %w", err)
 		}
-		reclaimed += info.Size() - offset
-		dropped += len(refs) - len(keep)
-		if offset == 0 {
-			if err := os.Remove(temp.Name()); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return reclaimed, dropped, fmt.Errorf("remove empty audit segment: %w", err)
-			}
-			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return reclaimed, dropped, fmt.Errorf("remove audit segment: %w", err)
-			}
-			s.mu.Lock()
-			for _, ref := range refs {
-				delete(s.refs, ref.Hash)
-			}
-			s.mu.Unlock()
-			continue
+		moved := ref
+		moved.Offset = offset
+		updates = append(updates, moved)
+		offset += int64(len(compressed))
+	}
+	source.Close()
+	if err := temp.Sync(); err != nil {
+		temp.Close()
+		os.Remove(temp.Name())
+		return nil, 0, 0, fmt.Errorf("sync compacted audit segment: %w", err)
+	}
+	if err := temp.Close(); err != nil {
+		os.Remove(temp.Name())
+		return nil, 0, 0, fmt.Errorf("close compacted audit segment: %w", err)
+	}
+	reclaimed := info.Size() - offset
+	dropped := len(refs) - len(keep)
+	if offset == 0 {
+		if err := os.Remove(temp.Name()); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, reclaimed, dropped, fmt.Errorf("remove empty audit segment: %w", err)
 		}
-		if err := os.Rename(temp.Name(), path); err != nil {
-			return reclaimed, dropped, fmt.Errorf("replace audit segment: %w", err)
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, reclaimed, dropped, fmt.Errorf("remove audit segment: %w", err)
 		}
 		s.mu.Lock()
-		for _, ref := range updates {
-			s.refs[ref.Hash] = ref
+		for _, ref := range refs {
+			delete(s.refs, ref.Hash)
 		}
 		s.mu.Unlock()
+		return nil, reclaimed, dropped, nil
 	}
-	return reclaimed, dropped, nil
+	if err := os.Rename(temp.Name(), path); err != nil {
+		return nil, reclaimed, dropped, fmt.Errorf("replace audit segment: %w", err)
+	}
+	s.mu.Lock()
+	for _, ref := range updates {
+		s.refs[ref.Hash] = ref
+	}
+	s.mu.Unlock()
+	return updates, reclaimed, dropped, nil
+}
+
+// removeStaleCompactionTemps deletes temp files left behind by a compaction
+// that crashed. The prefix keeps them out of segments(); the age check spares
+// a temp an in-flight pass could still be writing.
+func (s *SegmentStore) removeStaleCompactionTemps() {
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, ".") || !strings.Contains(name, ".compact-") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || time.Since(info.ModTime()) < time.Hour {
+			continue
+		}
+		_ = os.Remove(filepath.Join(s.dir, name))
+	}
 }
 
 // dropSegment removes one day partition outright: retention drops whole days,
@@ -468,3 +551,174 @@ func (s *SegmentStore) dropSegment(name string) (int64, error) {
 	}
 	return info.Size(), nil
 }
+
+// forget drops hashes from the in-memory index. The repair scanner uses it for
+// blocks whose bytes are provably gone, so later reads report a clean miss
+// instead of a decode error.
+func (s *SegmentStore) forget(hashes []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, hash := range hashes {
+		delete(s.refs, hash)
+	}
+}
+
+// lockCompaction excludes compaction for the duration of the returned unlock.
+// The repair scanner walks a segment's frames and rewrites nothing, but it
+// must not race a compaction moving those same frames under it.
+func (s *SegmentStore) lockCompaction() func() {
+	s.compactMu.Lock()
+	return s.compactMu.Unlock
+}
+
+// repairIndex rebuilds the offsets of one segment by locating every block's
+// frame in the file itself. Blocks are content-addressed — the recorded hash
+// is the sha256 of the decompressed bytes — so a match is self-verifying and
+// no trust is placed in the (possibly stale) recorded offsets.
+//
+// The ordered walk exploits the layout invariants: compaction preserves file
+// order and appends only ever grow the file, so frames appear in the order
+// the caller supplies (creation time, then recorded offset). A hole — bytes
+// lost to a crashed pass — is absorbed by probing a bounded window ahead.
+// Whatever the walk cannot place goes through a full magic scan before it is
+// declared absent, so a reference is only deleted when the whole file was
+// examined.
+func (s *SegmentStore) repairIndex(name string, ordered []blockRef) (found []blockRef, missing []string, err error) {
+	path := s.segmentPath(name)
+	file, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			for _, ref := range ordered {
+				missing = append(missing, ref.Hash)
+			}
+			return nil, missing, nil
+		}
+		return nil, nil, fmt.Errorf("open audit segment for repair: %w", err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, nil, fmt.Errorf("stat audit segment for repair: %w", err)
+	}
+	size := info.Size()
+
+	matched := make(map[string]bool, len(ordered))
+	found = make([]blockRef, 0, len(ordered))
+	pos := int64(0)
+walk:
+	for idx := 0; idx < len(ordered); idx++ {
+		ref := ordered[idx]
+		if matched[ref.Hash] {
+			continue
+		}
+		if s.trialFrame(file, size, pos, ref) {
+			matched[ref.Hash] = true
+			found = append(found, blockRef{Hash: ref.Hash, Size: ref.Size, Compressed: ref.Compressed, Segment: name, Offset: pos, Length: ref.Compressed})
+			pos += int64(ref.Compressed)
+			continue
+		}
+		// The frame the walk expects is not at pos: either an earlier block's
+		// bytes were lost (its frame is gone but later ones remain) or the
+		// frame belongs to a later row. Probe ahead before giving up on the
+		// ordered pass — placement stays sequential either way.
+		for probe := idx + 1; probe < len(ordered) && probe <= idx+repairProbeWindow; probe++ {
+			cand := ordered[probe]
+			if matched[cand.Hash] {
+				continue
+			}
+			if s.trialFrame(file, size, pos, cand) {
+				matched[cand.Hash] = true
+				found = append(found, blockRef{Hash: cand.Hash, Size: cand.Size, Compressed: cand.Compressed, Segment: name, Offset: pos, Length: cand.Compressed})
+				pos += int64(cand.Compressed)
+				idx = probe
+				continue walk
+			}
+		}
+		// Neither the expected frame nor a probed one sits at pos: the tail's
+		// layout violates the ordered assumption (a torn write, orphan frames).
+		// Stop the walk and let the full scan place the remainder.
+		break
+	}
+
+	// Every block the walk could not place gets one full-file scan: frames
+	// start with the zstd magic, and each hit is tried against the remaining
+	// rows at their exact recorded frame size. A budget keeps a file full of
+	// false hits from turning into an unbounded decode loop.
+	var unresolved []blockRef
+	for _, ref := range ordered {
+		if !matched[ref.Hash] {
+			unresolved = append(unresolved, ref)
+		}
+	}
+	if len(unresolved) == 0 {
+		return found, nil, nil
+	}
+
+	scanned := 0
+	const chunk = 1 << 20
+	buf := make([]byte, chunk)
+	var base int64
+	for base < size && len(unresolved) > 0 && scanned < repairScanBudget {
+		n, err := file.ReadAt(buf, base)
+		if err != nil && err != io.EOF {
+			return found, nil, fmt.Errorf("read audit segment for repair: %w", err)
+		}
+		window := buf[:n]
+		for i := 0; i+4 <= len(window) && scanned < repairScanBudget; {
+			if window[i] != 0x28 || window[i+1] != 0xB5 || window[i+2] != 0x2F || window[i+3] != 0xFD {
+				i++
+				continue
+			}
+			hit := base + int64(i)
+			for idx := 0; idx < len(unresolved) && scanned < repairScanBudget; idx++ {
+				ref := unresolved[idx]
+				scanned++
+				if s.trialFrame(file, size, hit, ref) {
+					matched[ref.Hash] = true
+					found = append(found, blockRef{Hash: ref.Hash, Size: ref.Size, Compressed: ref.Compressed, Segment: name, Offset: hit, Length: ref.Compressed})
+					unresolved = append(unresolved[:idx], unresolved[idx+1:]...)
+					break
+				}
+			}
+			i++
+		}
+		base += chunk - 3
+	}
+
+	missing = make([]string, 0, len(unresolved))
+	// Absence is only provable when the scan covered the whole file. A budget
+	// overrun leaves the remainder untouched rather than guessing.
+	if scanned < repairScanBudget || len(unresolved) == 0 {
+		for _, ref := range unresolved {
+			missing = append(missing, ref.Hash)
+		}
+	}
+	return found, missing, nil
+}
+
+// trialFrame reports whether the recorded frame of ref sits exactly at pos:
+// it reads the frame's recorded compressed size, decompresses it, and checks
+// both the decoded length and the content hash.
+func (s *SegmentStore) trialFrame(file *os.File, size, pos int64, ref blockRef) bool {
+	if pos < 0 || ref.Compressed <= 0 || pos+int64(ref.Compressed) > size {
+		return false
+	}
+	buf := make([]byte, ref.Compressed)
+	if _, err := file.ReadAt(buf, pos); err != nil {
+		return false
+	}
+	out, err := s.decoder.DecodeAll(buf, nil)
+	if err != nil {
+		return false
+	}
+	return len(out) == ref.Size && hashBlock(out) == ref.Hash
+}
+
+const (
+	// repairProbeWindow bounds how far the ordered walk looks ahead when the
+	// expected frame is missing; a crashed pass only ever punches small holes.
+	repairProbeWindow = 256
+	// repairScanBudget caps the fallback scan's decode trials so a pathological
+	// file costs seconds, not minutes.
+	repairScanBudget = 100000
+)

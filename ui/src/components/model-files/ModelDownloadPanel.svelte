@@ -333,6 +333,7 @@
     try {
       await cancelModelDownload(task.id);
       await loadTasks();
+      toast.success($translate("modelFiles.download.canceled"));
     } catch (cause) {
       formError = cause instanceof Error ? cause.message : String(cause);
     } finally {
@@ -390,7 +391,11 @@
   onMount(() => {
     readPatternMemory();
     void loadTasks();
-    const timer = window.setInterval(() => void loadTasks(), 1500);
+    // Download progress is only worth polling while someone is watching it.
+    const timer = window.setInterval(() => {
+      if (typeof document !== "undefined" && document.hidden) return;
+      void loadTasks();
+    }, 1500);
     return () => {
       window.clearInterval(timer);
     };

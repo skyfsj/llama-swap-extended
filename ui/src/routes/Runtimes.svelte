@@ -7,6 +7,7 @@
   import * as Card from "$lib/components/ui/card/index.js";
   import * as Dialog from "$lib/components/ui/dialog/index.js";
   import { translate } from "$lib/i18n";
+  import { toast } from "$lib/toast";
   import { ansiToHtml } from "$lib/ansi";
   import { isDarkMode } from "../stores/theme";
   import { fetchLMCacheDashboard, fetchLMCacheStatus, postLMCacheAction } from "$lib/lmcacheApi";
@@ -287,6 +288,7 @@
       await postRuntimeAction(name, "stage", { version: candidate.version, ref: candidate.ref, commit: candidate.commit, digest: candidate.digest });
       if (serial === stageRequestSerial) stageOpen = false;
       await loadAfterAction();
+      toast.success($translate("controlPlane.runtimeCenter.toast.staged", { runtime: name, version: candidate.version }));
     } catch (cause) {
       if (serial === stageRequestSerial && stageOpen) stageError = message(cause);
       else error = message(cause);
@@ -302,10 +304,31 @@
     try {
       await postRuntimeAction(name, path, body);
       await loadAfterAction();
+      notifyRuntimeOperation(name, path);
     } catch (cause) {
       error = message(cause);
     } finally {
       delete busy[name];
+    }
+  }
+
+  // Each lifecycle path gets its own result message so the operator sees what
+  // actually happened rather than a generic "done".
+  function notifyRuntimeOperation(name: string, path: string): void {
+    const toast_ = "controlPlane.runtimeCenter.toast";
+    if (path.startsWith("activate/")) {
+      toast.success($translate(`${toast_}.activated`, { runtime: name, version: decodeURIComponent(path.slice("activate/".length)) }));
+    } else if (path === "rollback") {
+      const previous = runtimes.find((item) => item.name === name)?.previous ?? "";
+      toast.success(previous
+        ? $translate(`${toast_}.rolledBack`, { runtime: name, version: previous })
+        : $translate(`${toast_}.rolledBackUnversioned`, { runtime: name }));
+    } else if (path.startsWith("pin/")) {
+      toast.success($translate(`${toast_}.pinned`, { runtime: name, version: decodeURIComponent(path.slice("pin/".length)) }));
+    } else if (path === "unpin") {
+      toast.success($translate(`${toast_}.unpinned`, { runtime: name }));
+    } else if (path === "check") {
+      toast.success($translate(`${toast_}.checked`, { runtime: name }));
     }
   }
 
@@ -323,6 +346,7 @@
         busy[name] = "stage";
         await postRuntimeAction(name, "stage", { version });
         if (disposed) return;
+        toast.success($translate("controlPlane.runtimeCenter.toast.staged", { runtime: name, version }));
         check = await fetchRuntimeReadiness(name, version);
         if (disposed) return;
         blocked = check.checks.find((item) => item.level === "block");
@@ -355,6 +379,7 @@
       try {
         await deleteRuntimeVersion(name, version);
         await loadAfterAction();
+        toast.success($translate("controlPlane.runtimeCenter.toast.deleted", { runtime: name, version }));
       } catch (cause) {
         error = message(cause);
       } finally {
@@ -404,7 +429,12 @@
       }
     };
     void load();
-    const timer = setInterval(() => void load(), 1500);
+    // The log tail is only read while its panel is on screen; a background tab
+    // would otherwise pull the same output every 1.5s for nobody.
+    const timer = setInterval(() => {
+      if (typeof document !== "undefined" && document.hidden) return;
+      void load();
+    }, 1500);
     return () => {
       logPollSerial++;
       clearInterval(timer);
@@ -436,6 +466,7 @@
     try {
       await postLMCacheAction(path, body);
       await loadAfterAction();
+      notifyLMCacheAction(path, body);
       return true;
     } catch (cause) {
       lmcacheError = message(cause);
@@ -445,12 +476,34 @@
     }
   }
 
+  // Mirrors the LMCache buttons onto a result message; the dialog and the card
+  // share this path space, so one mapping covers both entry points.
+  function notifyLMCacheAction(path: string, body?: unknown): void {
+    const toastKey = "controlPlane.lmcacheToast";
+    const payload = asRecord(body);
+    const action = payload.action;
+    // "upgrade to latest" carries no version, so the message has to survive a
+    // missing one instead of rendering "upgraded to ."
+    const version = typeof payload.version === "string" ? payload.version.trim() : "";
+    if (path === "enable") toast.success($translate(`${toastKey}.enabled`));
+    else if (path === "disable") toast.success($translate(`${toastKey}.disabled`));
+    else if (path === "server/start") toast.success($translate(`${toastKey}.serverStarted`));
+    else if (path === "server/stop") toast.success($translate(`${toastKey}.serverStopped`));
+    else if (path === "server/restart") toast.success($translate(`${toastKey}.serverRestarted`));
+    else if (action === "upgrade") toast.success($translate(version ? `${toastKey}.upgraded` : `${toastKey}.upgradedLatest`, { version }));
+    else if (action === "activate") toast.success($translate(`${toastKey}.activated`, { version }));
+    else if (action === "rollback") toast.success($translate(`${toastKey}.rolledBack`, { version }));
+  }
+
   async function commitLMCacheRuntimeAction(path: string): Promise<void> {
     lmcacheBusy = true;
     lmcacheError = "";
     try {
       await postRuntimeAction("lmcache", path);
       await loadAfterAction();
+      const version = path.startsWith("pin/") ? decodeURIComponent(path.slice("pin/".length)) : "";
+      if (path.startsWith("pin/")) toast.success($translate("controlPlane.lmcacheToast.pinned", { version }));
+      else if (path === "unpin") toast.success($translate("controlPlane.lmcacheToast.unpinned"));
     } catch (cause) {
       lmcacheError = message(cause);
     } finally {
@@ -460,7 +513,13 @@
 
   onMount(() => {
     void load();
-    const timer = window.setInterval(() => void load(), 10000);
+    // The runtime list, the settings snapshot and the LMCache status are refetched
+    // together, so skipping the tick while the tab is hidden saves three requests
+    // at a time.
+    const timer = window.setInterval(() => {
+      if (typeof document !== "undefined" && document.hidden) return;
+      void load();
+    }, 10000);
     return () => {
       window.clearInterval(timer);
       disposed = true;

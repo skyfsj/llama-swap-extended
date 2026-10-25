@@ -5,7 +5,11 @@
     AuditConversation,
     InflightRequestEntry,
   } from "../../lib/types";
-  import { activityRevision, getActivity, models } from "../../stores/api";
+  import { activityRevision, models } from "../../stores/api";
+  import {
+    activityRecordsKey,
+    fetchActivityRecords,
+  } from "../../lib/activityRecords";
   import { persistentStore } from "../../stores/persistent";
   import {
     emptyActivityFilters,
@@ -16,6 +20,7 @@
   import { errorMessageFromPayload } from "$lib/apiError";
   import ActivityTable from "../ActivityTable.svelte";
   import AuditConversationDialog from "../audit/AuditConversationDialog.svelte";
+import { apiUrl } from "../../lib/apiPath";
 
   interface Props {
     modelId?: string;
@@ -79,21 +84,37 @@
     $translate(modelId ? "modelDetail.noActivity" : "activity.empty"),
   );
 
+  // The key covers everything the server answer depends on. Panels mounted over
+  // the same records (the overview, the requests tab and the flat view) build the
+  // same key and therefore share one request instead of issuing their own.
+  let recordsKey = $derived(
+    activityRecordsKey({
+      modelId: modelId.trim(),
+      page,
+      limit,
+      sort,
+      order,
+      filters,
+    }),
+  );
+  let recordsParams = $derived({
+    model: modelId.trim() || undefined,
+    page,
+    limit,
+    sort,
+    order,
+    filters,
+    configuredOnly,
+  });
   async function load(): Promise<void> {
     const id = ++requestID;
     loading = true;
     error = "";
 
     try {
-      const activity = await getActivity({
-        model: modelId.trim() || undefined,
-        page,
-        limit,
-        sort,
-        order,
-        filters,
-        configuredOnly,
-      });
+      // The store reuses an in-flight request for the same key, so three panels
+      // asking for the same page produce one HTTP request.
+      const activity = await fetchActivityRecords(recordsKey, recordsParams);
       if (id !== requestID) return;
 
       activityRows = activity.data;
@@ -161,7 +182,7 @@
     detailLoading = true;
     conversationDialogOpen = true;
     try {
-      const response = await fetch(`/api/audit/conversations/${row.id}`);
+      const response = await fetch(apiUrl(`/api/audit/conversations/${row.id}`));
       const payload: unknown = await response.json().catch(() => ({}));
       if (id !== conversationRequestID) return;
       if (!response.ok) throw new Error(errorMessageFromPayload(payload, `HTTP ${response.status}`));

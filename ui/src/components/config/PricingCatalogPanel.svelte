@@ -7,6 +7,7 @@
   import { Button } from "$lib/components/ui/button/index.js";
   import { Input } from "$lib/components/ui/input/index.js";
   import { translate } from "../../lib/i18n";
+  import { toast } from "../../lib/toast";
   import { errorMessageFromPayload } from "../../lib/apiError";
   import {
     deletePricingPrice,
@@ -18,6 +19,7 @@
     type PricingPriceInput,
   } from "../../lib/pricing";
   import { property, record } from "../../lib/modelConfig";
+import { apiUrl } from "../../lib/apiPath";
 
   interface ConfigSnapshot {
     config?: Record<string, unknown>;
@@ -58,6 +60,7 @@
   let error = $state("");
   let syncedAt = $state("");
   let source = $state("");
+  let lastError = $state("");
   let requestID = 0;
 
   let editorOpen = $state(false);
@@ -83,7 +86,20 @@
   let pricingURL = $derived(typeof pricingSettings.url === "string" && pricingSettings.url.trim()
     ? pricingSettings.url.trim()
     : "https://models.dev/api.json");
+  let ambiguity = $derived(typeof pricingSettings.ambiguity === "string" && pricingSettings.ambiguity.trim()
+    ? pricingSettings.ambiguity.trim()
+    : "provider-first");
   let syncSaving = $state(false);
+  // Prices live in the SQLite catalog rather than in the YAML sources, so adding,
+  // editing, deleting or re-syncing one only needs the config-admin scope the
+  // API already enforces. These controls deliberately do not check
+  // snapshot.writable: that flag describes the config files, and gating the
+  // catalog on it locked operators out of the only place they could correct a
+  // rate whenever the config was read-only or absent.
+  //
+  // The sync switch is the exception: it patches pricing.modelsDev.enabled into
+  // the YAML, so it still requires a writable source and a current ETag.
+  let switchEditable = $derived(snapshot.writable && snapshot.etag !== "");
 
   const inputClass = "border-input bg-background h-9 w-full rounded-md border px-3 text-sm outline-none transition-colors focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/30 disabled:cursor-not-allowed disabled:opacity-60";
 
@@ -124,6 +140,7 @@
       totalPages = response.total_pages;
       syncedAt = response.syncedAt ?? "";
       source = response.source ?? "";
+      lastError = response.lastError ?? "";
     } catch (cause) {
       if (current === requestID) error = cause instanceof Error ? cause.message : String(cause);
     } finally {
@@ -193,6 +210,7 @@
     try {
       await savePricingPrice({ ...draft, provider, model });
       editorOpen = false;
+      toast.success($translate(editorMode === "create" ? "pricing.created" : "pricing.saved", { model }));
       await loadRows(editorMode === "create" ? 1 : page);
       await loadProviders();
     } catch (cause) {
@@ -214,6 +232,7 @@
     try {
       await deletePricingPrice(deleteTarget.provider, deleteTarget.model);
       deleteOpen = false;
+      toast.success($translate("pricing.deleted", { model: deleteTarget.model }));
       deleteTarget = null;
       await loadRows(page);
       await loadProviders();
@@ -263,6 +282,7 @@
     try {
       await syncPricing();
       page = 1;
+      toast.success($translate("pricing.synced"));
       await loadRows(1);
       await loadProviders();
     } catch (cause) {
@@ -273,7 +293,12 @@
   }
 
   async function setSyncEnabled(enabled: boolean): Promise<void> {
-    if (syncSaving || !snapshot.writable || !snapshot.etag) return;
+    if (syncSaving || !switchEditable) return;
+    await patchPricingModelsDev({ enabled });
+  }
+
+  /** Writes one pricing.modelsDev key through the shared validate+PATCH path. */
+  async function patchPricingModelsDev(value: Record<string, unknown>): Promise<void> {
     syncSaving = true;
     error = "";
     try {
@@ -282,13 +307,14 @@
       const pricingRecord = record(pricing);
       let patch: unknown[];
       if (!Object.prototype.hasOwnProperty.call(config, "pricing")) {
-        patch = [{ op: "add", path: "/pricing", value: { modelsDev: { enabled } } }];
+        patch = [{ op: "add", path: "/pricing", value: { modelsDev: value } }];
       } else if (!Object.prototype.hasOwnProperty.call(pricingRecord, "modelsDev")) {
-        patch = [{ op: "add", path: "/pricing/modelsDev", value: { enabled } }];
+        patch = [{ op: "add", path: "/pricing/modelsDev", value }];
       } else {
-        patch = [{ op: "add", path: "/pricing/modelsDev/enabled", value: enabled }];
+        const [key] = Object.keys(value);
+        patch = [{ op: "add", path: `/pricing/modelsDev/${key}`, value: value[key] }];
       }
-      const validationResponse = await fetch("/api/config/validate", {
+      const validationResponse = await fetch(apiUrl("/api/config/validate"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(patch),
@@ -297,7 +323,7 @@
       if (!validationResponse.ok || validation.valid === false) {
         throw new Error(validation.error ?? validation.issues?.[0]?.message ?? $translate("pricing.settingsSaveFailed"));
       }
-      const response = await fetch("/api/config", {
+      const response = await fetch(apiUrl("/api/config"), {
         method: "PATCH",
         headers: { "Content-Type": "application/json", "If-Match": snapshot.etag },
         body: JSON.stringify(patch),
@@ -306,11 +332,17 @@
       if (response.status === 412) throw new Error($translate("controlPlane.conflict"));
       if (!response.ok) throw new Error(errorMessageFromPayload(payload, `HTTP ${response.status}`));
       onSnapshot(payload as ConfigSnapshot);
+      toast.success($translate("pricing.syncSettingSaved"));
     } catch (cause) {
       error = cause instanceof Error ? cause.message : String(cause);
     } finally {
       syncSaving = false;
     }
+  }
+
+  async function setAmbiguity(policy: string): Promise<void> {
+    if (syncSaving || !switchEditable || policy === ambiguity) return;
+    await patchPricingModelsDev({ ambiguity: policy });
   }
 
   onMount(() => {
@@ -326,7 +358,7 @@
         <h3 class="text-sm font-semibold">{$translate("pricing.tableTitle")}</h3>
         <p class="text-muted-foreground mt-1 text-xs">{$translate("pricing.tableDescription")}</p>
       </div>
-      <Button class="ml-auto" size="sm" onclick={openCreate} disabled={!snapshot.writable}>
+      <Button class="ml-auto" size="sm" onclick={openCreate}>
         <Plus class="size-3.5" aria-hidden="true" />
         {$translate("pricing.add")}
       </Button>
@@ -375,7 +407,12 @@
                   <div class="flex min-w-0 items-center gap-2">
                     {#if isSelected(row)}<Check class="text-primary size-3.5 shrink-0" aria-label={$translate("pricing.selected")} />{/if}
                     <div class="min-w-0">
-                      <div class="truncate font-medium" title={row.model}>{row.model}</div>
+                      <div class="flex min-w-0 items-center gap-1.5">
+                        <span class="truncate font-medium" title={row.model}>{row.model}</span>
+                        {#if row.source === "operator"}
+                          <span class="border-border bg-muted text-muted-foreground shrink-0 rounded border px-1 text-[10px] leading-4">{$translate("pricing.customRow")}</span>
+                        {/if}
+                      </div>
                       <div class="text-muted-foreground truncate text-xs" title={row.provider}>{row.provider}</div>
                     </div>
                   </div>
@@ -388,8 +425,8 @@
                 <Table.Cell class="text-right">
                   <div class="flex justify-end gap-1">
                     <Button variant="outline" size="xs" onclick={() => applyMapping(row)}>{$translate("pricing.use")}</Button>
-                    <Button variant="ghost" size="icon-sm" title={$translate("pricing.edit")} aria-label={$translate("pricing.edit")} onclick={() => openEdit(row)} disabled={!snapshot.writable}><Pencil class="size-3.5" aria-hidden="true" /></Button>
-                    <Button variant="ghost" size="icon-sm" class="text-destructive hover:text-destructive" title={$translate("pricing.delete")} aria-label={$translate("pricing.delete")} onclick={() => askDelete(row)} disabled={!snapshot.writable}><Trash2 class="size-3.5" aria-hidden="true" /></Button>
+                    <Button variant="ghost" size="icon-sm" title={$translate("pricing.edit")} aria-label={$translate("pricing.edit")} onclick={() => openEdit(row)}><Pencil class="size-3.5" aria-hidden="true" /></Button>
+                    <Button variant="ghost" size="icon-sm" class="text-destructive hover:text-destructive" title={$translate("pricing.delete")} aria-label={$translate("pricing.delete")} onclick={() => askDelete(row)}><Trash2 class="size-3.5" aria-hidden="true" /></Button>
                   </div>
                 </Table.Cell>
               </Table.Row>
@@ -419,7 +456,7 @@
       </div>
       <div class="ml-auto flex items-center gap-2 text-xs">
         <span class="text-muted-foreground">{syncEnabled ? $translate("pricing.enabled") : $translate("pricing.disabled")}</span>
-        <Switch.Root checked={syncEnabled} onCheckedChange={(checked) => void setSyncEnabled(checked)} disabled={syncSaving || !snapshot.writable} aria-label={$translate("pricing.syncTitle")} />
+        <Switch.Root checked={syncEnabled} onCheckedChange={(checked) => void setSyncEnabled(checked)} disabled={syncSaving || !switchEditable} aria-label={$translate("pricing.syncTitle")} />
       </div>
     </div>
     <div class="text-muted-foreground mt-4 grid gap-3 text-xs sm:grid-cols-2">
@@ -432,6 +469,28 @@
         <span class="text-foreground">{absoluteTime(syncedAt)}</span>
       </div>
     </div>
+    <div class="mt-4 grid gap-2">
+      <label class="flex flex-col gap-1 text-xs">
+        <span class="text-muted-foreground">{$translate("pricing.ambiguity")}</span>
+        <select
+          class="border-input bg-background focus-visible:border-ring focus-visible:ring-ring/30 h-9 rounded-lg border px-3 text-sm outline-none focus-visible:ring-3 disabled:cursor-not-allowed disabled:opacity-60"
+          value={ambiguity}
+          disabled={syncSaving || !switchEditable}
+          onchange={(event) => void setAmbiguity(event.currentTarget.value)}
+        >
+          <option value="strict">{$translate("pricing.ambiguityStrict")}</option>
+          <option value="provider-first">{$translate("pricing.ambiguityProviderFirst")}</option>
+          <option value="lowest">{$translate("pricing.ambiguityLowest")}</option>
+        </select>
+        <span class="text-muted-foreground">{$translate("pricing.ambiguityHint")}</span>
+      </label>
+    </div>
+    {#if lastError}
+      <div class="border-destructive/40 bg-destructive/10 text-destructive mt-3 rounded-md border p-3 text-xs" role="status">
+        <div class="font-medium">{$translate("pricing.lastSyncFailed")}</div>
+        <div class="mt-1 break-words">{lastError}</div>
+      </div>
+    {/if}
     <div class="mt-4 flex flex-wrap justify-end gap-2">
       <Button variant="outline" size="sm" onclick={() => void openPicker()} disabled={loading || total === 0}>
         {$translate("pricing.chooseModel")}
@@ -440,7 +499,7 @@
         <RefreshCw class={`size-3.5 ${loading ? "animate-spin" : ""}`} aria-hidden="true" />
         {$translate("pricing.reload")}
       </Button>
-      <Button size="sm" onclick={() => void syncNow()} disabled={syncing || !syncEnabled || !snapshot.writable}>
+      <Button size="sm" onclick={() => void syncNow()} disabled={syncing || !syncEnabled}>
         {#if syncing}<LoaderCircle class="size-3.5 animate-spin" aria-hidden="true" />{:else}<RefreshCw class="size-3.5" aria-hidden="true" />{/if}
         {$translate("pricing.syncNow")}
       </Button>
@@ -485,7 +544,7 @@
     </div>
     <Dialog.Footer>
       <Button variant="outline" onclick={() => (editorOpen = false)} disabled={editorSaving}>{$translate("common.cancel")}</Button>
-      <Button onclick={() => void saveRow()} disabled={editorSaving || !snapshot.writable}>
+      <Button onclick={() => void saveRow()} disabled={editorSaving}>
         {#if editorSaving}<LoaderCircle class="size-4 animate-spin" aria-hidden="true" />{:else}<Check class="size-4" aria-hidden="true" />{/if}
         {$translate("common.save")}
       </Button>

@@ -42,6 +42,12 @@
     return accelerator.model ?? `${titleCase(accelerator.kind)} ${accelerator.index + 1}`;
   }
 
+  function systemLabel(snapshot: HardwareSnapshot): string {
+    const device = [snapshot.system?.vendor, snapshot.system?.model].filter(Boolean).join(" ");
+    if (!device) return "Not detected";
+    return snapshot.system.family ? `${device} (${snapshot.system.family})` : device;
+  }
+
   function environmentLabel(snapshot: HardwareSnapshot): string {
     return `${titleCase(snapshot.environment.kind)}${snapshot.environment.name ? ` (${snapshot.environment.name})` : ""}${snapshot.environment.version ? ` ${snapshot.environment.version}` : ""}`;
   }
@@ -80,6 +86,7 @@
       $translate("hardware.textSummary"),
       "",
       $translate("hardware.system"),
+      `  ${$translate("hardware.device")}: ${systemLabel(snapshot)}`,
       `  ${$translate("hardware.operatingSystem")}: ${osLabel(snapshot)}`,
       `  ${$translate("hardware.kernel")}: ${shown(snapshot.operating_system.kernel)}`,
       `  ${$translate("hardware.architecture")}: ${snapshot.architecture.name}`,
@@ -139,6 +146,7 @@
           <section class="rounded-lg border p-4">
             <h4 class="mb-3 text-sm font-semibold text-muted-foreground">{$translate("hardware.system")}</h4>
             <dl class="grid grid-cols-[minmax(8rem,auto)_1fr] gap-x-4 gap-y-2 text-sm">
+              <dt class="text-muted-foreground">{$translate("hardware.device")}</dt><dd>{systemLabel(hardware)}</dd>
               <dt class="text-muted-foreground">{$translate("hardware.operatingSystem")}</dt><dd>{osLabel(hardware)}</dd>
               <dt class="text-muted-foreground">{$translate("hardware.kernel")}</dt><dd>{shown(hardware.operating_system.kernel)}</dd>
               <dt class="text-muted-foreground">{$translate("hardware.architecture")}</dt><dd>{hardware.architecture.name}</dd>

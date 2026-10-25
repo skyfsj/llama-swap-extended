@@ -302,7 +302,7 @@ func responsesFoldServerArtifacts(request map[string]any) bool {
 	changed := false
 	for _, raw := range items {
 		item, ok := raw.(map[string]any)
-		if !ok || item["type"] != artifactResponsesCall {
+		if !ok || item["type"] != artifactResponsesCall || item["server_label"] != artifactServerLabel || item["status"] != "completed" {
 			folded = append(folded, raw)
 			continue
 		}

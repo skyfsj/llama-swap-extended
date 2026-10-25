@@ -54,8 +54,8 @@ func TestConfig_ProviderScalarForms(t *testing.T) {
 	if p.BareNamePolicy != "local-first" {
 		t.Errorf("bareNamePolicy = %q", p.BareNamePolicy)
 	}
-	if p.MaxRetries != 2 {
-		t.Errorf("maxRetries = %d", p.MaxRetries)
+	if got := p.MaxRetriesPerCredential(); got != 2 {
+		t.Errorf("maxRetries = %d", got)
 	}
 	if p.Timeouts.ResponseHeader != 600 {
 		t.Errorf("responseHeader default = %d", p.Timeouts.ResponseHeader)
@@ -114,6 +114,9 @@ providers:
 	if p.BareNamePolicy != "provider-first" {
 		t.Errorf("bareNamePolicy = %q", p.BareNamePolicy)
 	}
+	if got := p.MaxRetriesPerCredential(); got != 4 {
+		t.Errorf("maxRetries = %d, want the configured 4", got)
+	}
 	if len(p.ApiKeys) != 2 {
 		t.Fatalf("apiKeys = %+v", p.ApiKeys)
 	}
@@ -140,6 +143,39 @@ providers:
 	}
 	if p.Models[1].Local != "claude-haiku" || p.Models[1].Remote != "claude-haiku-4-5" {
 		t.Errorf("model1 shorthand mapping: %+v", p.Models[1])
+	}
+}
+
+// An explicit maxRetries: 0 must survive normalization: it means "try each key
+// once", which is a legitimate policy and not the same as leaving the field out
+// (the default is 2).
+func TestConfig_ProviderMaxRetriesExplicitZero(t *testing.T) {
+	yaml := `
+models:
+  local-model:
+    cmd: echo ${PORT}
+providers:
+  explicit-zero:
+    type: openai
+    endpoint: https://api.example.com
+    maxRetries: 0
+    apiKeys: [sk-a]
+    models: [m1]
+  omitted:
+    type: openai
+    endpoint: https://api.example.com
+    apiKeys: [sk-b]
+    models: [m2]
+`
+	cfg, err := loadProvidersYAML(t, yaml)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got := cfg.Providers["explicit-zero"].MaxRetriesPerCredential(); got != 0 {
+		t.Errorf("explicit maxRetries: 0 parsed as %d, want 0", got)
+	}
+	if got := cfg.Providers["omitted"].MaxRetriesPerCredential(); got != 2 {
+		t.Errorf("omitted maxRetries = %d, want the default 2", got)
 	}
 }
 

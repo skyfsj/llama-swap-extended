@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -73,7 +74,7 @@ func (s *Store) ListPricingPrices(ctx context.Context, provider, query string, p
 		page = totalPages
 	}
 	offset := (page - 1) * limit
-	rows, err := s.db.QueryContext(ctx, `SELECT provider,model,input_per_million,output_per_million,cache_read_per_million,cache_write_per_million,reasoning_per_million,synced_at
+	rows, err := s.db.QueryContext(ctx, `SELECT provider,model,input_per_million,output_per_million,cache_read_per_million,cache_write_per_million,reasoning_per_million,synced_at,source
 		FROM pricing_catalog WHERE `+where+` ORDER BY model COLLATE NOCASE,provider COLLATE NOCASE LIMIT ? OFFSET ?`, append(args, limit, offset)...)
 	if err != nil {
 		return PricingCatalogPage{}, err
@@ -83,7 +84,7 @@ func (s *Store) ListPricingPrices(ctx context.Context, provider, query string, p
 	for rows.Next() {
 		var price Price
 		var syncedAt int64
-		if err := rows.Scan(&price.Provider, &price.Model, &price.Input, &price.Output, &price.CacheRead, &price.CacheWrite, &price.Reasoning, &syncedAt); err != nil {
+		if err := rows.Scan(&price.Provider, &price.Model, &price.Input, &price.Output, &price.CacheRead, &price.CacheWrite, &price.Reasoning, &syncedAt, &price.Source); err != nil {
 			return PricingCatalogPage{}, err
 		}
 		price.SyncedAt = time.Unix(syncedAt, 0)
@@ -98,6 +99,11 @@ func (s *Store) ListPricingPrices(ctx context.Context, provider, query string, p
 // DeletePrice removes one exact provider/model row and reports whether it
 // existed. Keeping the operation exact avoids accidentally deleting every
 // provider's price when model IDs overlap.
+//
+// The stored ETag is dropped with the row. It validates the whole snapshot
+// against the source, so keeping it would let the next refresh answer 304 Not
+// Modified and leave the deleted model gone for good — the operator's edit would
+// be indistinguishable from a catalog the source no longer lists.
 func (s *Store) DeletePrice(ctx context.Context, provider, model string) (bool, error) {
 	ctx = normalizeContext(ctx)
 	if err := s.ensureDB(); err != nil {
@@ -116,7 +122,13 @@ func (s *Store) DeletePrice(ctx context.Context, provider, model string) (bool, 
 		return false, err
 	}
 	count, err := result.RowsAffected()
-	return count > 0, err
+	if err != nil || count == 0 {
+		return count > 0, err
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE pricing_meta SET etag='' WHERE id=1`); err != nil {
+		return false, fmt.Errorf("invalidate pricing etag: %w", err)
+	}
+	return true, nil
 }
 
 // ListPricingProviders returns provider IDs from the locally synchronized

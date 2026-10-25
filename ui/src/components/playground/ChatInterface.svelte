@@ -5,6 +5,7 @@
   import { playgroundStores } from "../../stores/playgroundActivity";
   import type { ChatMessage, ContentPart } from "../../lib/types";
   import { isSubmitEnter } from "../../lib/ime";
+  import { createThrottledSaver } from "../../lib/throttledSave";
   import ChatMessageComponent from "./ChatMessage.svelte";
   import ModelSelector from "./ModelSelector.svelte";
   import ExpandableTextarea from "./ExpandableTextarea.svelte";
@@ -56,6 +57,9 @@
   $effect(() => {
     if (wasStreaming && !isStreaming) {
       inputRef?.focus();
+      // The stream is over: persist its last tokens now instead of leaving them
+      // in the throttle window for a further two seconds.
+      saveMessages.flush();
     }
     wasStreaming = isStreaming;
   });
@@ -77,21 +81,21 @@
     }
   });
 
-  // Persist messages to localStorage (throttled to once per 2s)
-  let lastSaveTime = 0;
-  $effect(() => {
-    const json = JSON.stringify(messages);
-    const elapsed = Date.now() - lastSaveTime;
-    const save = () => {
+  // Persist messages to localStorage, at most once per two seconds.
+  //
+  // `messages` is replaced on every streamed token, so an effect that reads it
+  // re-runs per token. Serializing the whole conversation there is quadratic in
+  // the conversation length, so the saver reads `messages` only when it is
+  // actually about to write.
+  const saveMessages = createThrottledSaver(
+    (json) => {
       try { localStorage.setItem("playground-messages", json); } catch {}
-      lastSaveTime = Date.now();
-    };
-    if (elapsed >= 2000) {
-      save();
-      return;
-    }
-    const timer = setTimeout(save, 2000 - elapsed);
-    return () => clearTimeout(timer);
+    },
+    () => JSON.stringify(messages),
+  );
+
+  $effect(() => {
+    saveMessages.touch();
   });
 
   async function sendMessage() {

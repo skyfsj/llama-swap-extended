@@ -22,6 +22,7 @@
   import { Loader2, Pencil, Plus, PowerOff, Search, SquareStack, Trash2 } from "@lucide/svelte";
   import { Input } from "$lib/components/ui/input/index.js";
   import { translate } from "../lib/i18n";
+  import { toast } from "../lib/toast";
   import ModelCreateDialog from "../components/model/ModelCreateDialog.svelte";
   import ModelDeleteDialog from "../components/model/ModelDeleteDialog.svelte";
   import ModelSettingsDialog from "../components/model/ModelSettingsDialog.svelte";
@@ -61,8 +62,10 @@
     unloadingAll = true;
     try {
       await unloadAllModels();
+      const count = $models.filter((m) => m.state === "ready" || m.state === "sleeping").length;
+      toast.success($translate("models.allUnloaded", { count }));
     } catch (e) {
-      console.error(e);
+      toast.error($translate("models.unloadAllFailed", { message: e instanceof Error ? e.message : String(e) }));
     } finally {
       unloadingAll = false;
     }
@@ -147,7 +150,21 @@
                     {/if}
                   </td>
                   <td class="px-4 py-3">
-                    <div class="flex items-center gap-2 text-xs"><span class={`size-2 rounded-full ${statusDotColor(model)}`}></span><span>{$translate(`status.model.${model.state}`)}</span></div>
+                    <div class="flex items-center gap-2 text-xs">
+                      <span class={`size-2 rounded-full ${statusDotColor(model)}`}></span>
+                      <span>{$translate(`status.model.${model.state}`)}</span>
+                      {#if model.state === "starting" && typeof model.loadingProgress === "number"}
+                        <span class="text-muted-foreground tabular-nums">{Math.floor(model.loadingProgress * 100)}%</span>
+                      {/if}
+                    </div>
+                    {#if model.state === "starting" && typeof model.loadingProgress === "number"}
+                      <div class="mt-1 h-1 w-40 overflow-hidden rounded-full bg-muted">
+                        <div class="h-full bg-primary transition-[width]" style={`width: ${Math.max(0, Math.min(100, Math.floor(model.loadingProgress * 100)))}%`}></div>
+                      </div>
+                    {/if}
+                    {#if model.state === "starting" && model.loadingMessage}
+                      <p class="text-muted-foreground mt-1 max-w-64 truncate text-[0.625rem]" title={model.loadingMessage}>{model.loadingMessage}</p>
+                    {/if}
                     {#if model.disabled}<Tag class="mt-1 border-destructive/40 bg-destructive/10 px-1.5 text-[0.625rem] uppercase text-destructive">{$translate("models.disabled")}</Tag>{/if}
 {#if model.maintenance}<Tag class="mt-1 border-amber-500/40 bg-amber-500/10 px-1.5 text-[0.625rem] uppercase text-amber-600 dark:text-amber-400">{$translate("models.maintenance")}</Tag>{/if}
                     {#if model.unlisted}<Tag class="mt-1 px-1.5 text-[0.625rem] uppercase">{$translate("models.unlisted")}</Tag>{/if}

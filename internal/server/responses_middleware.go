@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/store"
+	"github.com/mostlygeek/llama-swap/pkg/dialect"
 )
 
 func readResponsesRequestBody(r *http.Request) ([]byte, error) {
@@ -53,6 +54,9 @@ func addPreviousResponseChainForModel(ctx context.Context, chatBody, responsesBo
 	if err != nil || !found {
 		return chatBody, fmt.Errorf("previous_response_id %q is not available", previous)
 	}
+	if affinity.IdentityID != "" && affinity.IdentityID != identityIDFromContext(ctx) {
+		return chatBody, fmt.Errorf("previous_response_id %q is not available", previous)
+	}
 	if expectedModel = strings.TrimSpace(expectedModel); expectedModel != "" && strings.TrimSpace(affinity.Model) != "" && affinity.Model != expectedModel {
 		return chatBody, fmt.Errorf("previous_response_id %q belongs to model %q, not %q", previous, affinity.Model, expectedModel)
 	}
@@ -64,6 +68,9 @@ func addPreviousResponseChainForModel(ctx context.Context, chatBody, responsesBo
 		return chatBody, fmt.Errorf("previous_response_id %q has invalid stored response: %w", previous, err)
 	}
 	var output []any
+	if incomplete, _ := previousResponse["_llama_swap_history_incomplete"].(bool); incomplete {
+		return chatBody, fmt.Errorf("previous_response_id %q exceeds the retained history budget; resume from a gateway conversation checkpoint", previous)
+	}
 	if rawOutput, exists := previousResponse["output"]; exists && rawOutput != nil {
 		var ok bool
 		output, ok = rawOutput.([]any)
@@ -75,7 +82,15 @@ func addPreviousResponseChainForModel(ctx context.Context, chatBody, responsesBo
 	if err := json.Unmarshal(chatBody, &chat); err != nil {
 		return chatBody, err
 	}
-	messages, _ := chat["messages"].([]any)
+	current, _ := chat["messages"].([]any)
+	var messages []any
+	var history map[string]any
+	if len(affinity.Request) > 0 {
+		if err := json.Unmarshal(affinity.Request, &history); err != nil || history == nil {
+			return chatBody, fmt.Errorf("previous_response_id %q has invalid stored history", previous)
+		}
+		messages, _ = history["messages"].([]any)
+	}
 	// skipped names the provider-hosted items this replay cannot carry; they are
 	// reported once per follow-up instead of failing the request.
 	var skipped []string
@@ -100,7 +115,7 @@ func addPreviousResponseChainForModel(ctx context.Context, chatBody, responsesBo
 			messages = append(messages, map[string]any{"role": "assistant", "content": nil, "reasoning_content": reasoning})
 		case "function_call":
 			callID, _ := item["call_id"].(string)
-			name, _ := item["name"].(string)
+			name, namespace := responsesReplayToolName(item)
 			if strings.TrimSpace(callID) == "" || strings.TrimSpace(name) == "" {
 				return chatBody, fmt.Errorf("previous_response_id %q contains malformed function_call", previous)
 			}
@@ -108,6 +123,7 @@ func addPreviousResponseChainForModel(ctx context.Context, chatBody, responsesBo
 			if err != nil {
 				return chatBody, fmt.Errorf("previous_response_id %q function_call: %w", previous, err)
 			}
+			_ = namespace
 			messages = append(messages, map[string]any{"role": "assistant", "content": nil, "tool_calls": []any{map[string]any{
 				"id": callID, "type": "function", "function": map[string]any{"name": name, "arguments": arguments},
 			}}})
@@ -122,7 +138,7 @@ func addPreviousResponseChainForModel(ctx context.Context, chatBody, responsesBo
 			name := "tool_search"
 			var arguments any = "{}"
 			if itemType == "custom_tool_call" {
-				name, _ = item["name"].(string)
+				name, _ = responsesReplayToolName(item)
 				input, hasInput := item["input"]
 				if !hasInput {
 					input = ""
@@ -185,12 +201,67 @@ func addPreviousResponseChainForModel(ctx context.Context, chatBody, responsesBo
 			return chatBody, fmt.Errorf("previous_response_id %q contains unsupported output item %q", previous, item["type"])
 		}
 	}
-	chat["messages"] = messages
+	var prefix []any
+	for len(current) > 0 {
+		message, _ := current[0].(map[string]any)
+		if message["role"] != "system" && message["role"] != "developer" {
+			break
+		}
+		prefix = append(prefix, current[0])
+		current = current[1:]
+	}
+	chat["messages"] = mergeResponseAssistantCalls(append(append(prefix, messages...), current...))
 	if len(skipped) > 0 {
 		slog.Warn("previous_response_id replay skipped provider-hosted items",
 			"response_id", previous, "item_types", skipped)
 	}
 	return json.Marshal(chat)
+}
+
+func mergeResponseAssistantCalls(messages []any) []any {
+	var out []any
+	for _, raw := range messages {
+		message, _ := raw.(map[string]any)
+		calls, _ := message["tool_calls"].([]any)
+		if len(calls) > 0 && len(out) > 0 {
+			last, _ := out[len(out)-1].(map[string]any)
+			previous, _ := last["tool_calls"].([]any)
+			if last["role"] == "assistant" && len(previous) > 0 && message["content"] == nil {
+				last["tool_calls"] = append(previous, calls...)
+				continue
+			}
+		}
+		out = append(out, raw)
+	}
+	return out
+}
+
+func responseRequestHistory(ctx context.Context, request []byte, model string, st *store.Store) ([]byte, error) {
+	var input map[string]json.RawMessage
+	if err := json.Unmarshal(request, &input); err != nil {
+		return nil, err
+	}
+	delete(input, "instructions")
+	delete(input, "previous_response_id")
+	body, err := json.Marshal(input)
+	if err != nil {
+		return nil, err
+	}
+	chat, _, err := dialect.ConvertRequest(dialect.OpenAIResponses, dialect.OpenAIChat, body, dialect.ConvertOptions{Model: model})
+	if err != nil {
+		return nil, err
+	}
+	chat, err = addPreviousResponseChainForModel(ctx, chat, request, model, st)
+	if err != nil {
+		return nil, err
+	}
+	var history struct {
+		Messages json.RawMessage `json:"messages"`
+	}
+	if err := json.Unmarshal(chat, &history); err != nil {
+		return nil, err
+	}
+	return json.Marshal(history)
 }
 
 // responseMessageToChat converts a Responses assistant message into the
@@ -295,6 +366,20 @@ func isHostedResponsesItem(itemType string) bool {
 	return false
 }
 
+// responsesReplayToolName restores the flattened function name a replayed
+// Responses item was declared under. The adapter upstream knows the tool only
+// by that name, so replaying the bare member name would reference a function
+// it never saw.
+func responsesReplayToolName(item map[string]any) (string, string) {
+	name, _ := item["name"].(string)
+	namespace, _ := item["namespace"].(string)
+	namespace = strings.TrimSpace(namespace)
+	if namespace != "" && namespace != "functions" {
+		return namespace + "__" + name, namespace
+	}
+	return name, namespace
+}
+
 func responseReasoningToChat(value any) (string, error) {
 	if value == nil {
 		return "", nil
@@ -387,19 +472,82 @@ func persistResponseAffinity(r *http.Request, st *store.Store, model, backend st
 	if len(storedResponse) > maxAffinityResponseBytes {
 		return
 	}
-	id, _ := out["id"].(string)
-	if id == "" {
+	responseID, _ := out["id"].(string)
+	if responseID == "" {
 		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), affinityWriteTimeout)
+	defer cancel()
+	history, err := responseRequestHistory(ctx, request, model, st)
+	if err != nil {
+		// The conversation history is a replay aid; failing to rebuild it must
+		// not cost the client the response row itself.
+		slog.Warn("response affinity stored without its request history",
+			"response_id", responseID, "error", err)
+		history = nil
+	}
+	fullHistoryBytes := len(history)
+	history = trimAffinityHistory(history, responseID, maxAffinityResponseBytes-len(storedResponse))
+	if err != nil || len(history) < fullHistoryBytes {
+		out["_llama_swap_history_incomplete"] = true
+		encoded, marshalErr := json.Marshal(out)
+		if marshalErr != nil || len(encoded) > maxAffinityResponseBytes {
+			return
+		}
+		storedResponse = encoded
+		history = trimAffinityHistory(history, responseID, maxAffinityResponseBytes-len(storedResponse))
 	}
 	state := responseAffinityState(out, status)
 	now := time.Now()
-	ctx, cancel := affinityWriteContext()
-	defer cancel()
-	_ = st.UpsertResponseAffinity(ctx, store.ResponseAffinity{
-		ResponseID: id, Model: model, Backend: backend, Status: state, Response: storedResponse,
+	if err := st.UpsertResponseAffinity(ctx, store.ResponseAffinity{
+		ResponseID: responseID, Model: model, Backend: backend, Status: state, Response: storedResponse, Request: history,
 		IdentityID: identityIDFromContext(r.Context()),
 		ExpiresAt:  now.Add(30 * 24 * time.Hour), CreatedAt: now, UpdatedAt: now,
-	})
+	}); err != nil {
+		slog.Warn("response affinity was not stored",
+			"response_id", responseID, "response_bytes", len(storedResponse), "history_bytes", len(history), "error", err)
+	}
+}
+
+// trimAffinityHistory keeps a request history inside the row budget by dropping
+// the oldest messages. A long conversation would otherwise push the whole row
+// over the limit, and losing the row costs the client both the stored response
+// and the ability to continue the conversation at all; dropping the oldest
+// turns keeps the recent context, which is the part a follow-up needs.
+func trimAffinityHistory(history []byte, responseID string, budget int) []byte {
+	if len(history) == 0 || len(history) <= budget {
+		return history
+	}
+	var stored struct {
+		Messages []json.RawMessage `json:"messages"`
+	}
+	if err := json.Unmarshal(history, &stored); err != nil {
+		slog.Warn("response affinity stored without its request history",
+			"response_id", responseID, "error", err)
+		return nil
+	}
+	messages := stored.Messages
+	dropped := 0
+	for len(messages) > 0 {
+		candidate, err := json.Marshal(struct {
+			Messages []json.RawMessage `json:"messages"`
+		}{Messages: messages})
+		if err != nil {
+			return nil
+		}
+		if len(candidate) <= budget {
+			if dropped > 0 {
+				slog.Warn("response affinity history trimmed to fit the stored row",
+					"response_id", responseID, "dropped_messages", dropped, "budget_bytes", budget)
+			}
+			return candidate
+		}
+		messages = messages[1:]
+		dropped++
+	}
+	slog.Warn("response affinity stored without its request history",
+		"response_id", responseID, "reason", "history exceeds the response budget")
+	return nil
 }
 
 // responseFromSSE builds the small canonical response chain needed for

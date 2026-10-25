@@ -1,4 +1,5 @@
 import { errorMessageFromPayload } from "./apiError";
+import { apiUrl } from "./apiPath";
 
 export interface PricingCatalogResponse {
   providers: string[];
@@ -14,6 +15,8 @@ export interface PricingPrice {
   cacheWrite: number;
   reasoning: number;
   syncedAt?: string;
+  /** "operator" marks a hand-written row that catalog refreshes preserve. */
+  source?: string;
 }
 
 export interface PricingPricesResponse {
@@ -25,6 +28,8 @@ export interface PricingPricesResponse {
   etag?: string;
   syncedAt?: string;
   source?: string;
+  /** Why the most recent refresh failed, when it did. Empty when healthy. */
+  lastError?: string;
 }
 
 export interface PricingPriceInput {
@@ -49,7 +54,7 @@ export async function getPricingCatalog(options: { provider?: string; query?: st
   if (options.provider?.trim()) params.set("provider", options.provider.trim());
   if (options.query?.trim()) params.set("q", options.query.trim());
   params.set("limit", String(options.limit ?? 200));
-  const response = await fetch(`/api/pricing/catalog?${params.toString()}`);
+  const response = await fetch(apiUrl(`/api/pricing/catalog?${params.toString()}`));
   if (!response.ok) {
     const payload = await response.json().catch(() => ({}));
     throw new Error(errorMessageFromPayload(payload, `Unable to load pricing catalog (HTTP ${response.status})`));
@@ -72,7 +77,7 @@ export async function getPricingPrices(options: { provider?: string; query?: str
   if (options.query?.trim()) params.set("q", options.query.trim());
   params.set("page", String(options.page ?? 1));
   params.set("limit", String(options.limit ?? 50));
-  const response = await fetch(`/api/pricing/prices?${params.toString()}`);
+  const response = await fetch(apiUrl(`/api/pricing/prices?${params.toString()}`));
   if (!response.ok) throw await readPricingError(response, "Unable to load pricing rows");
   const payload = await response.json() as Partial<PricingPricesResponse>;
   return {
@@ -84,11 +89,12 @@ export async function getPricingPrices(options: { provider?: string; query?: str
     etag: typeof payload.etag === "string" ? payload.etag : undefined,
     syncedAt: typeof payload.syncedAt === "string" ? payload.syncedAt : undefined,
     source: typeof payload.source === "string" ? payload.source : undefined,
+    lastError: typeof payload.lastError === "string" && payload.lastError.trim() ? payload.lastError : undefined,
   };
 }
 
 export async function savePricingPrice(price: PricingPriceInput): Promise<PricingPrice> {
-  const response = await fetch("/api/pricing/prices", {
+  const response = await fetch(apiUrl("/api/pricing/prices"), {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(price),
@@ -99,12 +105,12 @@ export async function savePricingPrice(price: PricingPriceInput): Promise<Pricin
 
 export async function deletePricingPrice(provider: string, model: string): Promise<void> {
   const params = new URLSearchParams({ provider, model });
-  const response = await fetch(`/api/pricing/prices?${params.toString()}`, { method: "DELETE" });
+  const response = await fetch(apiUrl(`/api/pricing/prices?${params.toString()}`), { method: "DELETE" });
   if (!response.ok) throw await readPricingError(response, "Unable to delete pricing row");
 }
 
 export async function syncPricing(): Promise<PricingSyncResponse> {
-  const response = await fetch("/api/pricing/sync", { method: "POST" });
+  const response = await fetch(apiUrl("/api/pricing/sync"), { method: "POST" });
   if (!response.ok) throw await readPricingError(response, "Unable to synchronize pricing");
   return await response.json() as PricingSyncResponse;
 }

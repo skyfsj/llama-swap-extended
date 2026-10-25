@@ -1,5 +1,6 @@
 import { errorMessageFromPayload } from "./apiError";
 import type { ModelDownload, ModelFile, ModelFilesResponse } from "./types";
+import { apiUrl } from "./apiPath";
 
 export interface ModelFileProject {
   key: string;
@@ -158,13 +159,13 @@ export async function getModelFiles(options: { source?: string; query?: string }
   const params = new URLSearchParams({ limit: "1000" });
   if (options.source && options.source !== "all") params.set("source", options.source);
   if (options.query?.trim()) params.set("query", options.query.trim());
-  const response = await fetch(`/api/model-files?${params.toString()}`);
+  const response = await fetch(apiUrl(`/api/model-files?${params.toString()}`));
   if (!response.ok) throw await readError(response, "Unable to load model files");
   return (await response.json()) as ModelFilesResponse;
 }
 
 export async function deleteModelFile(file: Pick<ModelFile, "id" | "source_id" | "path">): Promise<void> {
-  const response = await fetch(`/api/model-files/${encodeURIComponent(file.id)}`, {
+  const response = await fetch(apiUrl(`/api/model-files/${encodeURIComponent(file.id)}`), {
     method: "DELETE",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ source_id: file.source_id, path: file.path, confirm: true }),

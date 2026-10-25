@@ -55,6 +55,61 @@ func TestServer_ApplyFilters(t *testing.T) {
 			t.Errorf("top_p = %v, want 0.1", got)
 		}
 	})
+
+	t.Run("set-if-undefined only fills missing params", func(t *testing.T) {
+		f := config.Filters{
+			SetParams: map[string]any{
+				"max_tokens?": 32768,
+				"temperature": 0.2,
+			},
+		}
+		out, err := applyFilters([]byte(`{"model":"m","max_tokens":128}`), "m", "", f)
+		if err != nil {
+			t.Fatalf("applyFilters: %v", err)
+		}
+		if got := gjson.GetBytes(out, "max_tokens").Int(); got != 128 {
+			t.Errorf("max_tokens = %d, want the client's 128", got)
+		}
+		if got := gjson.GetBytes(out, "temperature").Float(); got != 0.2 {
+			t.Errorf("temperature = %v, want 0.2 (plain key still forces)", got)
+		}
+
+		out, err = applyFilters([]byte(`{"model":"m"}`), "m", "", f)
+		if err != nil {
+			t.Fatalf("applyFilters: %v", err)
+		}
+		if got := gjson.GetBytes(out, "max_tokens").Int(); got != 32768 {
+			t.Errorf("max_tokens = %d, want the soft default 32768", got)
+		}
+	})
+
+	t.Run("stripped param counts as undefined", func(t *testing.T) {
+		f := config.Filters{
+			StripParams: "max_tokens",
+			SetParams:   map[string]any{"max_tokens?": 1024},
+		}
+		out, err := applyFilters([]byte(`{"model":"m","max_tokens":128}`), "m", "", f)
+		if err != nil {
+			t.Fatalf("applyFilters: %v", err)
+		}
+		if got := gjson.GetBytes(out, "max_tokens").Int(); got != 1024 {
+			t.Errorf("max_tokens = %d, want the soft default after stripping", got)
+		}
+	})
+
+	t.Run("soft setParamsByID is a no-op when setParams already set the key", func(t *testing.T) {
+		f := config.Filters{
+			SetParams:     map[string]any{"top_p": 0.5},
+			SetParamsByID: map[string]map[string]any{"alias": {"top_p?": 0.1}},
+		}
+		out, err := applyFilters([]byte(`{"model":"alias"}`), "alias", "", f)
+		if err != nil {
+			t.Fatalf("applyFilters: %v", err)
+		}
+		if got := gjson.GetBytes(out, "top_p").Float(); got != 0.5 {
+			t.Errorf("top_p = %v, want 0.5 from setParams", got)
+		}
+	})
 }
 
 func TestServer_ResolveFilters_QualifiedPeer(t *testing.T) {

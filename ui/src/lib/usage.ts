@@ -1,4 +1,5 @@
 import { requestJson } from "./http";
+import { apiUrl } from "./apiPath";
 
 const request = requestJson;
 
@@ -161,7 +162,7 @@ export async function fetchUsageRecords(filters: UsageFilters, limit = 100, offs
 
 /** Downloads the filtered selection as CSV without a round-trip through the page. */
 export function usageExportUrl(filters: UsageFilters): string {
-  return `/api/usage/export.csv${usageFiltersToQuery(filters)}`;
+  return apiUrl(`/api/usage/export.csv${usageFiltersToQuery(filters)}`);
 }
 
 /**

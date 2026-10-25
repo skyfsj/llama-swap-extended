@@ -411,7 +411,9 @@ func TestGateway_RateLimitRespectsRetryAfter(t *testing.T) {
 	}
 }
 
-func TestGateway_TransientErrorCooldownAndRetry(t *testing.T) {
+// A transient failure spends the credential's retry budget instead of benching
+// it: the same key is tried again, and success leaves no cooldown behind.
+func TestGateway_TransientErrorRetriedOnSameCredential(t *testing.T) {
 	var calls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		n := calls.Add(1)
@@ -425,6 +427,13 @@ func TestGateway_TransientErrorCooldownAndRetry(t *testing.T) {
 	defer upstream.Close()
 
 	cfg := gwConfig(t, upstream.URL, config.ProviderTypeOpenAI)
+	// One key, so a retry can only be the same credential: this is the shape
+	// the per-credential budget exists for.
+	prov := cfg.Providers["prov"]
+	prov.ApiKeys = []config.ProviderKey{{Value: "only-key"}}
+	prov.MaxRetries = intPointerForTest(2)
+	cfg.Providers["prov"] = normalizeProvider(t, prov)
+
 	g, err := New(cfg, testLogger())
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -437,16 +446,61 @@ func TestGateway_TransientErrorCooldownAndRetry(t *testing.T) {
 	g.ServeHTTP(w, req, route, Session{})
 
 	if w.Code != 200 {
-		t.Fatalf("status = %d", w.Code)
+		t.Fatalf("status = %d body = %s", w.Code, w.Body.String())
 	}
-	cooled := 0
+	if calls.Load() != 2 {
+		t.Fatalf("upstream calls = %d, want 2 (the first 502 is retried on the same key)", calls.Load())
+	}
 	for _, m := range route.Members {
-		if m.Status().TransientUntil.After(time.Now()) {
-			cooled++
+		if until := m.Status().TransientUntil; !until.IsZero() {
+			t.Fatalf("a retried-then-successful credential must not stay benched: %s", until)
 		}
 	}
-	if cooled != 1 {
-		t.Fatalf("502 should apply a transient cooldown to the failed credential, got %d", cooled)
+}
+
+// Once the per-credential budget is spent, the credential is benched with its
+// class cooldown and the request continues on the next credential.
+func TestGateway_ExhaustedCredentialBenchedThenNextCredential(t *testing.T) {
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusBadGateway)
+		w.Write([]byte(`upstream down`))
+	}))
+	defer upstream.Close()
+
+	cfg := gwConfig(t, upstream.URL, config.ProviderTypeOpenAI)
+	prov := cfg.Providers["prov"]
+	prov.ApiKeys = []config.ProviderKey{{Value: "k1"}, {Value: "k2"}}
+	prov.MaxRetries = intPointerForTest(1)
+	cfg.Providers["prov"] = normalizeProvider(t, prov)
+
+	g, err := New(cfg, testLogger())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer g.Shutdown()
+
+	route := g.RouteFor("prov/m1", false)
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{}`))
+	w := httptest.NewRecorder()
+	g.ServeHTTP(w, req, route, Session{})
+
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d", w.Code)
+	}
+	// maxRetries 1 means two attempts per credential, and both keys are tried.
+	if calls.Load() != 4 {
+		t.Fatalf("upstream calls = %d, want 4 (2 attempts on each of 2 keys)", calls.Load())
+	}
+	benched := 0
+	for _, m := range route.Members {
+		if m.Status().TransientUntil.After(time.Now()) {
+			benched++
+		}
+	}
+	if benched != 2 {
+		t.Fatalf("both credentials should carry a transient cooldown after their budget, got %d", benched)
 	}
 }
 
@@ -1236,6 +1290,8 @@ func TestGateway_EmptySuccessBodyRetries(t *testing.T) {
 
 func boolPtr(v bool) *bool { return &v }
 
+func intPointerForTest(v int) *int { return &v }
+
 func TestGateway_PolicyForbiddenFailsOverWithoutCooldown(t *testing.T) {
 	var calls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1597,7 +1653,7 @@ func TestGateway_RepeatedUnauthorizedEscalates(t *testing.T) {
 	// 401 arrives inside the escalation window.
 	prov := cfg.Providers["prov"]
 	prov.ApiKeys = []config.ProviderKey{{Value: "only-key"}}
-	prov.MaxRetries = 1
+	prov.MaxRetries = intPointerForTest(1)
 	cfg.Providers["prov"] = normalizeProvider(t, prov)
 
 	g, err := New(cfg, testLogger())
@@ -2187,6 +2243,107 @@ func TestGateway_PublishesProviderOnExhaustedFailure(t *testing.T) {
 	}
 }
 
+// 多表面转发时，网关把一个失败候选交还给调用方继续试下一个之前，不得写入
+// 归属：holder 是"首个发布者胜出"，先失败的候选一旦抢先发布，真正答出
+// 200 的候选就再也写不进去，活动记录会把失败者当成服务器。
+// 这是"记录显示 opencode-go、实际由 DeepSeek 官方答出"的回归守卫。
+func TestGateway_HandedOffFailureLeavesRecordForTheAnsweringRoute(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusPaymentRequired)
+		_, _ = w.Write([]byte(`{"error":{"message":"Insufficient Balance"}}`))
+	}))
+	defer upstream.Close()
+
+	cfg := gwConfig(t, upstream.URL, config.ProviderTypeOpenAI)
+	g, err := New(cfg, testLogger())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer g.Shutdown()
+	route := g.RouteFor("prov/m1", false)
+	if route == nil {
+		t.Fatal("route not found")
+	}
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"remote-m1","messages":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req = req.WithContext(swaputil.WithRequestDiagnostics(req.Context()))
+	w := httptest.NewRecorder()
+	opts := AttemptOptions{StopOnRequestScoped: true, StopOnUnavailable: true}
+	outcome := g.ServeHTTPAttempt(w, req, []*Route{route}, Session{}, opts)
+	if outcome.Committed {
+		t.Fatal("交还给下一候选的失败不得提交响应")
+	}
+	if outcome.Status != http.StatusPaymentRequired {
+		t.Fatalf("outcome.Status = %d，期望 402", outcome.Status)
+	}
+
+	diagnostics := swaputil.RequestDiagnosticsFrom(req.Context())
+	if diagnostics == nil {
+		t.Fatal("诊断 holder 丢失")
+	}
+	if diagnostics.Provider != "" {
+		t.Fatalf("Provider = %q，交还给下一候选的失败不得写入归属", diagnostics.Provider)
+	}
+}
+
+// 整条链的凭据都已冷却时同样不得写入归属：调用方会拿这条链最近一次上游
+// 答复去试别的候选，归属属于最终答出来的那条链，而不是冷却中的这条。
+func TestGateway_BenchedChainLeavesRecordForTheAnsweringRoute(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusPaymentRequired)
+		_, _ = w.Write([]byte(`{"error":{"message":"Insufficient Balance"}}`))
+	}))
+	defer upstream.Close()
+
+	cfg := gwConfig(t, upstream.URL, config.ProviderTypeOpenAI)
+	g, err := New(cfg, testLogger())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer g.Shutdown()
+	route := g.RouteFor("prov/m1", false)
+	if route == nil {
+		t.Fatal("route not found")
+	}
+
+	newReq := func() *http.Request {
+		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"remote-m1","messages":[]}`))
+		req.Header.Set("Content-Type", "application/json")
+		return req.WithContext(swaputil.WithRequestDiagnostics(req.Context()))
+	}
+
+	// 第一条请求把每个 key 都打成 402：auth 失败触发默认 10 分钟冷却，
+	// 此后整条链不可调度。
+	first := newReq()
+	firstRecorder := httptest.NewRecorder()
+	g.ServeHTTP(firstRecorder, first, route, Session{})
+	if firstRecorder.Code != http.StatusPaymentRequired {
+		t.Fatalf("第一条请求 status = %d，期望 402", firstRecorder.Code)
+	}
+
+	second := newReq()
+	secondRecorder := httptest.NewRecorder()
+	opts := AttemptOptions{StopOnRequestScoped: true, StopOnUnavailable: true}
+	outcome := g.ServeHTTPAttempt(secondRecorder, second, []*Route{route}, Session{}, opts)
+	if outcome.Committed {
+		t.Fatal("冷却链交还给下一候选时不得提交响应")
+	}
+	if outcome.Status != http.StatusPaymentRequired {
+		t.Fatalf("outcome.Status = %d，期望链上最近一次上游答复 402", outcome.Status)
+	}
+
+	diagnostics := swaputil.RequestDiagnosticsFrom(second.Context())
+	if diagnostics == nil {
+		t.Fatal("诊断 holder 丢失")
+	}
+	if diagnostics.Provider != "" {
+		t.Fatalf("Provider = %q，冷却链的交还不得写入归属", diagnostics.Provider)
+	}
+}
+
 func TestGateway_ReportsAttemptBeforeTheAnswer(t *testing.T) {
 	release := make(chan struct{})
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2256,5 +2413,544 @@ func TestGateway_ReportsAttemptBeforeTheAnswer(t *testing.T) {
 	}
 	if diagnostics := swaputil.RequestDiagnosticsFrom(ctx); diagnostics.Provider != "prov" {
 		t.Fatalf("record provider after the answer = %q, want prov", diagnostics.Provider)
+	}
+}
+
+// A bare-name pool with equal priorities must actually rotate between its
+// providers across requests. Building a scheduler per request used to reset
+// the rotation cursor, so every request picked the same sorted-first provider
+// and the other providers never saw traffic.
+func TestGateway_PoolRotatesBetweenProvidersAcrossRequests(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	cfg := poolConfig(t, upstream.URL, upstream.URL, nil, config.GatewayFailoverConfig{})
+	g, err := New(cfg, testLogger())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer g.Shutdown()
+
+	counts := map[string]int{}
+	for i := 0; i < 20; i++ {
+		routes := g.PlanRoutes("shared-model", false, "", Session{})
+		if len(routes) != 2 {
+			t.Fatalf("pass %d: routes = %d, want both providers in the chain", i, len(routes))
+		}
+		counts[routes[0].ProviderID]++
+	}
+	if counts["alpha"] == 0 || counts["beta"] == 0 {
+		t.Fatalf("equal-priority pool did not rotate: %v", counts)
+	}
+	if counts["alpha"] < 6 || counts["beta"] < 6 {
+		t.Fatalf("rotation is lopsided: %v", counts)
+	}
+}
+
+// Priority still wins over rotation: the lower tier only appears when the high
+// tier has nothing usable left, and the chain keeps it as a failover target.
+func TestGateway_PoolPriorityTierBeatsRotation(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	cfg := poolConfig(t, upstream.URL, upstream.URL, nil, config.GatewayFailoverConfig{})
+	alpha := cfg.Providers["alpha"]
+	alpha.ApiKeys = []config.ProviderKey{{Value: "alpha-key", Priority: 10}}
+	cfg.Providers["alpha"] = normalizeProvider(t, alpha)
+
+	g, err := New(cfg, testLogger())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer g.Shutdown()
+
+	for i := 0; i < 10; i++ {
+		routes := g.PlanRoutes("shared-model", false, "", Session{})
+		if len(routes) != 2 {
+			t.Fatalf("routes = %d, want the high tier plus its failover", len(routes))
+		}
+		if routes[0].ProviderID != "alpha" {
+			t.Fatalf("pass %d: head = %s, want the higher priority provider", i, routes[0].ProviderID)
+		}
+		if routes[1].ProviderID != "beta" {
+			t.Fatalf("pass %d: tail = %s, want the other provider as failover", i, routes[1].ProviderID)
+		}
+	}
+}
+
+// Session affinity is per conversation *and* per upstream surface: one
+// conversation keeps hitting the same provider/adapter, while different
+// conversations still spread across the pool.
+func TestGateway_SessionAffinitySticksToSurfacePerSession(t *testing.T) {
+	var mu sync.Mutex
+	hits := map[string]map[string]int{} // session -> provider
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		session := r.Header.Get("x-session-id")
+		if hits[session] == nil {
+			hits[session] = map[string]int{}
+		}
+		hits[session][r.Host]++
+		mu.Unlock()
+		w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	cfg := poolConfig(t, upstream.URL, upstream.URL, nil, config.GatewayFailoverConfig{})
+	g, err := New(cfg, testLogger())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer g.Shutdown()
+
+	// Each session runs several turns. The first turn picks whatever the pool
+	// rotates to; every later turn must follow that binding.
+	bound := map[string]string{}
+	for turn := 0; turn < 4; turn++ {
+		for _, session := range []string{"s1", "s2", "s3", "s4", "s5", "s6"} {
+			routes := g.PlanRoutes("shared-model", false, "", Session{Hash: session, Model: "shared-model", ID: session})
+			if len(routes) == 0 {
+				t.Fatalf("no routes for %s", session)
+			}
+			if want, ok := bound[session]; ok && routes[0].ProviderID != want {
+				t.Fatalf("%s turn %d moved from %s to %s", session, turn, want, routes[0].ProviderID)
+			}
+			bound[session] = routes[0].ProviderID
+
+			// Serve it so the binding is recorded and the rotation advances.
+			req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{}`))
+			w := httptest.NewRecorder()
+			g.ServeHTTP(w, req, routes[0], Session{Hash: session, Model: "shared-model", ID: session})
+			if w.Code != 200 {
+				t.Fatalf("%s: status = %d", session, w.Code)
+			}
+		}
+	}
+	distinct := map[string]struct{}{}
+	for _, provider := range bound {
+		distinct[provider] = struct{}{}
+	}
+	if len(distinct) < 2 {
+		t.Fatalf("all sessions stuck to one provider (%v): affinity must not disable rotation", bound)
+	}
+}
+
+// The two adapters of one provider are one upstream account: a bare-name pool
+// must rotate between *providers*, not give a multi-adapter provider a bigger
+// share just because it exposes the model on more surfaces.
+func TestGateway_PoolRotationCountsProvidersNotAdapters(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	cfg := config.Config{
+		Providers: config.ProviderDictionaryConfig{
+			"multi": {
+				ApiKeys: []config.ProviderKey{{Value: "m1"}},
+				Adapters: []config.ProviderAdapter{
+					{Name: "Chat", Type: config.ProviderTypeOpenAI, Endpoint: upstream.URL,
+						Models: []config.ProviderModel{{Local: "shared-model", Remote: "shared-model"}}},
+					{Name: "Messages", Type: config.ProviderTypeAnthropic, Endpoint: upstream.URL,
+						Models: []config.ProviderModel{{Local: "shared-model", Remote: "shared-model"}}},
+				},
+			},
+			"single": {
+				Type: config.ProviderTypeOpenAI, Endpoint: upstream.URL,
+				ApiKeys: []config.ProviderKey{{Value: "s1"}},
+				Models:  []config.ProviderModel{{Local: "shared-model", Remote: "shared-model"}},
+			},
+		},
+	}
+	for id, p := range cfg.Providers {
+		cfg.Providers[id] = normalizeProvider(t, p)
+	}
+	g, err := New(cfg, testLogger())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer g.Shutdown()
+
+	multiHeads, singleHeads := 0, 0
+	for i := 0; i < 20; i++ {
+		routes := g.PlanRoutes("shared-model", false, "openai", Session{})
+		if len(routes) == 0 {
+			t.Fatal("no routes")
+		}
+		switch routes[0].ProviderID {
+		case "multi":
+			multiHeads++
+		case "single":
+			singleHeads++
+		}
+	}
+	if multiHeads == 0 || singleHeads == 0 {
+		t.Fatalf("rotation must visit both providers: multi=%d single=%d", multiHeads, singleHeads)
+	}
+	if multiHeads > 14 {
+		t.Fatalf("multi-adapter provider took %d/20 heads: adapters must not each count as a pool member", multiHeads)
+	}
+}
+
+// A provider-level "direct" must beat a process-wide proxy: an operator who
+// marks one provider as direct is saying that upstream must never go through
+// the shared egress, which is the toggle the providers page exposes.
+func TestGateway_ProviderProxyDirectBeatsGlobalProxy(t *testing.T) {
+	t.Setenv("HTTP_PROXY", deadProxy)
+	t.Setenv("HTTPS_PROXY", deadProxy)
+
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	cfg := config.Config{
+		Providers: config.ProviderDictionaryConfig{
+			"direct-provider": {
+				Type:     config.ProviderTypeOpenAI,
+				Endpoint: upstream.URL,
+				Proxy:    config.ProxyDirect,
+				ApiKeys:  []config.ProviderKey{{Value: "k"}},
+				Models:   []config.ProviderModel{{Local: "m1", Remote: "m1"}},
+				Timeouts: defaultTestTimeouts(),
+			},
+		},
+	}
+	for id, p := range cfg.Providers {
+		cfg.Providers[id] = normalizeProvider(t, p)
+	}
+	g, err := New(cfg, testLogger())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer g.Shutdown()
+
+	route := g.RouteFor("direct-provider/m1", false)
+	if route == nil {
+		t.Fatal("route missing")
+	}
+	// A provider-level proxy is resolved onto its credentials (the provider is
+	// one level above the key), so the credential is where the route reads it.
+	var resolved string
+	if len(route.Members) > 0 {
+		resolved = route.egressProxy(route.Members[0])
+	}
+	if resolved != config.ProxyDirect {
+		t.Fatalf("resolved egress proxy = %q, want %q", resolved, config.ProxyDirect)
+	}
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"m1"}`))
+	w := httptest.NewRecorder()
+	g.ServeHTTP(w, req, route, Session{})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s (a direct provider must not use the dead proxy)", w.Code, w.Body.String())
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("calls = %d", calls.Load())
+	}
+}
+
+// TestGateway_WholePoolExhaustedReportsRealUpstreamError pins what a client
+// sees when every credential of a bare-name pool is cooling down.
+//
+// This is the operator-visible shape of a provider outage: the last upstream
+// answer is reported verbatim (status and body), not a synthetic 502, because
+// the request did reach a real provider that refused it. The synthetic error is
+// reserved for a pool that never heard from any upstream at all — every key
+// disabled, or an unset env var — where there is genuinely nothing to report.
+//
+// Both branches are asserted because they differ only in whether the chain has
+// a recorded upstream answer, which is exactly the state an operator needs to
+// distinguish "my keys are bad" from "my keys are unconfigured".
+func TestGateway_WholePoolExhaustedReportsRealUpstreamError(t *testing.T) {
+	alpha := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte(`{"error":{"code":"upstream_timeout","message":"upstream timed out: rotation stopped"}}`))
+	}))
+	defer alpha.Close()
+	beta := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte(`{"error":{"code":"upstream_timeout","message":"upstream timed out: rotation stopped"}}`))
+	}))
+	defer beta.Close()
+
+	g, err := New(poolConfig(t, alpha.URL, beta.URL, nil, config.GatewayFailoverConfig{}), testLogger())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer g.Shutdown()
+
+	route := g.RouteFor("shared-model", false)
+	if route == nil {
+		t.Fatal("route not found")
+	}
+	chain := g.FailoverRoutes("shared-model", false, route)
+	if len(chain) != 2 {
+		t.Fatalf("chain = %d routes, want both providers", len(chain))
+	}
+
+	// One request exhausts both providers' keys: each answers 503, so each is
+	// benched with a transient cooldown and the chain has a recorded answer.
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"shared-model","messages":[{"role":"user","content":"hi"}]}`))
+	w := httptest.NewRecorder()
+	g.ServeHTTPWithFailover(w, req, chain, Session{})
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d body = %s, want the upstream's own 503", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "upstream_timeout") {
+		t.Fatalf("body = %s, want the upstream's own error, not a synthetic one", w.Body.String())
+	}
+
+	// The next request finds the whole pool benched. It must report the same
+	// real upstream answer rather than "no available credential".
+	req2 := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"shared-model","messages":[{"role":"user","content":"hi again"}]}`))
+	w2 := httptest.NewRecorder()
+	g.ServeHTTPWithFailover(w2, req2, chain, Session{})
+	if w2.Code != http.StatusServiceUnavailable {
+		t.Fatalf("exhausted-pool status = %d body = %s, want the recorded upstream 503",
+			w2.Code, w2.Body.String())
+	}
+	if !strings.Contains(w2.Body.String(), "upstream_timeout") {
+		t.Fatalf("exhausted-pool body = %s, want the recorded upstream error", w2.Body.String())
+	}
+	if strings.Contains(w2.Body.String(), "no available credential") {
+		t.Fatalf("exhausted-pool body = %s: a pool that heard from upstream must not report a synthetic error",
+			w2.Body.String())
+	}
+}
+
+// TestGateway_AllCoolingDownTriesShortestBench 覆盖"全冷却"的兜底：
+//
+// 一个池子的每个 key 都在冷却时，请求不该直接失败。冷却是对上游状态的预测，
+// 不是对凭据的判决：最快要解冻的那把 key 就是当下最好的猜测，试一次要么成功，
+// 要么拿回上游真实的错误——都比合成的 "all keys are cooling down" 有用。
+//
+// 这个形态在生产上真实出现过：突发流量把两家供应商的 transient 冷却同时打满，
+// 客户端看到的是一条与真实原因无关的 502。
+func TestGateway_AllCoolingDownTriesShortestBench(t *testing.T) {
+	var (
+		mu    sync.Mutex
+		calls []string
+	)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls = append(calls, r.Header.Get("Authorization"))
+		mu.Unlock()
+		w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	cfg := gwConfig(t, upstream.URL, config.ProviderTypeOpenAI)
+	prov := cfg.Providers["prov"]
+	prov.ApiKeys = []config.ProviderKey{
+		{Value: "long-bench"},
+		{Value: "short-bench"},
+	}
+	prov.MaxRetries = intPointerForTest(1)
+	cfg.Providers["prov"] = normalizeProvider(t, prov)
+
+	g, err := New(cfg, testLogger())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer g.Shutdown()
+
+	route := g.RouteFor("prov/m1", false)
+	if route == nil {
+		t.Fatal("route missing")
+	}
+	creds := route.Credentials()
+	if len(creds) != 2 {
+		t.Fatalf("credentials = %d, want 2", len(creds))
+	}
+
+	// Bench both keys, one for far longer than the other, as a burst of
+	// transient failures does.
+	now := time.Now()
+	CooldownForTest(creds[0], CooldownTransient, now.Add(4*time.Minute), "long")
+	CooldownForTest(creds[1], CooldownTransient, now.Add(2*time.Second), "short")
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"remote-m1","messages":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	g.ServeHTTP(w, req, route, Session{})
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s: a benched pool must be tried, not failed", w.Code, w.Body.String())
+	}
+
+	// It must be the key whose bench ends soonest, not the first in order.
+	mu.Lock()
+	defer mu.Unlock()
+	if len(calls) == 0 {
+		t.Fatal("upstream was never dialed")
+	}
+	if !strings.Contains(calls[0], "short-bench") {
+		t.Fatalf("first attempt used %q, want the shortest-remaining bench", calls[0])
+	}
+}
+
+// TestGateway_AllCoolingDownNeverRetriesTriedCredential 守住"本次请求没试过的"
+// 这个条件：兜底不能把已经失败过的 key 再来一遍，否则一次请求会把同一把坏 key
+// 打好几次。
+func TestGateway_AllCoolingDownNeverRetriesTriedCredential(t *testing.T) {
+	var (
+		mu        sync.Mutex
+		callCount int
+	)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		callCount++
+		mu.Unlock()
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte(`{"error":"down"}`))
+	}))
+	defer upstream.Close()
+
+	cfg := gwConfig(t, upstream.URL, config.ProviderTypeOpenAI)
+	prov := cfg.Providers["prov"]
+	prov.ApiKeys = []config.ProviderKey{{Value: "k1"}, {Value: "k2"}}
+	prov.MaxRetries = intPointerForTest(5)
+	cfg.Providers["prov"] = normalizeProvider(t, prov)
+
+	g, err := New(cfg, testLogger())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer g.Shutdown()
+
+	route := g.RouteFor("prov/m1", false)
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"remote-m1","messages":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+	g.ServeHTTP(httptest.NewRecorder(), req, route, Session{})
+
+	// Two keys with maxRetries 5: each key gets its own budget (6 attempts),
+	// and the fallback must never exceed that by cycling back to a key whose
+	// budget is already spent.
+	mu.Lock()
+	defer mu.Unlock()
+	want := 2 * (5 + 1)
+	if callCount > want {
+		t.Fatalf("upstream called %d times, want at most %d (one budget per key)", callCount, want)
+	}
+}
+
+// TestGateway_FallbackSkipsAuthBenchedCredentials 守住例外：401/402 是对凭据的
+// 判决，不是对上游状态的预测。用被拒绝的 key 重试不可能成功，还会给账号招来
+// 风控，所以兜底绝不碰它。
+func TestGateway_FallbackSkipsAuthBenchedCredentials(t *testing.T) {
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":{"message":"invalid api key"}}`))
+	}))
+	defer upstream.Close()
+
+	cfg := gwConfig(t, upstream.URL, config.ProviderTypeOpenAI)
+	prov := cfg.Providers["prov"]
+	prov.ApiKeys = []config.ProviderKey{{Value: "k1"}}
+	prov.MaxRetries = intPointerForTest(1)
+	cfg.Providers["prov"] = normalizeProvider(t, prov)
+
+	g, err := New(cfg, testLogger())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer g.Shutdown()
+
+	route := g.RouteFor("prov/m1", false)
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"remote-m1","messages":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+	g.ServeHTTP(httptest.NewRecorder(), req, route, Session{})
+	first := calls.Load()
+
+	// The key is now auth-benched. A second request must be answered from the
+	// recorded upstream state without dialing again.
+	req = httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"remote-m1","messages":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	g.ServeHTTP(w, req, route, Session{})
+
+	if extra := calls.Load() - first; extra != 0 {
+		t.Fatalf("auth-benched key was retried %d time(s); a 401 is a verdict, not a wait", extra)
+	}
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want the recorded upstream 401", w.Code)
+	}
+}
+
+// 禁用的密钥不参与调度，但额度卡片仍然要能读到它的订阅：ProviderCredentials
+// 给出全量凭据（含停用），Route.Members 仍然只有可调度的那些。
+func TestGateway_ProviderCredentialsIncludeDisabledKeys(t *testing.T) {
+	cfg := gwConfig(t, "http://192.0.2.1", config.ProviderTypeOpenAI)
+	prov := cfg.Providers["prov"]
+	prov.ApiKeys = []config.ProviderKey{
+		{Value: "key-live", Weight: 1},
+		{Value: "key-parked", Weight: 1, Disabled: true},
+	}
+	cfg.Providers["prov"] = normalizeProvider(t, prov)
+
+	g, err := New(cfg, testLogger())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer g.Shutdown()
+
+	credentials := g.ProviderCredentials("prov")
+	if len(credentials) != 2 {
+		t.Fatalf("credentials = %d, want every configured key", len(credentials))
+	}
+	disabled := 0
+	for _, cred := range credentials {
+		if cred.Disabled {
+			disabled++
+		}
+	}
+	if disabled != 1 {
+		t.Fatalf("disabled credentials = %d, want the configured one", disabled)
+	}
+
+	route := g.RouteFor("prov/m1", false)
+	if route == nil {
+		t.Fatal("route missing")
+	}
+	if len(route.Credentials()) != 1 {
+		t.Fatalf("route members = %d, a disabled key must never be schedulable", len(route.Credentials()))
+	}
+	if got := route.Credentials()[0].ID; got != CredentialID("prov", config.ProviderKey{Value: "key-live"}) {
+		t.Fatalf("route member = %s, want the live key", got)
+	}
+}
+
+// 整体停用的供应商没有任何路由，但它的密钥仍然要能被额度卡片找到。
+func TestGateway_DisabledProviderStillExposesCredentials(t *testing.T) {
+	cfg := gwConfig(t, "http://192.0.2.1", config.ProviderTypeOpenAI)
+	prov := cfg.Providers["prov"]
+	prov.Disabled = true
+	cfg.Providers["prov"] = normalizeProvider(t, prov)
+
+	g, err := New(cfg, testLogger())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer g.Shutdown()
+
+	if g.Handles("prov/m1") {
+		t.Fatal("disabled provider must not route")
+	}
+	if got := len(g.ProviderCredentials("prov")); got != 2 {
+		t.Fatalf("credentials = %d, want both configured keys", got)
 	}
 }

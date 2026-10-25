@@ -1,4 +1,5 @@
 import { requestJson } from "./http";
+import { apiUrl } from "./apiPath";
 
 /**
  * Client-side agent loop for the extension debug chat. Each user turn posts the
@@ -141,7 +142,7 @@ export interface DebugTurnResult {
 }
 
 async function debugChatResponse(id: string, request: Record<string, unknown>, signal?: AbortSignal, files?: Record<string, string>): Promise<Response> {
-  const response = await fetch(`/api/extensions/${encodeURIComponent(id)}/debug/chat`, {
+  const response = await fetch(apiUrl(`/api/extensions/${encodeURIComponent(id)}/debug/chat`), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ request, files }),

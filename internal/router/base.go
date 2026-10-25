@@ -536,6 +536,12 @@ func (b *baseRouter) handleReconfigure(conf config.Config, planner scheduler.Swa
 	prepared := make(map[string]process.Process)
 	preparedRuntime := make(map[string]processRuntimeSnapshot)
 	runtimeChanged := make(map[string]bool)
+	// lifecycleHotApplied tracks models whose lifecycle-only edit (ttl,
+	// unloadTimeout, sleep policy) was pushed into the live process object
+	// instead of scheduling a restart. Their processConfigs snapshot is
+	// refreshed in the publish section below so the next reconciliation
+	// does not see the same edit as outstanding.
+	lifecycleHotApplied := make(map[string]struct{})
 	lifecycleBusy := make(map[string]bool)
 	removalInProgress := make(map[string]bool)
 	removalPending := make(map[string]bool)
@@ -571,6 +577,11 @@ func (b *baseRouter) handleReconfigure(conf config.Config, planner scheduler.Swa
 		}
 	}
 	readdedDuringRemoval := make(map[string]struct{})
+	// The ${PORT} counter hands ports out by position in sorted-ID order, so a
+	// model that gains a port-consuming neighbour sorting before it moves up
+	// without any edit of its own. Measuring that move once for the whole
+	// reconciliation is what lets a model that only slid along be left alone.
+	portShift := config.PortShift(oldConfig, conf)
 	for id := range modelIDs {
 		desiredModel, exists := conf.Models[id]
 		if !exists {
@@ -608,13 +619,29 @@ func (b *baseRouter) handleReconfigure(conf config.Config, planner scheduler.Swa
 			prepared[id] = created
 			preparedRuntime[id] = runtimeSnapshot(conf, desiredModel)
 			readdedDuringRemoval[id] = struct{}{}
-			runtimeChanged[id] = actualKnown && processRuntimeChanged(actualModel, actualRuntime, desiredModel, conf)
+			runtimeChanged[id] = actualKnown && processRuntimeChanged(actualModel, actualRuntime, desiredModel, conf, portShift)
 			continue
 		}
-		changed := actualKnown && processRuntimeChanged(actualModel, actualRuntime, desiredModel, conf)
+		changed := actualKnown && processRuntimeChanged(actualModel, actualRuntime, desiredModel, conf, portShift)
 		runtimeChanged[id] = changed
 		if !changed {
-			continue
+			// A lifecycle-only edit (ttl, unloadTimeout, sleep mode/level)
+			// never reaches the process command line, so a live process can
+			// adopt it in place: the TTL watcher and the sleep/wake handlers
+			// read the hot-applied snapshot on every use. Processes without
+			// the applier capability keep the old restart semantics.
+			if actualKnown && config.ModelLifecycleChanged(actualModel, desiredModel) {
+				if applier, ok := managed.(process.LifecycleConfigApplier); ok {
+					applier.ApplyLifecycleConfig(desiredModel)
+					lifecycleHotApplied[id] = struct{}{}
+				} else {
+					runtimeChanged[id] = true
+					changed = true
+				}
+			}
+			if !changed {
+				continue
+			}
 		}
 		// A manual start's swap goroutine may sit between its registry read and
 		// EnsureReady while the process still reads as StateStopped. Replacing
@@ -659,6 +686,21 @@ func (b *baseRouter) handleReconfigure(conf config.Config, planner scheduler.Swa
 		b.processes[id] = created
 		b.processConfigs[id] = conf.Models[id]
 		b.processRuntime[id] = preparedRuntime[id]
+	}
+	// A hot-applied lifecycle edit must be reflected in the stored snapshot
+	// too, or the next reconciliation would see the same edit as outstanding
+	// again and re-apply it forever. Only the lifecycle fields move: the rest
+	// of the snapshot still describes the running generation.
+	for id := range lifecycleHotApplied {
+		desired, exists := conf.Models[id]
+		if !exists {
+			continue
+		}
+		stored := b.processConfigs[id]
+		stored.UnloadAfter = desired.UnloadAfter
+		stored.UnloadTimeout = desired.UnloadTimeout
+		stored.Backend.Lifecycle = desired.Backend.Lifecycle
+		b.processConfigs[id] = stored
 	}
 	b.processMu.Unlock()
 
@@ -712,8 +754,12 @@ func runtimeSnapshot(conf config.Config, model config.ModelConfig) processRuntim
 	return processRuntimeSnapshot{name: name, value: value, known: known}
 }
 
-func processRuntimeChanged(actual config.ModelConfig, actualRuntime processRuntimeSnapshot, desired config.ModelConfig, desiredConf config.Config) bool {
-	if config.ModelRuntimeConfigChanged(actual, desired) {
+func processRuntimeChanged(actual config.ModelConfig, actualRuntime processRuntimeSnapshot, desired config.ModelConfig, desiredConf config.Config, portShift int) bool {
+	// The ${PORT} counter is positional, so an unrelated model added with an
+	// earlier ID shifts this model's port without any edit of its own. The shift
+	// is measured across both configurations so a model that only slid along
+	// with the insert reads as unchanged.
+	if config.ModelRuntimeConfigChangedInPorts(actual, desired, portShift) {
 		return true
 	}
 	actualName := strings.TrimSpace(actual.Backend.Runtime)

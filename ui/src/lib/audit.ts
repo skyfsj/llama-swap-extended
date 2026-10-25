@@ -1,3 +1,5 @@
+import { apiUrl } from "./apiPath";
+
 // AuditConversation byte fields are encoded by Go's JSON encoder as base64
 // strings. Keep decoding in a small, browser-safe helper so the route and
 // future exports render the same concrete request/response content.
@@ -789,7 +791,7 @@ export async function fetchAuditConversationBody(
   which: "request" | "response",
 ): Promise<Uint8Array> {
   const response = await fetch(
-    `/api/audit/conversations/${encodeURIComponent(conversationID)}/body/${which}`,
+    apiUrl(`/api/audit/conversations/${encodeURIComponent(conversationID)}/body/${which}`),
   );
   if (!response.ok) {
     throw new Error(`HTTP ${response.status}`);

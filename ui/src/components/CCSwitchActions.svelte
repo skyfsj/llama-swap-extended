@@ -5,11 +5,13 @@
   import * as Select from "$lib/components/ui/select/index.js";
   import { Button } from "$lib/components/ui/button/index.js";
   import { translate } from "../lib/i18n";
+  import { toast } from "../lib/toast";
   import { errorMessageFromPayload } from "../lib/apiError";
   import { selectableModelNames } from "../lib/ccswitchModels";
   import { authSession } from "../stores/auth";
   import { currentRoute } from "../stores/route";
   import { fetchPlaygroundModels, playgroundModels } from "../stores/api";
+import { apiUrl } from "../lib/apiPath";
 
   // Applications CC Switch v4 imports provider links into. The order matches
   // internal/ccswitch.Apps, which mirrors CC Switch's own parser.
@@ -111,7 +113,7 @@
   async function loadKeys(): Promise<void> {
     keysLoading = true;
     try {
-      const response = await fetch("/api/cc-switch/options", { credentials: "same-origin" });
+      const response = await fetch(apiUrl("/api/cc-switch/options"), { credentials: "same-origin" });
       const payload = await response.json().catch(() => ({})) as { data?: unknown; currentKeyId?: unknown; error?: string };
       if (!response.ok) throw new Error(errorMessageFromPayload(payload, `HTTP ${response.status}`));
       keys = Array.isArray(payload.data)
@@ -205,7 +207,7 @@
   }
 
   async function requestLink(revision: number, createKey = false): Promise<string> {
-    const response = await fetch("/api/cc-switch/deeplink", {
+    const response = await fetch(apiUrl("/api/cc-switch/deeplink"), {
       method: "POST",
       credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
@@ -265,6 +267,9 @@
     error = "";
     try {
       const link = await requestLink(revision, true);
+      // The page navigates away immediately, so the freshly created key would
+      // otherwise be an invisible side effect of clicking "generate and open".
+      if (link) toast.info($translate("controlPlane.ccswitchKeyCreated"));
       if (link) window.location.assign(link);
     } catch (cause) {
       if (revision === generationRevision) error = cause instanceof Error ? cause.message : String(cause);

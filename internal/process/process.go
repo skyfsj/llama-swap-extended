@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 )
 
@@ -42,6 +43,18 @@ type SleepController interface {
 	Sleep(context.Context, int) error
 	Wake(context.Context) error
 	Sleeping() bool
+}
+
+// LifecycleConfigApplier is an optional process capability for pushing the
+// control-plane lifecycle fields (idle TTL, unload timeout, sleep mode/level)
+// into a live process. These fields never reach the process command line —
+// with one exception the router guards separately: a vLLM TTL crossing zero
+// adds or removes --enable-sleep-mode at start time. A process that implements
+// this interface lets the router apply a lifecycle-only config edit without
+// scheduling a restart; processes that do not implement it keep the old
+// restart semantics.
+type LifecycleConfigApplier interface {
+	ApplyLifecycleConfig(model config.ModelConfig)
 }
 
 type Process interface {

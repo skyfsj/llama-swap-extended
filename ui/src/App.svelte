@@ -27,6 +27,7 @@
   import { selectedPlaygroundTab } from "./stores/playground";
   import { authSession, refreshAuthSession } from "./stores/auth";
   import { locale, translate } from "./lib/i18n";
+  import { toast } from "./lib/toast";
   import { settingsDirty } from "./stores/settingsGuard";
   import { isInternalRoute, isSameSettingsTarget } from "./lib/navGuard";
 
@@ -112,8 +113,12 @@
     switchingProfile = true;
     try {
       await setActiveProfile(value === noProfileValue ? null : value);
+      const name = value === noProfileValue ? "" : value;
+      toast.success(name ? $translate("profile.switched", { name }) : $translate("profile.cleared"));
     } catch (error) {
-      console.error(error);
+      // A silent failure here looks like the picker is broken: the dropdown
+      // snaps back and nothing says why.
+      toast.error(error instanceof Error ? error.message : String(error));
     } finally {
       switchingProfile = false;
     }

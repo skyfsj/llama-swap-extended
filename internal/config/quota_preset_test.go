@@ -371,3 +371,258 @@ gateway:
 		t.Fatalf("最小样本默认值 = %d", skip.EffectiveMinSamples())
 	}
 }
+
+// New API 的令牌额度端点：一个请求给出剩余/已用/总额，单位是站点内部分数。
+func TestQuotaPreset_NewAPITokenUsage(t *testing.T) {
+	preset, ok := QuotaPresetByID("newapi")
+	if !ok {
+		t.Fatal("newapi 预设缺失")
+	}
+	if preset.Endpoint != "{base}/api/usage/token/" {
+		t.Fatalf("endpoint = %q，自建站点必须用 {base} 模板", preset.Endpoint)
+	}
+	if preset.Auth.Style != QuotaAuthBearer {
+		t.Fatalf("auth = %+v（令牌用 Bearer 鉴权）", preset.Auth)
+	}
+	if preset.DivideBy != 500000 {
+		t.Fatalf("divideBy = %v，new-api 默认 500000 额度 = 1 USD", preset.DivideBy)
+	}
+	if len(preset.Windows) != 1 {
+		t.Fatalf("windows = %+v，期望一条已用比例窗口", preset.Windows)
+	}
+	window := preset.Windows[0]
+	if window.Path != "data" || window.Percent != "total_used" || window.Limit != "total_granted" {
+		t.Errorf("window = %+v，金额窗口应读 data.total_used/data.total_granted", window)
+	}
+	wantExtras := map[string]string{
+		"available": "data.total_available",
+		"used":      "data.total_used",
+		"granted":   "data.total_granted",
+		"unlimited": "data.unlimited_quota",
+	}
+	for id, path := range wantExtras {
+		found := false
+		for _, extra := range preset.Extras {
+			if extra.ID == id {
+				found = true
+				if extra.Path != path {
+					t.Errorf("extra %s path = %q，期望 %q", id, extra.Path, path)
+				}
+			}
+		}
+		if !found {
+			t.Errorf("缺少 extra %s（现有 %+v）", id, preset.Extras)
+		}
+	}
+}
+
+// sub2api 的 /v1/usage 按密钥模式返回不同形状，窗口必须允许缺席。
+func TestQuotaPreset_Sub2APIModes(t *testing.T) {
+	preset, ok := QuotaPresetByID("sub2api")
+	if !ok {
+		t.Fatal("sub2api 预设缺失")
+	}
+	if preset.Endpoint != "{base}/v1/usage" {
+		t.Fatalf("endpoint = %q", preset.Endpoint)
+	}
+	if len(preset.Windows) == 0 {
+		t.Fatal("sub2api 预设应有订阅窗口")
+	}
+	for _, window := range preset.Windows {
+		if !window.Optional {
+			t.Errorf("window %s 必须是 optional：钱包模式不会有该字段", window.ID)
+		}
+	}
+	want := map[string]string{"remaining": "remaining", "balance": "balance", "plan": "planName", "mode": "mode"}
+	for id, path := range want {
+		found := false
+		for _, extra := range preset.Extras {
+			if extra.ID == id {
+				found = true
+				if extra.Path != path {
+					t.Errorf("extra %s path = %q，期望 %q", id, extra.Path, path)
+				}
+			}
+		}
+		if !found {
+			t.Errorf("缺少 extra %s", id)
+		}
+	}
+}
+
+func TestQuotaConfig_ResolveBaseEndpoint(t *testing.T) {
+	cases := []struct {
+		endpoint string
+		base     string
+		want     string
+	}{
+		{"{base}/v1/usage", "https://relay.example.com", "https://relay.example.com/v1/usage"},
+		{"{base}/api/usage/token/", "https://relay.example.com/", "https://relay.example.com/api/usage/token/"},
+		{"https://api.deepseek.com/user/balance", "https://relay.example.com", "https://api.deepseek.com/user/balance"},
+	}
+	for _, tc := range cases {
+		if got := ResolveQuotaEndpoint(tc.endpoint, tc.base); got != tc.want {
+			t.Errorf("ResolveQuotaEndpoint(%q, %q) = %q, want %q", tc.endpoint, tc.base, got, tc.want)
+		}
+	}
+}
+
+func TestQuotaConfig_ScaleQuotaValue(t *testing.T) {
+	if got := ScaleQuotaValue(float64(1500000), 500000); got != 3.0 {
+		t.Fatalf("scaled = %v, want 3", got)
+	}
+	// 换算不能把浮点噪声带到卡片上。
+	if got := ScaleQuotaValue(float64(150000), 500000); got != 0.3 {
+		t.Fatalf("scaled = %v, want a clean 0.3", got)
+	}
+	// 非数值（布尔、字符串时间）原样返回，不被换算破坏。
+	if got := ScaleQuotaValue(true, 500000); got != true {
+		t.Fatalf("bool scaled = %v", got)
+	}
+	if got := ScaleQuotaValue("2026-11-01T00:00:00Z", 500000); got != "2026-11-01T00:00:00Z" {
+		t.Fatalf("string scaled = %v", got)
+	}
+}
+
+func TestConfig_ProviderQuotaBaseTemplateValidation(t *testing.T) {
+	t.Setenv("PROVIDER_TEST_KEY", "sk-test-1")
+	base := `
+models:
+  local-model:
+    cmd: echo ${PORT}
+providers:
+  sub:
+    type: openai
+    endpoint: https://x.com
+    apiKeys: [${env.PROVIDER_TEST_KEY}]
+    models: [m1]
+    quota:
+`
+	cases := []struct {
+		name    string
+		quota   string
+		wantErr string
+	}{
+		{"base without slash", "      endpoint: \"{base}v1/usage\"\n      extras: [{id: a, path: a}]", "must use the form"},
+		{"relative path accepted", "      endpoint: \"{base}/v1/usage\"\n      extras: [{id: a, path: a}]", ""},
+		{"amount window with remaining mode", "      endpoint: https://x.com/u\n      windows: [{id: a, path: a, percent: used, limit: total, percentMode: remaining}]", "cannot combine limit"},
+		{"negative divideBy", "      endpoint: https://x.com/u\n      divideBy: -1\n      extras: [{id: a, path: a}]", "divideBy must be"},
+		{"unknown extra format", "      endpoint: https://x.com/u\n      extras: [{id: a, path: a, format: epoch}]", "format must be"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := loadProvidersYAML(t, base+tc.quota+"\n")
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("期望通过，实际 %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("err = %v, want containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// 金额窗口忘写 percent（已用量字段）时必须报错：默认值 "percent" 会去读
+// 一个绝对计数响应里不存在的字段，卡片就永远是 0%。
+func TestConfig_ProviderQuotaAmountWindowNeedsUsedField(t *testing.T) {
+	t.Setenv("PROVIDER_TEST_KEY", "sk-test-1")
+	yaml := `
+models:
+  local-model:
+    cmd: echo ${PORT}
+providers:
+  sub:
+    type: openai
+    endpoint: https://x.com
+    apiKeys: [${env.PROVIDER_TEST_KEY}]
+    models: [m1]
+    quota:
+      endpoint: https://x.com/u
+      windows: [{id: quota, path: data, limit: total}]
+`
+	_, err := loadProvidersYAML(t, yaml)
+	if err == nil || !strings.Contains(err.Error(), "needs percent") {
+		t.Fatalf("err = %v, want a missing used-field error", err)
+	}
+}
+
+// 脚本预设：界面要知道它带脚本，详情接口要能取出脚本文本。
+func TestQuotaPreset_ScriptPreset(t *testing.T) {
+	preset, ok := QuotaPresetByID("newapi-units")
+	if !ok {
+		t.Fatal("newapi-units 预设缺失")
+	}
+	if strings.TrimSpace(preset.Script) == "" {
+		t.Fatal("脚本预设没有脚本")
+	}
+	if !strings.Contains(preset.Script, "quota_per_unit") {
+		t.Errorf("脚本应读取站点的 quota_per_unit：%s", preset.Script)
+	}
+	if preset.Category != "self-hosted" {
+		t.Errorf("category = %q", preset.Category)
+	}
+
+	summaries := QuotaPresetSummaries()
+	found := false
+	for _, summary := range summaries {
+		if summary.ID == "newapi-units" {
+			found = true
+			if !summary.HasScript {
+				t.Error("摘要缺少 hasScript 标记")
+			}
+			if summary.NeedsBase {
+				t.Error("脚本预设没有静态端点，needsBase 必须为 false")
+			}
+		}
+	}
+	if !found {
+		t.Fatal("摘要列表缺少 newapi-units")
+	}
+
+	detail, ok := QuotaPresetDetailByID("newapi-units")
+	if !ok || strings.TrimSpace(detail.Script) == "" {
+		t.Fatalf("详情缺少脚本：%+v", detail)
+	}
+}
+
+func TestConfig_ProviderQuotaScriptValidation(t *testing.T) {
+	t.Setenv("PROVIDER_TEST_KEY", "sk-test-1")
+	base := `
+models:
+  local-model:
+    cmd: echo ${PORT}
+providers:
+  sub:
+    type: openai
+    endpoint: https://x.com
+    apiKeys: [${env.PROVIDER_TEST_KEY}]
+    models: [m1]
+    quota:
+`
+	// 只有脚本、没有 endpoint/windows/extras 的配置必须能通过。
+	cfg, err := loadProvidersYAML(t, base+"      script: |\n        ({ request: { url: \"{{baseUrl}}/usage\" }, extractor: (r) => ({ remaining: r.remaining }) })\n")
+	if err != nil {
+		t.Fatalf("脚本映射被拒：%v", err)
+	}
+	quota := cfg.Providers["sub"].Quota
+	if quota == nil || !quota.HasScript() {
+		t.Fatalf("quota = %+v", quota)
+	}
+
+	// 语法错误必须在加载时报出来，而不是等到刷新。
+	if _, err := loadProvidersYAML(t, base+"      script: |\n        ({ request: {\n"); err == nil || !strings.Contains(err.Error(), "does not parse") {
+		t.Fatalf("err = %v, want a parse error", err)
+	}
+
+	// 内联脚本覆盖预设脚本。
+	presetCfg, err := loadProvidersYAML(t, base+"      preset: newapi-units\n      script: |\n        ({ windows: [], extras: [{ id: a, label: a, value: 1 }] })\n")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got := presetCfg.Providers["sub"].Quota.Script; !strings.Contains(got, "extras") {
+		t.Fatalf("inline script did not win: %q", got)
+	}
+}

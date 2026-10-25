@@ -78,16 +78,28 @@ func EnsureVLLMSleepModeArgument(args []string, backendType string, ttl int) []s
 	if !strings.EqualFold(strings.TrimSpace(backendType), "vllm") || ttl <= 0 {
 		return result
 	}
+	if HasExplicitSleepModeArgument(args) {
+		return result
+	}
+	return append(result, "--enable-sleep-mode")
+}
+
+// HasExplicitSleepModeArgument reports whether the argv already names
+// --enable-sleep-mode in either token form. It is the same probe
+// EnsureVLLMSleepModeArgument uses to decide whether its injection would
+// clobber an operator-written flag, exposed so the reconciliation can tell a
+// TTL edit that rewrites the launch command from one that does not.
+func HasExplicitSleepModeArgument(args []string) bool {
 	for _, token := range SplitManagedLaunchTokens(args) {
 		name := token
 		if equals := strings.IndexByte(token, '='); equals > 0 {
 			name = token[:equals]
 		}
 		if name == "--enable-sleep-mode" {
-			return result
+			return true
 		}
 	}
-	return append(result, "--enable-sleep-mode")
+	return false
 }
 
 // RebuildManagedLaunchArguments normalizes operator-written backend args into

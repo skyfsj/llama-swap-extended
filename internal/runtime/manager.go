@@ -6,6 +6,7 @@ package runtime
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -3257,51 +3258,104 @@ func readOperations(path string) ([]Operation, error) {
 	defer file.Close()
 
 	// A runtime can append one small JSON record for every state transition for
-	// months. Detail only exposes the most recent 100 records, so never read an
-	// unbounded journal into memory. Seeking to a bounded tail keeps the
-	// response useful even when an old journal has grown unexpectedly large.
+	// months. Detail only exposes the most recent 100 records, so the tail is
+	// located first and only that slice is parsed: an old journal then costs a
+	// few block reads instead of decoding megabytes of records that are
+	// discarded afterwards.
 	const (
 		maxJournalBytes = 8 << 20
 		maxRecordBytes  = 256 << 10
+		maxOperations   = 100
+		blockSize       = 64 << 10
 	)
-	if info, statErr := file.Stat(); statErr != nil {
+	info, statErr := file.Stat()
+	if statErr != nil {
 		return nil, statErr
-	} else if info.Size() > maxJournalBytes {
-		offset := info.Size() - maxJournalBytes
-		if _, seekErr := file.Seek(offset, io.SeekStart); seekErr != nil {
-			return nil, seekErr
-		}
-		// The seek may land in the middle of a record. Inspect the byte immediately
-		// before the selected tail so an exact record boundary is preserved; only
-		// discard a prefix when the offset really points into a JSON line.
-		discardPrefix := offset == 0
-		if offset > 0 {
-			var previous [1]byte
-			read, readErr := file.ReadAt(previous[:], offset-1)
-			if readErr != nil && !(errors.Is(readErr, io.EOF) && read == 1) {
-				return nil, readErr
-			}
-			discardPrefix = read != 1 || previous[0] != '\n'
-		}
-		reader := bufio.NewReaderSize(file, 32<<10)
-		if discardPrefix {
-			_, readErr := reader.ReadString('\n')
-			if readErr != nil && !errors.Is(readErr, io.EOF) {
-				return nil, readErr
-			}
-			if errors.Is(readErr, io.EOF) {
-				// There was no complete record boundary in the selected tail. Rewind
-				// so the bounded record reader can still report a genuinely oversized
-				// unterminated record instead of silently dropping the whole tail.
-				if _, seekErr := file.Seek(offset, io.SeekStart); seekErr != nil {
-					return nil, seekErr
-				}
-				reader = bufio.NewReaderSize(file, 32<<10)
-			}
-		}
-		return readOperationsFrom(reader, maxRecordBytes)
 	}
-	return readOperationsFrom(bufio.NewReaderSize(file, 32<<10), maxRecordBytes)
+	if info.Size() <= maxJournalBytes {
+		return readOperationsFrom(bufio.NewReaderSize(file, 32<<10), maxRecordBytes)
+	}
+
+	// Read backwards in blocks until the last maxOperations complete records are
+	// inside the window, then hand that window to the same reader the whole-file
+	// path uses, so parsing (and its corruption rules) are shared. The window
+	// always ends at the file end, never starts before the bounded tail, and its
+	// first line is dropped only when it is really a partial record.
+	windowEnd := info.Size()
+	tailStart := windowEnd - maxJournalBytes
+	if tailStart < 0 {
+		tailStart = 0
+	}
+	for windowStart := windowEnd - blockSize; windowStart > tailStart; windowStart -= blockSize {
+		window := make([]byte, windowEnd-windowStart)
+		if _, readErr := file.ReadAt(window, windowStart); readErr != nil && !errors.Is(readErr, io.EOF) {
+			return nil, readErr
+		}
+		// The window's first line is only complete when the block boundary
+		// happened to land on a record boundary, so the count has to exclude it
+		// unless the byte before the window is a newline.
+		complete := countJournalRecords(window)
+		if windowStart > 0 && !startsOnRecordBoundary(file, windowStart) {
+			complete--
+		}
+		if complete < maxOperations {
+			continue
+		}
+		return parseJournalWindow(window, windowStart > 0, maxRecordBytes)
+	}
+	// The bounded tail holds fewer than maxOperations records: read exactly the
+	// slice the whole-file path would have read, so the result is unchanged.
+	window := make([]byte, windowEnd-tailStart)
+	if _, readErr := file.ReadAt(window, tailStart); readErr != nil && !errors.Is(readErr, io.EOF) {
+		return nil, readErr
+	}
+	return parseJournalWindow(window, tailStart > 0 && !startsOnRecordBoundary(file, tailStart), maxRecordBytes)
+}
+
+// parseJournalWindow parses one window of the journal. midRecord reports whether
+// the window starts inside a record, in which case its first partial line is
+// dropped; a window that starts exactly on a record boundary keeps it.
+func parseJournalWindow(window []byte, midRecord bool, maxRecordBytes int) ([]Operation, error) {
+	body := window
+	if midRecord {
+		if index := bytes.IndexByte(body, '\n'); index >= 0 {
+			body = body[index+1:]
+		} else {
+			body = nil
+		}
+	}
+	return readOperationsFrom(bufio.NewReaderSize(bytes.NewReader(body), 32<<10), maxRecordBytes)
+}
+
+// startsOnRecordBoundary reports whether the byte before offset ends a line,
+// which means the window begins exactly at the start of a record.
+func startsOnRecordBoundary(file *os.File, offset int64) bool {
+	if offset <= 0 {
+		return true
+	}
+	var previous [1]byte
+	read, err := file.ReadAt(previous[:], offset-1)
+	if err != nil && !(errors.Is(err, io.EOF) && read == 1) {
+		return false
+	}
+	return read == 1 && previous[0] == '\n'
+}
+
+// countJournalRecords counts the complete records in a journal window. A window
+// that ends at the file end may finish with an unterminated record, which is
+// not counted as complete.
+func countJournalRecords(window []byte) int {
+	records := 0
+	for _, line := range bytes.Split(window, []byte("\n")) {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		records++
+	}
+	if len(window) > 0 && window[len(window)-1] != '\n' {
+		records--
+	}
+	return records
 }
 
 func readOperationsFrom(reader *bufio.Reader, maxRecordBytes int) ([]Operation, error) {

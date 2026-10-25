@@ -1,4 +1,5 @@
 import { writable } from "svelte/store";
+import { apiUrl } from "../lib/apiPath";
 
 export interface AuthSession {
   loading: boolean;
@@ -32,7 +33,7 @@ export async function refreshAuthSession(): Promise<void> {
   const revision = ++requestRevision;
   authSession.update((current) => ({ ...current, loading: true, error: "" }));
   try {
-    const response = await fetch("/api/auth/session", { credentials: "same-origin" });
+    const response = await fetch(apiUrl("/api/auth/session"), { credentials: "same-origin" });
     const payload = await response.json().catch(() => ({})) as {
       configured?: boolean;
       authenticated?: boolean;
@@ -61,7 +62,7 @@ export async function refreshAuthSession(): Promise<void> {
 
 export async function signInWithAPIKey(key: string): Promise<void> {
   const revision = ++requestRevision;
-  const response = await fetch("/api/auth/session", {
+  const response = await fetch(apiUrl("/api/auth/session"), {
     method: "POST",
     credentials: "same-origin",
     headers: { "Content-Type": "application/json" },
@@ -75,7 +76,7 @@ export async function signInWithAPIKey(key: string): Promise<void> {
 
 export async function signOut(): Promise<void> {
   const revision = ++requestRevision;
-  const response = await fetch("/api/auth/session", { method: "DELETE", credentials: "same-origin" });
+  const response = await fetch(apiUrl("/api/auth/session"), { method: "DELETE", credentials: "same-origin" });
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   if (revision !== requestRevision) return;
   authSession.update((current) => ({ ...current, loading: false, authenticated: false, error: "" }));

@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/mostlygeek/llama-swap/docs"
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/extensions"
 	"github.com/mostlygeek/llama-swap/internal/hw"
@@ -201,6 +202,11 @@ func main() {
 		initialStore.Close()
 		os.Exit(1)
 	}
+	// The documentation is compiled into the binary and does not depend on the
+	// configuration, so it is indexed once at startup. A hot config reload
+	// reconfigures this same Server in place, so the index is shared for the
+	// life of the process.
+	initialSrv.SetDocumentation(docs.Files)
 	var configManager *config.ConfigManager
 	if manager, managerErr := config.NewConfigManager(*flagConfig, *flagConfigDir); managerErr != nil {
 		proxyLog.Warnf("config manager unavailable: %v", managerErr)

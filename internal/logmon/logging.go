@@ -378,20 +378,38 @@ func (w *Monitor) Info(msg string)  { w.log(LevelInfo, msg) }
 func (w *Monitor) Warn(msg string)  { w.log(LevelWarn, msg) }
 func (w *Monitor) Error(msg string) { w.log(LevelError, msg) }
 
+// Enabled reports whether a message of this level would be logged. The
+// formatted variants use it to skip building a message nobody reads: a disabled
+// Debugf on a hot path still paid for its fmt.Sprintf, and its arguments were
+// evaluated by the caller regardless.
+func (w *Monitor) Enabled(level Level) bool {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return level >= w.level
+}
+
 func (w *Monitor) Debugf(format string, args ...any) {
-	w.log(LevelDebug, fmt.Sprintf(format, args...))
+	if w.Enabled(LevelDebug) {
+		w.log(LevelDebug, fmt.Sprintf(format, args...))
+	}
 }
 
 func (w *Monitor) Infof(format string, args ...any) {
-	w.log(LevelInfo, fmt.Sprintf(format, args...))
+	if w.Enabled(LevelInfo) {
+		w.log(LevelInfo, fmt.Sprintf(format, args...))
+	}
 }
 
 func (w *Monitor) Warnf(format string, args ...any) {
-	w.log(LevelWarn, fmt.Sprintf(format, args...))
+	if w.Enabled(LevelWarn) {
+		w.log(LevelWarn, fmt.Sprintf(format, args...))
+	}
 }
 
 func (w *Monitor) Errorf(format string, args ...any) {
-	w.log(LevelError, fmt.Sprintf(format, args...))
+	if w.Enabled(LevelError) {
+		w.log(LevelError, fmt.Sprintf(format, args...))
+	}
 }
 
 func (l Level) String() string {

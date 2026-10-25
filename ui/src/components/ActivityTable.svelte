@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { ActivityLogEntry, InflightRequestEntry } from "../lib/types";
   import { cancelInflightRequest, uiConfig } from "../stores/api";
+  import { toast } from "../lib/toast";
   import { persistentStore } from "../stores/persistent";
   import { flip } from "svelte/animate";
   import { untrack } from "svelte";
@@ -330,21 +331,49 @@
   let cancelingInflightIds = $state<string[]>([]);
   let inflightNowMs = $state(performance.now());
 
+  // The elapsed counter only needs to be right when a human can see it, so the
+  // animation loop stops while the tab is hidden and resumes (with an immediate
+  // tick, so no time appears to have been skipped) when it comes back.
   $effect(() => {
     if (inflightRequests.length === 0) return;
 
-    // Refresh synchronously when the first request appears so the initial
-    // render does not use the timestamp from when this component mounted.
-    inflightNowMs = performance.now();
-
     let frame = 0;
+    let stopped = false;
+
     const tick = () => {
+      inflightNowMs = performance.now();
+      if (!stopped) frame = requestAnimationFrame(tick);
+    };
+
+    const start = () => {
+      if (stopped || frame) return;
       inflightNowMs = performance.now();
       frame = requestAnimationFrame(tick);
     };
-    frame = requestAnimationFrame(tick);
 
-    return () => cancelAnimationFrame(frame);
+    const stop = () => {
+      if (frame) {
+        cancelAnimationFrame(frame);
+        frame = 0;
+      }
+    };
+
+    const onVisibility = () => {
+      if (document.hidden) {
+        stop();
+        return;
+      }
+      start();
+    };
+
+    document.addEventListener("visibilitychange", onVisibility);
+    if (!document.hidden) start();
+
+    return () => {
+      stopped = true;
+      document.removeEventListener("visibilitychange", onVisibility);
+      stop();
+    };
   });
 
   // Built on demand rather than in a $derived: the source only matters while
@@ -379,6 +408,11 @@
     cancelingInflightIds = [...cancelingInflightIds, id];
     try {
       await cancelInflightRequest(id);
+      toast.success(t("controlPlane.inflightCanceled", { id }));
+    } catch (cause) {
+      // The request has no catch upstream, so an unhandled rejection would
+      // otherwise be the only trace of a failed cancel.
+      toast.error(t("controlPlane.inflightCancelFailed", { id, message: cause instanceof Error ? cause.message : String(cause) }));
     } finally {
       cancelingInflightIds = cancelingInflightIds.filter((current) => current !== id);
     }

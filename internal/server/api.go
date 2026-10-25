@@ -26,8 +26,12 @@ type modelRecord struct {
 	Capabilities        map[string]any `json:"capabilities,omitempty"`
 	SupportedParameters []string       `json:"supported_parameters,omitempty"`
 	ContextLength       int            `json:"context_length,omitempty"`
-	Meta                map[string]any `json:"meta,omitempty"`
-	Status              map[string]any `json:"status"`
+	// ContextWindow mirrors ContextLength for OpenAI-compatible gateways that
+	// read the context size from this field name (GROQ convention, followed by
+	// e.g. Bifrost).
+	ContextWindow int            `json:"context_window,omitempty"`
+	Meta          map[string]any `json:"meta,omitempty"`
+	Status        map[string]any `json:"status"`
 }
 
 // cappedMetadataKeys are top-level /v1/models fields produced by the
@@ -38,6 +42,7 @@ var cappedMetadataKeys = map[string]struct{}{
 	"capabilities":         {},
 	"supported_parameters": {},
 	"context_length":       {},
+	"context_window":       {},
 }
 
 // renderCapabilities converts a model's capabilities config into additional
@@ -181,6 +186,7 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 			Status:      map[string]any{"value": status},
 		}
 		rec.Architecture, rec.Capabilities, rec.SupportedParameters, rec.ContextLength = renderCapabilities(caps)
+		rec.ContextWindow = rec.ContextLength
 		if !caps.Empty() {
 			metadata = filterCappedMetadata(metadata)
 		}
@@ -230,7 +236,11 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 		if len(mc.Aliases) > 0 {
 			internalMetadata["aliases"] = mc.Aliases
 		}
-		data = append(data, newRecord(id, mc.Name, mc.Description, mc.Metadata, mc.Capabilities, status, internalMetadata))
+		// What the config declares, filled in with whatever the last probe of
+		// the running upstream learned (unless capabilities.disableAuto is
+		// set on the model).
+		caps := s.resolveCapabilities(r.Context(), id, mc)
+		data = append(data, newRecord(id, mc.Name, mc.Description, mc.Metadata, caps, status, internalMetadata))
 
 		if cfg.IncludeAliasesInList {
 			for _, alias := range mc.Aliases {
@@ -240,7 +250,7 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 						mc.Name,
 						mc.Description,
 						mc.Metadata,
-						mc.Capabilities,
+						caps,
 						status,
 						map[string]any{"type": "alias", "modelID": id},
 					))
@@ -393,11 +403,8 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 
 	sort.Slice(data, func(i, j int) bool { return data[i].ID < data[j].ID })
 
-	// Echo the Origin so browser clients can read the listing.
-	if origin := r.Header.Get("Origin"); origin != "" {
-		w.Header().Set("Access-Control-Allow-Origin", origin)
-	}
-
+	// The global CORS middleware already answered the browser; echoing the
+	// Origin here as well would produce two values under one header key.
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"object": "list",
@@ -551,19 +558,34 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("OK"))
 }
 
-func handleRootRedirect(w http.ResponseWriter, r *http.Request) {
-	http.Redirect(w, r, "/ui", http.StatusFound)
+// redirectRelative sends a redirect whose Location header stays relative to
+// the URL the client requested. http.Redirect resolves its destination against
+// the server-visible request path, which drops the path prefix when llama-swap
+// runs behind a prefix-stripping reverse proxy (a browser resolves a relative
+// Location against the URL it actually asked for, so the prefix survives).
+// Target must not start with "/".
+func redirectRelative(w http.ResponseWriter, target string, code int) {
+	w.Header().Set("Location", target)
+	w.WriteHeader(code)
 }
 
+func handleRootRedirect(w http.ResponseWriter, r *http.Request) {
+	redirectRelative(w, "ui/", http.StatusFound)
+}
+
+// handleUpstreamRedirect sends /upstream to the Models page. The target uses
+// the hash router (ui/#/models) so the document stays mounted at <prefix>/ui/:
+// a path route (ui/models) would leave the UI's prefix detection in
+// ui/src/lib/apiPath.ts unable to recover the proxy prefix, disconnecting the
+// page behind a prefix-stripping reverse proxy.
 func handleUpstreamRedirect(w http.ResponseWriter, r *http.Request) {
-	// The UI is a hash-routed SPA: the models page lives at /ui/#/models, not
-	// /ui/models. The old target only resolved while unknown /ui/* paths still
-	// fell back to index.html.
-	http.Redirect(w, r, "/ui/#/models", http.StatusFound)
+	redirectRelative(w, "ui/#/models", http.StatusFound)
 }
 
 func handleComfyUIRedirect(w http.ResponseWriter, r *http.Request) {
-	location := "/comfyui/"
+	// Relative Location so the redirect keeps a reverse proxy's path prefix
+	// (see redirectRelative).
+	location := "comfyui/"
 	if r.URL.RawQuery != "" {
 		location += "?" + r.URL.RawQuery
 	}
@@ -571,7 +593,7 @@ func handleComfyUIRedirect(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet || r.Method == http.MethodHead {
 		status = http.StatusMovedPermanently
 	}
-	http.Redirect(w, r, location, status)
+	redirectRelative(w, location, status)
 }
 
 // handleComfyUI proxies requests under /comfyui/ to the fixed local
@@ -638,16 +660,27 @@ func (s *Server) handleUpstream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Redirect /upstream/model to /upstream/model/ so relative URLs in upstream
-	// responses resolve. 301 for GET/HEAD, 308 otherwise to preserve the method.
+	// responses resolve. The Location stays relative so the redirect keeps a
+	// reverse proxy's path prefix (see redirectRelative). 301 for GET/HEAD,
+	// 308 otherwise to preserve the method.
+	//
+	// The target is built from the last escaped segment of the requested URL,
+	// not from searchName: a slash name ("author/model") arriving as two
+	// segments would resolve "author/model/" against /upstream/author/ and
+	// double the path, and a colon alias ("model1:high") would parse as a URL
+	// scheme (RFC 3986 4.2). "./<segment>/" stays path-relative for both, and
+	// reusing the escaped segment keeps %2F-encoded names redirecting to the
+	// URL the client actually requested.
 	if remainingPath == "/" && !strings.HasSuffix(r.URL.Path, "/") {
-		newPath := "/upstream/" + searchName + "/"
+		escapedPath := r.URL.EscapedPath()
+		newPath := "./" + escapedPath[strings.LastIndex(escapedPath, "/")+1:] + "/"
 		if r.URL.RawQuery != "" {
 			newPath += "?" + r.URL.RawQuery
 		}
 		if r.Method == http.MethodGet || r.Method == http.MethodHead {
-			http.Redirect(w, r, newPath, http.StatusMovedPermanently)
+			redirectRelative(w, newPath, http.StatusMovedPermanently)
 		} else {
-			http.Redirect(w, r, newPath, http.StatusPermanentRedirect)
+			redirectRelative(w, newPath, http.StatusPermanentRedirect)
 		}
 		return
 	}

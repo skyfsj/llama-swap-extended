@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   cooldownPolicyOf,
   normalizeProvider,
@@ -7,6 +7,8 @@ import {
   providersServingModel,
   providersSectionToConfig,
   normalizeProviderModels,
+  fetchProvidersStatus,
+  testQuotaScript,
 } from "./providersApi";
 
 describe("normalizeProvider", () => {
@@ -1041,5 +1043,117 @@ describe("normalizeProviderModels", () => {
     expect(normalizeProviderModels([{ local: " luna ", remote: " gpt-6-luna " }])).toEqual([
       { local: "luna", remote: "gpt-6-luna" },
     ]);
+  });
+});
+
+// 编辑供应商不能让 YAML 里手写的额度映射消失：面板只编辑 preset/endpoint/
+// refreshInterval/enforce，其余字段必须原样带走。
+describe("quota mapping round-trip", () => {
+  it("keeps inline windows, extras and divideBy through an edit", () => {
+    const section = normalizeProvidersSection({
+      providers: {
+        agg: {
+          type: "openai",
+          endpoint: "https://relay.example.com",
+          apiKeys: ["sk-1"],
+          models: ["m1"],
+          quota: {
+            endpoint: "{base}/v1/usage",
+            divideBy: 500000,
+            refreshInterval: "5m",
+            windows: [{ id: "quota", path: "data", percent: "used", limit: "limit" }],
+            extras: [{ id: "balance", path: "balance", divideBy: 1, suffix: " USD", format: "unix" }],
+          },
+        },
+      },
+    });
+    const out = providersSectionToConfig(section);
+    const quota = (out.agg as Record<string, unknown>).quota as Record<string, unknown>;
+    expect(quota.endpoint).toBe("{base}/v1/usage");
+    expect(quota.divideBy).toBe(500000);
+    expect(quota.refreshInterval).toBe("5m");
+    expect(quota.windows).toEqual([{ id: "quota", path: "data", percent: "used", limit: "limit" }]);
+    expect(quota.extras).toEqual([
+      { id: "balance", path: "balance", divideBy: 1, suffix: " USD", format: "unix" },
+    ]);
+  });
+
+  it("keeps an inline script through an edit", () => {
+    const section = normalizeProvidersSection({
+      providers: {
+        p: {
+          type: "openai",
+          endpoint: "https://x.com",
+          apiKeys: ["sk-1"],
+          models: ["m1"],
+          quota: { script: "({ windows: [], extras: [] })" },
+        },
+      },
+    });
+    const out = providersSectionToConfig(section);
+    const quota = (out.p as Record<string, unknown>).quota as Record<string, unknown>;
+    expect(quota.script).toBe("({ windows: [], extras: [] })");
+    expect(quota.endpoint).toBeUndefined();
+  });
+
+  it("drops an empty quota block instead of failing validation", () => {
+    const section = normalizeProvidersSection({
+      providers: {
+        p: {
+          type: "openai",
+          endpoint: "https://x.com",
+          apiKeys: ["sk-1"],
+          models: ["m1"],
+          quota: {},
+        },
+      },
+    });
+    const out = providersSectionToConfig(section);
+    expect((out.p as Record<string, unknown>).quota).toBeUndefined();
+  });
+});
+
+// 预设下拉曾经永远是空的：服务端返回了 quotaPresets，但这里按字段重建响应时
+// 把它丢掉了。这条测试锁住"整份响应透传"。
+describe("fetchProvidersStatus", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("keeps the quota preset list and other status fields", async () => {
+    const payload = {
+      providers: [],
+      routes: [],
+      stickySessionsEnabled: true,
+      quotaPresets: [
+        { id: "newapi", name: "New API", needsBase: true, windows: 1, extras: 6 },
+        { id: "deepseek", name: "DeepSeek", windows: 0, extras: 5 },
+      ],
+      latency: { agg: { samples: 3 } },
+    };
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(payload), { status: 200 })));
+
+    const status = await fetchProvidersStatus();
+    expect(status.quotaPresets).toHaveLength(2);
+    expect(status.quotaPresets?.[0]).toMatchObject({ id: "newapi", name: "New API", needsBase: true });
+    expect(status.stickySessionsEnabled).toBe(true);
+    expect(status.latency).toEqual({ agg: { samples: 3 } });
+  });
+});
+
+describe("testQuotaScript", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("posts the draft script without requiring the block to be saved", async () => {
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) =>
+      new Response(JSON.stringify({ snapshot: { providerID: "p", keyID: "k", extras: [] } }), { status: 200 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await testQuotaScript({ providerID: "p", script: "({ windows: [], extras: [] })" });
+    expect(result.snapshot.keyID).toBe("k");
+    const init = fetchMock.mock.calls[0][1];
+    expect(init?.method).toBe("POST");
+    expect(JSON.parse(String(init?.body))).toEqual({
+      providerID: "p",
+      script: "({ windows: [], extras: [] })",
+    });
   });
 });

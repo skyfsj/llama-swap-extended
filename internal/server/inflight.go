@@ -260,17 +260,36 @@ func (t *inflightTracker) observeResponseBytes(id string, total int, payload []b
 		return
 	}
 
+	// The parser is owned by the request's writer goroutine (see the note on
+	// inflightResponseWriter.Write), so the SSE parsing happens outside the
+	// tracker lock: only the entry update is serialized, which keeps a chatty
+	// stream from holding every other request's inflight bookkeeping hostage.
+	var (
+		preview   string
+		telemetry inflightTokenTelemetry
+	)
+	if len(payload) > 0 {
+		req, ok := t.peekRequest(id)
+		if !ok {
+			return
+		}
+		preview = req.outputParser.Append(payload)
+		telemetry = req.outputParser.Telemetry()
+	}
+
 	t.mu.Lock()
 	req, ok := t.requests[id]
 	if !ok {
+		// The request was removed while its bytes were being parsed: the final
+		// event has already been published, so this update is dropped exactly
+		// as it was when the lookup happened first.
 		t.mu.Unlock()
 		return
 	}
 	now := time.Now()
 	req.entry.RespBytes += int64(total)
 	if len(payload) > 0 {
-		req.entry.OutputPreview = req.outputParser.Append(payload)
-		telemetry := req.outputParser.Telemetry()
+		req.entry.OutputPreview = preview
 		applyInflightTelemetry(&req.entry, telemetry)
 		applyInflightCurrentRates(&req.entry, telemetry, now, &req.rateSamples)
 	}
@@ -289,6 +308,17 @@ func (t *inflightTracker) observeResponseBytes(id string, total int, payload []b
 		req.timer = time.AfterFunc(remaining, func() { t.emitPending(id) })
 	}
 	t.mu.Unlock()
+}
+
+// peekRequest returns the tracked request for id without holding the lock
+// across the caller's parsing. The returned pointer stays valid: an entry is
+// only removed from the map, never mutated away, and the parser it owns is used
+// by this one writer goroutine.
+func (t *inflightTracker) peekRequest(id string) (*inflightRequest, bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	req, ok := t.requests[id]
+	return req, ok
 }
 
 func (t *inflightTracker) emitPending(id string) {

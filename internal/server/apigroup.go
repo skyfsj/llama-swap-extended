@@ -49,6 +49,13 @@ type apiModel struct {
 	OldRequests   int            `json:"oldRequests"`
 	Waiting       int            `json:"waitingRequests"`
 	ConfigError   string         `json:"error,omitempty"`
+	// LoadingProgress is the fraction loaded (0 to 1) the upstream last
+	// reported through its health check. Only set while the model is starting
+	// and its upstream reports progress.
+	LoadingProgress *float64 `json:"loadingProgress,omitempty"`
+	// LoadingMessage is the loading step the upstream last reported. Only set
+	// while the model is starting.
+	LoadingMessage string `json:"loadingMessage,omitempty"`
 }
 
 type apiModelLoadConflict struct {
@@ -221,7 +228,7 @@ func (s *Server) modelStatus() []apiModel {
 		if s.modelSleeping(id) {
 			state = string(process.StateSleeping)
 		}
-		_, capsMap, _, ctxLen := renderCapabilities(mc.Capabilities)
+		_, capsMap, _, ctxLen := renderCapabilities(s.resolveCapabilities(context.Background(), id, mc))
 		modelLifecycle := lifecycle[id]
 		configStatus := modelLifecycle.ConfigStatus
 		if configStatus == "" {
@@ -259,6 +266,17 @@ func (s *Server) modelStatus() []apiModel {
 			Waiting:       modelLifecycle.WaitingRequests,
 			ConfigError:   publicConfigLifecycleError(modelLifecycle.Error),
 		})
+		// Loading progress is a start-time report from the upstream's own
+		// health check; it is meaningless once the model has moved on.
+		if state == string(process.StateStarting) {
+			if progress, ok := s.backendProgressSnapshot(id); ok && progress.Phase == "loading" {
+				if progress.Progress > 0 {
+					value := progress.Progress
+					models[len(models)-1].LoadingProgress = &value
+				}
+				models[len(models)-1].LoadingMessage = progress.Message
+			}
+		}
 	}
 
 	for peerID, peer := range cfg.Peers {
@@ -1142,11 +1160,21 @@ func (s *Server) handleAPIEvents(w http.ResponseWriter, r *http.Request) {
 		if j, err := json.Marshal(progress); err == nil {
 			send(messageEnvelope{Type: msgTypeBackendProgress, Data: string(j)})
 		}
+		// Loading progress also rides on the model rows (percentage and step
+		// next to the state), so the listing has to be refreshed with it. Only
+		// the loading phase does this: runtime build/download events already
+		// have their own panels and must not churn the model list.
+		if progress.Phase == "loading" {
+			sendModels()
+		}
 	}
 
 	defer event.On(func(e swaputil.ProcessStateChangeEvent) { sendModels() })()
 	defer event.On(func(e swaputil.ConfigFileChangedEvent) { sendModels() })()
 	defer event.On(func(e swaputil.ModelStatusesChangedEvent) { sendModels() })()
+	// Capability discovery completes after the ready transition, so the list
+	// pushed with that transition predates it.
+	defer event.On(func(e swaputil.ModelCapabilitiesChangedEvent) { sendModels() })()
 	defer event.On(func(e swaputil.ProfileChangedEvent) {
 		sendProfile()
 		sendModels()

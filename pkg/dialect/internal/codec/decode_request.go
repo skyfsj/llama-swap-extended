@@ -281,6 +281,18 @@ func decodeChatContent(content any, diagnostics *[]Diagnostic, path string) []Pa
 				if text := stringAt(part, "refusal"); text != "" {
 					parts = append(parts, Part{Kind: PartRefusal, Text: text})
 				}
+			case "input_audio":
+				audio := objectAt(part, "input_audio")
+				format := stringAt(audio, "format")
+				mime := "audio/" + format
+				if format == "mp3" {
+					mime = "audio/mpeg"
+				}
+				if data := stringAt(audio, "data"); data != "" && (format == "wav" || format == "mp3") {
+					parts = append(parts, Part{Kind: PartAudio, MediaType: mime, Base64: data})
+				} else {
+					appendDiagnostic(diagnostics, "invalid_audio", "input_audio requires data and wav or mp3 format", partPath)
+				}
 			case "image_url":
 				parts = append(parts, decodeImageURL(part["image_url"], diagnostics, partPath)...)
 			case "input_image":
@@ -331,7 +343,7 @@ func decodeFilePart(part map[string]any, diagnostics *[]Diagnostic, path string)
 	}
 	if data := stringAt(file, "file_data"); data != "" {
 		if mediaType, base64Data, ok := parseDataURL(data); ok {
-			return []Part{{Kind: PartDocument, MediaType: mediaType, Base64: base64Data}}
+			return []Part{{Kind: PartDocument, MediaType: mediaType, Base64: base64Data, Filename: stringAt(file, "filename")}}
 		}
 		return []Part{{Kind: PartDocument, Text: data}}
 	}
@@ -775,7 +787,7 @@ func decodeGeminiRequest(body []byte, diagnostics *[]Diagnostic) (*Request, erro
 			}
 		}
 		request.ResponseFormat = geminiResponseFormat(config, diagnostics)
-		request.Reasoning = geminiReasoning(config)
+		request.Reasoning = geminiReasoning(config, diagnostics)
 	}
 	request.Tools = decodeGeminiTools(arrayAt(object, "tools"), diagnostics)
 	request.ToolChoice = decodeGeminiToolChoice(objectAt(object, "toolConfig"), diagnostics)
@@ -807,15 +819,21 @@ type geminiCallTracker struct {
 	// orphans counts functionResponses with no matching call, so the decoder
 	// can report them.
 	orphans int
+	// mismatched counts results whose explicit id named no pending call and
+	// were paired by name instead, so the decoder can report the fallback.
+	mismatched int
 }
 
 func newGeminiCallTracker() *geminiCallTracker {
 	return &geminiCallTracker{pending: map[string][]string{}}
 }
 
-func (t *geminiCallTracker) callID(name string) string {
+func (t *geminiCallTracker) callID(name string, provided ...string) string {
 	t.sequence++
 	id := fmt.Sprintf("call_gemini_%d", t.sequence)
+	if len(provided) > 0 && provided[0] != "" {
+		id = provided[0]
+	}
 	t.pending[name] = append(t.pending[name], id)
 	return id
 }
@@ -824,8 +842,27 @@ func (t *geminiCallTracker) callID(name string) string {
 // name. An orphan (no preceding call) still gets an id so the converted request
 // never carries a tool result that no assistant call declares; the caller
 // reports it.
-func (t *geminiCallTracker) resolve(name string) string {
+func (t *geminiCallTracker) resolve(name string, provided ...string) string {
 	ids := t.pending[name]
+	if len(provided) > 0 && provided[0] != "" {
+		for index, id := range ids {
+			if id == provided[0] {
+				t.pending[name] = append(ids[:index], ids[index+1:]...)
+				return id
+			}
+		}
+		if len(ids) == 0 {
+			t.orphans++
+			return ""
+		}
+		// The result names an id no pending call declared. Pairing it by name
+		// keeps the answer the model produced; dropping it would lose a tool
+		// result from a request that is otherwise well-formed.
+		t.mismatched++
+		id := ids[0]
+		t.pending[name] = ids[1:]
+		return id
+	}
 	if len(ids) == 0 {
 		// An orphan reserves nothing: minting an id here left it pending, so a
 		// later real call/result pair could be handed the dropped result's id.
@@ -863,7 +900,7 @@ func decodeGeminiParts(raw []any, calls *geminiCallTracker, diagnostics *[]Diagn
 			if thought, ok := boolAt(part, "thought"); ok && thought {
 				kind = PartReasoning
 			}
-			if text != "" {
+			if text != "" || geminiThoughtSignature(part) != "" {
 				parts = append(parts, Part{
 					Kind: kind, Text: text, ThoughtSignature: geminiThoughtSignature(part),
 				})
@@ -902,7 +939,7 @@ func decodeGeminiParts(raw []any, calls *geminiCallTracker, diagnostics *[]Diagn
 			name := stringAt(call, "name")
 			arguments := rawObject(call["args"])
 			parts = append(parts, Part{
-				Kind: PartToolCall, ToolCallID: calls.callID(name), ToolName: name,
+				Kind: PartToolCall, ToolCallID: calls.callID(name, stringAt(call, "id")), ToolName: name,
 				Arguments: arguments, ArgumentsText: string(arguments),
 				ThoughtSignature: geminiThoughtSignature(part),
 			})
@@ -917,7 +954,7 @@ func decodeGeminiParts(raw []any, calls *geminiCallTracker, diagnostics *[]Diagn
 			if inner, ok := response["response"].(map[string]any); ok {
 				// functionResponse.response is an object; a single "result"
 				// field is the common shape.
-				if result, exists := inner["result"]; exists {
+				if result, exists := inner["result"]; exists && len(inner) == 1 {
 					if resultText, ok := result.(string); ok {
 						text = resultText
 					} else {
@@ -926,7 +963,8 @@ func decodeGeminiParts(raw []any, calls *geminiCallTracker, diagnostics *[]Diagn
 				}
 			}
 			before := calls.orphans
-			callID := calls.resolve(name)
+			mismatched := calls.mismatched
+			callID := calls.resolve(name, stringAt(response, "id"))
 			if calls.orphans > before {
 				// Anthropic rejects a tool_result whose tool_use_id has no
 				// preceding tool_use, so a synthetic id does not make the turn
@@ -935,8 +973,13 @@ func decodeGeminiParts(raw []any, calls *geminiCallTracker, diagnostics *[]Diagn
 					"a Gemini functionResponse has no matching functionCall and was dropped", partPath)
 				continue
 			}
-			parts = append(parts, toolResultPart(callID, name,
-				[]Part{{Kind: PartText, Text: text}}, false))
+			if calls.mismatched > mismatched {
+				appendDiagnostic(diagnostics, "tool_result_id_mismatch",
+					"a Gemini functionResponse named an id no call declared and was paired by name", partPath)
+			}
+			content := []Part{{Kind: PartText, Text: text}}
+			content = append(content, decodeGeminiParts(arrayAt(response, "parts"), calls, diagnostics, partPath+".parts")...)
+			parts = append(parts, toolResultPart(callID, name, content, objectAt(response, "response")["error"] != nil))
 		default:
 			appendDiagnostic(diagnostics, "gemini_part_dropped",
 				"Gemini part cannot be represented (executable code, code result or unknown field)", partPath)
@@ -1015,7 +1058,7 @@ func decodeGeminiToolChoice(config map[string]any, diagnostics *[]Diagnostic) *T
 	return choice
 }
 
-func geminiReasoning(config map[string]any) *ReasoningConfig {
+func geminiReasoning(config map[string]any, diagnostics *[]Diagnostic) *ReasoningConfig {
 	thinking := objectAt(config, "thinkingConfig")
 	if thinking == nil {
 		thinking = objectAt(config, "thinking_config")
@@ -1028,6 +1071,21 @@ func geminiReasoning(config map[string]any) *ReasoningConfig {
 		reasoning.BudgetTokens = &budget
 		enabled := budget != 0
 		reasoning.Enabled = &enabled
+	}
+	// thinkingLevel is the model-native control Gemini documents for models
+	// that do not accept a token budget. Dropping it silently left the client
+	// on the upstream default with no signal.
+	if level := firstString(thinking, "thinkingLevel", "thinking_level"); level != "" {
+		reasoning.Level = level
+	}
+	if include, ok := boolAt(thinking, "includeThoughts"); ok {
+		reasoning.Summary = ""
+		if include {
+			reasoning.Summary = "auto"
+		}
+	}
+	if reasoning.BudgetTokens == nil && reasoning.Effort == "" && reasoning.Enabled == nil && reasoning.Summary == "" {
+		return nil
 	}
 	return reasoning
 }
@@ -1130,7 +1188,12 @@ func decodeResponsesRequest(body []byte, diagnostics *[]Diagnostic) (*Request, e
 		Extra:       map[string]json.RawMessage{},
 	}
 	request.System = textParts(object["instructions"], diagnostics, "instructions")
-	request.Tools = decodeResponsesTools(arrayAt(object, "tools"), diagnostics)
+	request.ToolState = newToolState()
+	// One request declares tools in two places (the top-level array and
+	// additional_tools items inside the input). They are flattened into one list
+	// for the target, so the names they claim are tracked once for both.
+	declaredTools := map[string]struct{}{}
+	request.Tools = decodeResponsesTools(arrayAt(object, "tools"), diagnostics, request.ToolState, declaredTools)
 	request.ToolChoice = decodeResponsesToolChoice(object["tool_choice"], diagnostics)
 	request.ParallelTools = boolPtr(object, "parallel_tool_calls")
 	request.Metadata = stringMap(object, "metadata")
@@ -1138,16 +1201,31 @@ func decodeResponsesRequest(body []byte, diagnostics *[]Diagnostic) (*Request, e
 	request.ResponseFormat = responsesResponseFormat(object, diagnostics)
 	request.Reasoning = responsesReasoning(object)
 
-	for _, key := range []string{"store", "prompt_cache_key", "prompt_cache_retention", "truncation", "service_tier", "safety_identifier", "top_logprobs"} {
+	for _, key := range []string{
+		"store", "prompt_cache_key", "prompt_cache_retention", "truncation", "service_tier",
+		"safety_identifier", "top_logprobs", "include", "conversation", "background",
+		"max_tool_calls", "modalities", "audio", "text", "context_management",
+	} {
 		if raw, ok := object[key]; ok {
 			request.Extra[key] = rawObject(raw)
 		}
 	}
+	// A stateful reference cannot be resolved by a stateless target, and a
+	// background turn changes execution semantics: both must be reported by
+	// the encoder rather than disappearing here. A conversation is either a
+	// bare id or an object, so it is copied as-is when present.
+	if conversation, ok := object["conversation"]; ok && conversation != nil {
+		request.Extra["conversation"] = rawObject(conversation)
+	}
+	if background, ok := object["background"].(bool); ok && background {
+		request.Extra["background"] = rawObject(object["background"])
+	}
 
-	messages, err := decodeResponsesInput(object["input"], diagnostics)
+	messages, additionalTools, err := decodeResponsesInput(object["input"], diagnostics, request.ToolState, declaredTools)
 	if err != nil {
 		return nil, err
 	}
+	request.Tools = append(request.Tools, additionalTools...)
 	for _, message := range messages {
 		if message.Role == RoleSystem && len(request.Messages) == 0 {
 			// Only leading developer/system items are the system prompt; a
@@ -1160,17 +1238,24 @@ func decodeResponsesRequest(body []byte, diagnostics *[]Diagnostic) (*Request, e
 	return request, nil
 }
 
-func decodeResponsesInput(input any, diagnostics *[]Diagnostic) ([]Message, error) {
+// decodeResponsesInput reads the input transcript. Codex declares incremental
+// tools through additional_tools items embedded in the input; those are
+// returned separately so the caller merges them into the top-level tool list,
+// which is the only place a function-calling target can see them. seen carries
+// the names already declared by the top-level tool list, so one request cannot
+// declare the same flattened name twice from two different containers.
+func decodeResponsesInput(input any, diagnostics *[]Diagnostic, state *ToolState, seen map[string]struct{}) ([]Message, []Tool, error) {
 	switch value := input.(type) {
 	case nil:
-		return nil, nil
+		return nil, nil, nil
 	case string:
 		if value == "" {
-			return nil, nil
+			return nil, nil, nil
 		}
-		return []Message{{Role: RoleUser, Parts: []Part{{Kind: PartText, Text: value}}}}, nil
+		return []Message{{Role: RoleUser, Parts: []Part{{Kind: PartText, Text: value}}}}, nil, nil
 	case []any:
 		var messages []Message
+		var additional []Tool
 		for index, raw := range value {
 			item, ok := raw.(map[string]any)
 			if !ok {
@@ -1192,35 +1277,47 @@ func decodeResponsesInput(input any, diagnostics *[]Diagnostic) ([]Message, erro
 				// visible to that pass.
 				messages = append(messages, Message{Role: role, Parts: parts})
 			case "function_call":
+				name, namespace := responsesFunctionName(item)
 				call := Part{
 					Kind:          PartToolCall,
 					ToolCallID:    stringAt(item, "call_id"),
-					ToolName:      stringAt(item, "name"),
+					ToolName:      name,
+					ToolNamespace: namespace,
 					ArgumentsText: stringAt(item, "arguments"),
 					Arguments:     parseArguments(stringAt(item, "arguments"), diagnostics, itemPath+".arguments"),
 				}
+				if binding, ok := state.Binding(name); ok {
+					call.ToolKind = binding.Kind
+				}
 				messages = appendAssistantToolCall(messages, call)
 			case "custom_tool_call":
+				name, namespace := responsesFunctionName(item)
 				input, _ := item["input"].(string)
 				encoded := mustMarshal(map[string]any{"input": input})
-				appendDiagnostic(diagnostics, "custom_tool_approximated",
-					"custom tool call was approximated as a JSON function call", itemPath)
 				messages = appendAssistantToolCall(messages, Part{
 					Kind: PartToolCall, ToolCallID: stringAt(item, "call_id"),
-					ToolName: stringAt(item, "name"), Arguments: encoded, ArgumentsText: string(encoded),
+					ToolName: name, ToolNamespace: namespace, ToolKind: ToolKindCustom,
+					Arguments: encoded, ArgumentsText: string(encoded),
 				})
 			case "function_call_output", "custom_tool_call_output":
 				content := decodeResponsesToolOutput(item["output"], diagnostics, itemPath+".output")
-				messages = append(messages, Message{
-					Role:  RoleTool,
-					Parts: []Part{toolResultPart(stringAt(item, "call_id"), "", content, false)},
-				})
+				result := toolResultPart(stringAt(item, "call_id"), "", content, false)
+				if itemType == "custom_tool_call_output" {
+					result.ToolKind = ToolKindCustom
+				}
+				messages = append(messages, Message{Role: RoleTool, Parts: []Part{result}})
 			case "reasoning":
 				parts := decodeResponsesReasoning(item, diagnostics, itemPath)
 				if len(parts) == 0 {
 					continue
 				}
 				messages = append(messages, Message{Role: RoleAssistant, Parts: parts})
+			case "additional_tools":
+				tools := decodeResponsesTools(arrayAt(item, "tools"), diagnostics, state, seen)
+				additional = append(additional, tools...)
+				appendDiagnostic(diagnostics, "additional_tools_flattened",
+					"additional_tools items are merged into the top-level tool list; their position in the input is not preserved",
+					itemPath)
 			case "item_reference":
 				appendDiagnostic(diagnostics, "item_reference_dropped",
 					"item_reference cannot be resolved without the Responses store", itemPath)
@@ -1240,9 +1337,21 @@ func decodeResponsesInput(input any, diagnostics *[]Diagnostic) ([]Message, erro
 					fmt.Sprintf("input item type %q cannot be represented", itemType), itemPath)
 			}
 		}
-		return messages, nil
+		return messages, additional, nil
 	}
-	return nil, conversionErrorf("invalid_input", "input must be a string or an array of items")
+	return nil, nil, conversionErrorf("invalid_input", "input must be a string or an array of items")
+}
+
+// responsesFunctionName resolves a Responses tool-call item's name. A call
+// recorded with an explicit namespace is addressed by its flattened function
+// name, matching how the same tool was declared to a function-calling target.
+func responsesFunctionName(item map[string]any) (string, string) {
+	name := stringAt(item, "name")
+	namespace := strings.TrimSpace(stringAt(item, "namespace"))
+	if namespace != "" && namespace != defaultToolNamespace {
+		return FlattenToolName(namespace, name), namespace
+	}
+	return name, namespace
 }
 
 func decodeResponsesContent(content any, diagnostics *[]Diagnostic, path string) []Part {
@@ -1335,41 +1444,144 @@ func decodeResponsesReasoning(item map[string]any, diagnostics *[]Diagnostic, pa
 	return parts
 }
 
-func decodeResponsesTools(raw []any, diagnostics *[]Diagnostic) []Tool {
+// customToolInputSchema is the function schema a custom (freeform) tool is
+// given when a target only understands JSON-schema functions: one string
+// argument carrying the raw tool input.
+const customToolInputSchema = `{"type":"object","properties":{"input":{"type":"string"}},"required":["input"]}`
+
+// decodeResponsesTools flattens the Responses tool list into callable
+// functions. Namespace tools expand into one function per member named
+// "<namespace>__<name>", and each binding is recorded in state so the matching
+// response can restore the namespace. Custom (freeform) tools become functions
+// taking one string "input" argument and keep their kind.
+func decodeResponsesTools(raw []any, diagnostics *[]Diagnostic, state *ToolState, seen map[string]struct{}) []Tool {
 	var tools []Tool
+	if seen == nil {
+		seen = map[string]struct{}{}
+	}
+	appendTool := func(tool Tool, path string) {
+		if tool.Name == "" {
+			return
+		}
+		if _, duplicate := seen[tool.Name]; duplicate {
+			appendDiagnostic(diagnostics, "duplicate_tool_dropped",
+				fmt.Sprintf("tool %q shadows an earlier declaration under the same flattened name and was omitted", tool.Name), path)
+			return
+		}
+		seen[tool.Name] = struct{}{}
+		tools = append(tools, tool)
+		if tool.Kind == ToolKindCustom {
+			state.Set(tool.Name, ToolBinding{Kind: tool.Kind})
+		}
+	}
 	for index, item := range raw {
 		tool, ok := item.(map[string]any)
 		if !ok {
 			continue
 		}
-		typeName := stringAt(tool, "type")
-		if typeName != "" && typeName != "function" {
-			appendDiagnostic(diagnostics, "hosted_tool_dropped",
-				fmt.Sprintf("Responses hosted tool %q cannot be represented as a function", typeName),
-				fmt.Sprintf("tools[%d]", index))
-			continue
-		}
-		name := stringAt(tool, "name")
-		if name == "" {
-			// Some providers nest the function object.
-			function := objectAt(tool, "function")
-			name = stringAt(function, "name")
+		path := fmt.Sprintf("tools[%d]", index)
+		switch typeName := stringAt(tool, "type"); typeName {
+		case "namespace":
+			tools = append(tools, decodeResponsesNamespaceTools(tool, diagnostics, state, path, &seen)...)
+		case "custom":
+			name := stringAt(tool, "name")
 			if name == "" {
 				continue
 			}
-			tools = append(tools, Tool{
+			appendTool(Tool{
 				Name:        name,
-				Description: stringAt(function, "description"),
-				Parameters:  rawObject(function["parameters"]),
-				Strict:      boolPtr(function, "strict"),
-			})
+				Description: stringAt(tool, "description"),
+				Parameters:  json.RawMessage(customToolInputSchema),
+				Kind:        ToolKindCustom,
+				Format:      rawObject(tool["format"]),
+			}, path)
+		case "", "function":
+			description := stringAt(tool, "description")
+			parameters := rawObject(tool["parameters"])
+			strict := boolPtr(tool, "strict")
+			name := stringAt(tool, "name")
+			if name == "" {
+				// Some providers nest the function object.
+				function := objectAt(tool, "function")
+				name = stringAt(function, "name")
+				description = stringAt(function, "description")
+				parameters = rawObject(function["parameters"])
+				strict = boolPtr(function, "strict")
+			}
+			if name == "" {
+				continue
+			}
+			appendTool(Tool{
+				Name:         name,
+				Description:  description,
+				Parameters:   parameters,
+				Strict:       strict,
+				Kind:         ToolKindFunction,
+				DeferLoading: boolPtr(tool, "defer_loading"),
+			}, path)
+		default:
+			appendDiagnostic(diagnostics, "hosted_tool_dropped",
+				fmt.Sprintf("Responses hosted tool %q cannot be represented as a function", typeName), path)
+		}
+	}
+	return tools
+}
+
+// decodeResponsesNamespaceTools expands one namespace declaration. The
+// namespace description is folded into each member's description so a
+// function-calling target still sees it.
+func decodeResponsesNamespaceTools(namespace map[string]any, diagnostics *[]Diagnostic, state *ToolState, path string, seen *map[string]struct{}) []Tool {
+	namespaceName := strings.TrimSpace(stringAt(namespace, "name"))
+	if namespaceName == "" {
+		appendDiagnostic(diagnostics, "namespace_tool_dropped", "namespace tool declares no name", path)
+		return nil
+	}
+	namespaceDescription := strings.TrimSpace(stringAt(namespace, "description"))
+	members := arrayAt(namespace, "tools")
+	tools := make([]Tool, 0, len(members))
+	for index, rawMember := range members {
+		member, ok := rawMember.(map[string]any)
+		if !ok {
 			continue
 		}
+		memberPath := fmt.Sprintf("%s.tools[%d]", path, index)
+		name := strings.TrimSpace(stringAt(member, "name"))
+		if name == "" {
+			appendDiagnostic(diagnostics, "namespace_tool_dropped", "namespace member declares no name", memberPath)
+			continue
+		}
+		kind := ToolKindFunction
+		if stringAt(member, "type") == "custom" {
+			kind = ToolKindCustom
+		}
+		flattened := FlattenToolName(namespaceName, name)
+		description := strings.TrimSpace(stringAt(member, "description"))
+		if namespaceDescription != "" {
+			description = namespaceDescription
+			if memberDescription := strings.TrimSpace(stringAt(member, "description")); memberDescription != "" {
+				description += "\n\n" + memberDescription
+			}
+		}
+		parameters := rawObject(member["parameters"])
+		if kind == ToolKindCustom {
+			parameters = json.RawMessage(customToolInputSchema)
+		}
+		if _, duplicate := (*seen)[flattened]; duplicate {
+			appendDiagnostic(diagnostics, "duplicate_tool_dropped",
+				fmt.Sprintf("tool %q shadows an earlier declaration under the same flattened name and was omitted", flattened), memberPath)
+			continue
+		}
+		(*seen)[flattened] = struct{}{}
+		state.Set(flattened, ToolBinding{Namespace: namespaceName, Kind: kind})
 		tools = append(tools, Tool{
-			Name:        name,
-			Description: stringAt(tool, "description"),
-			Parameters:  rawObject(tool["parameters"]),
-			Strict:      boolPtr(tool, "strict"),
+			Name:         flattened,
+			Description:  description,
+			Parameters:   parameters,
+			Strict:       boolPtr(member, "strict"),
+			Namespace:    namespaceName,
+			Kind:         kind,
+			Format:       rawObject(member["format"]),
+			DeferLoading: boolPtr(member, "defer_loading"),
 		})
 	}
 	return tools
@@ -1384,33 +1596,42 @@ func decodeResponsesToolChoice(value any, diagnostics *[]Diagnostic) *ToolChoice
 		}
 	case map[string]any:
 		switch stringAt(typed, "type") {
-		case "function":
-			name := stringAt(typed, "name")
-			if name == "" {
-				name = stringAt(objectAt(typed, "function"), "name")
-			}
+		case "function", "custom":
+			name, namespace := responsesFunctionName(typed)
 			if name != "" {
-				return &ToolChoice{Mode: ToolChoiceTool, Name: name}
+				return &ToolChoice{Mode: ToolChoiceTool, Name: name, Namespace: namespace}
 			}
 			return &ToolChoice{Mode: ToolChoiceRequired}
 		case "allowed_tools":
 			mode := stringAt(typed, "mode")
-			tools := arrayAt(typed, "tools")
-			if len(tools) == 1 {
-				if tool, ok := tools[0].(map[string]any); ok {
-					name := stringAt(tool, "name")
-					if name == "" {
-						name = stringAt(objectAt(tool, "function"), "name")
-					}
-					if name != "" {
-						return &ToolChoice{Mode: ToolChoiceTool, Name: name}
+			allowed := make([]string, 0, len(arrayAt(typed, "tools")))
+			for _, raw := range arrayAt(typed, "tools") {
+				tool, ok := raw.(map[string]any)
+				if !ok {
+					continue
+				}
+				name, _ := responsesFunctionName(tool)
+				if name == "" {
+					if function := objectAt(tool, "function"); function != nil {
+						name, _ = responsesFunctionName(function)
 					}
 				}
+				if name != "" {
+					allowed = append(allowed, name)
+				}
 			}
-			if mode == "required" {
-				return &ToolChoice{Mode: ToolChoiceRequired}
+			// mode names the selection policy, and the tool list names the
+			// permitted set. Folding a single allowed tool into ToolChoiceTool
+			// turned an auto policy into a forced call, so the two are kept
+			// apart here.
+			choice := &ToolChoice{AllowedNames: allowed, Mode: ToolChoiceAuto}
+			switch mode {
+			case "required":
+				choice.Mode = ToolChoiceRequired
+			case "none":
+				choice.Mode = ToolChoiceNone
 			}
-			return &ToolChoice{Mode: ToolChoiceAuto}
+			return choice
 		case "none":
 			return &ToolChoice{Mode: ToolChoiceNone}
 		}

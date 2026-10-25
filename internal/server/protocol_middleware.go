@@ -27,6 +27,22 @@ type protocolBackendPath struct {
 	Stream bool
 }
 
+// geminiSignatureScopeKey carries the conversation scope a Gemini thought
+// signature belongs to, so the response side stores signatures under the same
+// key the request side looked them up with.
+type geminiSignatureScopeKey struct{}
+
+// signatureScopeFromContext returns the scope recorded for this request.
+func signatureScopeFromContext(ctx context.Context) string {
+	scope, _ := ctx.Value(geminiSignatureScopeKey{}).(string)
+	return scope
+}
+
+// withGeminiSignatureScope records the conversation scope on the request.
+func withGeminiSignatureScope(r *http.Request, scope string) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), geminiSignatureScopeKey{}, scope))
+}
+
 func protocolTargetFormat(r *http.Request) protocolrelaykit.Format {
 	if r == nil {
 		return ""
@@ -66,7 +82,11 @@ type ProviderDialect struct {
 // provider gateway serves; ok=false means the model is not provider-routed.
 type ProviderDialectResolver func(modelID string) (ProviderDialect, bool)
 
-func CreateProtocolAdapterMiddleware(cfg config.Config, st *store.Store, providerDialect ProviderDialectResolver) chain.Middleware {
+func CreateProtocolAdapterMiddleware(cfg config.Config, st *store.Store, providerDialect ProviderDialectResolver, signatures ...*geminiSignatureCache) chain.Middleware {
+	var signatureCache *geminiSignatureCache
+	if len(signatures) > 0 {
+		signatureCache = signatures[0]
+	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			route, ok := protocolrelaykit.RouteForRequest(r.Method, r.URL.Path)
@@ -144,10 +164,29 @@ func CreateProtocolAdapterMiddleware(cfg config.Config, st *store.Store, provide
 			}
 			stream := protocolrelaykit.RequestStreamed(route, requestBody)
 			meta := protocolrelaykit.NewMeta(data.ModelID, stream)
+			backendLabel := modelConfig.Backend.Type
+			if !isLocal {
+				backendLabel = provider.Label
+			}
+			// Resolve the conversation scope before the body is converted:
+			// signatureConversation reads the client's own headers.
+			scope := ""
+			if signatureCache != nil {
+				scope = signatureScope(signatureConversation(r), data.ModelID, backendLabel)
+				r = withGeminiSignatureScope(r, scope)
+			}
 			converted, err := convertProtocolRequest(r.Context(), meta, route.Format, target, requestBody, data.ModelID, st)
 			if err != nil {
 				swaputil.SendResponse(w, r, http.StatusBadRequest, err.Error())
 				return
+			}
+			if isGeminiTarget(target) && signatureCache != nil {
+				// The client's dialect cannot carry Google thought signatures,
+				// so replay any the relay captured for this conversation before
+				// the encoder falls back to the placeholder.
+				if cached := signatureCache.lookup(scope, replayCallIDs(converted), time.Now()); len(cached) > 0 {
+					converted = applyCachedGeminiSignatures(converted, cached)
+				}
 			}
 			path, err := protocolrelaykit.TargetPathForRequest(target, data.ModelID, stream, r.URL.Path)
 			if err != nil {
@@ -171,14 +210,14 @@ func CreateProtocolAdapterMiddleware(cfg config.Config, st *store.Store, provide
 			if route.Format == protocolrelaykit.Gemini {
 				r.Header.Del("x-goog-api-key")
 			}
-			backendLabel := modelConfig.Backend.Type
-			if !isLocal {
-				backendLabel = provider.Label
-			}
 			writer, err := newProtocolResponseWriter(w, r, st, data.ModelID, backendLabel, target, route.Format, requestBody, meta, stream)
 			if err != nil {
 				swaputil.SendResponse(w, r, http.StatusBadRequest, err.Error())
 				return
+			}
+			writer.signatures = signatureCache
+			if writer.streamWriter != nil {
+				writer.streamWriter.signatures = signatureCache
 			}
 			next.ServeHTTP(writer, r)
 			if finishErr := writer.finish(); finishErr != nil && !writer.committed() {
@@ -187,6 +226,12 @@ func CreateProtocolAdapterMiddleware(cfg config.Config, st *store.Store, provide
 			}
 		})
 	}
+}
+
+// isGeminiTarget reports whether a dialect carries Google thought signatures,
+// so the relay must replay them from its cache.
+func isGeminiTarget(format protocolrelaykit.Format) bool {
+	return format == protocolrelaykit.Gemini || format == protocolrelaykit.GeminiInteractions
 }
 
 // surfaceTypeForFormat maps a client dialect onto the provider type (API
@@ -406,6 +451,45 @@ type protocolResponseWriter struct {
 	overflow     bool
 	streamWriter *protocolStreamWriter
 	buffer       *protocolBufferedWriter
+	// signatures keeps the Gemini thought signatures the upstream returns for
+	// this conversation, so a later replay can restore them.
+	signatures *geminiSignatureCache
+}
+
+// captureGeminiSignatures records the thought signatures of one upstream
+// payload against this conversation. It runs on the raw upstream body, before
+// conversion drops signatures the client dialect cannot carry.
+func (p *protocolResponseWriter) captureGeminiSignatures(body []byte) {
+	if p.signatures == nil {
+		return
+	}
+	var signatures map[string]string
+	switch p.upstream {
+	case protocolrelaykit.Gemini:
+		signatures, _ = geminiSignaturesInResponse(body, 0)
+	case protocolrelaykit.GeminiInteractions:
+		signatures = geminiInteractionSignatures(body)
+	default:
+		return
+	}
+	if len(signatures) == 0 {
+		return
+	}
+	p.signatures.store(p.signatureScope(), signatures, time.Now())
+}
+
+// signatureScope is the key the request path looked signatures up with. The
+// encoded scope carries conversation, model and upstream surface, so the two
+// halves agree without re-deriving any of them.
+func (p *protocolResponseWriter) signatureScope() string {
+	if scope := signatureScopeFromContext(p.request.Context()); scope != "" {
+		return scope
+	}
+	model := p.model
+	if p.meta != nil && p.meta.Request != nil && p.meta.Request.Model != "" {
+		model = p.meta.Request.Model
+	}
+	return signatureScope(signatureConversation(p.request), model, p.backend)
 }
 
 // protocolBufferedWriter collects a whole JSON response so it can be converted.
@@ -510,6 +594,7 @@ func (p *protocolResponseWriter) finish() error {
 			if protocolrelaykit.ResponseFailed(p.upstream, body) {
 				status = http.StatusBadGateway
 			}
+			p.captureGeminiSignatures(body)
 			result, err := protocolrelaykit.ConvertResponse(p.request.Context(), p.meta, p.upstream, p.client, body)
 			if err != nil {
 				return err
@@ -572,7 +657,23 @@ func logResponseConversion(result *protocolrelaykit.ResponseResult, model string
 }
 
 func normalizeProtocolError(body []byte, target protocolrelaykit.Format, status int) []byte {
-	return protocolrelaykit.ErrorEnvelope(body, target, status)
+	normalized := protocolrelaykit.ErrorEnvelope(body, target, status)
+	var original, converted map[string]any
+	if json.Unmarshal(body, &original) == nil && json.Unmarshal(normalized, &converted) == nil {
+		source, _ := original["error"].(map[string]any)
+		dest, _ := converted["error"].(map[string]any)
+		if (source["type"] == "mcp_approval_required" || source["type"] == "mcp_input_required") && dest != nil {
+			for _, key := range []string{"type", "approval_id", "approval_ids", "approval_url", "resume_url", "client_tool_calls"} {
+				if value, exists := source[key]; exists {
+					dest[key] = value
+				}
+			}
+			if encoded, err := json.Marshal(converted); err == nil {
+				return encoded
+			}
+		}
+	}
+	return normalized
 }
 
 type protocolStreamWriter struct {
@@ -596,12 +697,24 @@ type protocolStreamWriter struct {
 	errorForward  bool
 	streamErr     error
 	finished      bool
+	// finishedBareJSON records that the upstream sent one whole JSON body
+	// instead of SSE; the response was converted and written as a single
+	// terminal frame, so nothing is left to finalize.
+	finishedBareJSON bool
+	// signatures keeps the Gemini thought signatures streamed by the upstream
+	// for this conversation, so a later replay can restore them.
+	signatures *geminiSignatureCache
+	// signatureCalls numbers the function calls this stream has delivered, so a
+	// call Gemini sent without an id gets the same positional id the decoder
+	// mints for the client and its signature is filed under that id.
+	signatureCalls int
 }
 
 func newProtocolStreamWriter(w http.ResponseWriter, r *http.Request, st *store.Store, model, backend string, upstream, client protocolrelaykit.Format, requestBody []byte, meta *protocolrelaykit.Meta) (*protocolStreamWriter, error) {
 	options := protocolrelaykit.StreamOptions{
 		Model: model, Created: time.Now().Unix(), IncludeUsage: true,
 		EstimateInputTokens: meta.EstimatePromptTokens,
+		Request:             meta.Request,
 	}
 	var state *protocolrelaykit.ResponseStreamState
 	if upstream != protocolrelaykit.OpenAIChat || client != protocolrelaykit.OpenAIResponses {
@@ -619,6 +732,19 @@ func newProtocolStreamWriter(w http.ResponseWriter, r *http.Request, st *store.S
 }
 
 func (w *protocolStreamWriter) Header() http.Header { return w.writer.Header() }
+
+// signatureScope is the key this stream files signatures under: the scope the
+// request path recorded, or one rebuilt from the request's own identity.
+func (w *protocolStreamWriter) signatureScope() string {
+	if scope := signatureScopeFromContext(w.request.Context()); scope != "" {
+		return scope
+	}
+	model := w.model
+	if w.meta != nil && w.meta.Request != nil && w.meta.Request.Model != "" {
+		model = w.meta.Request.Model
+	}
+	return signatureScope(signatureConversation(w.request), model, w.backend)
+}
 
 func (w *protocolStreamWriter) WriteHeader(status int) {
 	if w.status != 0 {
@@ -721,12 +847,32 @@ func sseData(event []byte) (string, bool) {
 
 func (w *protocolStreamWriter) convertEvent(event []byte) error {
 	data, ok := sseData(event)
-	if !ok || data == "" || data == "[DONE]" {
+	if !ok || data == "" {
+		return nil
+	}
+	if data == "[DONE]" {
+		// The source dialect's end-of-stream sentinel: a normal termination
+		// that carries no finish event of its own.
+		if w.state != nil {
+			w.state.MarkUpstreamTerminated()
+		}
 		return nil
 	}
 	response, err := protocolrelaykit.DecodeStreamResponse(w.upstream, []byte(data))
 	if err != nil {
 		return err
+	}
+	if w.upstream == protocolrelaykit.Gemini && w.signatures != nil {
+		signatures, calls := geminiSignaturesInResponse([]byte(data), w.signatureCalls)
+		w.signatureCalls = calls
+		if len(signatures) > 0 {
+			w.signatures.store(w.signatureScope(), signatures, time.Now())
+		}
+	}
+	if w.upstream == protocolrelaykit.GeminiInteractions && w.signatures != nil {
+		if signatures := geminiInteractionSignatures([]byte(data)); len(signatures) > 0 {
+			w.signatures.store(w.signatureScope(), signatures, time.Now())
+		}
 	}
 	if w.state == nil {
 		if w.client == protocolrelaykit.OpenAIResponses {
@@ -792,37 +938,36 @@ func (w *protocolStreamWriter) captureCompletedResponse(data []byte) {
 	}
 }
 
-// forwardBareJSON converts one whole non-streaming upstream body into the
-// client dialect and writes it as a single frame. It is the fallback for an
-// upstream that promised SSE and sent JSON.
-func (w *protocolStreamWriter) forwardBareJSON(body []byte) error {
-	converted, err := protocolrelaykit.ConvertResponse(w.request.Context(), w.meta, w.upstream, w.client, body)
-	if err != nil {
-		return err
-	}
-	logResponseConversion(converted, w.model)
-	encoded, err := protocolrelaykit.Marshal(converted.Value)
-	if err != nil {
-		return err
-	}
-	if w.client == protocolrelaykit.OpenAIResponses {
-		// A bare body has no event envelope; wrap it so the client sees a
-		// completed response rather than a dangling stream.
-		payload, marshalErr := json.Marshal(map[string]any{
-			"type": "response.completed", "response": json.RawMessage(encoded),
-		})
-		if marshalErr == nil {
-			encoded = payload
-			if _, writeErr := w.writer.Write([]byte("event: response.completed\ndata: " + string(encoded) + "\n\n")); writeErr != nil {
-				return writeErr
-			}
-			return nil
+// looksLikeSSE reports whether a body is SSE rather than one JSON document.
+// Checking for the literal "data:" anywhere misclassified JSON whose content
+// merely contains that substring, which dropped the whole answer.
+func looksLikeSSE(body []byte) bool {
+	for _, line := range bytes.Split(body, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+		if bytes.HasPrefix(line, []byte("data:")) || bytes.HasPrefix(line, []byte("event:")) ||
+			bytes.HasPrefix(line, []byte("id:")) || bytes.HasPrefix(line, []byte("retry:")) ||
+			bytes.HasPrefix(line, []byte(":")) {
+			return true
 		}
 	}
-	if _, err := w.writer.Write([]byte("data: " + string(encoded) + "\n\n")); err != nil {
+	return false
+}
+
+// forwardBareJSON converts one whole non-streaming upstream body into a legal
+// event sequence for the client dialect. It is the fallback for an upstream
+// that promised SSE and sent JSON.
+func (w *protocolStreamWriter) forwardBareJSON(body []byte) error {
+	frames, diagnostics, err := protocolrelaykit.StreamWholeResponse(w.upstream, w.client, body, w.streamOptions)
+	if err != nil {
 		return err
 	}
-	return nil
+	if len(diagnostics) > 0 {
+		slog.Warn("protocol stream conversion diagnostics", "model", w.model, "diagnostics", diagnostics)
+	}
+	return w.writeResults(frames)
 }
 
 // emitTerminalStreamError writes a final frame the client dialect can parse as
@@ -831,6 +976,11 @@ func (w *protocolStreamWriter) emitTerminalStreamError(cause error) {
 	message := cause.Error()
 	var frames [][]byte
 	switch w.client {
+	case protocolrelaykit.GeminiInteractions:
+		payload, err := json.Marshal(map[string]any{"event_type": "error", "error": map[string]any{"code": "stream_conversion_failed", "message": message}})
+		if err == nil {
+			frames = append(frames, []byte("event: error\ndata: "+string(payload)+"\n\n"))
+		}
 	case protocolrelaykit.ClaudeMessages:
 		payload, err := json.Marshal(map[string]any{
 			"type": "error", "error": map[string]any{"type": "api_error", "message": message},
@@ -921,15 +1071,36 @@ func (w *protocolStreamWriter) finish() error {
 		pending := append([]byte(nil), w.pending.Bytes()...)
 		w.pending.Reset()
 		// An upstream can ignore alt=sse and answer with one bare JSON body.
-		// Treating it as a malformed SSE event used to emit the opening frames
-		// and then nothing, so the client saw an empty successful answer.
-		if !bytes.Contains(pending, []byte("data:")) && json.Valid(pending) {
-			if err := w.forwardBareJSON(pending); err != nil {
+		// Both branches convert the whole body and are terminal: falling
+		// through to FinalizeStreamResponse after a bare body emitted a second
+		// created/completed pair under a new id.
+		if looksLikeSSE(pending) {
+			if err := w.convertEvent(pending); err != nil {
+				// The head is already committed and this is the last buffered
+				// data, so a conversion failure here must surface as a terminal
+				// error frame instead of an unexplained EOF.
+				w.emitTerminalStreamError(err)
 				return err
 			}
-		} else if err := w.convertEvent(pending); err != nil {
+		} else if json.Valid(bytes.TrimSpace(pending)) {
+			if err := w.forwardBareJSON(pending); err != nil {
+				w.emitTerminalStreamError(err)
+				return err
+			}
+			w.finishedBareJSON = true
+		} else {
+			err := fmt.Errorf("upstream stream ended with an incomplete event (%d bytes)", len(pending))
+			w.emitTerminalStreamError(err)
 			return err
 		}
+	}
+	if w.finishedBareJSON {
+		// The whole response was converted and written; there is no stream
+		// left to finalize.
+		if w.client == protocolrelaykit.OpenAIResponses {
+			persistResponseAffinity(w.request, w.store, w.model, w.backend, w.requestBody, w.captured.Bytes(), w.status)
+		}
+		return nil
 	}
 	if w.state == nil {
 		state, err := protocolrelaykit.NewResponseStreamState(w.upstream, w.client, w.streamOptions)

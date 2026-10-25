@@ -1,4 +1,5 @@
 import { errorMessageFromPayload } from "./apiError";
+import { apiUrl } from "./apiPath";
 
 export interface ModelConfigDeleteErrorPayload {
   error?: string | { message?: string };
@@ -24,7 +25,7 @@ export async function deleteModelConfig(
   etag: string,
   deleteModelFile: boolean,
 ): Promise<Record<string, unknown>> {
-  const response = await fetch(`/api/config/models/${encodeURIComponent(modelId)}`, {
+  const response = await fetch(apiUrl(`/api/config/models/${encodeURIComponent(modelId)}`), {
     method: "DELETE",
     headers: { "Content-Type": "application/json", "If-Match": etag },
     body: JSON.stringify({ delete_model_file: deleteModelFile }),

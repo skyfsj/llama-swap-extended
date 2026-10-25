@@ -1,0 +1,43 @@
+# New API / One API 自建中转站（自动读取站点的额度单位）。
+#
+# 与 newapi 预设的区别：那份映射假设 500000 额度 = 1 USD。站点的
+# QuotaPerUnit 是可配置的，这里用脚本先读 /api/status 的 data.quota_per_unit，
+# 再按真实单位换算，因此换站点也不用改 divideBy。
+#
+#   GET {base}/api/usage/token/   Authorization: Bearer sk-...   (令牌额度)
+#   GET {base}/api/status         无需鉴权                      (站点设置)
+#
+# 这是“完整函数形态”的示例：脚本是一个 async 函数，ctx.fetch 同步返回
+# {status, ok, json, text}，可以连续请求多次。
+id: newapi-units
+name: New API（自动额度单位）
+category: self-hosted
+description: 自建 New API / One API：先读 /api/status 的 quota_per_unit，再按站点真实单位换算令牌额度，免去手写 divideBy。
+script: |
+  (async (ctx) => {
+    const token = await ctx.fetch(ctx.baseUrl + "/api/usage/token/", {
+      headers: { Authorization: "Bearer " + ctx.apiKey }
+    });
+    if (!token.ok || !token.json || !token.json.data) {
+      throw new Error("usage endpoint returned " + token.status);
+    }
+    const status = await ctx.fetch(ctx.baseUrl + "/api/status");
+    const raw = status.ok && status.json && status.json.data && status.json.data.quota_per_unit;
+    const unit = typeof raw === "number" && raw > 0 ? raw : 500000;
+    const data = token.json.data;
+    const used = (data.total_used || 0) / unit;
+    const total = (data.total_granted || 0) / unit;
+    const available = (data.total_available || 0) / unit;
+    return {
+      windows: total > 0
+        ? [{ id: "quota", label: "额度", used: used, limit: total }]
+        : [],
+      extras: [
+        { id: "available", label: "剩余额度", value: available, suffix: " USD" },
+        { id: "total", label: "总额度", value: total, suffix: " USD" },
+        { id: "used", label: "已用额度", value: used, suffix: " USD" },
+        { id: "unlimited", label: "无限额度", value: !!data.unlimited_quota },
+        { id: "unit", label: "额度单位", value: unit }
+      ]
+    };
+  })

@@ -23,7 +23,11 @@ ARG ROCM_IMAGE=rocm/dev-ubuntu-24.04:7.2.4
 ARG GPU_TARGETS=""
 ARG CUDA_RUNTIME_IMAGE=nvidia/cuda:12.9.1-runtime-ubuntu24.04
 ARG CUDA_DEVEL_IMAGE=nvidia/cuda:12.9.1-devel-ubuntu24.04
-ARG GO_BUILDER_IMAGE=golang:1.26-bookworm
+# golang:1.26-bookworm 浮动在 1.26 小版本上；容器内构建的 vllm-wrapper 会把
+# 基础镜像自带的 Go 标准库静态链进产物，小版本过低会把 GO-2026-6xxx 系列
+# stdlib 漏洞（crypto/x509、net/http、crypto/tls 等）带进镜像。
+# 与 go.mod 的 `go 1.26.10` 对齐并锁定补丁版本。
+ARG GO_BUILDER_IMAGE=golang:1.26.10-bookworm
 ARG UBUNTU_IMAGE=ubuntu:24.04
 
 # ── Builder bases ──────────────────────────────────────────────────────
@@ -33,12 +37,19 @@ FROM ${CUDA_DEVEL_IMAGE} AS builder-base-cuda
 # Compute capabilities compiled as SASS, shared by every CUDA build stage.
 # 60/61 are Pascal (P100, GTX 10xx, P40) -- the oldest architecture ggml still
 # supports -- through 89 (Ada). CMake emits PTX alongside SASS for each entry,
-# so architectures between and above the list (70 Volta, 80 Ampere, 90 Hopper,
-# 100 and 120 Blackwell) still run by JIT-compiling the nearest lower PTX; they
-# just pay a first-run JIT cost and miss arch-specific kernels. Add those
-# numbers here to compile them natively, at the cost of build time in every
-# stage.
-ARG CMAKE_CUDA_ARCHITECTURES="60;61;75;86;89"
+# so architectures between and above the list still run by JIT-compiling the
+# nearest lower PTX; they just pay a first-run JIT cost and miss arch-specific
+# kernels.
+#
+# The JIT fallback is not safe for every bundled project, so Volta (70) is
+# compiled natively: ik_llama.cpp selects its WMMA flash-attention kernel from
+# the device's compute capability, and the only device code reachable from a
+# V100 by JIT is the sm_61 PTX, which has no WMMA kernel at all. Without 70,
+# ik-llama-server aborts on the first flash-attention call on a V100.
+#
+# Add further numbers here to compile them natively, at the cost of build time
+# in every stage.
+ARG CMAKE_CUDA_ARCHITECTURES="60;61;70;75;86;89"
 ENV DEBIAN_FRONTEND=noninteractive
 ENV CMAKE_CUDA_ARCHITECTURES=${CMAKE_CUDA_ARCHITECTURES}
 ENV CCACHE_DIR=/ccache
@@ -168,9 +179,9 @@ FROM ik-llama-${BACKEND} AS ik-llama-build
 # the C++ toolchain (vllm) do not need to resolve the CUDA devel image.
 
 FROM ${UBUNTU_IMAGE} AS llama-swap-download
-RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates git && rm -rf /var/lib/apt/lists/*
 ARG LS_VERSION=latest
-COPY install-llama-swap.sh /build/
+COPY lib-release.sh install-llama-swap.sh /build/
 RUN bash /build/install-llama-swap.sh "${LS_VERSION}"
 
 # ── Build vllm-wrapper from llama-swap source ─────────────────────────
@@ -180,7 +191,7 @@ RUN bash /build/install-llama-swap.sh "${LS_VERSION}"
 
 FROM ${GO_BUILDER_IMAGE} AS vllm-wrapper-build
 ARG LS_VERSION=latest
-COPY install-vllm-wrapper.sh /build/
+COPY lib-release.sh install-vllm-wrapper.sh /build/
 RUN --mount=type=cache,id=go-build,target=/root/.cache/go-build \
     --mount=type=cache,id=go-mod,target=/go/pkg/mod \
     bash /build/install-vllm-wrapper.sh "${LS_VERSION}"

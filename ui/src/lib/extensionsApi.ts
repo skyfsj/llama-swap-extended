@@ -1,4 +1,5 @@
 import { requestJson, HttpApiError } from "./http";
+import { apiUrl } from "./apiPath";
 
 export interface ExtensionManifest {
   id: string;
@@ -214,7 +215,7 @@ export interface ExtensionImportPreview {
 }
 
 export async function exportExtension(id: string): Promise<Blob> {
-  const response = await fetch(`/api/extensions/export/${encodeURIComponent(id)}`, { credentials: "same-origin" });
+  const response = await fetch(apiUrl(`/api/extensions/export/${encodeURIComponent(id)}`), { credentials: "same-origin" });
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   return response.blob();
 }
@@ -277,7 +278,7 @@ export async function fetchExtensionLogHistory(id: string): Promise<string> {
   // A new draft has no manifest id yet; asking for /logs/ produced a 404 on
   // every render of the editor.
   if (!id.trim()) return "";
-  const response = await fetch(`/api/extensions/logs/${encodeURIComponent(id)}`, { credentials: "same-origin" });
+  const response = await fetch(apiUrl(`/api/extensions/logs/${encodeURIComponent(id)}`), { credentials: "same-origin" });
   if (!response.ok) return "";
   return response.text();
 }
@@ -286,7 +287,7 @@ export async function fetchExtensionLogHistory(id: string): Promise<string> {
 export async function* streamExtensionLogs(id: string, options?: { signal?: AbortSignal; noHistory?: boolean }): AsyncGenerator<string> {
   if (!id.trim()) return;
   const query = options?.noHistory ? "?no-history" : "";
-  const response = await fetch(`/api/extensions/logs/${encodeURIComponent(id)}/stream${query}`, {
+  const response = await fetch(apiUrl(`/api/extensions/logs/${encodeURIComponent(id)}/stream${query}`), {
     credentials: "same-origin",
     signal: options?.signal,
   });

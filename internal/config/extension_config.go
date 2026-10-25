@@ -1330,9 +1330,112 @@ type PricingConfig struct {
 }
 
 type ModelsDevPricingConfig struct {
-	Enabled      bool          `yaml:"enabled" json:"enabled"`
+	// Enabled is a pointer so an absent key can be told apart from an explicit
+	// false. A plain bool collapses the two, which made any configuration that
+	// mentioned pricing without restating the switch silently disable the
+	// syncer — and made an explicit `enabled: false` impossible to honor.
+	Enabled      *bool         `yaml:"enabled" json:"enabled,omitempty"`
 	RefreshEvery time.Duration `yaml:"refreshEvery" json:"refreshEvery"`
 	URL          string        `yaml:"url" json:"url"`
+	// Ambiguity decides what happens when a model name matches several catalog
+	// entries (providers rarely agree on a price): "strict" never guesses,
+	// "provider-first" prefers the catalog entry of the provider that served
+	// the request and then the only entry with non-zero rates, "lowest" falls
+	// back to the cheapest remaining entry after those steps. Empty reads as
+	// "provider-first".
+	Ambiguity string `yaml:"ambiguity" json:"ambiguity"`
+	// Vendors maps a model-name prefix to the pricing-catalog provider id that
+	// counts as the model's official vendor ("gemini" -> "google"). The lookup
+	// prefers the official vendor's row over resellers' rows. It starts from
+	// DefaultPricingVendors; entries here override or extend it.
+	Vendors map[string]string `yaml:"vendors" json:"vendors,omitempty"`
+}
+
+// DefaultPricingVendors is the built-in prefix -> catalog-provider table used
+// to price a model at its official vendor's rate when several resellers list
+// the same name. Every mapping was verified against the models.dev snapshot:
+// the vendor's own provider entry lists models under that prefix. Prefixes
+// match case-insensitively and the longest match wins.
+var DefaultPricingVendors = map[string]string{
+	// OpenAI: gpt-3.5 through gpt-6.x, the o-series, realtime and image models.
+	"gpt": "openai", "o1": "openai", "o3": "openai", "o4": "openai",
+	// Google: the gemini family (gemma is not listed under google).
+	"gemini": "google",
+	// Alibaba: qwen3.x/qwen/qvq/qwq.
+	"qwen": "alibaba", "qvq": "alibaba", "qwq": "alibaba",
+	// Zhipu (Z.ai is the same vendor's international brand).
+	"glm": "zhipuai",
+	// DeepSeek, Anthropic, Moonshot, MiniMax, xAI, Xiaomi, StepFun.
+	"deepseek": "deepseek",
+	"claude":   "anthropic",
+	"kimi":     "moonshotai",
+	"minimax":  "minimax",
+	"grok":     "xai",
+	"mimo":     "xiaomi",
+	"step":     "stepfun",
+	// Mistral: the whole trademark family, not just mistral-*.
+	"mistral": "mistral", "ministral": "mistral", "codestral": "mistral",
+	"devstral": "mistral", "magistral": "mistral", "pixtral": "mistral",
+	"voxtral": "mistral",
+	// ByteDance (Volcano Engine), Cohere, Perplexity, Meta, Microsoft.
+	"doubao":  "volcengine",
+	"command": "cohere",
+	"sonar":   "perplexity",
+	"muse":    "meta",
+	"phi":     "azure",
+	"nvidia":  "nvidia",
+}
+
+// PricingVendorTable merges the built-in vendor table with operator overrides.
+// Prefixes are lowercased for case-insensitive matching; empty entries are
+// dropped (configuration validation rejects them, but a programmatically built
+// config should not poison the lookup).
+func PricingVendorTable(user map[string]string) map[string]string {
+	table := make(map[string]string, len(DefaultPricingVendors)+len(user))
+	for prefix, vendor := range DefaultPricingVendors {
+		table[strings.ToLower(prefix)] = vendor
+	}
+	for prefix, vendor := range user {
+		prefix = strings.ToLower(strings.TrimSpace(prefix))
+		vendor = strings.TrimSpace(vendor)
+		if prefix == "" || vendor == "" {
+			continue
+		}
+		table[prefix] = vendor
+	}
+	return table
+}
+
+// VendorForModel resolves the official vendor for a model name. The longest
+// matching prefix wins, so overlapping entries ("step" and "stepfun") resolve
+// deterministically.
+func VendorForModel(vendors map[string]string, model string) (string, bool) {
+	lower := strings.ToLower(strings.TrimSpace(model))
+	match := ""
+	vendor := ""
+	for prefix, candidate := range vendors {
+		if prefix != "" && strings.HasPrefix(lower, prefix) && len(prefix) > len(match) {
+			match = prefix
+			vendor = candidate
+		}
+	}
+	return vendor, match != ""
+}
+
+// How multi-provider price matches are resolved. The values are part of the
+// configuration surface (pricing.modelsDev.ambiguity) and of the schema.
+const (
+	PricingAmbiguityStrict        = "strict"
+	PricingAmbiguityProviderFirst = "provider-first"
+	PricingAmbiguityLowest        = "lowest"
+)
+
+// ModelsDevEnabled reports whether the catalog syncer should run, defaulting to
+// on when the operator has not said otherwise. Writing only `url` or
+// `refreshEvery` used to turn synchronization off, because the whole-section
+// zero-value check that supplied the default no longer matched.
+func (c ModelsDevPricingConfig) ModelsDevEnabled() bool {
+	return c.Enabled == nil || *c.Enabled
 }
 
 // EffectiveAudit returns the selected audit policy with the product defaults
@@ -1362,10 +1465,31 @@ func (c Config) EffectivePricing() PricingConfig {
 	if p.ModelsDev.RefreshEvery == 0 {
 		p.ModelsDev.RefreshEvery = 24 * time.Hour
 	}
-	if c.Pricing == (PricingConfig{}) {
-		p.ModelsDev.Enabled = true
+	if strings.TrimSpace(p.ModelsDev.Ambiguity) == "" {
+		p.ModelsDev.Ambiguity = PricingAmbiguityProviderFirst
 	}
 	return p
+}
+
+// ValidatePricing rejects ambiguity policies that are not part of the
+// configuration surface, so a typo fails at load time instead of silently
+// reading as the default, and vendor entries that could never match.
+func (c Config) ValidatePricing() error {
+	switch strings.TrimSpace(c.Pricing.ModelsDev.Ambiguity) {
+	case "", PricingAmbiguityStrict, PricingAmbiguityProviderFirst, PricingAmbiguityLowest:
+	default:
+		return fmt.Errorf("pricing.modelsDev.ambiguity must be one of %q, %q or %q",
+			PricingAmbiguityStrict, PricingAmbiguityProviderFirst, PricingAmbiguityLowest)
+	}
+	for prefix, vendor := range c.Pricing.ModelsDev.Vendors {
+		if strings.TrimSpace(prefix) == "" {
+			return fmt.Errorf("pricing.modelsDev.vendors: model-name prefix must not be empty")
+		}
+		if strings.TrimSpace(vendor) == "" {
+			return fmt.Errorf("pricing.modelsDev.vendors: vendor for prefix %q must not be empty", prefix)
+		}
+	}
+	return nil
 }
 
 // ValidateExtensionConfig validates only the extension fields. It is called
@@ -1379,6 +1503,9 @@ func (c Config) ValidateExtensionConfig() error {
 		return err
 	}
 	if err := c.ResourceBudget.Validate(); err != nil {
+		return err
+	}
+	if err := c.ValidatePricing(); err != nil {
 		return err
 	}
 	if c.RuntimeManager.Root != "" {

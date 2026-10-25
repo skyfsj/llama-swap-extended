@@ -70,6 +70,11 @@ type extensionPendingCall struct {
 	// by name and position, so the hash is what tells "the caller's own call"
 	// apart from a same-named call of another conversation.
 	ArgsHash string `json:"argsHash,omitempty"`
+	// Signature is the Gemini thought signature the model minted for a server
+	// call. The caller never sees that call, so the record is the only place the
+	// signature survives: the continuation replays the call and Gemini 3 rejects
+	// a functionCall part whose signature was dropped.
+	Signature string `json:"signature,omitempty"`
 }
 
 // pendingContextFingerprint hashes the conversation that led up to a round, on
@@ -177,7 +182,10 @@ func CreateExtensionContinuationMiddleware(s *Server, cfg config.Config) chain.M
 				swaputil.SendResponse(w, r, http.StatusRequestEntityTooLarge, "extension continuation body is too large")
 				return
 			}
-			setExtensionBody(r, body)
+			// This slice is read once here and never written again, so it is
+			// adopted rather than copied: the downstream replay contract (Body,
+			// ContentLength, GetBody) is identical either way.
+			swaputil.AdoptRequestBody(r, body)
 			endpoint := extensionEndpoint(r.URL.Path)
 			if !bytes.Contains(body, []byte("call_ls_")) && endpoint != "gemini.generateContent" {
 				next.ServeHTTP(w, r)
@@ -739,6 +747,19 @@ func geminiDeferredTurnIn(request map[string]any, payload extensionPendingPayloa
 	return deferredTurn{}, errContinuationNeedsReplay
 }
 
+// geminiSignatureOfPart reads the thought signature a functionCall part
+// carries, accepting both spellings the API uses.
+func geminiSignatureOfPart(part map[string]any) string {
+	if part == nil {
+		return ""
+	}
+	if signature, _ := part["thoughtSignature"].(string); signature != "" {
+		return signature
+	}
+	signature, _ := part["thought_signature"].(string)
+	return signature
+}
+
 // geminiFunctionCall reads a functionCall part, accepting both spellings.
 func geminiFunctionCall(part map[string]any) map[string]any {
 	if part == nil {
@@ -794,6 +815,13 @@ func foldGeminiDeferredTurn(request map[string]any, payload extensionPendingPayl
 			arguments = map[string]any{}
 		}
 		parts = append(parts, map[string]any{"functionCall": map[string]any{"name": entry.Name, "args": arguments}})
+		if entry.Signature != "" {
+			// Gemini 3 rejects a replayed function call whose thought signature
+			// was dropped. A server-executed call is replayed by this fold, so
+			// rebuilding the part from name and arguments alone lost the
+			// signature the model minted for it.
+			parts[len(parts)-1].(map[string]any)["thoughtSignature"] = entry.Signature
+		}
 	}
 	content["parts"] = parts
 
@@ -942,6 +970,11 @@ func (s *Server) saveExtensionMixed(ctx context.Context, state *extensionRequest
 	payload := extensionPendingPayload{Calls: make([]extensionPendingCall, 0, len(calls)), ClientIDs: mapping, ContextHash: state.promptFingerprint}
 	for _, call := range calls {
 		entry := extensionPendingCall{ID: call.ID, Name: call.Name, Arguments: call.Arguments, Kind: pendingCallServer}
+		if endpoint == "gemini.generateContent" {
+			// The caller never sees a server call, so its signature has no other
+			// way back: keep it in the record the continuation replays from.
+			entry.Signature = geminiSignatureOfPart(call.RawPart)
+		}
 		if call.Owner != nil {
 			entry.ExtensionID = call.Owner.Manifest.ID
 		}
@@ -1033,7 +1066,10 @@ func exposeExtensionClientCalls(response map[string]any, clientCalls []extension
 				}
 			}
 			if keep {
-				visible = append(visible, map[string]any{"functionCall": map[string]any{"name": name, "args": entry["args"]}})
+				// Echo the part as it arrived: a thought signature lives there,
+				// and rebuilding from name and arguments would drop it, making
+				// the caller's replay invalid for Gemini 3.
+				visible = append(visible, raw)
 			}
 		}
 		content["parts"] = visible

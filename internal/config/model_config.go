@@ -13,10 +13,13 @@ import (
 const (
 	MODEL_CONFIG_DEFAULT_TTL   = -1
 	MODEL_CONFIG_DEFAULT_PROXY = "http://localhost:${PORT}"
-	comfyUIConcurrencyLimit    = 50
+	comfyUIConcurrencyLimit    = 999
 
 	// ComfyUIModelID identifies the model used by the /comfyui endpoint.
 	ComfyUIModelID = "comfyui_auto"
+
+	// AudioCppModelID identifies the model used by the /audiocpp endpoint.
+	AudioCppModelID = "audiocpp_auto"
 )
 
 var validModalities = map[string]struct{}{
@@ -26,18 +29,70 @@ var validModalities = map[string]struct{}{
 	"video": {},
 }
 
+// validOutModalities adds "decisions", the only output of llama.cpp decision
+// models, which answer /v1/systemone and generate no text.
+var validOutModalities = map[string]struct{}{
+	"text":      {},
+	"audio":     {},
+	"image":     {},
+	"video":     {},
+	"decisions": {},
+}
+
 // ModelCapConfig defines what modalities and features a model supports.
 // Used in /v1/models to inform clients. An empty block (all zero values) is
 // treated as not configured.
 type ModelCapConfig struct {
-	In       []string `yaml:"in"`
-	Out      []string `yaml:"out"`
-	Tools    bool     `yaml:"tools"`
-	Reranker bool     `yaml:"reranker"`
+	In       []string `yaml:"in" json:"in,omitempty"`
+	Out      []string `yaml:"out" json:"out,omitempty"`
+	Tools    bool     `yaml:"tools" json:"tools,omitempty"`
+	Reranker bool     `yaml:"reranker" json:"reranker,omitempty"`
 	// Translation marks the model as a translation model (e.g. Hy-MT2).
 	// Clients use it to group the model under translation tooling.
-	Translation bool `yaml:"translation"`
-	Context     int  `yaml:"context"`
+	Translation bool `yaml:"translation" json:"translation,omitempty"`
+	Context     int  `yaml:"context" json:"context,omitempty"`
+
+	// Voices, when set, is returned as the response to
+	// GET /v1/audio/voices?model={id} instead of asking the upstream. It is
+	// never discovered and never rendered into /v1/models, so Empty and render
+	// leave it alone.
+	Voices []string `yaml:"voices" json:"-"`
+
+	// DisableAuto turns off automatic capability discovery for this model.
+	// It is a switch, not a capability, so Empty ignores it and it is never
+	// rendered into /v1/models.
+	DisableAuto bool `yaml:"disableAuto" json:"-"`
+}
+
+// Merge returns c with every capability field left at its zero value filled in
+// from auto, the value discovered from the running upstream. Configured values
+// always win, field by field, so a model that sets only capabilities.tools
+// still picks up a discovered context length.
+//
+// A field explicitly set to its zero value in the config is indistinguishable
+// from an omitted one, so `tools: false` cannot override a discovered true.
+// Use capabilities.disableAuto to suppress discovery for the model instead.
+//
+// DisableAuto and Voices are carried over from c unchanged; discovery never
+// sets them.
+func (c ModelCapConfig) Merge(auto ModelCapConfig) ModelCapConfig {
+	merged := c
+	if len(merged.In) == 0 {
+		merged.In = auto.In
+	}
+	if len(merged.Out) == 0 {
+		merged.Out = auto.Out
+	}
+	if !merged.Tools {
+		merged.Tools = auto.Tools
+	}
+	if !merged.Reranker {
+		merged.Reranker = auto.Reranker
+	}
+	if merged.Context == 0 {
+		merged.Context = auto.Context
+	}
+	return merged
 }
 
 // Empty returns true when all fields are at their zero values.
@@ -54,8 +109,8 @@ func (c ModelCapConfig) Validate() error {
 		}
 	}
 	for _, m := range c.Out {
-		if _, ok := validModalities[m]; !ok {
-			return fmt.Errorf("capabilities.out: invalid modality %q, must be one of: text, audio, image, video", m)
+		if _, ok := validOutModalities[m]; !ok {
+			return fmt.Errorf("capabilities.out: invalid modality %q, must be one of: text, audio, image, video, decisions", m)
 		}
 	}
 	if c.Context < 0 {
@@ -126,6 +181,11 @@ type ModelConfig struct {
 
 	// Timeout settings for proxy connections
 	Timeouts TimeoutsConfig `yaml:"timeouts"`
+
+	// DisableKeepAlives opens a new upstream connection for every request
+	// instead of reusing pooled ones. Works around upstreams that advertise
+	// keep-alive and then close the connection (#1205).
+	DisableKeepAlives bool `yaml:"disableKeepAlives"`
 
 	// Compatibility settings for upstream applications.
 	Compat CompatConfig `yaml:"compat"`

@@ -6,6 +6,8 @@
 # percent is the USED share of the window (0-100).
 id: opencode-go
 name: OpenCode Go
+category: subscription
+description: OpenCode Go / Go Plus 订阅用量：5 小时、每周、每月三个窗口的已用比例与重置时间。
 endpoint: https://opencode.ai/inference/go/v1/usage
 method: GET
 auth:

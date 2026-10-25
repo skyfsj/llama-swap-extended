@@ -4,6 +4,7 @@
   // single-model config modal; start/stop/logs are runtime operations on the
   // live model, independent of config edits.
   import { t } from "../../../lib/i18n";
+  import { toast } from "../../../lib/toast";
   import { push } from "svelte-spa-router";
   import {
     Boxes,
@@ -165,8 +166,13 @@
     busyId = id;
     actionError = "";
     try {
-      if (running) await unloadSingleModel(id);
-      else await loadModel(id);
+      if (running) {
+        await unloadSingleModel(id);
+        toast.success(t("models.unloaded", { model: id }));
+      } else {
+        await loadModel(id);
+        toast.success(t("models.loadStarted", { model: id }));
+      }
     } catch (cause) {
       actionError = cause instanceof Error ? cause.message : String(cause);
     } finally {

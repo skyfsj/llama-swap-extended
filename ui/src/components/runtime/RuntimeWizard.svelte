@@ -3,6 +3,7 @@
   import { Button } from "$lib/components/ui/button/index.js";
   import * as Dialog from "$lib/components/ui/dialog/index.js";
   import { translate } from "$lib/i18n";
+  import { toast } from "$lib/toast";
   import {
     cloneRuntimeValue,
     isOfficialRuntimeTemplate,
@@ -250,6 +251,7 @@
     try {
       await commitSettings(settingsSnapshot, buildDraft(), preview.previewHash);
       open = false;
+      toast.success($translate("controlPlane.runtimeCenter.toast.wizardCommitted", { name: name.trim() }));
       onCommitted();
     } catch (cause) {
       error = localizedError(cause);

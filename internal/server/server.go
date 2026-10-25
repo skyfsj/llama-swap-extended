@@ -15,8 +15,10 @@ import (
 
 	"github.com/mostlygeek/llama-swap/internal/auth"
 	"github.com/mostlygeek/llama-swap/internal/backend"
+	"github.com/mostlygeek/llama-swap/internal/capcompat"
 	"github.com/mostlygeek/llama-swap/internal/chain"
 	"github.com/mostlygeek/llama-swap/internal/config"
+	"github.com/mostlygeek/llama-swap/internal/docagent"
 	"github.com/mostlygeek/llama-swap/internal/event"
 	"github.com/mostlygeek/llama-swap/internal/extensions"
 	"github.com/mostlygeek/llama-swap/internal/hw"
@@ -40,14 +42,21 @@ import (
 	"github.com/tidwall/gjson"
 
 	"github.com/mostlygeek/llama-swap/internal/gateway"
+	"github.com/mostlygeek/llama-swap/internal/mcpruntime"
 )
 
 // Server owns the HTTP mux, cross-cutting middleware, and the local/peer model
 // dispatch. It supersedes router.Server: it builds the local and peer routers
 // directly and dispatches between them itself.
 type Server struct {
-	cfg   config.Config
-	cfgMu sync.RWMutex
+	mcpRuntimeMu           sync.Mutex
+	mcpBridgeMu            sync.Mutex
+	mcpBridges             map[string]*mcpLiveBridge
+	mcpBridgesClosed       bool
+	conversationBackground *conversationBackground
+	mcpRuntime             *mcpruntime.Manager
+	cfg                    config.Config
+	cfgMu                  sync.RWMutex
 
 	muxlog      *logmon.Monitor
 	proxylog    *logmon.Monitor
@@ -75,8 +84,11 @@ type Server struct {
 	auditLastMaint time.Time
 	auditLastGC    time.Time
 	store          *store.Store
-	extensionsMu   sync.RWMutex
-	extensions     *extensions.Manager
+	// geminiSignatures carries Gemini thought signatures across the turns a
+	// client cannot hold them for; see gemini_signature_cache.go.
+	geminiSignatures *geminiSignatureCache
+	extensionsMu     sync.RWMutex
+	extensions       *extensions.Manager
 	// extensionKVMu serializes the persistent-KV key-count check with the
 	// write, so concurrent extension requests cannot both observe room for
 	// one more key and exceed storageMaxKeys.
@@ -91,23 +103,39 @@ type Server struct {
 	downloads          *modeldownload.Manager
 	modelFilesMu       sync.RWMutex
 	pricing            *pricing.Syncer
-	resources          *resourcePlanner.Planner
-	resourcesMu        sync.RWMutex
-	resourceMu         sync.Mutex
-	lmcacheMod         *lmcacheService
-	backendAdapters    map[string]backend.BackendAdapter
-	backendAdapterMu   sync.RWMutex
-	cacheController    *backend.CacheController
-	progressMu         sync.RWMutex
-	backendProgress    map[string]swaputil.BackendProgressEvent
-	progressCancel     context.CancelFunc
+	// pricingMu guards the syncer and the loop it drives, because a
+	// configuration reload can replace either while a request is in flight.
+	pricingMu     sync.Mutex
+	pricingURL    string
+	pricingCancel context.CancelFunc
+	pricingWG     sync.WaitGroup
+	// pricingGeneration lets a superseded loop notice it has been replaced
+	// without having to observe the cancellation first.
+	pricingGeneration atomic.Uint64
+	resources         *resourcePlanner.Planner
+	resourcesMu       sync.RWMutex
+	resourceMu        sync.Mutex
+	lmcacheMod        *lmcacheService
+	backendAdapters   map[string]backend.BackendAdapter
+	backendAdapterMu  sync.RWMutex
+	cacheController   *backend.CacheController
+	progressMu        sync.RWMutex
+	backendProgress   map[string]swaputil.BackendProgressEvent
+	progressCancel    context.CancelFunc
 	// processProgressCancel bridges the local process lifecycle into the
 	// common BackendProgress stream. Keep this subscription separate from the
 	// runtime/download progress listener so either can be stopped independently
 	// during shutdown and tests can exercise the mapping in isolation.
 	processProgressCancel context.CancelFunc
-	build                 BuildInfo
-	hardware              *hw.HardwareSnapshot
+	// capcompat caches the capabilities discovered from a running upstream.
+	// It is nil-safe: a Server built without one simply advertises the
+	// configured capabilities.
+	capcompat *capcompat.Service
+	// mcpProvider answers the /api/mcp documentation tools. Nil disables the
+	// endpoint with a "not available in this build" error.
+	mcpProvider *docagent.Provider
+	build       BuildInfo
+	hardware    *hw.HardwareSnapshot
 
 	profileMu     sync.RWMutex
 	activeProfile string
@@ -163,6 +191,12 @@ func (s *Server) ActiveProfile() string {
 	s.profileMu.RLock()
 	defer s.profileMu.RUnlock()
 	return s.activeProfile
+}
+
+// currentConfigManager returns the source-aware configuration manager when one
+// is attached. Embedders and tests build a Server without one.
+func (s *Server) currentConfigManager() *config.ConfigManager {
+	return s.configManager
 }
 
 func (s *Server) currentConfig() config.Config {
@@ -424,7 +458,11 @@ func (s *Server) applyConfigCandidate(active, desired config.Config, changes con
 	// The provider gateway is a pure in-memory rebuild: construction either
 	// succeeds atomically or the previous gateway keeps serving. Cooldown
 	// state is intentionally reset on reload — the credential set itself
-	// changed.
+	// changed — but the per-session provider bindings and the pool rotation
+	// cursor are carried over: they describe which upstream each live
+	// conversation is using, and dropping them would send every in-flight
+	// conversation to a different provider (and its cold prompt cache) on the
+	// next request.
 	if !reflect.DeepEqual(active.Providers, effective.Providers) || !reflect.DeepEqual(active.Gateway, effective.Gateway) {
 		if len(effective.Providers) > 0 {
 			next, gwErr := gateway.New(effective, s.proxylog)
@@ -432,7 +470,7 @@ func (s *Server) applyConfigCandidate(active, desired config.Config, changes con
 				rollbackRuntimeDefinitions()
 				return fmt.Errorf("rebuilding provider gateway: %w", gwErr)
 			}
-			s.setGateway(next)
+			s.swapGateway(next)
 		} else {
 			s.setGateway(nil)
 		}
@@ -453,6 +491,28 @@ func (s *Server) applyConfigCandidate(active, desired config.Config, changes con
 	}
 
 	s.setConfig(effective)
+	if !reflect.DeepEqual(active.ProtocolRuntime, effective.ProtocolRuntime) {
+		s.mcpRuntimeMu.Lock()
+		manager := s.mcpRuntime
+		s.mcpRuntimeMu.Unlock()
+		if manager != nil {
+			manager.Reset()
+		}
+	}
+	// A model whose command, proxy or served name changed is cached under a new
+	// discovery key, so the previous key's entry can never be reached again.
+	// Dropping it here keeps the memo from growing by one entry per config edit
+	// for the life of the process.
+	s.forgetStaleCapabilities(active.Models, effective.Models)
+	// A configuration reload returns profile selection to the configured
+	// startup profile, the same state a fresh start would have. Runtime
+	// selection is deliberately not persisted, so a reload must not silently
+	// keep an operator's earlier choice across a changed file.
+	if effective.Hooks.OnStartup.Profile != s.ActiveProfile() {
+		if _, err := s.setActiveProfile(effective.Hooks.OnStartup.Profile); err != nil && s.proxylog != nil {
+			s.proxylog.Warnf("startup profile %q could not be activated after reload: %v", effective.Hooks.OnStartup.Profile, err)
+		}
+	}
 	s.extensionsMu.Lock()
 	previousExtensions := s.extensions
 	s.extensions = nextExtensions
@@ -477,6 +537,10 @@ func (s *Server) applyConfigCandidate(active, desired config.Config, changes con
 		s.metrics.configureAudit(effective.EffectiveAudit())
 		s.metrics.configurePricing(s.store, effective)
 	}
+	// The syncer and its loop are long-lived, so a models.dev change has to be
+	// applied here rather than waiting for a restart. Toggling the switch,
+	// moving the interval, or pointing at another mirror all take effect now.
+	s.reconfigurePricing(active.EffectivePricing().ModelsDev, effective.EffectivePricing().ModelsDev)
 	if s.perf != nil {
 		s.perf.UpdateConfig(effective.Performance, effective.Power)
 	}
@@ -565,6 +629,9 @@ var (
 		routeModelPaths(http.MethodPost, route.BodyJSON, "body"),
 		"/v1/audio/voices", // legacy POST accepted by older audio servers
 		"/sdapi/v1/txt2img", "/sdapi/v1/img2img",
+		// Stable Diffusion's "system one" extension endpoint takes the model
+		// in a JSON body like the rest of the sdapi surface.
+		"/v1/systemone",
 		"/audioapi/v1/tasks/run",
 		// Versionless aliases are retained for compatibility with older clients;
 		// stripVersionPrefix removes /v before forwarding upstream.
@@ -718,26 +785,29 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 
 	shutdownCtx, shutdownFn := context.WithCancel(context.Background())
 	s := &Server{
-		cfg:             cfg,
-		muxlog:          muxlog,
-		proxylog:        proxylog,
-		upstreamlog:     upstreamlog,
-		perf:            perfMon,
-		powerTracker:    newPowerOccupancyTracker(),
-		inflight:        newInflightTracker(),
-		metrics:         newMetricsMonitor(proxylog, cfg.MetricsMaxInMemory, st),
-		store:           st,
-		extensions:      extensionManager,
-		runtime:         manager,
-		build:           build,
-		hardware:        hardware,
-		local:           local,
-		peer:            peer,
-		gateway:         gw,
-		shutdownCtx:     shutdownCtx,
-		quota:           newQuotaStore(),
-		shutdownFn:      shutdownFn,
-		backendProgress: make(map[string]swaputil.BackendProgressEvent),
+		cfg:              cfg,
+		muxlog:           muxlog,
+		proxylog:         proxylog,
+		upstreamlog:      upstreamlog,
+		perf:             perfMon,
+		powerTracker:     newPowerOccupancyTracker(),
+		inflight:         newInflightTracker(),
+		metrics:          newMetricsMonitor(proxylog, cfg.MetricsMaxInMemory, st),
+		store:            st,
+		geminiSignatures: newGeminiSignatureCache(),
+		extensions:       extensionManager,
+		runtime:          manager,
+		build:            build,
+		hardware:         hardware,
+		activeProfile:    cfg.Hooks.OnStartup.Profile,
+		local:            local,
+		peer:             peer,
+		gateway:          gw,
+		shutdownCtx:      shutdownCtx,
+		quota:            newQuotaStore(),
+		shutdownFn:       shutdownFn,
+		backendProgress:  make(map[string]swaputil.BackendProgressEvent),
+		capcompat:        capcompat.New(st, proxylog),
 	}
 	s.configReconciler = NewConfigReconciler(cfg,
 		func(active, desired config.Config, changes config.ConfigChangeSet) error {
@@ -774,6 +844,9 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 	s.processProgressCancel = event.On(func(change swaputil.ProcessStateChangeEvent) {
 		s.recordProcessProgress(change)
 		s.releaseLMCacheReference(change)
+		// Discovery only happens for a model that is actually listening, and
+		// it must not run on this goroutine (see refreshCapabilitiesOnReady).
+		s.refreshCapabilitiesOnReady(change)
 	})
 	if err := s.seedStartupAPIKeys(cfg); err != nil {
 		// A configuration whose key changes cannot be reconciled without
@@ -850,18 +923,17 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 	s.metrics.configureAudit(cfg.EffectiveAudit())
 	s.metrics.configurePricing(st, cfg)
 	pricingConfig := cfg.EffectivePricing().ModelsDev
-	if pricingConfig.Enabled {
-		s.pricing = &pricing.Syncer{Store: st, URL: pricingConfig.URL}
-		// Populate the last-successful snapshot as soon as the control plane is
-		// ready; the periodic loop then refreshes it using ETag validation.
-		go func() {
-			ctx, cancel := context.WithTimeout(s.shutdownCtx, 2*time.Minute)
-			if _, syncErr := s.pricing.Sync(ctx); syncErr != nil && s.proxylog != nil {
-				s.proxylog.Warnf("initial pricing sync failed: %v", syncErr)
-			}
-			cancel()
-		}()
-		go s.runPricingSync(pricingConfig.RefreshEvery)
+	if pricingConfig.ModelsDevEnabled() {
+		initial := s.applyPricingConfig(config.ModelsDevPricingConfig{}, pricingConfig)
+		if initial != nil {
+			go func() {
+				ctx, cancel := context.WithTimeout(s.shutdownCtx, pricingSyncTimeout)
+				if _, syncErr := initial.Sync(ctx); syncErr != nil && s.proxylog != nil {
+					s.proxylog.Warnf("initial pricing sync failed: %v", syncErr)
+				}
+				cancel()
+			}()
+		}
 	}
 	manager.SetActivationHooks(s.switchRuntimeBefore, s.switchRuntimeProcesses)
 	manager.SetVersionProtectionProbe(s.protectedRuntimeVersion)
@@ -1110,26 +1182,31 @@ func (s *Server) localPeerHandlerWithConfig(w http.ResponseWriter, r *http.Reque
 	// Provider gateway arbitration: FQNs (provider/model) route exactly; a
 	// bare name yields to local models unless the winning route is
 	// provider-first.
+	//
+	// The eligibility check here is structural — which routes exist for this
+	// name after local arbitration — and deliberately ignores credential
+	// health. A pool whose every credential is cooling down still goes to the
+	// gateway, which plans the full chain and reports the real upstream state
+	// (the last answer a provider actually gave) instead of a synthetic 502.
+	// Answering here on "no schedulable route right now" used to bypass
+	// failover entirely, so one benched provider could take a pool down while a
+	// healthy sibling sat idle.
 	if gw := s.currentGateway(); gw != nil && gw.Handles(data.ModelID) {
-		localClaims := s.local.Handles(data.ModelID)
-		if route := gw.RouteFor(data.ModelID, localClaims); route != nil {
-			s.proxylog.Debugf("dispatch: using provider gateway for model: %s (provider %s)", data.ModelID, route.ProviderID)
-			s.serveGateway(w, r, gw, route, data, cfg)
+		if len(gw.PoolRoutes(data.ModelID, s.local.Handles(data.ModelID), "")) > 0 {
+			s.proxylog.Debugf("dispatch: using provider gateway for model: %s", data.ModelID)
+			s.serveGateway(w, r, gw, data, cfg)
 			return
 		}
 	}
 
-	if gw := s.currentGateway(); gw != nil && gw.Handles(data.ModelID) {
-		// The gateway knows this model but has no credential to serve it
-		// right now (every key is cooling down or parked). Say so instead of
-		// reporting an unroutable model.
-		swaputil.SendResponse(w, r, http.StatusBadGateway, fmt.Sprintf(
-			"gateway: no credential is currently available for model %s (all keys are cooling down, parked or disabled)", data.ModelID))
-		return
-	}
-
 	switch {
 	case s.local.Handles(data.ModelID):
+		// A configured voices list answers GET /v1/audio/voices without starting
+		// the model: the upstream route is non-standard and unreliable, so the
+		// operator's list wins when present.
+		if s.serveConfiguredVoices(w, r, cfg, data.ModelID) {
+			return
+		}
 		// Thermal guard failover: a model parked by the thermal guard is
 		// unusable on this host; when the request is not an operator start,
 		// forward it to a configured provider or peer so clients keep being
@@ -1144,7 +1221,7 @@ func (s *Server) localPeerHandlerWithConfig(w http.ResponseWriter, r *http.Reque
 		// provider-served request learns its route from the gateway.
 		swaputil.PublishLocalRoute(r.Context())
 		s.proxylog.Debugf("dispatch: using local process for model: %s", data.ModelID)
-		s.local.ServeHTTP(w, r)
+		s.serveLocalWithProtocolHooks(w, r, data.ModelID, cfg, s.local.ServeHTTP)
 	case s.peer.Handles(data.ModelID):
 		// A peer is neither a local model nor an upstream provider: nothing is
 		// published, so the record and the live row both report it as
@@ -1183,7 +1260,7 @@ func (s *Server) forwardMaintenanceModel(w http.ResponseWriter, r *http.Request,
 	if gw := s.currentGateway(); gw != nil && gw.Handles(data.ModelID) {
 		if route := gw.RouteFor(data.ModelID, false); route != nil {
 			s.proxylog.Warnf("dispatch: model %s is thermally parked, forwarding to provider %s", data.ModelID, route.ProviderID)
-			s.serveGateway(w, r, gw, route, data, cfg)
+			s.serveGateway(w, r, gw, data, cfg)
 			return false
 		}
 	}
@@ -1205,93 +1282,47 @@ func (s *Server) forwardMaintenanceModel(w http.ResponseWriter, r *http.Request,
 // serveGateway rewrites the model name to the upstream name and forwards the
 // request through the gateway, keeping the audit attribution on the original
 // (gateway-facing) model ID.
-func (s *Server) serveGateway(w http.ResponseWriter, r *http.Request, gw *gateway.Gateway, route *gateway.Route, data swaputil.ReqContextData, cfg config.Config) {
-	// A model exposed on several upstream surfaces (one adapter per API) is
-	// forwarded surface by surface: the client's own dialect first, then the
-	// others, converting the request for each. An upstream that rejects the
-	// request on its surface makes the next surface try instead, so a model
-	// listed on both an OpenAI and an Anthropic adapter works from either kind
-	// of client without any manual bookkeeping.
-	if groups := gw.SurfaceGroups(data.ModelID, s.local.Handles(data.ModelID), clientSurface(r)); len(groups) > 1 {
-		if data.Model != route.ModelID {
-			rewritten, err := swaputil.ReplaceRequestModel(r, data.Model, route.ModelID)
-			if err != nil {
-				swaputil.SendResponse(w, r, http.StatusBadRequest, err.Error())
-				return
-			}
-			r = rewritten
-		}
-		session := gatewaySession(r, cfg)
-		s.forwardAcrossSurfaces(w, r, gw, groups, data, session)
-		return
-	}
-	if route.Type() == config.ProviderTypeGemini {
-		// A Gemini adapter speaks the native dialect: the upstream paths are
-		// /v1beta/models/... . Forwarding an OpenAI/Anthropic path would only
-		// produce a confusing upstream 404, so name the mismatch instead.
-		if geminiRoute, ok := protocolrelaykit.RouteForRequest(r.Method, r.URL.Path); !ok || geminiRoute.Format != protocolrelaykit.Gemini {
-			swaputil.SendResponse(w, r, http.StatusBadRequest, fmt.Sprintf(
-				"%s is type gemini; call /v1beta/models/<model>:generateContent instead of %s",
-				providerRouteLabel(route), r.URL.Path))
-			return
-		}
-	}
-	if data.Model != route.ModelID {
-		rewritten, err := swaputil.ReplaceRequestModel(r, data.Model, route.ModelID)
-		if err != nil {
-			swaputil.SendResponse(w, r, http.StatusBadRequest, err.Error())
-			return
-		}
-		r = rewritten
-	}
-	// The upstream model name is rewritten per attempt inside the gateway:
-	// a failover may continue on another provider whose model name differs.
-
+//
+// Routing is one pool per client-facing model name: every provider and every
+// API surface that serves the name is a candidate, and the pick is made across
+// all of them with session affinity and priority/weight rotation. The request
+// is converted to each candidate's dialect on the attempt, so an OpenAI client
+// can land on an Anthropic adapter when that provider wins its share of the
+// traffic.
+func (s *Server) serveGateway(w http.ResponseWriter, r *http.Request, gw *gateway.Gateway, data swaputil.ReqContextData, cfg config.Config) {
 	// Session affinity hash: explicit configured headers first, falling back
 	// to client identity + a body fingerprint. The raw session id accompanies
 	// the hash so providers can opt into receiving it as a request header.
-	session := gatewaySession(r, cfg)
+	session := gatewaySession(r, cfg, data.ModelID)
+	localHasModel := s.local.Handles(data.ModelID)
 
-	// A bare model name may continue on every provider that serves it; a
-	// provider-qualified name stays pinned to that provider.
-	chain := gw.FailoverRoutes(data.ModelID, s.local.Handles(data.ModelID), route)
-	// A request the conversion layer rewrote for one dialect cannot continue on
-	// a provider speaking another one: keep only same-dialect siblings.
+	// A request the protocol middleware already converted (a local model
+	// forwarded to a provider, for instance) still carries that surface's body
+	// and path. The pool then stays within that dialect: the original client
+	// body is gone, so another dialect could not be rebuilt from it.
 	if target := protocolTargetFormat(r); target != "" {
-		chain = sameDialectRoutes(chain, route)
+		chain := sameSurfaceRoutes(gw.PlanRoutes(data.ModelID, localHasModel, "", session), target)
+		if len(chain) == 0 {
+			swaputil.SendResponse(w, r, http.StatusBadRequest, fmt.Sprintf(
+				"no configured provider serves model %s in the %s dialect this request was converted to",
+				data.ModelID, target))
+			return
+		}
+		gw.ServeHTTPWithFailover(w, r, chain, session)
+		return
 	}
 
-	gw.ServeHTTPWithFailover(w, r, chain, session)
-}
-
-// clientSurface names the API surface the client itself speaks, from the
-// request path. The protocol middleware rewrites the path only for requests it
-// converted; a request that reaches the gateway unconverted still carries the
-// client's own path, which is exactly the case where the surface order matters.
-func clientSurface(r *http.Request) string {
-	route, ok := protocolrelaykit.RouteForRequest(r.Method, r.URL.Path)
-	if !ok {
-		return ""
-	}
-	return surfaceTypeForFormat(route.Format)
-}
-
-// forwardAcrossSurfaces tries the model's upstream surfaces in order until one
-// serves the request. The request is converted per surface; the response is
-// converted back to the client's dialect. An upstream that rejects the request
-// on its surface (a request-scoped 4xx) hands it to the next surface instead of
-// answering the client, so a model that several adapters expose keeps working
-// from any client dialect.
-func (s *Server) forwardAcrossSurfaces(w http.ResponseWriter, r *http.Request, gw *gateway.Gateway, groups [][]*gateway.Route, data swaputil.ReqContextData, session gateway.Session) {
 	clientRoute, ok := protocolrelaykit.RouteForRequest(r.Method, r.URL.Path)
 	if !ok {
-		// No dialect information (a non-generation path): forward normally.
-		gw.ServeHTTPWithFailover(w, r, groups[0], session)
+		// A non-generation path (no dialect information): forward untouched.
+		chain := gw.PlanRoutes(data.ModelID, localHasModel, "", session)
+		gw.ServeHTTPWithFailover(w, r, chain, session)
 		return
 	}
 	client := clientRoute.Format
+	clientSurface := surfaceTypeForFormat(client)
 
-	// Buffer the client body once: every surface conversion starts from it.
+	// Buffer the client body once: every dialect conversion starts from it.
 	body, err := io.ReadAll(io.LimitReader(r.Body, backendTransformBodyLimit+1))
 	if err != nil {
 		swaputil.SendResponse(w, r, http.StatusBadRequest, "could not read request body")
@@ -1303,15 +1334,36 @@ func (s *Server) forwardAcrossSurfaces(w http.ResponseWriter, r *http.Request, g
 	}
 	_ = r.Body.Close()
 
+	chain := gw.PlanRoutes(data.ModelID, localHasModel, clientSurface, session)
+	if len(chain) == 0 {
+		// The caller admitted this request to the gateway on the strength of a
+		// non-empty PoolRoutes, so an empty plan here means local arbitration
+		// won the name (a local model outranks every provider that does not opt
+		// into provider-first). That is a local request, not a gateway failure.
+		if localHasModel {
+			swaputil.PublishLocalRoute(r.Context())
+			s.proxylog.Debugf("dispatch: local model %s outranks the provider pool", data.ModelID)
+			s.serveLocalWithProtocolHooks(w, r, data.ModelID, cfg, s.local.ServeHTTP)
+			return
+		}
+		swaputil.SendResponse(w, r, http.StatusBadGateway, fmt.Sprintf(
+			"gateway: no credential is currently available for model %s (all keys are cooling down, parked or disabled)", data.ModelID))
+		return
+	}
+
 	stream := protocolrelaykit.RequestStreamed(clientRoute, body)
 	meta := protocolrelaykit.NewMeta(data.ModelID, stream)
-	last := len(groups) - 1
+	// The cache is shared by every candidate; each attempt records its own
+	// scope (conversation + model + surface) before it is converted, so the
+	// response side files signatures under exactly the key the next request
+	// looks them up with.
+	signatureCache := s.geminiSignatures
+	lastStatus, lastBody := 0, ""
+	var lastCandidate *gateway.Route
 
-	var lastStatus int
-	var lastBody string
-	for index, group := range groups {
-		surface := group[0]
-		target := surfaceFormatForType(surface.Type())
+	last := len(chain) - 1
+	for index, candidate := range chain {
+		target := surfaceFormatForType(candidate.Type())
 		if target == "" {
 			target = client
 		}
@@ -1321,14 +1373,37 @@ func (s *Server) forwardAcrossSurfaces(w http.ResponseWriter, r *http.Request, g
 		attempt.GetBody = func() (io.ReadCloser, error) {
 			return io.NopCloser(bytes.NewReader(body)), nil
 		}
+		if signatureCache != nil {
+			// Each candidate is its own upstream surface, so its signatures
+			// live under a scope of their own: a signature minted by one
+			// provider's Gemini upstream cannot be replayed to another's.
+			attempt = withGeminiSignatureScope(attempt, signatureScope(signatureConversation(r), data.ModelID, surfaceLabel(candidate)))
+		}
 
 		out := w
 		var writer *protocolResponseWriter
 		if target != client {
 			converted, convErr := convertProtocolRequest(r.Context(), meta, client, target, body, data.ModelID, s.store)
 			if convErr != nil {
+				// A surface that cannot express this request is a property of
+				// that surface, not of the request: another candidate speaking
+				// a dialect that can express it must still be tried. Only the
+				// last candidate turns the failure into the client's answer.
+				if index < last {
+					s.proxylog.Warnf("dispatch: model %s cannot be converted to %s for provider %s adapter %q: %v, trying the next candidate",
+						data.ModelID, target, candidate.ProviderID, candidate.Adapter(), convErr)
+					lastStatus = http.StatusBadRequest
+					lastBody = convErr.Error()
+					lastCandidate = candidate
+					continue
+				}
 				swaputil.SendResponse(w, r, http.StatusBadRequest, convErr.Error())
 				return
+			}
+			if isGeminiTarget(target) && signatureCache != nil {
+				if cached := signatureCache.lookup(signatureScopeFromContext(attempt.Context()), replayCallIDs(converted), time.Now()); len(cached) > 0 {
+					converted = applyCachedGeminiSignatures(converted, cached)
+				}
 			}
 			path, pathErr := protocolrelaykit.TargetPathForRequest(target, data.ModelID, stream, r.URL.Path)
 			if pathErr != nil {
@@ -1344,13 +1419,18 @@ func (s *Server) forwardAcrossSurfaces(w http.ResponseWriter, r *http.Request, g
 			attempt.GetBody = func() (io.ReadCloser, error) {
 				return io.NopCloser(bytes.NewReader(converted)), nil
 			}
-			// The response writer converts back from this surface's dialect;
-			// the request keeps the client request for context and Responses
-			// affinity, which is keyed on the client path.
-			writer, err = newProtocolResponseWriter(w, r, s.store, data.ModelID, surfaceLabel(surface), target, client, body, meta, stream)
+			// The writer keys signatures off the attempt: it carries the scope
+			// this candidate's upstream mints for.
+			writer, err = newProtocolResponseWriter(w, attempt, s.store, data.ModelID, surfaceLabel(candidate), target, client, body, meta, stream)
 			if err != nil {
 				swaputil.SendResponse(w, r, http.StatusBadGateway, err.Error())
 				return
+			}
+			// This candidate's upstream minted the signatures the replay needs,
+			// and the scope recorded on the attempt names exactly this surface.
+			writer.signatures = signatureCache
+			if writer.streamWriter != nil {
+				writer.streamWriter.signatures = signatureCache
 			}
 			out = writer
 			attempt = markProtocolBackendRequest(attempt, client, target, path, stream)
@@ -1365,31 +1445,61 @@ func (s *Server) forwardAcrossSurfaces(w http.ResponseWriter, r *http.Request, g
 			}
 		}
 
-		opts := gateway.AttemptOptions{StopOnRequestScoped: index < last}
-		result := gw.ServeHTTPAttempt(out, attempt, group, session, opts)
-		if !result.Committed {
-			// The upstream refused this request on this surface and the
-			// gateway wrote nothing, so the next surface still gets a clean
-			// shot at it.
-			lastStatus = result.Status
-			lastBody = result.Snippet
-			s.proxylog.Warnf("dispatch: model %s not served by the %s surface (status %d), trying the next surface",
-				data.ModelID, surface.Type(), result.Status)
-			continue
+		// Every candidate is one failover pass: credentials of that
+		// provider/surface are tried inside it, and a refusal on that surface
+		// (or a surface with no usable credential) hands the request to the
+		// next candidate instead of answering the client from here. The last
+		// candidate commits normally, so a lone failing upstream still answers
+		// with its own error body exactly as before.
+		opts := gateway.AttemptOptions{
+			StopOnRequestScoped: index < last,
+			StopOnUnavailable:   index < last,
 		}
-		if writer != nil {
-			if writer.overflow {
-				swaputil.SendResponse(w, r, http.StatusBadGateway, fmt.Sprintf("protocol response body exceeds %d bytes", backendTransformBodyLimit))
-				return
+		result := gw.ServeHTTPAttempt(out, attempt, []*gateway.Route{candidate}, session, opts)
+		if result.Committed {
+			if writer != nil {
+				if writer.overflow {
+					swaputil.SendResponse(w, r, http.StatusBadGateway, fmt.Sprintf("protocol response body exceeds %d bytes", backendTransformBodyLimit))
+					return
+				}
+				if finishErr := writer.finish(); finishErr != nil && !writer.committed() {
+					swaputil.SendResponse(w, r, http.StatusBadGateway, finishErr.Error())
+					return
+				}
 			}
-			if finishErr := writer.finish(); finishErr != nil && !writer.committed() {
-				swaputil.SendResponse(w, r, http.StatusBadGateway, finishErr.Error())
-				return
-			}
+			return
 		}
-		return
+		lastStatus = result.Status
+		lastBody = result.Snippet
+		lastCandidate = candidate
+		if len(chain) > 1 {
+			s.proxylog.Warnf("dispatch: model %s not served by provider %s adapter %q (status %d), trying the next candidate",
+				data.ModelID, candidate.ProviderID, candidate.Adapter(), result.Status)
+		}
 	}
+
+	if lastStatus == 0 {
+		lastStatus = http.StatusBadGateway
+	}
+	// Every candidate refused the request. The last one tried is the provider
+	// whose error the client sees, so that is what the record must name.
+	publishRouteAttribution(r, lastCandidate)
 	swaputil.SendResponse(w, r, lastStatus, truncateForClient(lastBody))
+}
+
+// forwardAcrossSurfaces keeps only the routes whose adapter speaks the given
+// dialect. It is used when the request body was already converted for one
+// surface (a local model forwarded to a provider): the original client body is
+// gone, so another dialect cannot be rebuilt from it.
+func sameSurfaceRoutes(chain []*gateway.Route, surface protocolrelaykit.Format) []*gateway.Route {
+	want := surfaceTypeForFormat(surface)
+	keep := make([]*gateway.Route, 0, len(chain))
+	for _, route := range chain {
+		if want == "" || route.Type() == want {
+			keep = append(keep, route)
+		}
+	}
+	return keep
 }
 
 func surfaceLabel(route *gateway.Route) string {
@@ -1406,22 +1516,6 @@ func truncateForClient(s string) string {
 		return s
 	}
 	return s[:limit] + "..."
-}
-
-// sameDialectRoutes keeps the primary route plus the siblings whose adapter
-// speaks the same dialect and protocol, so a converted request never lands on
-// an upstream that cannot read it.
-func sameDialectRoutes(chain []*gateway.Route, primary *gateway.Route) []*gateway.Route {
-	if len(chain) <= 1 {
-		return chain
-	}
-	keep := make([]*gateway.Route, 0, len(chain))
-	for _, route := range chain {
-		if route == primary || route.Type() == primary.Type() {
-			keep = append(keep, route)
-		}
-	}
-	return keep
 }
 
 // providerModelName maps a provider model name onto the client-facing name the
@@ -1451,25 +1545,32 @@ func (s *Server) providerDialectFor(modelID string) (ProviderDialect, bool) {
 	if gw == nil {
 		return ProviderDialect{}, false
 	}
-	route := gw.RouteFor(modelID, s.local.Handles(modelID))
-	if route == nil {
+	// PoolRoutes does not rotate: resolving the dialect must not consume the
+	// model's rotation turn, or every request would advance the cursor twice.
+	routes := gw.PoolRoutes(modelID, s.local.Handles(modelID), "")
+	if len(routes) == 0 {
 		return ProviderDialect{}, false
 	}
+	route := routes[0]
 	label := route.ProviderID
 	if adapter := route.Adapter(); adapter != "" {
 		label += "/" + adapter
 	}
-	surfaces := len(gw.SurfaceGroups(modelID, s.local.Handles(modelID), ""))
-	return ProviderDialect{Type: route.Type(), Label: label, Surfaces: surfaces}, true
+	// Surfaces is "candidates in the pool". More than one means the forward
+	// path owns dialect decisions: it converts per candidate and can fall back
+	// to another provider's surface, so converting here would pin the request
+	// to one dialect and take every other candidate out of the pool.
+	return ProviderDialect{Type: route.Type(), Label: label, Surfaces: len(routes)}, true
 }
 
-// providerRouteLabel describes the provider (and adapter, when named) a route
-// belongs to for user-facing errors.
-func providerRouteLabel(route *gateway.Route) string {
-	if adapter := route.Adapter(); adapter != "" {
-		return fmt.Sprintf("provider %s adapter %q", route.ProviderID, adapter)
+// publishRouteAttribution records which upstream produced the answer for the
+// audit row. The gateway publishes on success; this covers the exhausted chain,
+// where the last provider tried is the one an operator needs to see.
+func publishRouteAttribution(r *http.Request, route *gateway.Route) {
+	if r == nil || route == nil {
+		return
 	}
-	return "provider " + route.ProviderID
+	swaputil.PublishRequestProvider(r.Context(), route.ProviderID, route.Adapter())
 }
 
 // currentGateway returns the active provider gateway (nil when none is
@@ -1494,6 +1595,24 @@ func (s *Server) setGateway(gw *gateway.Gateway) {
 	}
 }
 
+// swapGateway replaces the active gateway for a configuration reload. Unlike
+// setGateway it carries the session bindings and the rotation cursor across, so
+// a reload does not move live conversations onto another provider. The previous
+// gateway is then released the same way.
+func (s *Server) swapGateway(gw *gateway.Gateway) {
+	s.gatewayMu.Lock()
+	previous := s.gateway
+	s.gateway = gw
+	s.gatewayMu.Unlock()
+	if previous == nil {
+		return
+	}
+	if adopted := gw.CarryState(previous); adopted > 0 && s.proxylog != nil {
+		s.proxylog.Infof("gateway reload: carried %d session binding(s) onto the new provider topology", adopted)
+	}
+	previous.Shutdown()
+}
+
 // gatewaySession derives the sticky session key for provider routing and the
 // session id providers can opt into receiving as a request header
 // (providers.<id>.sessionHeaders).
@@ -1503,7 +1622,7 @@ func (s *Server) setGateway(gw *gateway.Gateway) {
 // (metadata.user_id, prompt_cache_key or the first message/part content) so
 // follow-up turns of one conversation share an id. Requests carrying neither
 // signal inject nothing.
-func gatewaySession(r *http.Request, cfg config.Config) gateway.Session {
+func gatewaySession(r *http.Request, cfg config.Config, model string) gateway.Session {
 	sessionID := clientSessionID(r, cfg)
 
 	// Content signals: Anthropic metadata.user_id, OpenAI prompt_cache_key,
@@ -1529,9 +1648,18 @@ func gatewaySession(r *http.Request, cfg config.Config) gateway.Session {
 		// share one upstream session. This is the sticky affinity key too.
 		upstreamID = gateway.SessionHash("", clientIP, keyID, bodyFingerprint)
 	}
+	// Affinity needs a real per-conversation signal. Hashing an empty
+	// fingerprint would give every request from one caller the same key,
+	// pinning the whole caller (not one conversation) to one provider and
+	// defeating the pool's rotation. No signal means no affinity.
+	hash := ""
+	if sessionID != "" || bodyFingerprint != "" {
+		hash = gateway.SessionHash(sessionID, clientIP, keyID, bodyFingerprint)
+	}
 	return gateway.Session{
-		Hash: gateway.SessionHash(sessionID, clientIP, keyID, bodyFingerprint),
-		ID:   upstreamID,
+		Hash:  hash,
+		Model: model,
+		ID:    upstreamID,
 	}
 }
 
@@ -1591,6 +1719,13 @@ func gatewayBodyFingerprint(r *http.Request) (string, error) {
 	}
 	// Fall back to the first message content: OpenAI/Anthropic messages shape,
 	// then the Gemini contents shape.
+	// Responses API: input is a string or a list of items.
+	if v := gjson.GetBytes(body, "input").String(); v != "" {
+		return v, nil
+	}
+	if v := gjson.GetBytes(body, "input.0.content").String(); v != "" {
+		return v, nil
+	}
 	if v := gjson.GetBytes(body, "messages.0.content").String(); v != "" {
 		return v, nil
 	}
@@ -1687,18 +1822,33 @@ func (s *Server) routes() {
 		authMW,
 		CreateRealtimeMiddleware(cfg),
 		RequireScope("inference"),
+		// Normalize the body format before anything branches on Content-Type.
+		createContentTypeMiddleware(),
+	}
+	// globalConcurrencyLimit guards the top of the inference chain after auth:
+	// a rejected caller must spend no slot. A limit of 0 (the default) means
+	// no limit, so the middleware is left out rather than wrapping every
+	// request in a no-op semaphore.
+	if cfg.GlobalConcurrencyLimit > 0 {
+		modelMiddlewares = append(modelMiddlewares, CreateConcurrencyLimitMiddleware(cfg.GlobalConcurrencyLimit))
 	}
 	extensionManager := s.currentExtensions()
-	if cfg.Extensions.Enabled && extensionManager != nil {
+	useToolRuntime := cfg.Extensions.Enabled && extensionManager != nil || cfg.ProtocolRuntime.MCP.Enabled
+	if useToolRuntime {
 		modelMiddlewares = append(modelMiddlewares, CreateExtensionOriginMiddleware(s), CreateExtensionContinuationMiddleware(s, cfg))
 	}
 	modelMiddlewares = append(modelMiddlewares,
 		CreateProfileMiddleware(s),
 		CreateSelectorMiddleware(s),
 		CreateRequestContextMiddleware(cfg),
+		createCompatibilityMiddleware(),
+		createMCPContextMiddleware(s, cfg),
+		createProtocolFilesMiddleware(s),
+		CreateConversationMiddleware(s, cfg),
 	)
-	if cfg.Extensions.Enabled && extensionManager != nil {
+	if useToolRuntime {
 		modelMiddlewares = append(modelMiddlewares,
+			createInteractionsToolsMiddleware(),
 			CreateInflightMiddleware(s.inflight, cfg),
 			CreateMetricsMiddleware(s.metrics, cfg, s.providerModelName),
 			CreateExtensionsMiddleware(s, cfg, extensionManager),
@@ -1707,10 +1857,10 @@ func (s *Server) routes() {
 	modelMiddlewares = append(modelMiddlewares,
 		CreateBackendCapabilityMiddleware(cfg),
 		CreateAnthropicCacheMiddleware(cfg),
-		CreateProtocolAdapterMiddleware(cfg, s.store, s.providerDialectFor),
+		CreateProtocolAdapterMiddleware(cfg, s.store, s.providerDialectFor, s.geminiSignatures),
 		CreateResponseAffinityMiddleware(cfg, s.store),
 	)
-	if cfg.Extensions.Enabled && extensionManager != nil {
+	if useToolRuntime {
 		modelMiddlewares = append(modelMiddlewares, CreateFilterMiddleware(cfg), CreateFormFilterMiddleware(cfg))
 	} else {
 		modelMiddlewares = append(modelMiddlewares,
@@ -1720,7 +1870,7 @@ func (s *Server) routes() {
 			CreateMetricsMiddleware(s.metrics, cfg, s.providerModelName),
 		)
 	}
-	if cfg.Extensions.Enabled && extensionManager != nil {
+	if useToolRuntime {
 		modelMiddlewares = append(modelMiddlewares, CreateExtensionsBeforeForwardMiddleware())
 	}
 	modelMiddlewares = append(modelMiddlewares,
@@ -1769,6 +1919,14 @@ func (s *Server) routes() {
 	}
 	for _, path := range modelGetRoutes {
 		mux.Handle("GET "+path, modelChain.Then(dispatch))
+	}
+	// Codex probes /v1/responses over WebSocket when its provider declares
+	// supports_websockets. This daemon only speaks the HTTP Responses
+	// transport, and a 405 makes the client retry the handshake until its
+	// budget runs out: the request then fails instead of falling back. 426
+	// Upgrade Required is the status that tells it to switch to HTTP.
+	for _, path := range []string{"/v1/responses", "/v/responses"} {
+		mux.HandleFunc("GET "+path, handleResponsesCollectionGet)
 	}
 	// Responses retrieval/cancellation carry the response id in the path, so
 	// they cannot use the model-in-body dispatcher. The affinity record supplies
@@ -1845,6 +2003,11 @@ func (s *Server) routes() {
 	mux.Handle("/comfyui", comfyUIChain.ThenFunc(handleComfyUIRedirect))
 	mux.Handle("/comfyui/{comfyPath...}", comfyUIChain.ThenFunc(s.handleComfyUI))
 
+	// audio.cpp UI passthrough. This uses the fixed audiocpp_auto model so
+	// requests do not have to name a model.
+	mux.Handle("/audiocpp", comfyUIChain.ThenFunc(handleAudioCppRedirect))
+	mux.Handle("/audiocpp/{audioCppPath...}", comfyUIChain.ThenFunc(s.handleAudioCpp))
+
 	// API group (API-key protected) consumed by the UI.
 	mux.Handle("POST /api/models/unload", modelUnloadAPI.ThenFunc(s.handleAPIUnloadAll))
 	mux.Handle("GET /api/models/conflicts/{model...}", modelUnloadAPI.ThenFunc(s.handleAPIModelLoadConflicts))
@@ -1855,6 +2018,30 @@ func (s *Server) routes() {
 	mux.Handle("PUT /api/profiles/active", configAPI.ThenFunc(s.handleAPIActiveProfile))
 	mux.Handle("POST /api/inflight/{id}/cancel", modelUnloadAPI.ThenFunc(s.handleAPICancelInflight))
 	mux.Handle("GET /api/events", logsAPI.ThenFunc(s.handleAPIEvents))
+	// Documentation tools for MCP clients. It is an inference-scoped API: any
+	// key that may run a model may also ask how this server is configured.
+	mux.Handle("POST /api/mcp", inferenceAPI.ThenFunc(s.handleAPIMCP))
+	mux.Handle("/mcp", inferenceAPI.ThenFunc(s.handleMCPRuntime))
+	mux.Handle("POST /api/protocol/plan", inferenceAPI.ThenFunc(s.handleProtocolPlan))
+	mux.Handle("POST /v1/files", inferenceAPI.ThenFunc(s.handleProtocolFiles))
+	mux.Handle("GET /v1/files", inferenceAPI.ThenFunc(s.handleProtocolFiles))
+	mux.Handle("GET /v1/files/{file_id}", inferenceAPI.ThenFunc(s.handleProtocolFile))
+	mux.Handle("GET /v1/files/{file_id}/content", inferenceAPI.ThenFunc(s.handleProtocolFile))
+	mux.Handle("DELETE /v1/files/{file_id}", inferenceAPI.ThenFunc(s.handleProtocolFile))
+	mux.Handle("GET /api/mcp/approvals/{approval_id}", inferenceAPI.ThenFunc(s.handleMCPApproval))
+	mux.Handle("POST /api/mcp/approvals/{approval_id}", inferenceAPI.ThenFunc(s.handleMCPApproval))
+	mux.Handle("POST /api/mcp/approvals/{approval_id}/resume", inferenceAPI.ThenFunc(s.handleMCPResume))
+	mux.Handle("POST /api/conversations", inferenceAPI.ThenFunc(s.handleConversations))
+	mux.Handle("GET /api/conversations", inferenceAPI.ThenFunc(s.handleConversations))
+	mux.Handle("GET /api/conversations/{conversation_id}", inferenceAPI.ThenFunc(s.handleConversation))
+	mux.Handle("DELETE /api/conversations/{conversation_id}", inferenceAPI.ThenFunc(s.handleConversation))
+	mux.Handle("POST /api/conversations/{conversation_id}/checkpoints", inferenceAPI.ThenFunc(s.handleConversationCheckpoint))
+	mux.Handle("POST /api/conversations/{conversation_id}/fork", inferenceAPI.ThenFunc(s.handleConversationFork))
+	mux.Handle("POST /api/conversations/{conversation_id}/compact", inferenceAPI.ThenFunc(s.handleConversationCompact))
+	mux.Handle("POST /api/conversations/{conversation_id}/generations", inferenceAPI.ThenFunc(s.handleConversationGenerate))
+	mux.Handle("GET /api/conversation-generations/{generation_id}", inferenceAPI.ThenFunc(s.handleConversationGeneration))
+	mux.Handle("POST /api/conversation-generations/{generation_id}/cancel", inferenceAPI.ThenFunc(s.handleConversationGeneration))
+	mux.Handle("DELETE /api/conversation-generations/{generation_id}", inferenceAPI.ThenFunc(s.handleConversationGeneration))
 	mux.Handle("GET /api/metrics/activity", auditAPI.ThenFunc(s.handleAPIActivity))
 	mux.Handle("GET /api/metrics/stats", auditAPI.ThenFunc(s.handleAPIActivityStats))
 	mux.Handle("GET /api/metrics/speed", auditAPI.ThenFunc(s.handleAPIMetricsSpeed))
@@ -1871,6 +2058,8 @@ func (s *Server) routes() {
 	mux.Handle("POST /api/providers/probe", configAPI.ThenFunc(s.handleAPIProvidersProbe))
 	mux.Handle("GET /api/providers/quotas", configAPI.ThenFunc(s.handleAPIProvidersQuotas))
 	mux.Handle("POST /api/providers/quotas/refresh", configAPI.ThenFunc(s.handleAPIProvidersQuotasRefresh))
+	mux.Handle("POST /api/providers/quotas/test", configAPI.ThenFunc(s.handleAPIProvidersQuotasTest))
+	mux.Handle("GET /api/providers/quota-presets/{id}", configAPI.ThenFunc(s.handleAPIProviderQuotaPreset))
 	mux.Handle("GET /api/providers/templates", configAPI.ThenFunc(s.handleAPIProviderTemplates))
 	mux.Handle("POST /api/providers/templates/{id}/apply", configAPI.ThenFunc(s.handleAPIProviderTemplateApply))
 	mux.Handle("GET /api/extensions", configAPI.ThenFunc(s.handleAPIExtensions))
@@ -1983,7 +2172,7 @@ func (s *Server) routes() {
 		CreateClientIPMiddleware(cfg.Network),
 		CreateSecurityHeadersMiddleware(cfg.Server.HeadersEnabled()),
 		CreateRequestLogMiddleware(s.proxylog, s.recordRequestError),
-		CreateCORSMiddleware(),
+		CreateCORSMiddleware(cfg),
 	).Then(mux)
 	s.handlerMu.Lock()
 	s.mux = mux
@@ -2107,27 +2296,142 @@ func (s *Server) SetConfigManager(manager *config.ConfigManager) {
 	}
 }
 
-func (s *Server) runPricingSync(interval time.Duration) {
-	if s.pricing == nil {
+// currentPricingSyncer returns the syncer and its source under pricingMu, so a
+// configuration reload that replaces either cannot be observed half-done.
+func (s *Server) currentPricingSyncer() (*pricing.Syncer, string) {
+	if s == nil {
+		return nil, ""
+	}
+	s.pricingMu.Lock()
+	defer s.pricingMu.Unlock()
+	return s.pricing, s.pricingURL
+}
+
+// runPricingSync refreshes the models.dev snapshot on the configured interval.
+// The loop is owned by pricingCancel: a configuration change that alters the
+// interval or the source cancels the running loop and starts a new one, so an
+// edit takes effect without a daemon restart. The first refresh is left to the
+// caller (the initial sync), which is what keeps startup from double-fetching.
+//
+// syncer and stop are captured by the caller rather than read from the Server:
+// restarting the loop holds pricingMu while it waits for the previous one to
+// exit, so taking that lock here would deadlock against the wait.
+func (s *Server) runPricingSync(syncer *pricing.Syncer, stop <-chan struct{}, interval time.Duration) {
+	if syncer == nil {
 		return
 	}
 	if interval <= 0 {
 		interval = 24 * time.Hour
 	}
+	// Bind the loop to a generation so a superseded loop stops on its own even
+	// if the cancel arrives before the select is entered.
+	generation := s.pricingGeneration.Add(1)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-s.shutdownCtx.Done():
 			return
+		case <-stop:
+			return
 		case <-ticker.C:
-			ctx, cancel := context.WithTimeout(s.shutdownCtx, 2*time.Minute)
-			if _, err := s.pricing.Sync(ctx); err != nil && s.proxylog != nil {
+			if s.pricingGeneration.Load() != generation {
+				return
+			}
+			ctx, cancel := context.WithTimeout(s.shutdownCtx, pricingSyncTimeout)
+			if _, err := syncer.Sync(ctx); err != nil && s.proxylog != nil {
 				s.proxylog.Warnf("pricing sync failed: %v", err)
 			}
 			cancel()
 		}
 	}
+}
+
+// reconfigurePricing applies a models.dev configuration change to the long-lived
+// syncer. Starting with no syncer (the section was off) installs one and kicks
+// off the first fetch; disabling it stops the periodic loop and drops the
+// syncer so a later manual sync goes through the on-demand path instead of a
+// goroutine nobody is watching. An interval or URL change replaces the loop
+// rather than leaving the old one ticking on the previous values.
+//
+// The first fetch of a new source runs after the lock is released: it can take
+// minutes on a slow link, and holding pricingMu across it would stall every
+// other pricing read.
+func (s *Server) reconfigurePricing(active, desired config.ModelsDevPricingConfig) {
+	if s == nil {
+		return
+	}
+	initial := s.applyPricingConfig(active, desired)
+	if initial == nil {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(s.shutdownCtx, pricingSyncTimeout)
+		if _, err := initial.Sync(ctx); err != nil && s.proxylog != nil {
+			s.proxylog.Warnf("initial pricing sync failed: %v", err)
+		}
+		cancel()
+	}()
+}
+
+// applyPricingConfig installs the new syncer and loop under pricingMu and
+// returns the syncer that still needs a first fetch, or nil when the existing
+// snapshot can be reused.
+func (s *Server) applyPricingConfig(active, desired config.ModelsDevPricingConfig) *pricing.Syncer {
+	s.pricingMu.Lock()
+	defer s.pricingMu.Unlock()
+	if !desired.ModelsDevEnabled() {
+		s.stopPricingSyncLocked()
+		s.pricing = nil
+		s.pricingURL = ""
+		return nil
+	}
+	if s.pricing != nil && s.pricingURL == desired.URL {
+		// Same source: keep the syncer so its ETag and in-flight state survive.
+		if active.RefreshEvery != desired.RefreshEvery {
+			s.restartPricingSyncLocked(s.pricing, desired.RefreshEvery)
+		}
+		return nil
+	}
+	s.stopPricingSyncLocked()
+	initial := &pricing.Syncer{Store: s.store, URL: desired.URL}
+	s.pricing = initial
+	s.pricingURL = desired.URL
+	s.restartPricingSyncLocked(initial, desired.RefreshEvery)
+	return initial
+}
+
+// stopPricingSync cancels the running loop and waits for it to observe the
+// cancellation, so a replacement loop cannot race the one it supersedes. The
+// caller must hold pricingMu.
+func (s *Server) stopPricingSyncLocked() {
+	if s.pricingCancel == nil {
+		return
+	}
+	s.pricingCancel()
+	s.pricingCancel = nil
+	s.pricingWG.Wait()
+}
+
+// restartPricingSync replaces the periodic loop with one running on interval.
+// The caller must hold pricingMu, which is why the syncer is passed in: the loop
+// must not take that lock itself, because this function waits for the previous
+// loop to exit while still holding it.
+func (s *Server) restartPricingSyncLocked(syncer *pricing.Syncer, interval time.Duration) {
+	s.stopPricingSyncLocked()
+	if syncer == nil {
+		return
+	}
+	if interval <= 0 {
+		interval = 24 * time.Hour
+	}
+	ctx, cancel := context.WithCancel(s.shutdownCtx)
+	s.pricingCancel = cancel
+	s.pricingWG.Add(1)
+	go func() {
+		defer s.pricingWG.Done()
+		s.runPricingSync(syncer, ctx.Done(), interval)
+	}()
 }
 
 // runResponseAffinityCleanup keeps the durable Responses chain bounded even
@@ -2176,6 +2480,11 @@ const (
 	// reclaimed; walking the blob tree is cheap but still pointless at
 	// request rate.
 	auditBlobGCInterval = time.Hour
+
+	// pricingSyncTimeout bounds one models.dev fetch. The catalog is several
+	// megabytes, so the budget has to cover a slow link as well as a stalled
+	// one; a fetch that outlives it is abandoned rather than retried forever.
+	pricingSyncTimeout = 5 * time.Minute
 )
 
 // signalAuditDirty wakes the maintenance task after audit data changed (a
@@ -2390,6 +2699,7 @@ func (s *Server) auditRetention() time.Duration {
 // tear down routers; call Shutdown for that. Safe to call repeatedly.
 func (s *Server) CloseStreams() {
 	s.shutdownFn()
+	s.closeMCPRuntime()
 	if manager := s.currentExtensions(); manager != nil {
 		manager.Close()
 	}
@@ -2407,6 +2717,7 @@ func (s *Server) Shutdown(timeout time.Duration) error {
 		return nil
 	}
 	s.shutdownFn()
+	s.closeMCPRuntime()
 	if s.thermal != nil {
 		s.thermal.Stop()
 		s.thermal = nil

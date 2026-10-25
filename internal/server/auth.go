@@ -139,57 +139,6 @@ func CreateRequestContextMiddleware(cfg config.Config) chain.Middleware {
 	}
 }
 
-// CreateCORSMiddleware returns middleware that answers OPTIONS preflight
-// requests with permissive CORS headers (see issues #81, #77, #42). Non-OPTIONS
-// requests pass through untouched, except state-changing requests aimed at the
-// management API (/api/) that carry a cross-origin browser Origin header:
-// those are rejected. The web UI is same-origin, so no legitimate client can
-// make such a request, while a malicious web page can drive a keyless or
-// session-cookie deployment (the permissive preflight makes /api/ writes
-// preflightable). Cross-origin inference paths keep their API contract.
-func CreateCORSMiddleware() chain.Middleware {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.Method != http.MethodOptions {
-				if isCrossOriginManagementWrite(r) {
-					swaputil.SendResponse(w, r, http.StatusForbidden, "cross-origin management requests are not allowed")
-					return
-				}
-				next.ServeHTTP(w, r)
-				return
-			}
-
-			w.Header().Set("Access-Control-Allow-Origin", "*")
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-			if headers := r.Header.Get("Access-Control-Request-Headers"); headers != "" {
-				w.Header().Set("Access-Control-Allow-Headers", sanitizeAccessControlRequestHeaderValues(headers))
-			} else {
-				w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, X-Requested-With")
-			}
-			w.Header().Set("Access-Control-Max-Age", "86400")
-			w.WriteHeader(http.StatusNoContent)
-		})
-	}
-}
-
-// isCrossOriginManagementWrite reports whether the request is a state-changing
-// browser request aimed at the management API from a different origin.
-func isCrossOriginManagementWrite(r *http.Request) bool {
-	switch r.Method {
-	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
-	default:
-		return false
-	}
-	origin := r.Header.Get("Origin")
-	if origin == "" {
-		return false
-	}
-	if !strings.HasPrefix(r.URL.Path, "/api/") {
-		return false
-	}
-	return !sameOrigin(origin, r.Host)
-}
-
 // sameOrigin compares an Origin header value against the request's Host,
 // tolerating the omitted default port browsers use in Origin.
 func sameOrigin(origin, host string) bool {

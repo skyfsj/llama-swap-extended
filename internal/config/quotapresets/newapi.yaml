@@ -1,0 +1,61 @@
+# New API / One API 自建中转站。
+#
+#   GET {base}/api/usage/token/
+#   Authorization: Bearer sk-...
+#
+# 该端点用令牌本身鉴权（TokenAuthReadOnly），返回当前令牌的额度计数：
+#   {"code":true,"message":"ok","data":{"object":"token_usage","name":"...",
+#    "total_granted":1500000,"total_used":200000,"total_available":1300000,
+#    "unlimited_quota":false,"expires_at":0}}
+#
+# 端点是站点自己的域名，因此写成 {base}/...：协议+主机取自
+# providers.<id>.endpoint，换站点不需要改映射。
+#
+# 计数单位由站点的 QuotaPerUnit 决定（new-api 默认 500000 额度 = 1 USD）。
+# 站点改过这个值时覆盖 divideBy 即可，例如：
+#
+#   quota:
+#     preset: newapi
+#     divideBy: 1000000
+#
+# total_granted 是"已用+剩余"的总额，所以用它和 total_used 组成一条
+# 已用比例窗口；unlimited_quota 的令牌总额为 0，窗口显示"无上限"。
+id: newapi
+name: New API
+category: self-hosted
+description: 自建 New API / One API：读取令牌的剩余、已用与总额度（按站点额度单位换算，默认 500000 = 1 USD）。
+endpoint: "{base}/api/usage/token/"
+method: GET
+auth:
+  style: bearer
+timeoutSeconds: 15
+divideBy: 500000
+windows:
+  - id: quota
+    label: 额度
+    path: data
+    percent: total_used
+    limit: total_granted
+extras:
+  - id: available
+    label: 剩余额度
+    path: data.total_available
+    suffix: " USD"
+  - id: granted
+    label: 总额度
+    path: data.total_granted
+    suffix: " USD"
+  - id: used
+    label: 已用额度
+    path: data.total_used
+    suffix: " USD"
+  - id: unlimited
+    label: 无限额度
+    path: data.unlimited_quota
+  - id: token
+    label: 令牌
+    path: data.name
+  - id: expires_at
+    label: 过期时间
+    path: data.expires_at
+    format: unix

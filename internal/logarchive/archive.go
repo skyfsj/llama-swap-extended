@@ -4,6 +4,7 @@ package logarchive
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -209,6 +210,41 @@ func (s *Store) Read(name string) ([]byte, Entry, error) {
 	}
 	entry.Size = int64(len(data))
 	return data, entry, nil
+}
+
+// ReadHead returns the first n bytes of an archive, for callers that only need
+// to classify it. Reading the whole entry to answer "what route was this" made
+// listing the incident logs cost every retained archive in full — up to
+// MaxEntryBytes each — on every request.
+//
+// Fewer bytes than n are returned when the archive is shorter, which is not an
+// error: the caller has as much as exists.
+func (s *Store) ReadHead(name string, n int) ([]byte, error) {
+	if s == nil {
+		return nil, errors.New("incident log store is nil")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := parseName(name); !ok || filepath.Base(name) != name {
+		return nil, errors.New("invalid incident log name")
+	}
+	if n <= 0 {
+		return nil, errors.New("head size must be positive")
+	}
+	file, err := os.Open(filepath.Join(s.dir, name))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, os.ErrNotExist
+		}
+		return nil, fmt.Errorf("open incident log: %w", err)
+	}
+	defer file.Close()
+	head := make([]byte, n)
+	read, err := io.ReadFull(file, head)
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return nil, fmt.Errorf("read incident log head: %w", err)
+	}
+	return head[:read], nil
 }
 
 func (s *Store) listLocked() ([]Entry, error) {

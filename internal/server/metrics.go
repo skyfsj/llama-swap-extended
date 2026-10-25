@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -50,11 +51,18 @@ type metricsMonitor struct {
 	audit      config.AuditConfig
 	// dirtyAudit wakes the background audit maintenance task after a
 	// conversation is persisted. Wired by the Server; nil in standalone use.
-	dirtyAudit    func()
-	priceStore    *store.Store
-	priceRefs     map[string]config.PricingRef
-	priceMu       sync.Mutex
-	priceCache    map[string]priceLookup
+	dirtyAudit func()
+	priceStore *store.Store
+	priceRefs  map[string]config.PricingRef
+	priceMu    sync.Mutex
+	priceCache map[string]priceLookup
+	// priceAmbiguity decides how a model name backed by several catalog
+	// entries is priced; see resolveAmbiguousPrice.
+	priceAmbiguity priceAmbiguityPolicy
+	// priceVendors maps a model-name prefix to the catalog provider id treated
+	// as the model's official vendor ("gemini" -> google), merged from the
+	// built-in table and pricing.modelsDev.vendors.
+	priceVendors  map[string]string
 	cacheObserver func(string, backend.CacheReport)
 	// firstTokenObserver 把一条请求的真实首字延迟交给网关做供应商选择。
 	// 与 cacheObserver 同样是回调注入：指标层只负责测量，网关只负责路由，
@@ -89,6 +97,12 @@ func newMetricsMonitor(logger *logmon.Monitor, maxMetrics int, st *store.Store) 
 // configurePricing wires the exact model/provider mapping used for estimates.
 // The catalog itself remains in SQLite so a restart with a persistent store
 // keeps the last successful models.dev snapshot available immediately.
+//
+// Besides the local models' pricing refs, every provider model gets a ref
+// resolved from its own pricing block or, by default, from the provider name
+// plus the upstream model name — models.dev catalogs vendors under their own
+// ids, so a provider named "DeepSeek" prices "deepseek-flash" against
+// models.dev's deepseek entries with no configuration at all.
 func (mp *metricsMonitor) configurePricing(st *store.Store, cfg config.Config) {
 	if mp == nil {
 		return
@@ -96,15 +110,90 @@ func (mp *metricsMonitor) configurePricing(st *store.Store, cfg config.Config) {
 	mp.priceMu.Lock()
 	defer mp.priceMu.Unlock()
 	mp.priceStore = st
+	mp.priceAmbiguity = priceAmbiguityFromConfig(cfg.EffectivePricing().ModelsDev.Ambiguity)
+	mp.priceVendors = config.PricingVendorTable(cfg.EffectivePricing().ModelsDev.Vendors)
 	mp.priceRefs = make(map[string]config.PricingRef, len(cfg.Models))
 	for model, modelCfg := range cfg.Models {
 		mp.priceRefs[model] = modelCfg.Backend.Pricing
+	}
+	providerIDs := make([]string, 0, len(cfg.Providers))
+	for id := range cfg.Providers {
+		providerIDs = append(providerIDs, id)
+	}
+	sort.Strings(providerIDs)
+	for _, id := range providerIDs {
+		provider := cfg.Providers[id]
+		for _, model := range provider.AllModels() {
+			ref, ok := providerPricingRef(id, provider, model)
+			if !ok {
+				continue
+			}
+			for _, name := range providerPricingNames(id, provider, model) {
+				// Local models and earlier providers win: the map holds one ref
+				// per name, and bare names can be shared by a pool of providers.
+				if _, exists := mp.priceRefs[name]; !exists {
+					mp.priceRefs[name] = ref
+				}
+			}
+		}
 	}
 	// A reconfiguration may change the provider/model mapping or point at a
 	// different store. Cached positive and negative lookups must not survive
 	// that boundary, otherwise activity rows can be priced with a stale catalog
 	// for up to the five-minute lookup TTL.
 	mp.priceCache = make(map[string]priceLookup)
+}
+
+// providerPricingRef resolves the catalog entry that prices one provider
+// model: the model's own pricing block wins, then the provider's catalog id,
+// then the provider's own name lowercased. The model part defaults to the
+// upstream name because that is the identity the vendor's catalog lists.
+func providerPricingRef(providerID string, provider config.ProviderConfig, model config.ProviderModel) (config.PricingRef, bool) {
+	ref := model.Pricing
+	catalogProvider := strings.TrimSpace(ref.Provider)
+	if catalogProvider == "" {
+		catalogProvider = strings.TrimSpace(provider.PricingProvider)
+	}
+	if catalogProvider == "" {
+		catalogProvider = strings.ToLower(strings.TrimSpace(providerID))
+	}
+	catalogModel := strings.TrimSpace(ref.Model)
+	if catalogModel == "" {
+		catalogModel = strings.TrimSpace(model.Remote)
+	}
+	if catalogProvider == "" || catalogModel == "" {
+		return config.PricingRef{}, false
+	}
+	return config.PricingRef{Provider: catalogProvider, Model: catalogModel}, true
+}
+
+// providerPricingNames lists every name a provider model can be recorded under:
+// the prefixed and provider-qualified forms the routing layer registers, plus
+// the bare names the bare-name pool makes callable.
+func providerPricingNames(providerID string, provider config.ProviderConfig, model config.ProviderModel) []string {
+	seen := make(map[string]struct{}, 8)
+	names := make([]string, 0, 8)
+	add := func(name string) {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return
+		}
+		if _, duplicate := seen[name]; duplicate {
+			return
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	for _, name := range providerActivityNames(providerID, provider, model) {
+		add(name)
+	}
+	for _, name := range model.Names() {
+		add(name)
+	}
+	if provider.ExposesUpstreamName() {
+		add(model.Remote)
+	}
+	return names
 }
 
 func (mp *metricsMonitor) configureAudit(audit config.AuditConfig) {
@@ -348,19 +437,21 @@ func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *resp
 	}
 
 	if strings.Contains(recorder.Header().Get("Content-Type"), "text/event-stream") {
-		// First-token timing is measured from the response bytes alone, so it
-		// is computed before (and independently of) usage parsing. Coupling the
-		// two meant any stream without usage telemetry — which is most of them,
-		// a backend only sends usage when asked — reported -1: the usage parser
-		// failed, and the branch that recorded the timing never ran. The timing
-		// is a transport fact; the counters are a protocol fact.
-		firstContent, lastContent, hasContent := recorder.StreamingContentTimes()
-		if parsed, err := processStreamingResponse(modelID, recorder.StartTime(), body); err != nil {
+		// One walk of the captured body feeds all three stream consumers. The
+		// order they run in is unchanged: the usage pass first (its output token
+		// count anchors the speed curve), then the content-time pass, then the
+		// curve itself. Each consumer keeps its own view of the bytes — the
+		// usage consumers see joined frames, the timing consumers see lines —
+		// so the recorded values are the same as when each scanned the body on
+		// its own.
+		stream := scanStreamBody(body, recorder.writes, recorder.StartTime())
+		firstContent, lastContent, hasContent := stream.contentTimes()
+		if parsed, err := stream.usageEntry(modelID, recorder.StartTime()); err != nil {
 			mp.warnf("error processing streaming response: %v, path=%s, recording minimal metrics", err, r.URL.Path)
 		} else {
 			if hasContent {
 				applyObservedStreamingRates(&parsed, recorder.StartTime(), firstContent, lastContent)
-				parsed.SpeedTimeline = streamingSpeedTimeline(body, recorder.writes, recorder.StartTime(), parsed.Tokens.OutputTokens)
+				parsed.SpeedTimeline = stream.speedTimeline(recorder.StartTime(), parsed.Tokens.OutputTokens)
 			}
 			mergeParsedMetrics(&tm, &parsed)
 		}
@@ -394,7 +485,11 @@ func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *resp
 	} else {
 		mp.warnf("metrics: invalid JSON in response body path=%s, recording minimal metrics", r.URL.Path)
 	}
-	applyUsageTelemetry(&tm, body)
+	// The two telemetry consumers below read the same frames the stream scan
+	// already produced (or the whole body, when the response is one JSON
+	// document), so the body is not walked again for them.
+	frames := sseFrames(body)
+	applyUsageTelemetryFrames(&tm, frames)
 	if mp.controlMetrics != nil {
 		mp.controlMetrics.observeUsage(tm)
 	}
@@ -404,7 +499,7 @@ func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *resp
 	// labels. The persisted store still provides restart-safe aggregate queries.
 	currentCacheHit := tm.Tokens.CachedTokens > 0 || tm.CacheHitRatio > 0
 	hasCurrentCacheTelemetry := tm.PrefixHash != "" || currentCacheHit || tm.CacheCreationTokens > 0
-	if mp.applySessionUsage(&tm, body) {
+	if mp.applySessionUsageFrames(&tm, frames) {
 		hasCurrentCacheTelemetry = true
 	}
 	if mp.cacheObserver != nil && hasCurrentCacheTelemetry {
@@ -434,7 +529,20 @@ func (mp *metricsMonitor) applySessionUsage(entry *ActivityLogEntry, body []byte
 	if mp == nil || mp.sessionUsage == nil || entry == nil || strings.TrimSpace(entry.SessionID) == "" {
 		return false
 	}
-	usage := anthropiccache.ExtractUsage(body)
+	return mp.applySessionUsageFrames(entry, sseFrames(body))
+}
+
+// applySessionUsageFrames is applySessionUsage for a body that has already been
+// split into frames, so a caller that scanned the body does not scan it again.
+func (mp *metricsMonitor) applySessionUsageFrames(entry *ActivityLogEntry, frames []json.RawMessage) bool {
+	if mp == nil || mp.sessionUsage == nil || entry == nil || strings.TrimSpace(entry.SessionID) == "" {
+		return false
+	}
+	raw := make([][]byte, len(frames))
+	for i, frame := range frames {
+		raw[i] = frame
+	}
+	usage := anthropiccache.ExtractUsageFrames(raw)
 	if usage.CacheReadInputTokens <= 0 && usage.CacheCreationInputTokens <= 0 && usage.UncachedInputTokens <= 0 {
 		return false
 	}
@@ -446,7 +554,7 @@ func (mp *metricsMonitor) applyEstimatedCost(entry *ActivityLogEntry, path strin
 	if entry == nil {
 		return
 	}
-	price, ok := mp.lookupPrice(entry.Model)
+	price, ok := mp.lookupPrice(entry.Model, entry.Provider)
 	if !ok {
 		return
 	}
@@ -483,48 +591,174 @@ func (mp *metricsMonitor) applyEstimatedCost(entry *ActivityLogEntry, path strin
 	entry.CostEstimated = true
 }
 
-func (mp *metricsMonitor) lookupPrice(model string) (store.Price, bool) {
+// priceAmbiguityPolicy mirrors config.ModelsDevPricingConfig.Ambiguity.
+type priceAmbiguityPolicy int
+
+const (
+	// priceAmbiguityStrict never guesses: several catalog entries for one model
+	// name mean no price at all. A hand-entered operator row is not a guess.
+	priceAmbiguityStrict priceAmbiguityPolicy = iota
+	// priceAmbiguityProviderFirst prefers the official vendor's entry, then the
+	// entry of the provider that served the request, then the only entry with
+	// non-zero rates, and gives up when the choice is still not determined.
+	priceAmbiguityProviderFirst
+	// priceAmbiguityLowest is provider-first, falling back to the cheapest
+	// remaining entry (with a deterministic tie-break) instead of giving up.
+	priceAmbiguityLowest
+)
+
+func priceAmbiguityFromConfig(value string) priceAmbiguityPolicy {
+	switch strings.TrimSpace(value) {
+	case config.PricingAmbiguityStrict:
+		return priceAmbiguityStrict
+	case config.PricingAmbiguityLowest:
+		return priceAmbiguityLowest
+	default:
+		return priceAmbiguityProviderFirst
+	}
+}
+
+// priceResolution carries what lookupPrice knows about a request into the
+// ambiguity resolver.
+type priceResolution struct {
+	model string
+	// attribution is the provider that served the request ("" for local
+	// models), matched case-insensitively against catalog provider ids.
+	attribution string
+	// vendors maps a model-name prefix to the catalog provider id treated as
+	// the model's official vendor; nil disables the step.
+	vendors map[string]string
+	policy  priceAmbiguityPolicy
+}
+
+// resolveAmbiguousPrice picks one row out of several catalog entries that
+// carry the same model name. In order:
+//
+//  1. a lone operator-owned row — a hand-entered price is an explicit
+//     statement, not a guess, so it wins even under the strict policy;
+//  2. the official vendor's row ("gemini" -> google): resellers quote wildly
+//     different rates for the same model and the vendor's own list price is
+//     the estimate the operator asked for;
+//  3. the row of the provider that served the request — what the caller
+//     actually pays through when that provider is itself in the catalog;
+//  4. a lone row with real rates beats zero-rate token-plan rows;
+//  5. the "lowest" policy finally prices at the cheapest survivor (stable
+//     tie-break); anything else gives up.
+func resolveAmbiguousPrice(rows []store.Price, resolution priceResolution) (store.Price, bool) {
+	var operator []store.Price
+	for _, row := range rows {
+		if row.Source == "operator" {
+			operator = append(operator, row)
+		}
+	}
+	if len(operator) == 1 {
+		return operator[0], true
+	}
+	if resolution.policy == priceAmbiguityStrict {
+		return store.Price{}, false
+	}
+	if vendor, ok := config.VendorForModel(resolution.vendors, resolution.model); ok {
+		for _, row := range rows {
+			if strings.EqualFold(row.Provider, vendor) {
+				return row, true
+			}
+		}
+	}
+	if trimmed := strings.TrimSpace(resolution.attribution); trimmed != "" {
+		for _, row := range rows {
+			if strings.EqualFold(row.Provider, trimmed) {
+				return row, true
+			}
+		}
+	}
+	priced := make([]store.Price, 0, len(rows))
+	for _, row := range rows {
+		if row.Input > 0 || row.Output > 0 || row.CacheRead > 0 || row.CacheWrite > 0 || row.Reasoning > 0 {
+			priced = append(priced, row)
+		}
+	}
+	switch {
+	case len(priced) == 1:
+		return priced[0], true
+	case len(priced) == 0, resolution.policy != priceAmbiguityLowest:
+		return store.Price{}, false
+	}
+	sort.Slice(priced, func(i, j int) bool {
+		if priced[i].Output != priced[j].Output {
+			return priced[i].Output < priced[j].Output
+		}
+		if priced[i].Input != priced[j].Input {
+			return priced[i].Input < priced[j].Input
+		}
+		return priced[i].Provider < priced[j].Provider
+	})
+	return priced[0], true
+}
+
+// lookupPrice resolves the catalog price for one recorded model. attribution
+// is the provider that served the request (empty for local models); it steers
+// the ambiguity policy but never overrides an explicit pricing ref.
+func (mp *metricsMonitor) lookupPrice(model, attribution string) (store.Price, bool) {
 	if mp == nil || strings.TrimSpace(model) == "" {
 		return store.Price{}, false
 	}
 	model = strings.TrimSpace(model)
+	attribution = strings.TrimSpace(attribution)
 	now := time.Now()
+	cacheKey := model + "\x00" + attribution
 	mp.priceMu.Lock()
 	if mp.priceStore == nil {
 		mp.priceMu.Unlock()
 		return store.Price{}, false
 	}
-	if cached, ok := mp.priceCache[model]; ok && cached.expires.After(now) {
+	if cached, ok := mp.priceCache[cacheKey]; ok && cached.expires.After(now) {
 		mp.priceMu.Unlock()
 		return cached.price, cached.found && !cached.ambiguous
 	}
 	ref := mp.priceRefs[model]
 	st := mp.priceStore
+	policy := mp.priceAmbiguity
+	vendors := mp.priceVendors
 	mp.priceMu.Unlock()
 	var prices []store.Price
-	var err error
 	if strings.TrimSpace(ref.Provider) != "" || strings.TrimSpace(ref.Model) != "" {
 		providerModel := strings.TrimSpace(ref.Model)
 		if providerModel == "" {
 			providerModel = model
 		}
-		prices, err = st.FindPrices(context.Background(), strings.TrimSpace(ref.Provider), providerModel)
-	} else {
-		prices, err = st.FindPrices(context.Background(), "", model)
+		if matched, err := st.FindPrices(context.Background(), strings.TrimSpace(ref.Provider), providerModel); err == nil && len(matched) == 1 {
+			prices = matched
+		}
+	}
+	// A ref that resolves to nothing (or to several rows, which the primary
+	// key makes impossible today but costs nothing to handle) falls through to
+	// the bare-name path instead of hard-blocking the estimate.
+	if len(prices) != 1 {
+		if found, err := st.FindPrices(context.Background(), "", model); err == nil {
+			prices = found
+		} else {
+			prices = nil
+		}
 	}
 	lookup := priceLookup{expires: now.Add(5 * time.Minute)}
-	if err == nil {
-		lookup.found = len(prices) > 0
-		lookup.ambiguous = len(prices) != 1
-		if len(prices) == 1 {
-			lookup.price = prices[0]
+	switch {
+	case len(prices) == 1:
+		lookup.found = true
+		lookup.price = prices[0]
+	case len(prices) > 1:
+		resolution := priceResolution{model: model, attribution: attribution, vendors: vendors, policy: policy}
+		if price, ok := resolveAmbiguousPrice(prices, resolution); ok {
+			lookup.found = true
+			lookup.price = price
+		} else {
+			lookup.ambiguous = true
 		}
 	}
 	mp.priceMu.Lock()
 	if mp.priceCache == nil {
 		mp.priceCache = make(map[string]priceLookup)
 	}
-	mp.priceCache[model] = lookup
+	mp.priceCache[cacheKey] = lookup
 	mp.priceMu.Unlock()
 	return lookup.price, lookup.found && !lookup.ambiguous
 }
@@ -879,11 +1113,11 @@ func processStreamingResponse(modelID string, start time.Time, body []byte) (Act
 		inputTokens, outputTokens int64
 		cachedTokens              int64 = -1
 		hasAny                    bool
+		usage                     gjson.Result
 		timings                   gjson.Result
 		responseMetrics           gjson.Result
 	)
 
-	var eventData bytes.Buffer
 	consume := func(data []byte) {
 		data = bytes.TrimSpace(data)
 		if len(data) == 0 || bytes.Equal(data, []byte("[DONE]")) || !gjson.ValidBytes(data) {
@@ -910,6 +1144,9 @@ func processStreamingResponse(modelID string, start time.Time, body []byte) (Act
 			if c >= 0 {
 				cachedTokens = c
 			}
+			// Remember the last usage block so buildMetrics can read the rates
+			// a backend embeds there (TabbyAPI, oMLX).
+			usage = u
 		}
 		if t := parsed.Get("timings"); t.Exists() {
 			timings = t
@@ -920,59 +1157,22 @@ func processStreamingResponse(modelID string, start time.Time, body []byte) (Act
 			hasAny = true
 		}
 	}
-	flush := func() {
-		if eventData.Len() == 0 {
-			return
-		}
-		consume(eventData.Bytes())
-		eventData.Reset()
-	}
-	for offset := 0; offset < len(body); {
-		nl := bytes.IndexByte(body[offset:], '\n')
-		var line []byte
-		if nl == -1 {
-			line = body[offset:]
-			offset = len(body)
-		} else {
-			line = body[offset : offset+nl]
-			offset += nl + 1
-		}
-		line = bytes.TrimSuffix(line, []byte{'\r'})
-		trimmed := bytes.TrimSpace(line)
-		if len(trimmed) == 0 {
-			flush()
-			continue
-		}
-		if !bytes.HasPrefix(trimmed, []byte("data:")) {
-			continue
-		}
-		payload := bytes.TrimSpace(bytes.TrimPrefix(trimmed, []byte("data:")))
-		// Accept providers that omit the blank line between complete JSON events,
-		// while still joining genuine multiline SSE data fields.
-		if eventData.Len() > 0 && gjson.ValidBytes(bytes.TrimSpace(eventData.Bytes())) {
-			flush()
-		}
-		if bytes.Equal(payload, []byte("[DONE]")) {
-			flush()
-			continue
-		}
-		if eventData.Len() > 0 {
-			eventData.WriteByte('\n')
-		}
-		eventData.Write(payload)
-	}
-	flush()
+	// The frame join (blank line, or a data line that already completes a JSON
+	// object) is the scanner's job, so this consumer only sees whole events.
+	scanSSEBody(body, nil, func(data []byte) {
+		consume(data)
+	})
 
 	if !hasAny {
 		return ActivityLogEntry{}, fmt.Errorf("no valid JSON data found in stream")
 	}
 
-	return buildMetrics(modelID, start, inputTokens, outputTokens, cachedTokens, timings, responseMetrics), nil
+	return buildMetrics(modelID, start, inputTokens, outputTokens, cachedTokens, usage, timings, responseMetrics), nil
 }
 
 func parseMetrics(modelID string, start time.Time, usage, timings, responseMetrics gjson.Result) (ActivityLogEntry, error) {
 	input, output, cached, _ := extractUsageTokens(usage)
-	return buildMetrics(modelID, start, input, output, cached, timings, responseMetrics), nil
+	return buildMetrics(modelID, start, input, output, cached, usage, timings, responseMetrics), nil
 }
 
 // applyUsageTelemetry fills Anthropic's cache-specific counters and reasoning
@@ -980,6 +1180,16 @@ func parseMetrics(modelID string, start time.Time, usage, timings, responseMetri
 // additive and therefore safe for mixed backends.
 func applyUsageTelemetry(entry *ActivityLogEntry, body []byte) {
 	if entry == nil || len(body) == 0 {
+		return
+	}
+	applyUsageTelemetryFrames(entry, sseFrames(body))
+}
+
+// applyUsageTelemetryFrames applies the cache/counters telemetry of already
+// scanned frames. A frame is a JSON object, or the whole body when it is one
+// JSON document rather than a stream.
+func applyUsageTelemetryFrames(entry *ActivityLogEntry, frames []json.RawMessage) {
+	if entry == nil {
 		return
 	}
 	apply := func(usage gjson.Result) {
@@ -1071,61 +1281,37 @@ func applyUsageTelemetry(entry *ActivityLogEntry, body []byte) {
 			}
 		}
 	}
-	if gjson.ValidBytes(body) {
-		parsed := gjson.ParseBytes(body)
+	for _, frame := range frames {
+		if !gjson.ValidBytes(frame) {
+			continue
+		}
+		parsed := gjson.ParseBytes(frame)
 		apply(parsed.Get("usage"))
 		apply(parsed.Get("message.usage"))
 		apply(parsed.Get("response.usage"))
-		return
 	}
-	var eventData bytes.Buffer
-	flush := func() {
-		data := bytes.TrimSpace(eventData.Bytes())
+}
+
+// sseFrames splits a captured body into the JSON documents its consumers read.
+// A body that is itself one JSON document (a non-streaming response) yields
+// that document, so the callers do not have to branch on the content type.
+func sseFrames(body []byte) []json.RawMessage {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return nil
+	}
+	if gjson.ValidBytes(trimmed) {
+		return []json.RawMessage{trimmed}
+	}
+	var frames []json.RawMessage
+	scanSSEBody(body, nil, func(data []byte) {
+		data = bytes.TrimSpace(data)
 		if len(data) == 0 || bytes.Equal(data, []byte("[DONE]")) {
-			eventData.Reset()
 			return
 		}
-		if gjson.ValidBytes(data) {
-			parsed := gjson.ParseBytes(data)
-			apply(parsed.Get("usage"))
-			apply(parsed.Get("message.usage"))
-			apply(parsed.Get("response.usage"))
-		}
-		eventData.Reset()
-	}
-	for offset := 0; offset < len(body); {
-		nl := bytes.IndexByte(body[offset:], '\n')
-		var line []byte
-		if nl < 0 {
-			line = body[offset:]
-			offset = len(body)
-		} else {
-			line = body[offset : offset+nl]
-			offset += nl + 1
-		}
-		line = bytes.TrimSuffix(line, []byte{'\r'})
-		trimmed := bytes.TrimSpace(line)
-		if len(trimmed) == 0 {
-			flush()
-			continue
-		}
-		if !bytes.HasPrefix(trimmed, []byte("data:")) {
-			continue
-		}
-		payload := bytes.TrimSpace(bytes.TrimPrefix(trimmed, []byte("data:")))
-		if eventData.Len() > 0 && gjson.ValidBytes(bytes.TrimSpace(eventData.Bytes())) {
-			flush()
-		}
-		if bytes.Equal(payload, []byte("[DONE]")) {
-			flush()
-			continue
-		}
-		if eventData.Len() > 0 {
-			eventData.WriteByte('\n')
-		}
-		eventData.Write(payload)
-	}
-	flush()
+		frames = append(frames, json.RawMessage(append([]byte(nil), data...)))
+	})
+	return frames
 }
 
 func saturatingUsageAdd(values ...int64) int64 {
@@ -1171,10 +1357,34 @@ func usageHasAny(value gjson.Result, paths ...string) bool {
 	return firstUsageResult(value, paths...).Exists()
 }
 
+// usageRate reads the first numeric value among paths from a usage block and
+// returns -1 when none is present. Null counts as absent: several backends
+// emit the key unconditionally and only fill it on some requests. A numeric
+// string is accepted because gateways occasionally re-encode numbers as text.
+func usageRate(usage gjson.Result, paths ...string) float64 {
+	for _, path := range paths {
+		value := usage.Get(path)
+		if !value.Exists() || value.Type == gjson.Null {
+			continue
+		}
+		switch value.Type {
+		case gjson.Number:
+			return value.Float()
+		case gjson.String:
+			if parsed, err := strconv.ParseFloat(strings.TrimSpace(value.String()), 64); err == nil {
+				return parsed
+			}
+		}
+	}
+	return -1
+}
+
 // buildMetrics composes an ActivityLogEntry from accumulated token counts and
 // optional llama-server timings (which override input/output and provide rates)
 // or vLLM response metrics (cache, rates and speculative decoding counters).
-func buildMetrics(modelID string, start time.Time, inputTokens, outputTokens, cachedTokens int64, timings, responseMetrics gjson.Result) ActivityLogEntry {
+// TabbyAPI and oMLX embed their rates in the usage block; those supply base
+// values that timings and response metrics override when present.
+func buildMetrics(modelID string, start time.Time, inputTokens, outputTokens, cachedTokens int64, usage, timings, responseMetrics gjson.Result) ActivityLogEntry {
 	wallDurationMs := int(time.Since(start).Milliseconds())
 	durationMs := wallDurationMs
 	tokensPerSecond := -1.0
@@ -1184,6 +1394,27 @@ func buildMetrics(modelID string, start time.Time, inputTokens, outputTokens, ca
 	cacheCreationTokens := 0
 	cacheHitRatio := 0.0
 	firstTokenMs := -1
+
+	// Base rates from the usage block. TabbyAPI spells them with the short
+	// suffix, oMLX with the long one; the short key wins when both are
+	// present. Values arrive as numbers, strings or null depending on the
+	// backend, so a null is treated as absent rather than as zero.
+	if usage.Exists() {
+		if value := usageRate(usage, "prompt_tokens_per_sec", "prompt_tokens_per_second"); value >= 0 {
+			promptPerSecond = metricPromptRate(value)
+		}
+		if value := usageRate(usage, "completion_tokens_per_sec", "generation_tokens_per_second"); value >= 0 {
+			tokensPerSecond = metricDecodeRate(value)
+		}
+		// TabbyAPI also reports the request's total time; use it as a lower
+		// bound so buffering cannot make the wall duration look shorter.
+		if totalSeconds := usageRate(usage, "total_time"); totalSeconds > 0 {
+			totalMs := totalSeconds * 1000
+			if totalMs > float64(durationMs) && totalMs < math.Ldexp(1, 63) {
+				durationMs = int(totalMs)
+			}
+		}
+	}
 
 	if timings.Exists() {
 		if value, ok := usageInt(timings.Get("prompt_n")); ok {
@@ -1246,13 +1477,13 @@ func buildMetrics(modelID string, start time.Time, inputTokens, outputTokens, ca
 		}
 		promptRate := metricPromptRate(firstMetricFloat(responseMetrics, "prompt_per_second", "prompt_tokens_per_second", "promptPerSecond", "promptTokensPerSecond"))
 		promptTokens := uncachedPromptTokens(inputTokens, cachedTokens)
+		// A backend that reports its own prefill window is authoritative: it
+		// measures the same thing with better data than a usage-embedded rate.
 		if prefillMs > 0 && promptTokens > 0 {
 			promptPerSecond = metricPromptRate(float64(promptTokens) / (prefillMs / 1000))
-		}
-		if promptPerSecond < 0 && timeToFirstTokenMs > 0 && promptTokens > 0 {
+		} else if timeToFirstTokenMs > 0 && promptTokens > 0 {
 			promptPerSecond = metricPromptRate(float64(promptTokens) / (timeToFirstTokenMs / 1000))
-		}
-		if promptPerSecond < 0 && promptRate >= 0 {
+		} else if promptRate >= 0 {
 			promptPerSecond = promptRate
 		}
 
@@ -1746,37 +1977,25 @@ func streamingContentTimes(body []byte, writes []responseBodyWrite) (time.Time, 
 		return time.Time{}
 	}
 
-	for offset := 0; offset < len(body); {
-		lineStart := offset
-		newline := bytes.IndexByte(body[offset:], '\n')
-		if newline < 0 {
-			offset = len(body)
-		} else {
-			offset += newline + 1
+	scanSSEBody(body, func(line sseLine) {
+		if !gjson.ValidBytes(line.payload) {
+			return
 		}
-		line := bytes.TrimSpace(body[lineStart:offset])
-		if !bytes.HasPrefix(line, []byte("data:")) {
-			continue
-		}
-		payload := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
-		if !gjson.ValidBytes(payload) {
-			continue
-		}
-		parsed := gjson.ParseBytes(payload)
+		parsed := gjson.ParseBytes(line.payload)
 		if !streamingEventHasText(parsed) {
-			continue
+			return
 		}
 		// The first content frame takes the earliest plausible bound inside a
 		// compaction hole; later frames (including the last) take the latest.
-		at := writeAt(offset, !first.IsZero())
+		at := writeAt(line.offset, !first.IsZero())
 		if at.IsZero() {
-			continue
+			return
 		}
 		if first.IsZero() {
 			first = at
 		}
 		last = at
-	}
+	}, nil)
 	if first.IsZero() || last.Before(first) {
 		return time.Time{}, time.Time{}, false
 	}

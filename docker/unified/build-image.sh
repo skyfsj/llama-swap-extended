@@ -384,7 +384,21 @@ if [[ "${VARIANT}" == "full" || "${VARIANT}" == "1cat-vllm" ]]; then
         exit 1
     fi
 
-    echo "audio.cpp verified: deployment build (compiled model spec catalog), binary runs"
+    # Kokoro, SanoTTS and Inflect phonemize with the eSpeak-ng linked into
+    # audio.cpp. It reads its data from espeak-ng-data next to the executable; a
+    # packed espeak-ng-data.bin there would be used instead and unpacked into
+    # $HOME/.cache, which is not writable in every image.
+    if ! docker run "${SMOKE_ARGS[@]}" --entrypoint sh "${DOCKER_IMAGE_TAG}" -c \
+            'test -f /usr/local/bin/espeak-ng-data/phontab &&
+             test -f /usr/local/bin/espeak-ng-data/en_dict &&
+             test ! -e /usr/local/bin/espeak-ng-data.bin &&
+             test -f /usr/local/share/audiocpp/licenses/espeak-ng/COPYING'; then
+        echo "ERROR: eSpeak-ng data or license files are missing from the image;"
+        echo "       Kokoro and other eSpeak-based audio.cpp models will fail."
+        exit 1
+    fi
+
+    echo "audio.cpp verified: deployment build (compiled model spec catalog), eSpeak-ng data, binary runs"
 else
     echo "audio.cpp checks skipped (not part of the ${VARIANT} variant)"
 fi

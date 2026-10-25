@@ -673,12 +673,36 @@ func redactPreview(preview Preview) Preview {
 
 func sensitivePath(path string) bool {
 	lower := strings.ToLower(path)
-	for _, token := range []string{"secret", "password", "token", "apikey", "api_key", "/env"} {
-		if strings.Contains(lower, token) {
-			return true
+	segment := lastPathSegment(lower)
+	for _, token := range []string{"secret", "password", "token", "apikey", "api_key"} {
+		if !strings.Contains(lower, token) {
+			continue
 		}
+		// A generation limit or a usage counter is a number, not a credential.
+		// The last path segment carries the field name the rules are written
+		// against, so max_tokens stays visible while access_token does not.
+		if token == "token" && !config.IsSensitiveConfigName(segment) {
+			continue
+		}
+		return true
+	}
+	// An env section holds NAME=value entries, and the environment rule is
+	// name-aware (GPU ordinals stay visible, credentials do not).
+	if strings.Contains(lower, "/env") || segment == "env" {
+		return true
 	}
 	return false
+}
+
+// lastPathSegment returns the final field name of a settings path, accepting
+// both dot ("a.b.c") and slash ("/a/b/c") notation. The caller lowercases when
+// case-insensitive comparison matters.
+func lastPathSegment(path string) string {
+	trimmed := strings.TrimRight(strings.ReplaceAll(path, "\\", "/"), "/")
+	if index := strings.LastIndexAny(trimmed, "./"); index >= 0 {
+		return trimmed[index+1:]
+	}
+	return trimmed
 }
 
 func (m *Manager) History(ctx context.Context, limit int) ([]Revision, error) {

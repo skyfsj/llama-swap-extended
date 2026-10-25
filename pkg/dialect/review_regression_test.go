@@ -2,6 +2,7 @@ package dialect
 
 import (
 	"encoding/json"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -496,6 +497,69 @@ func TestResponsesMidConversationSystemStaysInPlace(t *testing.T) {
 	}
 }
 
+// A Chat target may carry a system message only at the front: chat templates
+// such as Qwen's raise "System message must be at the beginning" for any later
+// one, which made every Responses request whose transcript ended with a system
+// turn fail upstream. The trailing turn must survive as user text instead of
+// being emitted as a second system message or dropped.
+func TestChatTargetDowngradesMidConversationSystem(t *testing.T) {
+	body := []byte(`{"model":"m","input":[
+		{"type":"message","role":"system","content":"SYS"},
+		{"type":"message","role":"user","content":"one"},
+		{"type":"message","role":"developer","content":"mid instruction"},
+		{"type":"message","role":"user","content":"two"},
+		{"type":"message","role":"system","content":"trailing reminder"}
+	]}`)
+	converted, _, err := ConvertRequest(OpenAIResponses, OpenAIChat, body, ConvertOptions{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages := decodeMap(t, converted)["messages"].([]any)
+	if len(messages) != 5 {
+		t.Fatalf("messages = %d, want 5: %s", len(messages), converted)
+	}
+	roles := make([]string, 0, len(messages))
+	for _, raw := range messages {
+		roles = append(roles, raw.(map[string]any)["role"].(string))
+	}
+	if roles[0] != "system" {
+		t.Fatalf("leading system turn lost its role: %v", roles)
+	}
+	for index, role := range roles[1:] {
+		if role == "system" || role == "developer" {
+			t.Fatalf("message %d is %q, but only the first may be a system turn: %v", index+1, role, roles)
+		}
+	}
+	if text := messages[4].(map[string]any)["content"]; text != "trailing reminder" {
+		t.Fatalf("trailing system content = %v, want the text preserved as user content", text)
+	}
+}
+
+// The same downgrade applies when the source is already Chat: a client that
+// sends a system turn in the middle must not round-trip it back out as system.
+func TestChatToChatKeepsOnlyLeadingSystem(t *testing.T) {
+	body := []byte(`{"model":"m","messages":[
+		{"role":"system","content":"SYS"},
+		{"role":"user","content":"one"},
+		{"role":"system","content":"mid"},
+		{"role":"user","content":"two"}
+	]}`)
+	converted, _, err := ConvertRequest(OpenAIChat, OpenAIChat, body, ConvertOptions{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages := decodeMap(t, converted)["messages"].([]any)
+	if len(messages) != 4 {
+		t.Fatalf("messages = %d, want 4: %s", len(messages), converted)
+	}
+	if role := messages[2].(map[string]any)["role"]; role != "user" {
+		t.Fatalf("mid-conversation system turn became %q, want user: %s", role, converted)
+	}
+	if role := messages[0].(map[string]any)["role"]; role != "system" {
+		t.Fatalf("leading system turn became %q, want system: %s", role, converted)
+	}
+}
+
 func TestDisableParallelReachesResponsesAndGeminiDiagnoses(t *testing.T) {
 	body := []byte(`{"model":"m","max_tokens":64,"messages":[{"role":"user","content":"hi"}],"tools":[{"name":"lookup","input_schema":{"type":"object"}}],"tool_choice":{"type":"auto","disable_parallel_tool_use":true}}`)
 	responses, _, err := ConvertRequest(ClaudeMessages, OpenAIResponses, body, ConvertOptions{Model: "m"})
@@ -550,17 +614,27 @@ func TestGeminiRequestConversionIsLinear(t *testing.T) {
 	large := build(400)
 	options := ConvertOptions{Model: "m"}
 
-	convert := func(body []byte) time.Duration {
-		started := time.Now()
-		for i := 0; i < 5; i++ {
-			if _, _, err := ConvertRequest(OpenAIChat, Gemini, body, options); err != nil {
-				t.Fatal(err)
+	// One conversion takes tens of microseconds, so a single wall-clock sample
+	// measures the scheduler as much as the converter. Each size is timed over
+	// enough iterations to dominate a pause, and the fastest of several rounds
+	// is kept so one interfering round cannot decide the ratio.
+	perConversion := func(body []byte, iterations int) time.Duration {
+		best := time.Duration(math.MaxInt64)
+		for round := 0; round < 9; round++ {
+			started := time.Now()
+			for i := 0; i < iterations; i++ {
+				if _, _, err := ConvertRequest(OpenAIChat, Gemini, body, options); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if elapsed := time.Since(started); elapsed < best {
+				best = elapsed
 			}
 		}
-		return time.Since(started)
+		return best / time.Duration(iterations)
 	}
-	smallDuration := convert(small)
-	largeDuration := convert(large)
+	smallDuration := perConversion(small, 2000)
+	largeDuration := perConversion(large, 100)
 	// 20x the messages must stay well under 20^2/2 = 200x the work; a
 	// quadratic rebuild lands near that bound, linear stays near 20x.
 	if largeDuration > smallDuration*60 {

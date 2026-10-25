@@ -806,6 +806,111 @@ func TestBaseRouter_ConfigRestartDrainsOldRequestAndServesWaitingRequest(t *test
 	}
 }
 
+// plainProcess hides the optional LifecycleConfigApplier capability behind
+// the bare Process interface, so tests can prove the router falls back to
+// restart semantics for embedders that cannot hot-apply lifecycle edits.
+type plainProcess struct {
+	process.Process
+}
+
+// TestBaseRouter_LifecycleEditHotAppliesWithoutRestart pins the
+// operator-visible contract: editing ttl, unloadTimeout or the sleep policy
+// on a running model applies into the live process and never raises the
+// "config modified, restart required" state.
+func TestBaseRouter_LifecycleEditHotAppliesWithoutRestart(t *testing.T) {
+	oldConfig := config.Config{
+		HealthCheckTimeout: 1,
+		Models: map[string]config.ModelConfig{
+			"a": {
+				Cmd:                "server-a",
+				UnloadAfter:        600,
+				UnloadTimeout:      30,
+				Backend:            config.BackendConfig{Lifecycle: config.LifecycleConfig{Mode: "sleep", SleepLevel: 1}},
+				HealthCheckTimeout: 1,
+			},
+		},
+	}
+	oldProcess := newFakeProcess("gen1")
+	oldProcess.markReady()
+
+	b := newTestBaseWithConfig(t, oldConfig, map[string]process.Process{"a": oldProcess}, &stubPlanner{})
+	var factoryCalls atomic.Int32
+	b.setProcessFactory(func(_ context.Context, _ string, _ config.ModelConfig) (process.Process, error) {
+		factoryCalls.Add(1)
+		return nil, fmt.Errorf("lifecycle edit must not create a process")
+	})
+
+	desired := oldConfig
+	desired.Models = map[string]config.ModelConfig{
+		"a": {
+			Cmd:                "server-a",
+			UnloadAfter:        900,
+			UnloadTimeout:      60,
+			Backend:            config.BackendConfig{Lifecycle: config.LifecycleConfig{Mode: "sleep", SleepLevel: 2}},
+			HealthCheckTimeout: 1,
+		},
+	}
+	if err := b.Reconfigure(desired, &stubPlanner{}, map[string]struct{}{"a": {}}); err != nil {
+		t.Fatalf("Reconfigure: %v", err)
+	}
+
+	if got := oldProcess.lifecycleUpdateCount(); got != 1 {
+		t.Fatalf("lifecycle updates pushed to the process = %d, want 1", got)
+	}
+	if status := b.ModelLifecycleStatuses()["a"]; status.ConfigStatus == scheduler.ConfigStatusModified {
+		t.Fatalf("lifecycle edit raised config status %q; it must hot-apply", status.ConfigStatus)
+	}
+	if got := factoryCalls.Load(); got != 0 {
+		t.Fatalf("process factory called %d times for a lifecycle edit, want 0", got)
+	}
+
+	// The stored snapshot must absorb the edit: replaying the same desired
+	// config is a no-op, not a second push.
+	if err := b.Reconfigure(desired, &stubPlanner{}, map[string]struct{}{"a": {}}); err != nil {
+		t.Fatalf("second Reconfigure: %v", err)
+	}
+	if got := oldProcess.lifecycleUpdateCount(); got != 1 {
+		t.Fatalf("lifecycle updates after identical reload = %d, want still 1 (snapshot not refreshed)", got)
+	}
+
+	// The pushed config is the desired one, so the TTL watcher and the
+	// sleep/wake handlers observe the operator's new values.
+	updates := oldProcess.lifecycleUpdates
+	if len(updates) != 1 || updates[0].UnloadAfter != 900 || updates[0].UnloadTimeout != 60 ||
+		updates[0].Backend.Lifecycle.SleepLevel != 2 || updates[0].Backend.Lifecycle.Mode != "sleep" {
+		t.Fatalf("pushed lifecycle config=%+v want the desired ttl/unloadTimeout/sleep policy", updates)
+	}
+}
+
+// TestBaseRouter_LifecycleEditFallsBackToRestartWithoutApplier covers
+// processes that do not implement the optional hot-apply capability: the
+// edit must keep the old restart semantics instead of being silently
+// dropped.
+func TestBaseRouter_LifecycleEditFallsBackToRestartWithoutApplier(t *testing.T) {
+	oldConfig := config.Config{
+		HealthCheckTimeout: 1,
+		Models: map[string]config.ModelConfig{
+			"a": {Cmd: "server-a", UnloadAfter: 600, HealthCheckTimeout: 1},
+		},
+	}
+	oldProcess := &plainProcess{Process: newFakeProcess("gen1")}
+	oldProcess.Process.(*fakeProcess).markReady()
+
+	b := newTestBaseWithConfig(t, oldConfig, map[string]process.Process{"a": oldProcess}, &stubPlanner{})
+
+	desired := oldConfig
+	desired.Models = map[string]config.ModelConfig{
+		"a": {Cmd: "server-a", UnloadAfter: 900, HealthCheckTimeout: 1},
+	}
+	if err := b.Reconfigure(desired, &stubPlanner{}, map[string]struct{}{"a": {}}); err != nil {
+		t.Fatalf("Reconfigure: %v", err)
+	}
+	if status := b.ModelLifecycleStatuses()["a"]; status.ConfigStatus != scheduler.ConfigStatusModified {
+		t.Fatalf("config status=%q want %q for a process without the applier capability",
+			status.ConfigStatus, scheduler.ConfigStatusModified)
+	}
+}
+
 func TestBaseRouter_ForceRestartFencesOldGeneration(t *testing.T) {
 	oldConfig := config.Config{
 		HealthCheckTimeout: 1,

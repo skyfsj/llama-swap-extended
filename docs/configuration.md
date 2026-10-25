@@ -627,6 +627,54 @@ credential, and `GET /api/auth/session` reports whether the presented one is
 valid. The login screen's anonymous poll carries no credential and is never
 counted.
 
+### Cross-origin requests (CORS)
+
+`security.cors` controls the `Access-Control-*` headers sent to browsers:
+
+```yaml
+security:
+  cors:
+    allowedOrigins:
+      - https://dashboard.example.com
+    allowCredentials: true
+    maxAge: 86400
+```
+
+Leaving `allowedOrigins` out keeps the permissive default llama-swap has always
+had: any origin may read responses. Setting it restricts that to the listed
+origins, each written as a bare `scheme://host[:port]` (a path or trailing
+slash never matches, so it is rejected at load time). `"*"` allows any origin
+deliberately; writing an empty list is an error rather than a silent
+allow-all. `allowCredentials` (cookies and `Authorization` across origins) and
+`allowPrivateNetwork` (Chrome's Private Network Access preflight) cannot be
+combined with `"*"`.
+
+Headers are only sent when the request carries an `Origin`, so `curl` and most
+SDKs see no CORS headers at all. Upstream CORS headers are stripped from
+proxied responses, keeping llama-swap the only source and preventing the
+duplicate-value fold that strict clients reject.
+
+`allowedOrigins` decides who may **read** a response. State-changing
+cross-origin requests to the management API (`/api/`) are rejected regardless:
+a browser page on another origin has no legitimate reason to drive the control
+plane with an ambient session cookie.
+
+### Global concurrency limit
+
+`globalConcurrencyLimit` caps how many inference requests are served at once
+across every model combined, using one shared semaphore:
+
+```yaml
+globalConcurrencyLimit: 8
+```
+
+The default `0` means no limit, and the middleware is then left out of the
+request chain entirely. Once the limit is reached, further requests are
+rejected immediately with `429 Too Many Requests` and `Retry-After: 1` rather
+than queued. Unlike `models.*.concurrencyLimit`, which only counts requests to
+one model, this protects shared hardware from traffic spread across many
+models.
+
 ## LMCache (optional KV-cache accelerator)
 
 LMCache is an optional module that accelerates repeated vLLM prompts with a
@@ -916,6 +964,59 @@ models:
       --cache-type-v q8_0
 ```
 
+## Documentation for agents (MCP)
+
+Gateway-owned tools, resource/prompt context, file uploads and conversation
+checkpoints are documented in [Protocol runtime](protocol-runtime.md).
+
+`POST /api/mcp` serves llama-swap's own documentation and a read-only view of
+the running configuration to an MCP client (Claude Code, Codex, any agent host):
+
+```json
+{"mcpServers": {"llama-swap": {"url": "http://localhost:8080/api/mcp"}}}
+```
+
+Three tool families are exposed:
+
+| Tool | Answers |
+| --- | --- |
+| `docs__list`, `docs__search`, `docs__get` | this documentation, indexed one section per entry, with the source file and line so a citation can be checked |
+| `config__get` | a jq query against the configuration this server is running right now, with credentials redacted |
+| `sys__overview` | build version, how many models/providers are configured, which are running, host hardware |
+
+`config__get` is the one to reach for when an agent gives advice about a
+deployment: it reads the live, source-aware configuration rather than a sample
+file, so the answer describes the server in front of it. Queries are evaluated
+against the document alone — the process environment is not in scope — and a
+result larger than 32 KB is refused rather than truncated.
+
+The endpoint speaks two MCP revisions, because both are in the wild: the
+stateless `2026-07-28` revision (`server/discover`, `Mcp-Protocol-Version` and
+`Mcp-Method` headers) and the classic `2025-06-18` handshake (`initialize`). It
+is authenticated like the rest of the inference API, so a client needs one of
+the configured API keys.
+
+## Loading progress from the health check
+
+While a model starts, its health check endpoint may answer with a non-200
+status and a JSON body describing progress:
+
+```json
+{"progress": 0.42, "message": "loading tensors"}
+```
+
+`progress` is a fraction from 0 to 1 and `message` a short step description;
+both are optional, and the message is trimmed to 1024 characters. The UI shows
+the percentage next to the model's state, a progress bar along the row, and
+the message.
+
+Aside from being informational, `progress` changes the timeout: every new
+value restarts the `healthCheckTimeout` countdown, so the timeout bounds how
+long a load may go **without progress** rather than how long it may take in
+total. A change in `message` alone does not count — a message can change while
+a load is stuck, e.g. a growing ETA. Bodies that do not carry either field,
+including llama-server's own loading response, behave exactly as before.
+
 ## Support for any OpenAI API compatible server
 
 llama-swap supports any OpenAI API compatible server. If you can run it on the CLI llama-swap will be able to manage it. Even if it's run in Docker or Podman containers.
@@ -969,8 +1070,163 @@ Setting `useModelName` (or `backend.launch.servedModelName` for a managed
 launch) overrides the name that is used, which is the escape hatch when the
 engine must serve a name other than the model ID.
 
-## Maintenance mode (disabling a model)
+## Per-model request filters
 
+`filters.setParams` and `filters.setParamsByID` force values into a request
+body, `stripParams` removes them, and `useModelName` rewrites the model field.
+A key ending in `?` is **set-if-undefined**: it is applied only when the request
+does not already carry that parameter.
+
+```yaml
+models:
+  qwen:
+    cmd: llama-server --port ${PORT} -m qwen.gguf
+    filters:
+      stripParams: "top_k"
+      setParams:
+        temperature: 0.2       # always forced
+        max_tokens?: 32768     # only when the client sent none
+```
+
+Filters apply like a pipe — `stripParams`, then `setParams`, then
+`setParamsByID` — so a stripped parameter counts as undefined and an earlier
+stage's value counts as defined. When a key is spelled both ways (`top_p` and
+`top_p?`), the plain spelling wins and is always applied.
+
+## Upstream keep-alive
+
+`disableKeepAlives` makes llama-swap open a new connection for every request to
+that model instead of reusing pooled ones:
+
+```yaml
+models:
+  llama:
+    cmd: llama-server --port ${PORT} -m model.gguf
+    disableKeepAlives: true
+```
+
+It works around upstreams that advertise `Keep-Alive` and then close the
+connection — llama-server does this after a streamed response, so a request
+made right after a stream can fail with `502 proxy error: EOF` without ever
+reaching the model. Keep-alive stays on by default, so `timeouts.idleConn` and
+the pool settings keep working everywhere else; with this option on,
+`timeouts.idleConn` has no effect.
+
+## Speech model voice lists
+
+`GET /v1/audio/voices` is a non-standard endpoint, and upstream answers vary in
+shape. `capabilities.voices` pins the list llama-swap returns, without starting
+the model or contacting the upstream:
+
+```yaml
+models:
+  tts:
+    cmd: audio-server --port ${PORT}
+    capabilities:
+      out: [audio]
+      voices: [alloy, echo, fable]
+```
+
+The list is answered verbatim, is never discovered at runtime, and is not
+rendered into `/v1/models`. Models without it keep forwarding the request
+upstream.
+
+## Capability discovery
+
+A `capabilities` block says what a model accepts and produces. Anything left
+out of it is filled in automatically: when a model becomes ready, llama-swap
+asks its upstream what it supports and remembers the answer, so the model list
+advertises a context length and modalities without you having to write them
+down.
+
+```yaml
+models:
+  qwen:
+    cmd: llama-server --port ${PORT} -m qwen.gguf
+  # discovers: in=text,image, out=text, tools, context from /props
+```
+
+Discovery reads the upstream's own report, and a field you set always wins over
+what it finds — so hand-setting one value does not cost you discovery for the
+rest:
+
+| Upstream | What it is asked | What is discovered |
+| --- | --- | --- |
+| llama-server, ik_llama.cpp (`owned_by: llamacpp`) | `/props` | input modalities (text, image, audio, video), tool support, context length of one generation slot |
+| halogen-flash-server (`owned_by: halogen`) | `/health` | vision input, tool support, context length |
+| any other OpenAI-compatible server | `/v1/models` | text in/out, and the context length the listing reports |
+
+Fields a server cannot report stay unset rather than guessed: a reranking
+server does not advertise `reranker`, and a
+server that lists no context length leaves it at zero.
+
+The probe runs once per model start and its result is cached (keyed by the
+model's command, proxy and served name), so a model that is unloaded and
+reloaded keeps advertising what it reported, and a restart of llama-swap does
+not lose it. Upstreams with no capability surface — an image or transcription
+server — simply produce nothing; that is not an error.
+
+To opt a model out, because its upstream reports something you do not want
+advertised:
+
+```yaml
+models:
+  sd:
+    cmd: sd-server --port ${PORT}
+    capabilities:
+      disableAuto: true
+```
+
+## Cost estimation (pricing)
+
+The usage records page estimates a cost per request from the public
+[models.dev](https://models.dev) catalog. The catalog is synchronized in the
+background (default every 24h, `pricing.modelsDev.refreshEvery`) and stored in
+SQLite, so estimates survive a restart. Estimates are never a bill.
+
+A request is priced by looking its recorded model name up in the catalog.
+Exact matches work on their own; everything else can be steered:
+
+- **A model entry can pin its catalog row** — `models.<id>.backend.pricing:
+  {provider, model}` for local models, `providers.<id>.models[].pricing` for
+  provider models. The model editor's pricing panel writes this for you.
+- **Provider models resolve by default** against the provider's own id
+  lowercased and the upstream model name, so a provider named `DeepSeek` prices
+  `deepseek-flash` against models.dev's `deepseek` entries with no
+  configuration. `providers.<id>.pricingProvider` overrides the catalog
+  provider.
+- **Several providers pricing the same name** is the normal case
+  (`glm-5.2` is listed by dozens of resellers). Resolution runs in order: a
+  lone row you edited by hand wins (an explicit price is not a guess), then
+  the **official vendor's** row — `pricing.modelsDev.vendors` maps name
+  prefixes to the catalog provider that counts as official. The built-in
+  table covers the major families (`gpt`/`o1`/`o3`/`o4` → openai,
+  `gemini` → google, `qwen`/`qvq`/`qwq` → alibaba, `glm` → zhipuai,
+  `claude` → anthropic, `kimi` → moonshotai, `grok` → xai, `doubao` →
+  volcengine, the mistral trademark family, and others), each verified
+  against the catalog; entries in `vendors` override or extend it. Then the
+  row of the provider that actually served the request, then the only row
+  with non-zero rates. `pricing.modelsDev.ambiguity` decides how it ends when
+  those steps still leave several candidates: `strict` refuses to estimate,
+  `provider-first` (the default) stops there, `lowest` falls back to the
+  cheapest remaining row. The provider of a row is matched
+  case-insensitively.
+
+Rows you add or edit by hand in the pricing panel (for a locally hosted model
+the catalog does not know, for example) are marked as yours and survive every
+catalog refresh; a refresh only rebuilds the rows it owns. Deleting a
+catalog-owned row is temporary by design — the next refresh restores what the
+source lists.
+
+## audio.cpp UI passthrough
+
+A local model configured under the reserved ID `audiocpp_auto` is exposed at
+`/audiocpp/`, the same way `/comfyui/` serves `comfyui_auto`. Requests do not
+name a model; every path under `/audiocpp/` is forwarded to the model with the
+prefix stripped. Only a request for `/audiocpp/` itself may start an unloaded
+model, so a stale browser tab cannot reload it.
+
+## Maintenance mode (disabling a model)
 `disabled: true` on a model takes it out of service without deleting it. The
 configuration, aliases and files stay exactly as they are, so bringing it back
 is a one-field change instead of a re-create:

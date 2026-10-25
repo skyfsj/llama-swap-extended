@@ -1,5 +1,6 @@
 import { writable, type Readable } from "svelte/store";
 import { t } from "../lib/i18n";
+import { apiUrl } from "../lib/apiPath";
 import {
   LOG_PANEL_LENGTH_LIMIT,
   renderLogTail,
@@ -80,7 +81,7 @@ export function streamModelLog(modelId: string): Readable<string> {
     while (isActive()) {
       let receivedData = false;
       try {
-        const res = await fetch(`/logs/stream/${encodeURIComponent(modelId)}`, {
+        const res = await fetch(apiUrl(`/logs/stream/${encodeURIComponent(modelId)}`), {
           method: "GET",
           cache: "no-store",
           credentials: "same-origin",

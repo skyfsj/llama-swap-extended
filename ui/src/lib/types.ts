@@ -46,6 +46,10 @@ export interface Model {
   oldRequests?: number;
   waitingRequests?: number;
   error?: string;
+  // Loading progress reported by the upstream's health check while the model
+  // is starting. Both are absent unless the upstream reports progress.
+  loadingProgress?: number;
+  loadingMessage?: string;
 }
 
 export interface ModelFile {
@@ -926,10 +930,19 @@ export interface HardwareSnapshot {
   capture: HardwareCapture;
   architecture: HardwareArchitecture;
   operating_system: HardwareOperatingSystem;
+  system: HardwareSystem;
   environment: HardwareEnvironment;
   cpu: HardwareCPU;
   memory: HardwareMemory;
   accelerators: HardwareAccelerator[];
+}
+
+// The physical machine, read from DMI product data. A null field means the
+// platform does not expose it.
+export interface HardwareSystem {
+  vendor: string | null;
+  model: string | null;
+  family: string | null;
 }
 
 export interface HardwareCapture {

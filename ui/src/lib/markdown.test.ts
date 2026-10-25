@@ -422,13 +422,45 @@ describe("renderStreamingMarkdown", () => {
   });
 });
 
-// Model output is untrusted: prompt injection can carry markup, so raw HTML,
-// event handlers, javascript: URLs and scripts must never reach the DOM.
+// Model output is untrusted: prompt injection can carry markup, so event
+// handlers, javascript:/data: URLs, scripts and other unsafe markup must
+// never reach the DOM. Raw HTML is parsed (rehype-raw) then filtered against
+// the schema allowlist: allowed elements survive, unknown tags are stripped
+// while their text stays visible.
 describe("markdown sanitization", () => {
-  it("strips inline HTML event handlers", () => {
+  it("strips inline HTML event handlers but keeps the element", () => {
     const html = renderMarkdown(`<img src=x onerror="alert(1)">`);
     expect(html).not.toContain("onerror");
-    expect(html).not.toContain("<img");
+    expect(html).not.toContain("alert(1)");
+    expect(html).toContain("<img");
+  });
+
+  it("keeps text inside block-level unknown HTML tags", () => {
+    // Agent traffic wraps user turns in tags like <system-reminder>; before
+    // rehype-raw the whole raw block (text included) was dropped and the
+    // audit transcript showed an empty bubble with a nonzero char count.
+    const html = renderMarkdown("<system-reminder>\nsome reminder text\n</system-reminder>");
+    expect(html).toContain("some reminder text");
+  });
+
+  it("keeps allowed block-level elements", () => {
+    const html = renderMarkdown("<div>\ntext inside\n</div>");
+    expect(html).toContain("<div>");
+    expect(html).toContain("text inside");
+  });
+
+  it("strips javascript: and data: image sources", () => {
+    const html = renderMarkdown(`<img src="javascript:alert(1)">next<img src="data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=">`);
+    expect(html).not.toContain("javascript:");
+    expect(html).not.toContain("data:image");
+    expect(html).toContain("<img>");
+  });
+
+  it("drops disallowed embeds like iframes but keeps surrounding text", () => {
+    const html = renderMarkdown(`<iframe src="https://evil.example"></iframe>text after`);
+    expect(html).not.toContain("<iframe");
+    expect(html).not.toContain("evil.example");
+    expect(html).toContain("text after");
   });
 
   it("strips script tags entirely", () => {

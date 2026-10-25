@@ -4,6 +4,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -20,10 +21,44 @@ import (
 type extensionLogRegistry struct {
 	mu       sync.Mutex
 	monitors map[string]*logmon.Monitor
+	// rotation is the rolling on-disk store shared by every extension log
+	// sink. It lives on the registry so its per-extension append handles stay
+	// open across requests instead of being reopened for every log line. A
+	// configuration reload rebuilds it when the log root or the retention
+	// settings change.
+	rotation     *extensionLogRotation
+	rotationRoot string
+	rotationCfg  config.ExtensionsConfig
 }
 
 func newExtensionLogRegistry() *extensionLogRegistry {
 	return &extensionLogRegistry{monitors: map[string]*logmon.Monitor{}}
+}
+
+// rotationFor returns the shared rolling store, created on first use from the
+// log root and extension configuration the server is running with.
+func (r *extensionLogRegistry) rotationFor(root string, cfg config.ExtensionsConfig) *extensionLogRotation {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.rotation != nil && r.rotationRoot == root && reflect.DeepEqual(r.rotationCfg, cfg) {
+		return r.rotation
+	}
+	if r.rotation != nil {
+		r.rotation.close()
+	}
+	r.rotation = newExtensionLogRotation(root, cfg)
+	r.rotationRoot = root
+	r.rotationCfg = cfg
+	return r.rotation
+}
+
+// close releases the rolling store's cached handles.
+func (r *extensionLogRegistry) close() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.rotation != nil {
+		r.rotation.close()
+	}
 }
 
 // monitorFor returns (creating if needed) the monitor for an extension.
@@ -101,6 +136,10 @@ type extensionLogRotation struct {
 	dir        string
 	maxDiskMiB int64
 	retainDays int
+	// files caches one append handle per extension so a chatty extension pays
+	// one open instead of one open per log line. The handle is opened on first
+	// use and dropped when the file is removed (prune) or the store is closed.
+	files map[string]*os.File
 }
 
 func newExtensionLogRotation(dir string, cfg config.ExtensionsConfig) *extensionLogRotation {
@@ -108,6 +147,7 @@ func newExtensionLogRotation(dir string, cfg config.ExtensionsConfig) *extension
 		dir:        extensionLogDir(dir),
 		maxDiskMiB: int64(cfg.EffectiveLogMaxDiskMiB()),
 		retainDays: cfg.EffectiveLogRetainDays(),
+		files:      map[string]*os.File{},
 	}
 }
 
@@ -119,13 +159,62 @@ func (r *extensionLogRotation) append(extensionID string, line string) {
 	if err := os.MkdirAll(r.dir, 0o700); err != nil {
 		return
 	}
-	target := filepath.Join(r.dir, extensionID+".log")
-	file, err := os.OpenFile(target, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	file, err := r.openLocked(extensionID)
 	if err != nil {
 		return
 	}
-	defer file.Close()
+	// A short write is reported nowhere: the rolling log is an operator aid, and
+	// the live broadcast (which every record also reaches) is the durable view.
 	_, _ = file.WriteString(line)
+}
+
+// openLocked returns the cached append handle for an extension, opening it on
+// first use. A file that has since been removed (by prune) is reopened.
+func (r *extensionLogRotation) openLocked(extensionID string) (*os.File, error) {
+	if r.files == nil {
+		r.files = map[string]*os.File{}
+	}
+	if file, ok := r.files[extensionID]; ok {
+		if _, err := os.Stat(file.Name()); err == nil {
+			return file, nil
+		}
+		// The file disappeared underneath the handle (prune removed it): close
+		// the stale descriptor and fall through to a fresh open.
+		_ = file.Close()
+		delete(r.files, extensionID)
+	}
+	target := filepath.Join(r.dir, extensionID+".log")
+	file, err := os.OpenFile(target, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	r.files[extensionID] = file
+	return file, nil
+}
+
+// dropLocked closes and forgets the cached handle for a log file name, so a
+// file removed by prune is reopened on the next append instead of writing
+// through a stale descriptor.
+func (r *extensionLogRotation) dropLocked(name string) {
+	id, ok := strings.CutSuffix(name, ".log")
+	if !ok {
+		return
+	}
+	if file, ok := r.files[id]; ok {
+		_ = file.Close()
+		delete(r.files, id)
+	}
+}
+
+// close drops every cached handle. It runs when the store is shut down so a
+// long-lived daemon does not hold a descriptor per extension forever.
+func (r *extensionLogRotation) close() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for id, file := range r.files {
+		_ = file.Close()
+		delete(r.files, id)
+	}
 }
 
 // prune enforces the retention policy: delete files older than retainDays and
@@ -156,6 +245,7 @@ func (r *extensionLogRotation) prune() {
 		total += info.Size()
 		if info.ModTime().Before(cutoff) {
 			_ = os.Remove(filepath.Join(r.dir, entry.Name()))
+			r.dropLocked(entry.Name())
 			continue
 		}
 		infos = append(infos, entryInfo{filepath.Join(r.dir, entry.Name()), info.ModTime(), info.Size()})
@@ -171,6 +261,7 @@ func (r *extensionLogRotation) prune() {
 			break
 		}
 		_ = os.Remove(info.path)
+		r.dropLocked(filepath.Base(info.path))
 		total -= info.size
 	}
 }

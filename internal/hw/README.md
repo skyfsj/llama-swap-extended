@@ -51,6 +51,25 @@ CPU, operating-system, environment, and accelerator fields are best effort. A
 failed optional probe leaves its fields `null`, uses an allowed unknown value,
 or produces an empty accelerator list.
 
+### Machine identity (`system`)
+
+On Linux the snapshot carries the physical machine read from DMI product data
+(`/sys/class/dmi/id`): `vendor`, `model` and `family`. It answers "which box is
+this?", which the CPU model cannot when several nodes run the same processor.
+
+`product_version` is preferred for `model` when it is descriptive, because
+vendors put the marketing name there (ThinkStation PGX) and the machine type in
+`product_name` (30KL0004FC). Values that are a bare revision (`1.0`, `0001`),
+`Not Specified`, or one of the standard placeholder strings ("To be filled by
+O.E.M.", "System Product Name", "Not Defined", …) are treated as absent rather
+than reported, so a placeholder never reaches the UI as a model name.
+
+The same probe fills in `cpu.socket_count` from the CPU topology when
+per-platform detection could not: arm64 systems have no `physical id` in
+`/proc/cpuinfo`, so the count comes from the distinct
+`topology/physical_package_id` values instead. A machine with neither keeps an
+unknown (`null`) socket count.
+
 ## Snapshot concepts
 
 ### Inference-host scope

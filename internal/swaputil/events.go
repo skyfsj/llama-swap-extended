@@ -16,6 +16,7 @@ const InFlightRequestsEventID = 0x07
 const ProfileChangedEventID = 0x08
 const BackendProgressEventID = 0x09
 const ModelStatusesChangedEventID = 0x0A
+const ModelCapabilitiesChangedEventID = 0x0B
 
 // ProcessStateChangeEvent is emitted whenever a process transitions between
 // lifecycle states. States are carried as strings so this package stays a leaf
@@ -43,6 +44,18 @@ type ConfigFileChangedEvent struct {
 
 func (e ConfigFileChangedEvent) Type() uint32 {
 	return ConfigFileChangedEventID
+}
+
+// ModelCapabilitiesChangedEvent is emitted when capability discovery learned
+// something new for a model. Discovery finishes after the process reported
+// itself ready, so the model list pushed on that state change predates the
+// probe; this event is what tells subscribers to re-read the listing.
+type ModelCapabilitiesChangedEvent struct {
+	ModelID string
+}
+
+func (e ModelCapabilitiesChangedEvent) Type() uint32 {
+	return ModelCapabilitiesChangedEventID
 }
 
 // ModelStatusesChangedEvent tells SSE subscribers that scheduler lifecycle

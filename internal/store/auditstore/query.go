@@ -483,6 +483,12 @@ func (s *Store) BodySize(hash string) (int64, error) {
 
 // blockData reads one block, consulting the in-memory index first and the
 // database second (a block written by another process instance).
+//
+// A decode failure means the index disagrees with the segment file — a stale
+// offset from a compaction that crashed before its index update, or one written
+// before offsets were persisted at all. One repair pass per segment rebuilds
+// the misplaced offsets from the frames themselves; blocks are
+// content-addressed, so every placement is verified against the recorded hash.
 func (s *Store) blockData(hash string) ([]byte, error) {
 	ref, ok := s.segments.lookup(hash)
 	if !ok {
@@ -498,29 +504,215 @@ func (s *Store) blockData(hash string) ([]byte, error) {
 		s.segments.loadIndex([]blockRef{loaded})
 		ref = loaded
 	}
-	return s.segments.get(ref)
+	data, err := s.segments.get(ref)
+	if err == nil {
+		return data, nil
+	}
+	if errors.Is(err, ErrBlockNotFound) {
+		return nil, ErrBlockNotFound
+	}
+	if !s.repairSegment(ref.Segment) {
+		return nil, err
+	}
+	// The repair either relocated the block (retry through the fresh in-memory
+	// ref) or proved its bytes are gone (clean miss instead of a decode error).
+	updated, ok := s.segments.lookup(hash)
+	if !ok {
+		return nil, ErrBlockNotFound
+	}
+	return s.segments.get(updated)
 }
+
+// auditRepairCooldown spaces out repair attempts per segment so a segment that
+// cannot be fixed costs one scan per minute, not one per read.
+const auditRepairCooldown = time.Minute
+
+// repairSegment rebuilds the offsets of one segment from its frames. It
+// reports whether the index changed. Attempts are serialized against
+// compaction (both rewrite the same file) and rate-limited per segment.
+func (s *Store) repairSegment(name string) bool {
+	if s == nil || s.db == nil || strings.TrimSpace(name) == "" {
+		return false
+	}
+	s.repairMu.Lock()
+	defer s.repairMu.Unlock()
+	if time.Since(s.repairAttempted[name]) < auditRepairCooldown {
+		return false
+	}
+	s.repairAttempted[name] = time.Now()
+	defer s.segments.lockCompaction()()
+
+	ordered, err := s.segmentBlocksByCreation(name)
+	if err != nil || len(ordered) == 0 {
+		return false
+	}
+	found, missing, err := s.segments.repairIndex(name, ordered)
+	if err != nil {
+		return false
+	}
+	if len(found) == 0 && len(missing) == 0 {
+		return false
+	}
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, ref := range found {
+		if _, err := tx.Exec(`UPDATE blocks SET offset = ?, length = ? WHERE hash = ?`, ref.Offset, ref.Length, ref.Hash); err != nil {
+			return false
+		}
+	}
+	for _, hash := range missing {
+		if _, err := tx.Exec(`DELETE FROM blocks WHERE hash = ? AND segment = ?`, hash, name); err != nil {
+			return false
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false
+	}
+	if len(found) > 0 {
+		s.segments.loadIndex(found)
+	}
+	if len(missing) > 0 {
+		s.segments.forget(missing)
+	}
+	return true
+}
+
+// segmentBlocksByCreation loads one segment's block references in file order:
+// compaction preserves creation order and appends only grow the file, so
+// creation time (then the recorded offset) is the order the frames appear in.
+func (s *Store) segmentBlocksByCreation(name string) ([]blockRef, error) {
+	rows, err := s.db.Query(`SELECT hash, size, compressed_size, segment, offset, length, first_seen FROM blocks WHERE segment = ?`, name)
+	if err != nil {
+		return nil, fmt.Errorf("list audit blocks for repair: %w", err)
+	}
+	defer rows.Close()
+	type indexed struct {
+		blockRef
+		firstSeen int64
+	}
+	refs := make([]indexed, 0, 64)
+	for rows.Next() {
+		var entry indexed
+		if err := rows.Scan(&entry.Hash, &entry.Size, &entry.Compressed, &entry.Segment, &entry.Offset, &entry.Length, &entry.firstSeen); err != nil {
+			return nil, fmt.Errorf("scan audit blocks for repair: %w", err)
+		}
+		refs = append(refs, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read audit blocks for repair: %w", err)
+	}
+	sort.Slice(refs, func(i, j int) bool {
+		if refs[i].firstSeen != refs[j].firstSeen {
+			return refs[i].firstSeen < refs[j].firstSeen
+		}
+		return refs[i].Offset < refs[j].Offset
+	})
+	ordered := make([]blockRef, len(refs))
+	for i, entry := range refs {
+		ordered[i] = entry.blockRef
+	}
+	return ordered, nil
+}
+
+// blockInsertGrace shields blocks whose bookkeeping is still in flight from a
+// concurrent compaction. A block's bytes land in the segment before its index
+// row exists, and the row is committed with refcount 0 before the referencing
+// body bumps it to 1 — both windows span only the milliseconds of one Insert,
+// but a compaction pass running in that window would otherwise drop bytes a
+// committed transaction is about to reference. The cost is that freshly
+// deleted blocks wait out the grace before their bytes are reclaimed, which
+// the 10-minute maintenance cadence never notices.
+const blockInsertGrace = 2 * time.Second
 
 // CompactSegments rewrites the segment files keeping only referenced blocks and
 // removes segments whose day has fully expired. It returns reclaimed bytes and
 // the number of dropped blocks.
+//
+// Compaction moves the surviving blocks to new offsets, so the references the
+// database recorded before the rewrite are stale the moment the new file
+// lands. They are persisted here, before the call returns: the in-memory index
+// keeps reads working either way, but a restart reloads offsets from the
+// database, and skipping this write would turn every moved block into a
+// decode failure after the next restart.
 func (s *Store) CompactSegments(ctx context.Context) (int64, int, error) {
 	if s == nil || s.db == nil {
 		return 0, 0, errors.New("audit store is unavailable")
 	}
-	live, err := s.liveBlocks(ctx)
-	if err != nil {
-		return 0, 0, err
+	graceCutoff := time.Now().Add(-blockInsertGrace).Unix()
+	type blockRow struct {
+		refcount int64
+		lastSeen int64
 	}
-	reclaimed, dropped, err := s.segments.compact(live)
+	rows := make(map[string]blockRow)
+	{
+		cursor, err := s.db.QueryContext(ctx, `SELECT hash, refcount, last_seen FROM blocks`)
+		if err != nil {
+			return 0, 0, fmt.Errorf("list audit block states: %w", err)
+		}
+		defer cursor.Close()
+		for cursor.Next() {
+			var hash string
+			var row blockRow
+			if err := cursor.Scan(&hash, &row.refcount, &row.lastSeen); err != nil {
+				return 0, 0, fmt.Errorf("scan audit block states: %w", err)
+			}
+			rows[hash] = row
+		}
+		if err := cursor.Err(); err != nil {
+			return 0, 0, fmt.Errorf("read audit block states: %w", err)
+		}
+	}
+	keep := func(hash string) bool {
+		row, known := rows[hash]
+		if !known {
+			// Bytes can be in the file before their index row commits; a hash
+			// with no row at all is an insert in flight, not garbage. A failed
+			// insert leaks its bytes until the next process restart.
+			return true
+		}
+		if row.refcount > 0 {
+			return true
+		}
+		// Unreferenced, but possibly still waiting for the body transaction
+		// that bumps it to 1.
+		return row.lastSeen >= graceCutoff
+	}
+	moved, reclaimed, dropped, err := s.segments.compact(keep)
 	if err != nil {
 		return reclaimed, dropped, err
 	}
-	// Blocks whose bytes are gone must not stay in the index.
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM blocks WHERE refcount <= 0`); err != nil {
+	if len(moved) > 0 {
+		if err := s.persistBlockRefs(ctx, moved); err != nil {
+			return reclaimed, dropped, fmt.Errorf("persist audit block offsets: %w", err)
+		}
+	}
+	// Blocks whose bytes are gone must not stay in the index. The grace window
+	// mirrors the keep predicate: a refcount-0 row can still be waiting for its
+	// referencing body transaction.
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM blocks WHERE refcount <= 0 AND last_seen < ?`, graceCutoff); err != nil {
 		return reclaimed, dropped, fmt.Errorf("prune audit block index: %w", err)
 	}
 	return reclaimed, dropped, nil
+}
+
+// persistBlockRefs writes compaction's new offsets in one transaction. A crash
+// between the file rewrite and this commit leaves stale database offsets; the
+// repair scanner on the read path rebuilds them from the frames themselves.
+func (s *Store) persistBlockRefs(ctx context.Context, refs []blockRef) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, ref := range refs {
+		if _, err := tx.ExecContext(ctx, `UPDATE blocks SET offset = ?, length = ? WHERE hash = ?`, ref.Offset, ref.Length, ref.Hash); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // DropExpiredSegments deletes whole day segments older than the cutoff: the
@@ -553,26 +745,6 @@ func (s *Store) DropExpiredSegments(ctx context.Context, before time.Time) (int6
 		reclaimed += freed
 	}
 	return reclaimed, nil
-}
-
-func (s *Store) liveBlocks(ctx context.Context) (map[string]bool, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT hash FROM blocks WHERE refcount > 0`)
-	if err != nil {
-		return nil, fmt.Errorf("list live audit blocks: %w", err)
-	}
-	defer rows.Close()
-	live := make(map[string]bool, 1024)
-	for rows.Next() {
-		var hash string
-		if err := rows.Scan(&hash); err != nil {
-			return nil, fmt.Errorf("scan live audit block: %w", err)
-		}
-		live[hash] = true
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("read live audit blocks: %w", err)
-	}
-	return live, nil
 }
 
 // Stats summarizes the audit store for diagnostics: row count, logical and

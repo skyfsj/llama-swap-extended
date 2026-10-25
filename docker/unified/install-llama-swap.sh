@@ -4,6 +4,9 @@
 #   version: release version number (e.g., "170") or "latest" (default)
 set -e
 
+# shellcheck source=lib-release.sh
+source "$(dirname "$0")/lib-release.sh"
+
 VERSION="${1:-latest}"
 # Default to this fork's releases; LS_BINARY_REPO overrides (e.g. to
 # mostlygeek/llama-swap when building with an upstream release binary).
@@ -22,8 +25,14 @@ if echo "${VERSION}" | grep -qE '^[0-9a-f]{7,40}$'; then
         echo "Resolved to tag: ${TAG}"
         VERSION="${TAG#v}"
     else
-        echo "No release tag found for commit ${VERSION:0:7}, using latest"
-        VERSION="latest"
+        # A commit hash with no release tag cannot be honoured here: this
+        # stage downloads a published release archive, and there is none for
+        # that revision. Falling back to latest would silently build a
+        # different revision than the operator pinned, so refuse instead.
+        echo "FATAL: no release tag points at commit ${VERSION:0:7} in ${REPO}" >&2
+        echo "       This stage installs a published release archive; pin a release tag" >&2
+        echo "       (LS_VERSION=<tag>) or set LS_BINARY_REPO to a repository that has one." >&2
+        exit 1
     fi
 fi
 
@@ -33,10 +42,10 @@ VERSION="${VERSION#v}"
 # Resolve "latest" to actual version number
 if [ "$VERSION" = "latest" ]; then
     echo "=== Resolving latest llama-swap release ==="
-    VERSION=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
-        | grep '"tag_name"' | head -1 | cut -d'"' -f4 | sed 's/^v//')
+    VERSION=$(resolve_latest_version "${REPO}")
     if [ -z "$VERSION" ]; then
         echo "FATAL: Could not determine latest release version" >&2
+        echo "       Pass an explicit release tag as LS_VERSION." >&2
         exit 1
     fi
     echo "Latest version: ${VERSION}"

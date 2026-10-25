@@ -455,6 +455,35 @@ func TestExtractContextNilPostBodyIsSafe(t *testing.T) {
 	}
 }
 
+// A bodyless request must stay bodyless. Replacing the nil body with a reader
+// over zero bytes makes net/http frame the forwarded POST as chunked, and a
+// peer that does not decode chunked requests then reads the terminating chunk
+// as a second, malformed request on the same connection.
+func TestExtractContextKeepsBodylessRequestBodyless(t *testing.T) {
+	for _, start := range []struct {
+		name string
+		body io.ReadCloser
+	}{
+		{"nil", nil},
+		{"nobody", http.NoBody},
+	} {
+		t.Run(start.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodPost, "/v1/responses/resp_1/cancel", nil)
+			r.Body = start.body
+			if _, err := extractContext(r); err != nil {
+				t.Fatalf("extractContext: %v", err)
+			}
+			if r.Body != start.body {
+				t.Fatalf("body = %T, want the original %s", r.Body, start.name)
+			}
+			if r.Body == nil || r.Body == http.NoBody {
+				return
+			}
+			t.Fatalf("body is a non-nil reader again: %T", r.Body)
+		})
+	}
+}
+
 func TestExtractContext_MultipartBodyRestored(t *testing.T) {
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)

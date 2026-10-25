@@ -53,16 +53,29 @@ func (c *StreamConverter) decodeInteractionsEvent(data []byte) ([]Event, error) 
 		index, _ := intAt(object, "index")
 		switch stringAt(step, "type") {
 		case "function_call":
-			return []Event{{
+			events := []Event{{
 				Kind: EventToolCallStart, Index: index,
 				ToolCallID: stringAt(step, "id"), ToolName: stringAt(step, "name"),
-			}}, nil
+			}}
+			if args := objectAt(step, "arguments"); len(args) > 0 {
+				events = append(events, Event{Kind: EventToolCallDelta, Index: index, ArgumentsDelta: string(mustMarshal(args))})
+			}
+			return events, nil
+		case "function_result":
+			part := toolResultPart(stringAt(step, "call_id"), stringAt(step, "name"), decodeInteractionsFunctionResult(step["result"], &c.diagnostics, "step.result"), boolValue(step, "is_error"))
+			if c.target != GeminiInteractions {
+				c.diagnose("executed_tool_result_dropped", "the target has no native executed tool-result response event", "step.type")
+			}
+			return []Event{{Kind: EventToolExecution, Parts: []Part{part}}}, nil
 		case "thought":
 			if signature := stringAt(step, "signature"); signature != "" {
 				return []Event{{Kind: EventReasoningDelta, ThoughtSignature: signature}}, nil
 			}
 			return nil, nil
 		default:
+			if kind := stringAt(step, "type"); kind != "model_output" {
+				c.diagnose("hosted_step_dropped", "the hosted step has no cross-dialect representation", "step.type")
+			}
 			return nil, nil
 		}
 	case "step.delta":
@@ -194,10 +207,14 @@ func (c *StreamConverter) interactionsDeltaEvents(delta map[string]any, index in
 		if signature == "" {
 			return nil
 		}
-		// A signature with no text attaches to whatever block is open: the
-		// reasoning summary or the tool call it belongs to.
-		if pending := c.openToolIndex(); pending >= 0 {
-			return []Event{{Kind: EventToolCallDelta, Index: pending, ThoughtSignature: signature}}
+		// The delta's index is a *step* index and names the step the signature
+		// belongs to: the thought summary it authenticates, or the function
+		// call it authorises. Attaching it to "whatever part is open" used an
+		// accumulated-parts index, which does not follow the step numbering:
+		// after a thought step, or with gaps in the step indices, the signature
+		// was filed against the wrong call (or dropped outright).
+		if _, ok := c.toolParts[index]; ok {
+			return []Event{{Kind: EventToolCallDelta, Index: index, ThoughtSignature: signature}}
 		}
 		return []Event{{Kind: EventReasoningDelta, ThoughtSignature: signature}}
 	case "arguments_delta", "arguments":
@@ -238,17 +255,6 @@ func (c *StreamConverter) interactionsDeltaEvents(delta map[string]any, index in
 	}
 }
 
-// openToolIndex reports the index of the tool call currently being streamed, or
-// -1 when none is open.
-func (c *StreamConverter) openToolIndex() int {
-	for index := len(c.response.Parts) - 1; index >= 0; index-- {
-		if c.response.Parts[index].Kind == PartToolCall {
-			return index
-		}
-	}
-	return -1
-}
-
 func interactionsCreatedAt(object map[string]any) int64 {
 	if created := stringAt(object, "created"); created != "" {
 		if moment, err := time.Parse(time.RFC3339, created); err == nil {
@@ -270,9 +276,12 @@ type interactionsStreamEncoder struct {
 	usage   Usage
 
 	stepIndex    int
-	openStep     string // model_output, thought, function_call
+	openStep     string // model_output, thought
 	openStepID   int
 	finishReason string
+	toolSteps    map[int]int
+	toolOrder    []int
+	closedTools  map[int]bool
 	// failed records a terminal error so the closing frame reports a failed
 	// status instead of "completed".
 	failed         bool
@@ -376,24 +385,55 @@ func (e *interactionsStreamEncoder) Encode(event Event) ([]Frame, error) {
 		return frames, nil
 	case EventToolCallStart:
 		frames = append(frames, e.closeStep()...)
+		if e.toolSteps == nil {
+			e.toolSteps = map[int]int{}
+			e.closedTools = map[int]bool{}
+		}
+		if _, exists := e.toolSteps[event.Index]; exists {
+			return frames, nil
+		}
+		index := e.stepIndex
+		e.stepIndex++
+		e.toolSteps[event.Index] = index
+		e.toolOrder = append(e.toolOrder, event.Index)
 		step := map[string]any{"type": "function_call", "name": event.ToolName, "arguments": map[string]any{}}
 		if event.ToolCallID != "" {
 			step["id"] = event.ToolCallID
 		}
-		frames = append(frames, e.ensureStep("function_call", step)...)
+		started, err := e.event("step.start", map[string]any{"index": index, "step": step})
+		if err != nil {
+			return frames, err
+		}
+		frames = append(frames, started)
 		if event.ThoughtSignature != "" {
-			signature, err := e.delta(map[string]any{
-				"type": "thought_signature", "signature": event.ThoughtSignature,
-			})
+			signature, err := e.toolDelta(event.Index, map[string]any{"type": "thought_signature", "signature": event.ThoughtSignature})
 			if err != nil {
 				return frames, err
 			}
 			frames = append(frames, signature...)
 		}
 		return frames, nil
+	case EventToolExecution:
+		frames = append(frames, e.closeStep()...)
+		frames = append(frames, e.closeTools()...)
+		encoded := encodeInteractionsResponse(&Response{Parts: event.Parts}, &e.diagnostics)
+		for _, step := range arrayAt(encoded, "steps") {
+			index := e.stepIndex
+			e.stepIndex++
+			start, err := e.event("step.start", map[string]any{"index": index, "step": step})
+			if err != nil {
+				return frames, err
+			}
+			stop, err := e.event("step.stop", map[string]any{"index": index})
+			if err != nil {
+				return frames, err
+			}
+			frames = append(frames, start, stop)
+		}
+		return frames, nil
 	case EventToolCallDelta:
 		if event.ThoughtSignature != "" && event.ArgumentsDelta == "" {
-			signature, err := e.delta(map[string]any{
+			signature, err := e.toolDelta(event.Index, map[string]any{
 				"type": "thought_signature", "signature": event.ThoughtSignature,
 			})
 			if err != nil {
@@ -404,13 +444,13 @@ func (e *interactionsStreamEncoder) Encode(event Event) ([]Frame, error) {
 		if event.ArgumentsDelta == "" {
 			return frames, nil
 		}
-		delta, err := e.delta(map[string]any{"type": "arguments_delta", "arguments": event.ArgumentsDelta})
+		delta, err := e.toolDelta(event.Index, map[string]any{"type": "arguments_delta", "arguments": event.ArgumentsDelta})
 		if err != nil {
 			return frames, err
 		}
 		return append(frames, delta...), nil
 	case EventToolCallEnd:
-		return append(frames, e.closeStep()...), nil
+		return append(frames, e.closeTool(event.Index)...), nil
 	case EventUsage:
 		if event.Usage != nil {
 			e.usage.Add(*event.Usage)
@@ -419,14 +459,16 @@ func (e *interactionsStreamEncoder) Encode(event Event) ([]Frame, error) {
 	case EventFinish:
 		e.finishReason = event.FinishReason
 		frames = append(frames, e.closeStep()...)
+		frames = append(frames, e.closeTools()...)
 		return frames, nil
 	case EventError:
 		e.failed = true
 		e.failureCode = errorCode(event.Error)
 		e.failureMessage = errorMessage(event.Error)
 		frames = append(frames, e.closeStep()...)
+		frames = append(frames, e.closeTools()...)
 		f, err := e.event("error", map[string]any{
-			"error": map[string]any{"code": e.failureCode, "message": e.failureMessage},
+			"error": withStreamErrorDetails(map[string]any{"code": e.failureCode, "message": e.failureMessage}, event.Error),
 		})
 		if err != nil {
 			return frames, err
@@ -483,6 +525,39 @@ func (e *interactionsStreamEncoder) delta(delta map[string]any) ([]Frame, error)
 	return []Frame{f}, nil
 }
 
+func (e *interactionsStreamEncoder) toolDelta(source int, delta map[string]any) ([]Frame, error) {
+	index, ok := e.toolSteps[source]
+	if !ok || e.closedTools[source] {
+		return nil, conversionErrorf("invalid_tool_delta", "tool call %d is not open", source)
+	}
+	f, err := e.event("step.delta", map[string]any{"index": index, "delta": delta})
+	if err != nil {
+		return nil, err
+	}
+	return []Frame{f}, nil
+}
+
+func (e *interactionsStreamEncoder) closeTool(source int) []Frame {
+	index, ok := e.toolSteps[source]
+	if !ok || e.closedTools[source] {
+		return nil
+	}
+	e.closedTools[source] = true
+	f, err := e.event("step.stop", map[string]any{"index": index})
+	if err != nil {
+		return nil
+	}
+	return []Frame{f}
+}
+
+func (e *interactionsStreamEncoder) closeTools() []Frame {
+	var frames []Frame
+	for _, source := range e.toolOrder {
+		frames = append(frames, e.closeTool(source)...)
+	}
+	return frames
+}
+
 func (e *interactionsStreamEncoder) interactionObject(status string, steps []any) map[string]any {
 	created := time.Unix(e.created, 0).UTC().Format(time.RFC3339)
 	object := map[string]any{
@@ -512,6 +587,7 @@ func (e *interactionsStreamEncoder) Finish() ([]Frame, error) {
 		frames = append(frames, started...)
 	}
 	frames = append(frames, e.closeStep()...)
+	frames = append(frames, e.closeTools()...)
 	// A stream that ended on a length, content filter or error must not report
 	// "completed": clients read the status to decide whether to retry.
 	status := "completed"

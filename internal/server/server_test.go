@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"github.com/mostlygeek/llama-swap/internal/auth"
 	"github.com/mostlygeek/llama-swap/internal/backend"
+	"github.com/mostlygeek/llama-swap/internal/capcompat"
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/event"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
@@ -121,6 +122,12 @@ func (s *stubRouter) setModelLogger(modelID string, monitor *logmon.Monitor) {
 
 // newTestServer wires a Server with stub routers and a built mux.
 func newTestServer(local router.LocalRouter, peer router.Router) *Server {
+	return newTestServerWithConfig(config.Config{}, local, peer)
+}
+
+// newTestServerWithConfig is newTestServer with a caller-supplied config, for
+// tests that exercise config-driven middleware wiring in routes().
+func newTestServerWithConfig(cfg config.Config, local router.LocalRouter, peer router.Router) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	proxylog := logmon.NewWriter(io.Discard)
 	st, err := store.New("")
@@ -128,17 +135,23 @@ func newTestServer(local router.LocalRouter, peer router.Router) *Server {
 		panic(err)
 	}
 	s := &Server{
-		cfg:         config.Config{},
+		cfg:         cfg,
 		muxlog:      logmon.NewWriter(io.Discard),
 		proxylog:    proxylog,
 		upstreamlog: logmon.NewWriter(io.Discard),
 		inflight:    newInflightTracker(),
 		metrics:     newMetricsMonitor(proxylog, 0, st),
 		store:       st,
-		local:       local,
-		peer:        peer,
-		shutdownCtx: ctx,
-		shutdownFn:  cancel,
+		// New builds this too; a Server without it would silently skip
+		// capability discovery, which is what most of these tests exercise.
+		capcompat: capcompat.New(st, proxylog),
+		// New builds the signature cache as well; without it the protocol
+		// middleware skips thought-signature carry-over entirely.
+		geminiSignatures: newGeminiSignatureCache(),
+		local:            local,
+		peer:             peer,
+		shutdownCtx:      ctx,
+		shutdownFn:       cancel,
 	}
 	s.routes()
 	return s
@@ -674,6 +687,7 @@ func TestServer_CORSPreflight(t *testing.T) {
 	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
 
 	req := httptest.NewRequest(http.MethodOptions, "/v1/chat/completions", nil)
+	req.Header.Set("Origin", "http://example.com")
 	w := httptest.NewRecorder()
 	s.ServeHTTP(w, req)
 
@@ -682,6 +696,44 @@ func TestServer_CORSPreflight(t *testing.T) {
 	}
 	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "*" {
 		t.Errorf("Access-Control-Allow-Origin=%q want *", got)
+	}
+	if got := w.Header().Get("Access-Control-Allow-Methods"); !strings.Contains(got, "POST") {
+		t.Errorf("Access-Control-Allow-Methods=%q want POST listed", got)
+	}
+}
+
+// A preflight without an Origin is not a browser CORS request; it still gets
+// 204 (the mux registers no OPTIONS routes) but no CORS headers.
+func TestServer_CORSPreflightWithoutOrigin(t *testing.T) {
+	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest(http.MethodOptions, "/v1/chat/completions", nil))
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status=%d want 204", w.Code)
+	}
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "" {
+		t.Errorf("Access-Control-Allow-Origin=%q want empty", got)
+	}
+}
+
+// A passing preflight does not let a browser read the response; the actual
+// response needs the header too. Without it a cross-origin GET /running is
+// fetched and then discarded, which is what broke browser dashboards.
+func TestServer_CORSActualResponse(t *testing.T) {
+	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+
+	req := httptest.NewRequest(http.MethodGet, "/running", nil)
+	req.Header.Set("Origin", "http://example.com")
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d want 200", w.Code)
+	}
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Errorf("Access-Control-Allow-Origin=%q want * on the actual response", got)
 	}
 }
 

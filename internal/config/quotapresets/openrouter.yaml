@@ -1,0 +1,33 @@
+# OpenRouter credits.
+#
+#   GET https://openrouter.ai/api/v1/credits
+#   Authorization: Bearer <API Key>
+#
+#   {"data":{"total_credits":100.5,"total_usage":12.3}}
+#
+# total_credits 是累计充值额度，total_usage 是已用；剩余 = total_credits -
+# total_usage。金额单位为美元。
+id: openrouter
+name: OpenRouter
+category: official
+description: OpenRouter：累计充值额度与已用额度（USD），并直接给出用量比例条。
+endpoint: https://openrouter.ai/api/v1/credits
+method: GET
+auth:
+  style: bearer
+timeoutSeconds: 15
+windows:
+  - id: credits
+    label: 额度
+    path: data
+    percent: total_usage
+    limit: total_credits
+extras:
+  - id: total
+    label: 累计充值
+    path: data.total_credits
+    suffix: " USD"
+  - id: used
+    label: 已用额度
+    path: data.total_usage
+    suffix: " USD"

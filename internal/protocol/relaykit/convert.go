@@ -33,11 +33,22 @@ type Meta struct {
 	IsStream bool
 	// EstimatePromptTokens seeds dialects that report input usage up front.
 	EstimatePromptTokens int
+	// Request is the canonical request the response answers. A Responses
+	// target reads its tool bindings to restore flattened namespaces.
+	Request *dialect.Request
 }
 
 // NewMeta builds the conversion metadata for one request.
 func NewMeta(model string, stream bool) *Meta {
 	return &Meta{IsStream: stream}
+}
+
+// SetRequest records the canonical request a later response conversion reads.
+func (m *Meta) SetRequest(request *dialect.Request) {
+	if m == nil {
+		return
+	}
+	m.Request = request
 }
 
 // Route describes a generation request recognised from its path.
@@ -88,6 +99,9 @@ type ResponseResult struct {
 
 // ConvertRequest converts a request body from source to target.
 func ConvertRequest(ctx context.Context, meta *Meta, source, target Format, body []byte, model string) (*RequestResult, error) {
+	if err := checkCompatibility(ctx, source, target, nil); err != nil {
+		return nil, err
+	}
 	if source == target {
 		return &RequestResult{Value: append([]byte(nil), body...), From: source, To: target, Converter: "identity", Quality: "exact"}, nil
 	}
@@ -105,6 +119,19 @@ func ConvertRequest(ctx context.Context, meta *Meta, source, target Format, body
 	if request.Model == "" {
 		request.Model = model
 	}
+	if request.N != nil && *request.N > 1 && (request.Stream || meta != nil && meta.IsStream) {
+		return nil, fmt.Errorf("n_unsupported: cross-dialect streaming supports one candidate per request")
+	}
+	if meta != nil {
+		// The response side restores Responses tool namespaces from these
+		// bindings, so they travel with the conversion instead of being
+		// rebuilt from a converted body that no longer has them. A second hop
+		// of a multi-step conversion decodes an intermediate body with no
+		// bindings, so it must not clear what the first hop recorded.
+		if meta.Request == nil || !request.ToolState.Empty() {
+			meta.SetRequest(request)
+		}
+	}
 	if meta != nil && meta.EstimatePromptTokens == 0 && meta.IsStream {
 		// Seed Anthropic message_start usage; the real counts arrive in the
 		// final message_delta. Only a stream needs the estimate because a
@@ -116,6 +143,9 @@ func ConvertRequest(ctx context.Context, meta *Meta, source, target Format, body
 		return nil, err
 	}
 	diagnostics = append(diagnostics, encodeDiagnostics...)
+	if err := checkCompatibility(ctx, source, target, diagnostics); err != nil {
+		return nil, err
+	}
 	return &RequestResult{
 		Value: converted, From: source, To: target, Converter: string(source) + "->" + string(target),
 		Quality: qualityOf(diagnostics), Diagnostics: diagnostics,
@@ -127,8 +157,15 @@ func ConvertResponse(ctx context.Context, meta *Meta, source, target Format, bod
 	if source == target {
 		return &ResponseResult{Value: append([]byte(nil), body...), From: source, To: target, Converter: "identity", Quality: "exact"}, nil
 	}
-	converted, diagnostics, err := dialect.ConvertResponse(source, target, body)
+	var request *dialect.Request
+	if meta != nil {
+		request = meta.Request
+	}
+	converted, diagnostics, err := dialect.ConvertResponseWithRequest(source, target, body, request)
 	if err != nil {
+		return nil, err
+	}
+	if err := checkCompatibility(ctx, source, target, diagnostics); err != nil {
 		return nil, err
 	}
 	return &ResponseResult{
@@ -264,11 +301,16 @@ type StreamOptions struct {
 	Created             int64
 	IncludeUsage        bool
 	EstimateInputTokens int
+	// Request carries the canonical request so a Responses target can restore
+	// tool namespaces and echo the request's tool policy.
+	Request *dialect.Request
 }
 
 // ResponseStreamState is one in-flight stream conversion.
 type ResponseStreamState struct {
 	converter *dialect.StreamConverter
+	source    Format
+	target    Format
 }
 
 // NewResponseStreamState builds a stream converter for source -> target.
@@ -280,11 +322,12 @@ func NewResponseStreamState(source, target Format, options StreamOptions) (*Resp
 		Created:             options.Created,
 		IncludeUsage:        options.IncludeUsage,
 		EstimateInputTokens: estimate,
+		Request:             options.Request,
 	})
 	if err != nil {
 		return nil, err
 	}
-	return &ResponseStreamState{converter: converter}, nil
+	return &ResponseStreamState{converter: converter, source: source, target: target}, nil
 }
 
 // ConvertStreamResponseChunk converts one upstream frame.
@@ -298,6 +341,9 @@ func ConvertStreamResponseChunk(ctx context.Context, meta *Meta, state *Response
 	}
 	frames, err := state.converter.Feed(frame.Data)
 	if err != nil {
+		return nil, err
+	}
+	if err := checkCompatibility(ctx, state.source, state.target, state.converter.Diagnostics()); err != nil {
 		return nil, err
 	}
 	return wrapFrames(frames), nil
@@ -315,6 +361,17 @@ func FinalizeStreamResponse(ctx context.Context, meta *Meta, state *ResponseStre
 	return wrapFrames(frames), nil
 }
 
+// MarkUpstreamTerminated records that the upstream ended its stream with its
+// dialect's sentinel (Chat's [DONE]) rather than an explicit finish event. The
+// converter needs this to distinguish a normal end from a truncated
+// connection: an EOF with no sentinel and no finish is a failed turn.
+func (s *ResponseStreamState) MarkUpstreamTerminated() {
+	if s == nil || s.converter == nil {
+		return
+	}
+	s.converter.MarkUpstreamTerminated()
+}
+
 // Diagnostics reports the conversion notes gathered for a stream.
 func (s *ResponseStreamState) Diagnostics() []Diagnostic {
 	if s == nil || s.converter == nil {
@@ -329,6 +386,14 @@ func wrapFrames(frames []dialect.Frame) []ResponseResult {
 		results = append(results, ResponseResult{Value: &SSEFrame{Event: item.Event, Data: item.Data}})
 	}
 	return results
+}
+
+func StreamWholeResponse(source, target Format, body []byte, options StreamOptions) ([]ResponseResult, []Diagnostic, error) {
+	frames, diagnostics, err := dialect.ConvertResponseToStream(source, target, body, dialect.StreamOptions{
+		Model: options.Model, ID: options.ID, Created: options.Created,
+		IncludeUsage: options.IncludeUsage, EstimateInputTokens: options.EstimateInputTokens, Request: options.Request,
+	})
+	return wrapFrames(frames), diagnostics, err
 }
 
 // ResponseFailed reports whether a whole upstream response says it failed.

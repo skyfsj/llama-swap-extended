@@ -70,6 +70,7 @@ func (c HTTPServerConfig) Validate() error {
 // network policy.
 type SecurityConfig struct {
 	AuthRateLimit AuthRateLimitConfig `yaml:"authRateLimit" json:"authRateLimit"`
+	CORS          CORSConfig          `yaml:"cors" json:"cors"`
 }
 
 // Effective fills the limiter defaults.
@@ -78,9 +79,12 @@ func (c SecurityConfig) Effective() SecurityConfig {
 	return c
 }
 
-// Validate rejects a limiter configuration that could not possibly work.
+// Validate rejects a configuration that could not possibly work.
 func (c SecurityConfig) Validate() error {
-	return c.Effective().AuthRateLimit.Validate()
+	if err := c.AuthRateLimit.Validate(); err != nil {
+		return err
+	}
+	return c.CORS.Validate()
 }
 
 // AuthRateLimitConfig throttles failed credential checks per caller address.

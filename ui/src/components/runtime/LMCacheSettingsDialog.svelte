@@ -7,6 +7,7 @@
   import * as Dialog from "$lib/components/ui/dialog/index.js";
   import { fetchLMCacheCandidates, fetchLMCacheConfig, patchLMCacheConfig, type LMCacheConfigSnapshot } from "$lib/lmcacheApi";
   import { translate } from "$lib/i18n";
+  import { toast } from "$lib/toast";
   import type { LMCacheDashboardResponse, LMCacheStatus, RuntimeVersionCandidate } from "$lib/types";
   import ConfirmDialog from "../ConfirmDialog.svelte";
 
@@ -241,6 +242,7 @@
         updateChecked = false;
       }
       await onRefresh();
+      toast.success($translate("controlPlane.lmcacheToast.saved"));
     } catch (cause) {
       if (currentSession(session)) localError = message(cause);
     } finally {

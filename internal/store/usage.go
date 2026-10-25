@@ -44,6 +44,16 @@ type UsageQuery struct {
 	Order  string
 	Limit  int
 	Offset int
+	// AfterID continues a keyset walk instead of skipping Offset rows. It is the
+	// id of the last row the caller has seen; rows strictly after it in the
+	// requested order are returned. Zero means "start from the beginning".
+	//
+	// A keyset walk matters because OFFSET makes the database read and discard
+	// every row it skips: exporting a large selection in batches costs the sum
+	// of all the offsets, which grows quadratically with the export size.
+	// AfterID is only honoured for the time ordering, which is the one the
+	// export uses and the only one whose order the row id can follow.
+	AfterID int
 }
 
 // UsageTotals is the summary-card aggregate for the current filter selection.
@@ -181,7 +191,6 @@ func (s *Store) UsageAnalytics(ctx context.Context, query UsageQuery, granularit
 	if err != nil {
 		return UsageAnalytics{}, err
 	}
-	where, args := usageWhere(query)
 	analytics := UsageAnalytics{
 		Start:       query.Start,
 		End:         query.End,
@@ -192,6 +201,17 @@ func (s *Store) UsageAnalytics(ctx context.Context, query UsageQuery, granularit
 		ByKey:       []UsageDimensionRow{},
 		Trend:       []UsageTrendBucket{},
 	}
+	// The rollup answers the same numbers from a handful of bucket folds instead
+	// of six full scans, and its group/key dimensions no longer run a subquery
+	// per row. It is used only when it can express this query and it has caught
+	// up with the activity table; otherwise the scan below runs, which is slower
+	// but always correct.
+	if rollupQuery, ok := usageRollupFor(query); ok && s.rollupReady(ctx) {
+		if folded, rollupErr := s.usageAnalyticsFromRollup(ctx, query, canonical, rollupQuery, bucketSeconds); rollupErr == nil {
+			return folded, nil
+		}
+	}
+	where, args := usageWhere(query)
 	totals, err := s.usageTotals(ctx, where, args)
 	if err != nil {
 		return UsageAnalytics{}, err
@@ -356,9 +376,30 @@ func (s *Store) UsageRecords(ctx context.Context, query UsageQuery) (UsageRecord
 		offset = 0
 	}
 	where, args := usageWhere(query)
+	// A keyset walk already knows where it is, so it does not need the total:
+	// skipping the count keeps an export from re-counting the whole selection on
+	// every batch.
 	var total int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM activity`+where, args...).Scan(&total); err != nil {
-		return UsageRecordPage{}, fmt.Errorf("count usage records: %w", err)
+	if query.AfterID <= 0 {
+		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM activity`+where, args...).Scan(&total); err != nil {
+			return UsageRecordPage{}, fmt.Errorf("count usage records: %w", err)
+		}
+	}
+	// A keyset walk replaces OFFSET with "rows after the one I have". Both forms
+	// need the same ORDER BY, which for the export is time-ascending; the row id
+	// is a unique, monotonic tiebreaker there, so "id > last seen" selects exactly
+	// the rows the next page would have held.
+	// where already carries its own " WHERE ..." when filters are present, so the
+	// keyset predicate either extends it with AND or introduces the clause.
+	walk := ""
+	walkArgs := []any{}
+	if query.AfterID > 0 {
+		joiner := " AND "
+		if where == "" {
+			joiner = " WHERE "
+		}
+		walk = joiner + `activity.id > ?`
+		walkArgs = append(walkArgs, query.AfterID)
 	}
 	statement := `
 		SELECT activity.id, activity.ts_created, activity.model_id,
@@ -368,9 +409,10 @@ func (s *Store) UsageRecords(ctx context.Context, query UsageQuery) (UsageRecord
 			activity.estimated_cost, activity.cost_estimated, activity.duration_ms, activity.first_token_ms,
 			activity.provider_id, activity.provider_adapter
 		FROM activity
-		LEFT JOIN api_keys ON api_keys.id = activity.key_id` + where + usageRecordOrder(query) + `
+		LEFT JOIN api_keys ON api_keys.id = activity.key_id` + where + walk + usageRecordOrder(query) + `
 		LIMIT ? OFFSET ?`
-	rows, err := s.db.QueryContext(ctx, statement, append(args, limit, offset)...)
+	queryArgs := append(append([]any{}, args...), walkArgs...)
+	rows, err := s.db.QueryContext(ctx, statement, append(queryArgs, limit, offset)...)
 	if err != nil {
 		return UsageRecordPage{}, fmt.Errorf("list usage records: %w", err)
 	}

@@ -12,6 +12,10 @@ func EncodeRequest(request *Request, target Format, options ConvertOptions) ([]b
 		return nil, nil, conversionErrorf("invalid_request", "request is nil")
 	}
 	var diagnostics []Diagnostic
+	diagnosePartSignatures(request.System, target, &diagnostics)
+	for _, message := range request.Messages {
+		diagnosePartSignatures(message.Parts, target, &diagnostics)
+	}
 	var out map[string]any
 	var err error
 	switch target {
@@ -36,6 +40,30 @@ func EncodeRequest(request *Request, target Format, options ConvertOptions) ([]b
 		return nil, diagnostics, err
 	}
 	return encoded, diagnostics, nil
+}
+
+// restrictToolsToAllowed narrows the tool list to a Responses allowed_tools
+// policy when the target cannot express that policy natively. Only Responses
+// carries an allowed set; every other dialect would otherwise advertise tools
+// the client never permitted, and the model could call one.
+func restrictToolsToAllowed(request *Request, diagnostics *[]Diagnostic, dialect string) []Tool {
+	if request == nil || request.ToolChoice == nil || len(request.ToolChoice.AllowedNames) == 0 {
+		return request.Tools
+	}
+	allowed := make(map[string]struct{}, len(request.ToolChoice.AllowedNames))
+	for _, name := range request.ToolChoice.AllowedNames {
+		allowed[name] = struct{}{}
+	}
+	kept := make([]Tool, 0, len(allowed))
+	for _, tool := range request.Tools {
+		if _, ok := allowed[tool.Name]; ok {
+			kept = append(kept, tool)
+		}
+	}
+	appendDiagnostic(diagnostics, "allowed_tools_filtered",
+		fmt.Sprintf("%s has no allowed_tools policy; the tool list was narrowed to the %d permitted tool(s)", dialect, len(kept)),
+		"tool_choice.allowed_tools")
+	return kept
 }
 
 func targetModel(request *Request, options ConvertOptions) string {
@@ -63,6 +91,13 @@ func systemText(parts []Part, diagnostics *[]Diagnostic, dialect string) string 
 	return builder.String()
 }
 
+// geminiSignaturePlaceholder is Google's documented stand-in for a thought
+// signature a framework could not preserve. Any other value — including the
+// empty string — is rejected by Gemini 3 with "Function call is missing a
+// thought_signature in functionCall parts", which surfaces to clients as an
+// opaque ModelProtocolUnsupported failure.
+const geminiSignaturePlaceholder = "skip_thought_signature_validator"
+
 // diagnoseSignatureLoss reports a Gemini thought signature that the target
 // dialect cannot carry. Dropping it silently would break a later Gemini turn
 // that replays this conversation.
@@ -73,6 +108,16 @@ func diagnoseSignatureLoss(part Part, dialect string, diagnostics *[]Diagnostic)
 	appendDiagnostic(diagnostics, "thought_signature_dropped",
 		"Gemini thought signature cannot be represented in "+dialect+"; a replay of this turn on Gemini may be rejected",
 		"contents")
+}
+
+func diagnosePartSignatures(parts []Part, target Format, diagnostics *[]Diagnostic) {
+	if target == Gemini || target == GeminiInteractions {
+		return
+	}
+	for _, part := range parts {
+		diagnoseSignatureLoss(part, string(target), diagnostics)
+		diagnosePartSignatures(part.Content, target, diagnostics)
+	}
 }
 
 func applyTemperature(object map[string]any, request *Request) {
@@ -145,8 +190,9 @@ func encodeChatRequest(request *Request, options ConvertOptions, diagnostics *[]
 	if request.Metadata != nil {
 		out["metadata"] = request.Metadata
 	}
-	if len(request.Tools) > 0 {
-		out["tools"] = encodeChatTools(request.Tools)
+	tools := restrictToolsToAllowed(request, diagnostics, "OpenAI Chat")
+	if len(tools) > 0 {
+		out["tools"] = encodeChatTools(tools)
 	}
 	if choice := encodeChatToolChoice(request.ToolChoice); choice != nil {
 		out["tool_choice"] = choice
@@ -166,6 +212,21 @@ func encodeChatRequest(request *Request, options ConvertOptions, diagnostics *[]
 	}
 	if request.Reasoning != nil && request.Reasoning.Effort != "" {
 		out["reasoning_effort"] = request.Reasoning.Effort
+	}
+	if request.Reasoning != nil {
+		// Chat has one reasoning knob: reasoning_effort. A token budget or an
+		// explicit disable that it cannot express must not vanish silently,
+		// because the client asked for a thinking policy it will not get.
+		if request.Reasoning.BudgetTokens != nil {
+			appendDiagnostic(diagnostics, "reasoning_budget_dropped",
+				fmt.Sprintf("a %d-token thinking budget cannot be expressed as reasoning_effort; the upstream default applies", *request.Reasoning.BudgetTokens),
+				"thinking.budget_tokens")
+		}
+		if enabled := request.Reasoning.Enabled; enabled != nil && !*enabled {
+			appendDiagnostic(diagnostics, "reasoning_disable_dropped",
+				"OpenAI Chat has no parameter that disables reasoning; the upstream default applies",
+				"thinking")
+		}
 	}
 	for key, raw := range request.Extra {
 		switch key {
@@ -187,8 +248,17 @@ func encodeChatRequest(request *Request, options ConvertOptions, diagnostics *[]
 				"Interactions cached_content names a server-side cache this target cannot resolve; the cached prefix is not included",
 				key)
 		case "background":
+			appendDiagnostic(diagnostics, "background_dropped",
+				"a background turn is executed synchronously by this target", key)
+		case "conversation":
+			// Dropping the reference would silently start a fresh conversation
+			// and lose the referenced turns, so the failure is explicit.
+			return nil, conversionErrorf("conversation_unsupported",
+				"conversation %s names server-side Responses state this target cannot resolve; send the conversation history in input instead",
+				strings.TrimSpace(string(raw)))
+		case "include", "max_tool_calls", "modalities", "audio", "text", "context_management":
 			appendDiagnostic(diagnostics, "field_dropped",
-				"background interactions are not supported by this target", key)
+				fmt.Sprintf("%s is a Responses-only request field this target cannot express", key), key)
 		case "labels", "response_modalities":
 			appendDiagnostic(diagnostics, "field_dropped",
 				fmt.Sprintf("%s is not part of this target's request", key), key)
@@ -211,8 +281,17 @@ func encodeChatMessages(request *Request, diagnostics *[]Diagnostic) []any {
 	for _, message := range request.Messages {
 		switch message.Role {
 		case RoleSystem:
+			// Only a system turn at the very front may stay a system message.
+			// Chat templates such as Qwen's raise "System message must be at
+			// the beginning" for any later one, so a mid-conversation system
+			// turn becomes user text — the same downgrade the Anthropic and
+			// Gemini encoders perform.
 			if text := systemText(message.Parts, diagnostics, "OpenAI Chat"); text != "" {
-				messages = append(messages, map[string]any{"role": "system", "content": text})
+				role := "user"
+				if len(messages) == 0 {
+					role = "system"
+				}
+				messages = append(messages, map[string]any{"role": role, "content": text})
 			}
 		case RoleTool:
 			messages = append(messages, encodeChatToolMessages(message, diagnostics)...)
@@ -230,7 +309,7 @@ func encodeChatMessages(request *Request, diagnostics *[]Diagnostic) []any {
 				}
 				messages = append(messages, map[string]any{
 					"role": "tool", "tool_call_id": part.ToolCallID,
-					"content": encodeChatContent(part.Content, diagnostics, "tool content"),
+					"content": encodeChatToolContent(part.Content, diagnostics),
 				})
 			}
 			if len(userParts) > 0 {
@@ -241,7 +320,60 @@ func encodeChatMessages(request *Request, diagnostics *[]Diagnostic) []any {
 			}
 		}
 	}
-	return messages
+	return mergeChatAssistantMessages(messages)
+}
+
+func mergeChatAssistantMessages(messages []any) []any {
+	var out []any
+	for _, raw := range messages {
+		message, ok := raw.(map[string]any)
+		if !ok || message["role"] != "assistant" || len(out) == 0 {
+			out = append(out, raw)
+			continue
+		}
+		last, ok := out[len(out)-1].(map[string]any)
+		if !ok || last["role"] != "assistant" || len(arrayAt(last, "tool_calls")) == 0 || len(arrayAt(message, "tool_calls")) == 0 {
+			out = append(out, raw)
+			continue
+		}
+		last["tool_calls"] = append(arrayAt(last, "tool_calls"), arrayAt(message, "tool_calls")...)
+		for _, key := range []string{"content", "reasoning_content", "refusal"} {
+			if message[key] == nil {
+				continue
+			}
+			if last[key] == nil {
+				last[key] = message[key]
+			} else if key == "content" {
+				var parts []any
+				for _, value := range []any{last[key], message[key]} {
+					if text, ok := value.(string); ok {
+						parts = append(parts, map[string]any{"type": "text", "text": text})
+					} else if content, ok := value.([]any); ok {
+						parts = append(parts, content...)
+					}
+				}
+				last[key] = singleTextOrParts(parts)
+			} else {
+				last[key] = stringAt(last, key) + stringAt(message, key)
+			}
+		}
+	}
+	return out
+}
+
+func encodeChatToolContent(parts []Part, diagnostics *[]Diagnostic) any {
+	var content []Part
+	for _, part := range parts {
+		if part.Kind == PartText || part.Kind == PartRefusal {
+			content = append(content, part)
+		} else {
+			appendDiagnostic(diagnostics, "tool_result_part_dropped", "Chat tool messages support only text content", "messages.tool.content")
+		}
+	}
+	if result := encodeChatContent(content, diagnostics, "tool content"); result != nil {
+		return result
+	}
+	return ""
 }
 
 func encodeChatToolMessages(message Message, diagnostics *[]Diagnostic) []any {
@@ -255,7 +387,7 @@ func encodeChatToolMessages(message Message, diagnostics *[]Diagnostic) []any {
 		messages = append(messages, map[string]any{
 			"role":         "tool",
 			"tool_call_id": part.ToolCallID,
-			"content":      encodeChatContent(part.Content, diagnostics, "tool content"),
+			"content":      encodeChatToolContent(part.Content, diagnostics),
 		})
 	}
 	return messages
@@ -279,7 +411,6 @@ func encodeChatAssistantMessage(message Message, diagnostics *[]Diagnostic) map[
 			}
 			reasoning.WriteString(part.Text)
 		case PartToolCall:
-			diagnoseSignatureLoss(part, "OpenAI Chat", diagnostics)
 			toolCalls = append(toolCalls, map[string]any{
 				"id":   part.ToolCallID,
 				"type": "function",
@@ -353,9 +484,29 @@ func encodeChatContent(parts []Part, diagnostics *[]Diagnostic, context string) 
 				content = append(content, map[string]any{"type": "text", "text": part.Text})
 				continue
 			}
-			appendDiagnostic(diagnostics, "document_dropped",
-				"Chat Completions has no document content part", context)
-		case PartAudio, PartVideo:
+			if part.Base64 != "" && part.MediaType == "application/pdf" {
+				name := part.Filename
+				if name == "" {
+					name = "document.pdf"
+				}
+				content = append(content, map[string]any{"type": "file", "file": map[string]any{"filename": name, "file_data": dataURL(part.MediaType, part.Base64)}})
+			} else {
+				appendDiagnostic(diagnostics, "document_dropped", "Chat Completions requires inline PDF file data", context)
+			}
+		case PartAudio:
+			format := ""
+			switch part.MediaType {
+			case "audio/wav", "audio/x-wav":
+				format = "wav"
+			case "audio/mp3", "audio/mpeg":
+				format = "mp3"
+			}
+			if part.Base64 != "" && format != "" {
+				content = append(content, map[string]any{"type": "input_audio", "input_audio": map[string]any{"data": part.Base64, "format": format}})
+			} else {
+				appendDiagnostic(diagnostics, "audio_dropped", "Chat Completions requires inline wav or mp3 audio", context)
+			}
+		case PartVideo:
 			// Chat Completions has no audio/video part; say so instead of
 			// emitting an unusable media block.
 			appendDiagnostic(diagnostics, string(part.Kind)+"_dropped",
@@ -483,8 +634,9 @@ func encodeClaudeRequest(request *Request, options ConvertOptions, diagnostics *
 		}
 		out["stop_sequences"] = stop
 	}
-	if len(request.Tools) > 0 {
-		out["tools"] = encodeClaudeTools(request.Tools)
+	tools := restrictToolsToAllowed(request, diagnostics, "Anthropic Messages")
+	if len(tools) > 0 {
+		out["tools"] = encodeClaudeTools(tools)
 	}
 	disableParallel := request.ParallelTools != nil && !*request.ParallelTools
 	if request.ToolChoice != nil && request.ToolChoice.DisableParallel != nil && *request.ToolChoice.DisableParallel {
@@ -627,18 +779,26 @@ func encodeClaudeAssistantBlocks(parts []Part, diagnostics *[]Diagnostic) []any 
 				blocks = append(blocks, map[string]any{"type": "text", "text": part.Text})
 			}
 		case PartReasoning:
-			diagnoseSignatureLoss(part, "Anthropic Messages", diagnostics)
 			if part.Redacted {
 				blocks = append(blocks, map[string]any{"type": "redacted_thinking", "data": part.Data})
 				continue
 			}
-			block := map[string]any{"type": "thinking", "thinking": part.Text}
-			if part.Signature != "" {
-				block["signature"] = part.Signature
+			// Anthropic verifies the signature of every thinking block it
+			// receives and rejects the whole request (HTTP 400, "thinking block
+			// is missing a signature") when one was stripped. A block that
+			// arrived from another dialect has no Anthropic signature — either
+			// it never had one, or the source kept its own opaque signature
+			// under ThoughtSignature — so it cannot be replayed. Sending it
+			// unsigned fails the turn; dropping it only loses the summary, and
+			// the visible answer is untouched.
+			if part.Signature == "" {
+				appendDiagnostic(diagnostics, "thinking_block_dropped",
+					"the reasoning block has no Anthropic signature, which the API requires on replay; the block was dropped",
+					"messages")
+				continue
 			}
-			blocks = append(blocks, block)
+			blocks = append(blocks, map[string]any{"type": "thinking", "thinking": part.Text, "signature": part.Signature})
 		case PartToolCall:
-			diagnoseSignatureLoss(part, "Anthropic Messages", diagnostics)
 			input := part.Arguments
 			if len(input) == 0 {
 				input = json.RawMessage(`{}`)
@@ -890,6 +1050,11 @@ func encodeGeminiRequest(request *Request, options ConvertOptions, diagnostics *
 		switch {
 		case request.Reasoning.BudgetTokens != nil:
 			thinking["thinkingBudget"] = *request.Reasoning.BudgetTokens
+		case request.Reasoning.Level != "":
+			// A level the client already specified is passed through verbatim:
+			// Gemini rejects models where only the level applies, and a
+			// synthesized budget would change the requested policy.
+			thinking["thinkingLevel"] = request.Reasoning.Level
 		case request.Reasoning.Effort != "":
 			budget, ok := geminiThinkingBudget(request.Reasoning.Effort)
 			if ok {
@@ -897,9 +1062,14 @@ func encodeGeminiRequest(request *Request, options ConvertOptions, diagnostics *
 				appendDiagnostic(diagnostics, "reasoning_effort_mapped",
 					fmt.Sprintf("reasoning effort %q was mapped to thinkingBudget %d", request.Reasoning.Effort, budget),
 					"generationConfig.thinkingConfig")
+			} else {
+				thinking["thinkingLevel"] = request.Reasoning.Effort
 			}
 		case request.Reasoning.Enabled != nil && !*request.Reasoning.Enabled:
 			thinking["thinkingBudget"] = 0
+		}
+		if request.Reasoning.Summary != "" {
+			thinking["includeThoughts"] = true
 		}
 		if len(thinking) > 0 {
 			generation["thinkingConfig"] = thinking
@@ -908,9 +1078,10 @@ func encodeGeminiRequest(request *Request, options ConvertOptions, diagnostics *
 	if len(generation) > 0 {
 		out["generationConfig"] = generation
 	}
-	if len(request.Tools) > 0 {
-		declarations := make([]any, 0, len(request.Tools))
-		for _, tool := range request.Tools {
+	geminiTools := restrictToolsToAllowed(request, diagnostics, "Gemini")
+	if len(geminiTools) > 0 {
+		declarations := make([]any, 0, len(geminiTools))
+		for _, tool := range geminiTools {
 			declaration := map[string]any{"name": tool.Name}
 			if tool.Description != "" {
 				declaration["description"] = tool.Description
@@ -1018,8 +1189,12 @@ func encodeGeminiParts(parts []Part, callNames map[string]string, diagnostics *[
 	for _, part := range parts {
 		switch part.Kind {
 		case PartText:
-			if part.Text != "" {
-				out = append(out, map[string]any{"text": part.Text})
+			if part.Text != "" || part.ThoughtSignature != "" {
+				block := map[string]any{"text": part.Text}
+				if part.ThoughtSignature != "" {
+					block["thoughtSignature"] = part.ThoughtSignature
+				}
+				out = append(out, block)
 			}
 		case PartReasoning:
 			block := map[string]any{"thought": true}
@@ -1067,10 +1242,21 @@ func encodeGeminiParts(parts []Part, callNames map[string]string, diagnostics *[
 			block := map[string]any{
 				"functionCall": map[string]any{"name": part.ToolName, "args": decoded},
 			}
+			if part.ToolCallID != "" {
+				block["functionCall"].(map[string]any)["id"] = part.ToolCallID
+			}
 			// Gemini 3 rejects a replayed function call whose thought
-			// signature was dropped.
+			// signature was dropped. A client on a dialect that cannot carry
+			// signatures (Chat Completions, Responses, Messages) can never
+			// return the original, so the documented placeholder takes its
+			// place instead of failing the whole turn upstream.
 			if part.ThoughtSignature != "" {
 				block["thoughtSignature"] = part.ThoughtSignature
+			} else {
+				block["thoughtSignature"] = geminiSignaturePlaceholder
+				appendDiagnostic(diagnostics, "thought_signature_placeholder",
+					"the replayed function call had no Gemini thought signature; the placeholder allows the turn to proceed",
+					"contents")
 			}
 			out = append(out, block)
 		case PartToolResult:
@@ -1083,11 +1269,25 @@ func encodeGeminiParts(parts []Part, callNames map[string]string, diagnostics *[
 					"Gemini functionResponse requires the function name", "contents")
 				continue
 			}
-			out = append(out, map[string]any{
-				"functionResponse": map[string]any{
-					"name": name, "response": geminiToolResponse(part),
-				},
-			})
+			response := map[string]any{"name": name, "response": geminiToolResponse(part)}
+			if part.ToolCallID != "" {
+				response["id"] = part.ToolCallID
+			}
+			var media []any
+			for _, nested := range part.Content {
+				if nested.Kind == PartText || nested.Kind == PartRefusal {
+					continue
+				}
+				if nested.Base64 != "" && (nested.Kind == PartImage || nested.Kind == PartAudio || nested.Kind == PartVideo || nested.Kind == PartDocument) {
+					media = append(media, map[string]any{"inlineData": map[string]any{"mimeType": mediaTypeOrDefault(nested.MediaType), "data": nested.Base64}})
+				} else {
+					appendDiagnostic(diagnostics, "tool_result_part_dropped", "Gemini function results require inline media", "functionResponse.parts")
+				}
+			}
+			if len(media) > 0 {
+				response["parts"] = media
+			}
+			out = append(out, map[string]any{"functionResponse": response})
 		case PartRefusal:
 			if part.Text != "" {
 				out = append(out, map[string]any{"text": part.Text})
@@ -1353,10 +1553,7 @@ func encodeResponsesInput(request *Request, diagnostics *[]Diagnostic) []any {
 				if part.Kind != PartToolResult {
 					continue
 				}
-				input = append(input, map[string]any{
-					"type": "function_call_output", "call_id": part.ToolCallID,
-					"output": encodeResponsesToolOutput(part.Content, diagnostics),
-				})
+				input = append(input, encodeResponsesToolOutputItem(part, diagnostics))
 			}
 		case RoleAssistant:
 			input = append(input, encodeResponsesAssistantItems(message.Parts, diagnostics)...)
@@ -1370,10 +1567,7 @@ func encodeResponsesInput(request *Request, diagnostics *[]Diagnostic) []any {
 					userParts = append(userParts, part)
 					continue
 				}
-				input = append(input, map[string]any{
-					"type": "function_call_output", "call_id": part.ToolCallID,
-					"output": encodeResponsesToolOutput(part.Content, diagnostics),
-				})
+				input = append(input, encodeResponsesToolOutputItem(part, diagnostics))
 			}
 			if len(userParts) > 0 {
 				content := encodeResponsesUserContent(userParts, diagnostics)
@@ -1420,12 +1614,8 @@ func encodeResponsesAssistantItems(parts []Part, diagnostics *[]Diagnostic) []an
 				"type": "reasoning", "summary": summary,
 			})
 		case PartToolCall:
-			diagnoseSignatureLoss(part, "OpenAI Responses", diagnostics)
 			flushContent()
-			items = append(items, map[string]any{
-				"type": "function_call", "call_id": part.ToolCallID,
-				"name": part.ToolName, "arguments": argumentsText(part.Arguments),
-			})
+			items = append(items, encodeResponsesToolCallItem(part))
 		case PartImage, PartDocument, PartAudio, PartVideo:
 			appendDiagnostic(diagnostics, "assistant_media_dropped",
 				"assistant output in Responses cannot carry input media", "input")
@@ -1433,6 +1623,28 @@ func encodeResponsesAssistantItems(parts []Part, diagnostics *[]Diagnostic) []an
 	}
 	flushContent()
 	return items
+}
+
+// encodeResponsesToolCallItem replays one assistant tool call. A call that
+// belongs to a namespace is addressed by its bare name plus the namespace, and
+// a custom call keeps its freeform input, so the transcript means what the
+// previous turn meant.
+func encodeResponsesToolCallItem(part Part) map[string]any {
+	entry := map[string]any{"call_id": part.ToolCallID}
+	name := part.ToolName
+	if part.ToolNamespace != "" && part.ToolNamespace != defaultToolNamespace {
+		name = strings.TrimPrefix(name, part.ToolNamespace+"__")
+		entry["namespace"] = part.ToolNamespace
+	}
+	entry["name"] = name
+	if part.ToolKind == ToolKindCustom {
+		entry["type"] = "custom_tool_call"
+		entry["input"] = customToolInputFromArguments(argumentsText(part.Arguments))
+	} else {
+		entry["type"] = "function_call"
+		entry["arguments"] = argumentsText(part.Arguments)
+	}
+	return entry
 }
 
 func encodeResponsesUserContent(parts []Part, diagnostics *[]Diagnostic) []any {
@@ -1452,7 +1664,12 @@ func encodeResponsesUserContent(parts []Part, diagnostics *[]Diagnostic) []any {
 		case PartDocument:
 			url := part.URL
 			if part.Base64 != "" {
-				url = dataURL(part.MediaType, part.Base64)
+				name := part.Filename
+				if name == "" {
+					name = "document"
+				}
+				content = append(content, map[string]any{"type": "input_file", "filename": name, "file_data": dataURL(part.MediaType, part.Base64)})
+				continue
 			}
 			if url != "" {
 				content = append(content, map[string]any{"type": "input_file", "file_url": url})
@@ -1477,6 +1694,19 @@ func encodeResponsesUserContent(parts []Part, diagnostics *[]Diagnostic) []any {
 		}
 	}
 	return content
+}
+
+// encodeResponsesToolOutputItem renders one tool result. A custom tool answer
+// keeps custom_tool_call_output so the client pairs it with its call kind.
+func encodeResponsesToolOutputItem(part Part, diagnostics *[]Diagnostic) map[string]any {
+	itemType := "function_call_output"
+	if part.ToolKind == ToolKindCustom {
+		itemType = "custom_tool_call_output"
+	}
+	return map[string]any{
+		"type": itemType, "call_id": part.ToolCallID,
+		"output": encodeResponsesToolOutput(part.Content, diagnostics),
+	}
 }
 
 func encodeResponsesToolOutput(parts []Part, diagnostics *[]Diagnostic) any {
@@ -1516,33 +1746,123 @@ func encodeResponsesToolOutput(parts []Part, diagnostics *[]Diagnostic) any {
 	return content
 }
 
+// encodeResponsesTools renders the canonical tool list back into Responses
+// declarations. Tools that share a non-default namespace are regrouped into
+// one namespace entry, and custom tools keep their freeform shape.
 func encodeResponsesTools(tools []Tool) []any {
 	out := make([]any, 0, len(tools))
+	// namespaceOrder preserves first-appearance order so the rendered tool
+	// list stays close to the request it came from.
+	var namespaceOrder []string
+	namespaces := map[string][]any{}
 	for _, tool := range tools {
+		entry := map[string]any{"type": "function", "name": tool.Name}
+		if tool.Kind == ToolKindCustom {
+			entry["type"] = "custom"
+			entry["name"] = tool.Name
+			if len(tool.Format) > 0 {
+				entry["format"] = rawJSONOrEmpty(tool.Format)
+			}
+			if tool.Description != "" {
+				entry["description"] = tool.Description
+			}
+			if tool.DeferLoading != nil {
+				entry["defer_loading"] = *tool.DeferLoading
+			}
+		} else {
+			entry["parameters"] = rawJSONOrEmpty(tool.Parameters)
+			if tool.Description != "" {
+				entry["description"] = tool.Description
+			}
+			if tool.Strict != nil {
+				entry["strict"] = *tool.Strict
+			}
+			if tool.DeferLoading != nil {
+				entry["defer_loading"] = *tool.DeferLoading
+			}
+		}
+		if tool.Namespace == "" || tool.Namespace == defaultToolNamespace {
+			out = append(out, entry)
+			continue
+		}
+		if _, seen := namespaces[tool.Namespace]; !seen {
+			namespaceOrder = append(namespaceOrder, tool.Namespace)
+		}
+		namespaces[tool.Namespace] = append(namespaces[tool.Namespace], entry)
+		// The member entry carries the bare name inside the namespace.
+		entry["name"] = strings.TrimPrefix(tool.Name, tool.Namespace+"__")
+	}
+	for _, namespace := range namespaceOrder {
 		entry := map[string]any{
-			"type": "function", "name": tool.Name,
-			"parameters": rawJSONOrEmpty(tool.Parameters),
+			"type": "namespace", "name": namespace, "tools": namespaces[namespace],
 		}
-		if tool.Description != "" {
-			entry["description"] = tool.Description
-		}
-		if tool.Strict != nil {
-			entry["strict"] = *tool.Strict
+		// A namespace description has no field of its own in the canonical
+		// model; it travels as the paragraph every member description shares.
+		// Emitting that paragraph on both the namespace and its members would
+		// fold it in again on the next decode, so it is split back out here.
+		if description, ok := sharedNamespaceDescription(namespaces[namespace]); ok {
+			entry["description"] = description
+			for _, member := range namespaces[namespace] {
+				item, _ := member.(map[string]any)
+				text, _ := item["description"].(string)
+				item["description"] = strings.TrimPrefix(text, description+"\n\n")
+			}
 		}
 		out = append(out, entry)
 	}
 	return out
 }
 
+// sharedNamespaceDescription reports the leading paragraph that every member
+// description of one namespace agrees on, which is how the canonical model
+// carries a namespace description. Members that do not agree carry no shared
+// description and the namespace is emitted without one.
+func sharedNamespaceDescription(entries []any) (string, bool) {
+	if len(entries) == 0 {
+		return "", false
+	}
+	first, _ := entries[0].(map[string]any)
+	text, _ := first["description"].(string)
+	index := strings.Index(text, "\n\n")
+	if index <= 0 {
+		return "", false
+	}
+	candidate := text[:index]
+	for _, raw := range entries {
+		item, _ := raw.(map[string]any)
+		member, _ := item["description"].(string)
+		if !strings.HasPrefix(member, candidate+"\n\n") {
+			return "", false
+		}
+	}
+	return candidate, true
+}
+
 func encodeResponsesToolChoice(choice *ToolChoice) any {
 	if choice == nil {
 		return nil
+	}
+	if len(choice.AllowedNames) > 0 {
+		// Responses expresses the permitted set natively, so the mode and the
+		// allowed list both survive instead of being collapsed.
+		allowed := make([]any, 0, len(choice.AllowedNames))
+		for _, name := range choice.AllowedNames {
+			allowed = append(allowed, map[string]any{"type": "function", "name": name})
+		}
+		return map[string]any{
+			"type": "allowed_tools", "mode": string(choice.Mode), "tools": allowed,
+		}
 	}
 	switch choice.Mode {
 	case ToolChoiceAuto, ToolChoiceNone, ToolChoiceRequired:
 		return string(choice.Mode)
 	case ToolChoiceTool:
-		return map[string]any{"type": "function", "name": choice.Name}
+		entry := map[string]any{"type": "function", "name": choice.Name}
+		if choice.Namespace != "" && choice.Namespace != defaultToolNamespace {
+			entry["name"] = strings.TrimPrefix(choice.Name, choice.Namespace+"__")
+			entry["namespace"] = choice.Namespace
+		}
+		return entry
 	}
 	return nil
 }

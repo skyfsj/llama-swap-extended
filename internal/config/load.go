@@ -100,6 +100,9 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		return Config{}, fmt.Errorf("security: %w", err)
 	}
 	config.Network = config.Network.Effective()
+	if err = config.ProtocolRuntime.Validate(); err != nil {
+		return Config{}, err
+	}
 
 	if err = config.Gateway.Failover.Validate(); err != nil {
 		return Config{}, err
@@ -108,6 +111,9 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		return Config{}, err
 	}
 	if err = config.Gateway.SkipSlow.Validate(); err != nil {
+		return Config{}, err
+	}
+	if err = config.Gateway.EmptyResponse.Validate(); err != nil {
 		return Config{}, err
 	}
 
@@ -124,6 +130,10 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 	}
 	if config.UnloadTimeout == 0 {
 		config.UnloadTimeout = DEFAULT_UNLOAD_TIMEOUT
+	}
+
+	if config.GlobalConcurrencyLimit < 0 {
+		return Config{}, fmt.Errorf("globalConcurrencyLimit must be >= 0")
 	}
 
 	// A nil RollbackOnModelStartFailure keeps the historical behaviour
@@ -510,6 +520,11 @@ func validateProfiles(config Config) error {
 				}
 				return fmt.Errorf("profiles.%s.pins.%s references unknown model %q", profileName, pin, target)
 			}
+		}
+	}
+	if profile := config.Hooks.OnStartup.Profile; profile != "" {
+		if _, found := config.Profiles[profile]; !found {
+			return fmt.Errorf("hooks.on_startup.profile references unknown profile %q", profile)
 		}
 	}
 	return nil

@@ -605,7 +605,7 @@ func TestPreviousResponseChainNormalizesResponsesOutputContent(t *testing.T) {
 		t.Fatal(err)
 	}
 	messages := chat["messages"].([]any)
-	assistant := messages[1].(map[string]any)
+	assistant := messages[0].(map[string]any)
 	content := assistant["content"].([]any)
 	if content[0].(map[string]any)["type"] != "text" || content[0].(map[string]any)["text"] != "hello" {
 		t.Fatalf("assistant content was not normalized: %#v", assistant["content"])
@@ -613,16 +613,19 @@ func TestPreviousResponseChainNormalizesResponsesOutputContent(t *testing.T) {
 	if assistant["refusal"] != "no thanks" {
 		t.Fatalf("assistant refusal = %#v", assistant["refusal"])
 	}
-	reasoning := messages[2].(map[string]any)
+	reasoning := messages[1].(map[string]any)
 	if reasoning["reasoning_content"] != "think" {
 		t.Fatalf("reasoning content = %#v", reasoning["reasoning_content"])
 	}
-	call := messages[3].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)
+	call := messages[2].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)
 	if call["function"].(map[string]any)["arguments"] != `{"q":"x"}` {
 		t.Fatalf("tool arguments = %#v", call)
 	}
-	if messages[4].(map[string]any)["content"] != `{"ok":true}` {
-		t.Fatalf("tool output = %#v", messages[4].(map[string]any)["content"])
+	if messages[3].(map[string]any)["content"] != `{"ok":true}` {
+		t.Fatalf("tool output = %#v", messages[3].(map[string]any)["content"])
+	}
+	if messages[4].(map[string]any)["role"] != "user" || messages[4].(map[string]any)["content"] != "continue" {
+		t.Fatalf("current input = %#v", messages[4])
 	}
 }
 
@@ -675,17 +678,17 @@ func TestPreviousResponseChainReplaysCustomAndToolSearchCalls(t *testing.T) {
 	if len(messages) != 4 {
 		t.Fatalf("expected 4 messages, got %d: %#v", len(messages), messages)
 	}
-	custom := messages[1].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)
+	custom := messages[0].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)
 	if custom["function"].(map[string]any)["name"] != "apply_patch" {
 		t.Fatalf("custom call name = %#v", custom)
 	}
 	if custom["function"].(map[string]any)["arguments"] != `{"input":"*** Begin Patch"}` {
 		t.Fatalf("custom call arguments = %#v", custom["function"])
 	}
-	if messages[2].(map[string]any)["tool_call_id"] != "call-1" {
-		t.Fatalf("custom output call id = %#v", messages[2])
+	if messages[1].(map[string]any)["tool_call_id"] != "call-1" {
+		t.Fatalf("custom output call id = %#v", messages[1])
 	}
-	search := messages[3].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)
+	search := messages[2].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)
 	if search["function"].(map[string]any)["name"] != "tool_search" {
 		t.Fatalf("tool search name = %#v", search)
 	}

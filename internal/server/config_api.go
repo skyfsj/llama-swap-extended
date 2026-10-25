@@ -520,6 +520,5 @@ func isSensitiveConfigKey(key, parent string) bool {
 }
 
 func sensitiveConfigName(name string) bool {
-	lower := strings.ToLower(strings.ReplaceAll(name, "-", "_"))
-	return lower == "apikey" || lower == "api_key" || lower == "authorization" || lower == "auth_token" || lower == "password" || lower == "secret" || lower == "token" || strings.Contains(lower, "secret") || strings.Contains(lower, "password") || strings.Contains(lower, "token")
+	return config.IsSensitiveConfigName(name)
 }

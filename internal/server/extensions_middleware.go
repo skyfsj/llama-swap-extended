@@ -19,6 +19,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/extensions"
 	protocolrelaykit "github.com/mostlygeek/llama-swap/internal/protocol/relaykit"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
+	"github.com/mostlygeek/llama-swap/pkg/dialect"
 	"strings"
 )
 
@@ -68,9 +69,12 @@ func validExtensionRequestID(value string) bool {
 }
 
 type extensionRequestState struct {
-	items  []*extensions.Compiled
-	meta   extensions.Context
-	owners map[string]*extensions.Compiled
+	toolChoice        *dialect.ToolChoice
+	parallelTools     *bool
+	unknownToolChoice bool
+	items             []*extensions.Compiled
+	meta              extensions.Context
+	owners            map[string]*extensions.Compiled
 	// hostedToolsBefore is the provider-hosted tool count captured before the
 	// request hooks ran, so a hook-injected hosted tool can be told apart from
 	// a client-sent one when the protocol adapter decides what to strip.
@@ -152,7 +156,7 @@ func CreateExtensionsMiddleware(s *Server, cfg config.Config, manager *extension
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			endpoint := extensionEndpoint(r.URL.Path)
-			if manager == nil || endpoint == "" || r.Method != http.MethodPost {
+			if (manager == nil && !cfg.ProtocolRuntime.MCP.Enabled) || endpoint == "" || r.Method != http.MethodPost {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -187,7 +191,17 @@ func CreateExtensionsMiddleware(s *Server, cfg config.Config, manager *extension
 			meta.Session = extensionSession(r, identity)
 			meta.Locale = requestLocale(r)
 			meta.Models = extensionModelSnapshot(cfg, identity)
-			state := &extensionRequestState{items: manager.Match(meta), meta: meta, owners: map[string]*extensions.Compiled{}, continuationLimit: cfg.Extensions.EffectiveMaxContinuationBytes()}
+			var matched []*extensions.Compiled
+			if manager != nil && cfg.Extensions.Enabled {
+				matched = manager.Match(meta)
+			}
+			mcpItems, mcpErr := s.mcpExtensions(r.Context(), cfg, meta)
+			if mcpErr != nil {
+				swaputil.SendResponse(w, r, http.StatusBadGateway, mcpErr.Error())
+				return
+			}
+			matched = append(matched, mcpItems...)
+			state := &extensionRequestState{items: matched, meta: meta, owners: map[string]*extensions.Compiled{}, continuationLimit: cfg.Extensions.EffectiveMaxContinuationBytes()}
 			// A debug chat request runs exactly one extension regardless of its
 			// enabled state or match rules, so the editor tests a work-in-progress
 			// extension in isolation from everything else that would match.
@@ -200,8 +214,7 @@ func CreateExtensionsMiddleware(s *Server, cfg config.Config, manager *extension
 			// and the closure is identical for every request, so concurrent
 			// writes race only on the benign field, not on behavior.
 			if s.extensionLogs != nil {
-				logRoot := extensionLogRoot(&cfg)
-				rotation := newExtensionLogRotation(logRoot, cfg.Extensions)
+				rotation := s.extensionLogs.rotationFor(extensionLogRoot(&cfg), cfg.Extensions)
 				for _, item := range state.items {
 					if item == nil || item.LogSink != nil {
 						continue
@@ -249,6 +262,24 @@ func CreateExtensionsMiddleware(s *Server, cfg config.Config, manager *extension
 			if err := json.Unmarshal(body, &request); err != nil {
 				swaputil.SendResponse(w, r, http.StatusBadRequest, "extension request must be JSON: "+jsonErrorDetail(body, err))
 				return
+			}
+			format := dialect.OpenAIResponses
+			switch endpoint {
+			case "chat.completions":
+				format = dialect.OpenAIChat
+			case "anthropic.messages":
+				format = dialect.ClaudeMessages
+			case "gemini.generateContent":
+				format = dialect.Gemini
+			}
+			if parsed, notes, err := dialect.DecodeRequest(format, body); err == nil {
+				state.toolChoice = parsed.ToolChoice
+				state.parallelTools = parsed.ParallelTools
+				for _, note := range notes {
+					if note.Code == "tool_choice_dropped" {
+						state.unknownToolChoice = true
+					}
+				}
 			}
 			if serverToolArtifactsVisible(endpoint) {
 				// A caller that replayed the previous turn carries the server-tool
@@ -424,6 +455,13 @@ func CreateExtensionsMiddleware(s *Server, cfg config.Config, manager *extension
 					swaputil.SendResponse(w, r, http.StatusBadGateway, err.Error())
 					return
 				}
+				if err := prepareMCPApprovals(r.Context(), state, request, response, serverCalls, endpoint); err != nil {
+					if mcpErrorResponse(w, r, err) {
+						return
+					}
+					swaputil.SendResponse(w, r, 502, err.Error())
+					return
+				}
 				// Alternate choices never join the extension loop, and a call there
 				// must not reach the caller unexecuted, whichever branch answers.
 				stripAlternateChoiceCalls(response, endpoint)
@@ -461,6 +499,9 @@ func CreateExtensionsMiddleware(s *Server, cfg config.Config, manager *extension
 					// travel back as artifacts instead of a daemon-side record:
 					// nothing about this round has to survive the round trip.
 					if err := extensionContinue(r.Context(), state, request, response, serverCalls, endpoint); err != nil {
+						if mcpErrorResponse(w, r, err) {
+							return
+						}
 						swaputil.SendResponse(w, r, http.StatusBadGateway, err.Error())
 						return
 					}
@@ -528,6 +569,9 @@ func CreateExtensionsMiddleware(s *Server, cfg config.Config, manager *extension
 					return
 				}
 				if err := extensionContinue(r.Context(), state, request, response, serverCalls, endpoint); err != nil {
+					if mcpErrorResponse(w, r, err) {
+						return
+					}
 					swaputil.SendResponse(w, r, http.StatusBadGateway, err.Error())
 					return
 				}
@@ -1308,7 +1352,15 @@ func classifyExtensionCalls(ctx context.Context, state *extensionRequestState, c
 	serverCalls := make([]extensionCall, 0, len(calls))
 	clientCalls := make([]extensionCall, 0, len(calls))
 	withheld := state.withheldServerTools()
+	if len(calls) > 1 && (state.parallelTools != nil && !*state.parallelTools || state.toolChoice != nil && state.toolChoice.DisableParallel != nil && *state.toolChoice.DisableParallel) {
+		return nil, nil, errors.New("upstream violated the request's parallel tool-call policy")
+	}
 	for _, call := range calls {
+		if state.owners[call.Name] != nil {
+			if err := validateExtensionToolChoice(state, call.Name); err != nil {
+				return nil, nil, err
+			}
+		}
 		if withheld[call.Name] {
 			// The round did not offer this tool, so it cannot be run and the
 			// client cannot run it either: drop the call rather than hand over
@@ -1326,6 +1378,9 @@ func classifyExtensionCalls(ctx context.Context, state *extensionRequestState, c
 		for _, item := range state.items {
 			if !item.Manifest.InterceptClientTools || !hasExtensionHook(item, "onToolCall") {
 				continue
+			}
+			if err := validateExtensionToolChoice(state, call.Name); err != nil {
+				return nil, nil, err
 			}
 			conflict := false
 			for _, tool := range item.Tools {
@@ -1451,7 +1506,11 @@ func extensionCalls(response map[string]any, endpoint string) []extensionCall {
 				arguments = []byte("{}")
 			}
 			if name != "" {
-				result = append(result, extensionCall{ID: geminiCallID(index), Name: name, Arguments: string(arguments)})
+				id, _ := entry["id"].(string)
+				if id == "" {
+					id = geminiCallID(index)
+				}
+				result = append(result, extensionCall{ID: id, Name: name, Arguments: string(arguments), RawPart: part})
 			}
 		}
 		return result
@@ -1524,6 +1583,11 @@ func applyToolResultHooks(ctx context.Context, state *extensionRequestState, out
 // the input back. The echo produced a tool message the engine rejects (a tool
 // result whose content is an object), which failed the whole request.
 func toolResultFor(endpoint string, call extensionCall, output map[string]any) map[string]any {
+	if native, err := mcpNativeToolResult(endpoint, call, output); err == nil && native != nil {
+		return native
+	} else if err != nil {
+		output = toolFailureResult(call.Name, err)
+	}
 	content, ok := output["content"]
 	if !ok || content == nil {
 		output = toolFailureResult(call.Name, errors.New("the extension returned no tool result"))
@@ -1588,6 +1652,9 @@ func toolFailureResult(tool string, failure error) map[string]any {
 }
 
 func extensionContinue(ctx context.Context, state *extensionRequestState, request, response map[string]any, calls []extensionCall, endpoint string) error {
+	if err := prepareMCPApprovals(ctx, state, request, response, calls, endpoint); err != nil {
+		return err
+	}
 	var results []any
 	for _, call := range calls {
 		var args any
@@ -1613,6 +1680,16 @@ func extensionContinue(ctx context.Context, state *extensionRequestState, reques
 			output, err = extensionMapHook(ctx, call.Owner, "onToolCall", state.meta, input)
 		}
 		if err != nil {
+			var waiting *mcpApprovalRequired
+			if errors.As(err, &waiting) && waiting.InputRequired {
+				for i := range calls {
+					if prior := state.serverOutputs[calls[i].ID]; prior != nil {
+						calls[i].Precomputed = prior
+					}
+				}
+				ctx := context.WithValue(ctx, mcpPendingInputKey{}, map[string]string{call.ID: waiting.ID})
+				return prepareMCPApprovals(ctx, state, request, response, calls, endpoint)
+			}
 			if call.Owner.Manifest.FailOnToolError {
 				return err
 			}
@@ -1621,6 +1698,9 @@ func extensionContinue(ctx context.Context, state *extensionRequestState, reques
 		}
 		output, err = applyToolResultHooks(ctx, state, output)
 		if err != nil {
+			return err
+		}
+		if _, err := mcpNativeToolResult(endpoint, call, output); err != nil {
 			return err
 		}
 		if _, ok := output["content"]; !ok {
@@ -1667,6 +1747,10 @@ func extensionContinue(ctx context.Context, state *extensionRequestState, reques
 		parts := make([]any, 0, len(results))
 		for _, result := range results {
 			entry, _ := result.(map[string]any)
+			if native, ok := entry["native"].(map[string]any); ok {
+				parts = append(parts, map[string]any{"functionResponse": native})
+				continue
+			}
 			responsePayload := map[string]any{"result": entry["response"]}
 			if entry["response"] == nil {
 				responsePayload["result"] = ""

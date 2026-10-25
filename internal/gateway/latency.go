@@ -20,6 +20,10 @@ type skipSlowPolicy struct {
 	// this multiple; 0 means the rule is off.
 	relativeFactor float64
 	minSamples     int
+	// probeInterval is how long a skipped provider stays excluded before it is
+	// admitted again for one measurement. 0 disables probing, which makes
+	// exclusion permanent — see the starvation note on filterSlowRoutes.
+	probeInterval time.Duration
 }
 
 func resolveSkipSlow(cfg config.GatewaySkipSlowConfig) skipSlowPolicy {
@@ -38,6 +42,7 @@ func resolveSkipSlow(cfg config.GatewaySkipSlowConfig) skipSlowPolicy {
 		maxFirstTokenMs: float64(cfg.MaxFirstTokenMs),
 		relativeFactor:  factor,
 		minSamples:      cfg.EffectiveMinSamples(),
+		probeInterval:   cfg.EffectiveProbeInterval(),
 	}
 }
 
@@ -54,6 +59,18 @@ type latencySample struct {
 	// skipped counts how many times this provider was passed over because of
 	// this policy, so the effect is visible instead of looking like a mystery.
 	skipped int
+	// excludedSince is when this provider was first judged too slow in the
+	// current exclusion streak. Zero while the provider is not excluded. The
+	// probe interval is measured from here, so a provider is skipped normally
+	// and only admitted again after it has been out of the pool that long.
+	excludedSince time.Time
+	// probeUntil is the end of the current admission window that lets an
+	// excluded provider be measured again. Zero means no window is open. The
+	// window (rather than a one-shot admission) is what makes probing work at
+	// all: one request consults the policy several times as the route is
+	// resolved and planned, and a one-shot flag would be consumed by the first
+	// lookup and leave the actual dispatch filtered out.
+	probeUntil time.Time
 }
 
 // latencyTable tracks per-provider first-token latency.
@@ -96,6 +113,12 @@ func (t *latencyTable) observe(provider string, latency time.Duration) {
 	entry.ewma = latencyEWMAAlpha*ms + (1-latencyEWMAAlpha)*entry.ewma
 	entry.samples++
 	entry.lastAt = time.Now()
+	// A measurement ends the probe: the provider has just been observed, so the
+	// next exclusion streak (if it is still slow) starts from this moment. The
+	// window must not stay open, or a provider that is still slow would keep
+	// receiving traffic for the rest of it.
+	entry.probeUntil = time.Time{}
+	entry.excludedSince = time.Time{}
 }
 
 // ObserveFirstToken records one measured first-token latency for a provider.
@@ -152,6 +175,47 @@ func (t *latencyTable) latency(provider string, minSamples int) (float64, bool, 
 	return entry.ewma, entry.samples >= minSamples, entry.skipped
 }
 
+// admitForProbe decides whether a provider the rule wants to skip should be
+// admitted anyway so its recovery can be measured.
+//
+// The first time a provider is judged too slow it is skipped normally and the
+// exclusion streak starts. Once it has been excluded for a full interval, a
+// probe window opens and the provider is admitted again. Without this, skipping
+// is self-reinforcing: a provider that is never picked never produces another
+// measurement, so its smoothed latency stays frozen at the value that excluded
+// it and it can never prove it recovered.
+//
+// The window stays open for one interval (several lookups happen per request,
+// and a one-shot admission would be spent before dispatch) and is closed by the
+// next observation, which also ends the exclusion streak.
+func (t *latencyTable) admitForProbe(provider string, now time.Time, interval time.Duration) bool {
+	if t == nil || provider == "" || interval <= 0 {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	entry, ok := t.observations[provider]
+	if !ok {
+		return false
+	}
+	if entry.probeUntil.After(now) {
+		// A probe window is already open: keep admitting until it is measured
+		// or the window expires.
+		return true
+	}
+	if entry.excludedSince.IsZero() {
+		// First time this provider is judged too slow: start the streak and
+		// skip it as the policy says.
+		entry.excludedSince = now
+		return false
+	}
+	if now.Sub(entry.excludedSince) < interval {
+		return false
+	}
+	entry.probeUntil = now.Add(interval)
+	return true
+}
+
 // ProviderLatency is one provider's latency as reported to the status API.
 type ProviderLatency struct {
 	FirstTokenMs float64 `json:"firstTokenMs,omitempty"`
@@ -205,13 +269,6 @@ func (g *Gateway) fastRoutes(routes []*Route) []*Route {
 	return filterSlowRoutes(routes, policy, latency, g.logger)
 }
 
-// fastRoutesLocked is fastRoutes for a caller that already holds g.mu (read).
-// RouteFor resolves its candidates under the lock, and re-acquiring it there
-// would deadlock behind a pending writer.
-func (g *Gateway) fastRoutesLocked(routes []*Route) []*Route {
-	return filterSlowRoutes(routes, g.skipSlow, g.latency, g.logger)
-}
-
 func filterSlowRoutes(routes []*Route, policy skipSlowPolicy, latency *latencyTable, logger *logmon.Monitor) []*Route {
 	if len(routes) <= 1 {
 		// 单候选（需求点名的那条）：没有可比对象，也绝不能因为"它慢"就
@@ -244,12 +301,16 @@ func filterSlowRoutes(routes []*Route, policy skipSlowPolicy, latency *latencyTa
 	}
 	if len(measurements) < 2 {
 		// Fewer than two trusted measurements: there is nothing to compare
-		// against, so no decision can be made.
+		// against, so no decision can be made. Note this is a real gap for the
+		// caller: the providers that would be filtered are exactly the ones
+		// with no measurement, so they are kept by the fail-open rule below
+		// anyway. Kept as an early exit so the common unevaluated case is cheap.
 		return routes
 	}
 
 	kept := make([]*Route, 0, len(routes))
 	skipped := make([]string, 0, len(routes))
+	now := time.Now()
 	for _, route := range routes {
 		ms, trusted, _ := latency.latency(route.ProviderID, policy.minSamples)
 		if !trusted {
@@ -257,6 +318,19 @@ func filterSlowRoutes(routes []*Route, policy skipSlowPolicy, latency *latencyTa
 			continue
 		}
 		if slow := tooSlow(ms, fastest, policy); slow {
+			// A provider the rule would drop is admitted while its probe
+			// window is open. Skipping is self-reinforcing — an excluded
+			// provider produces no new measurement, so its smoothed latency
+			// stays frozen at the value that excluded it and a recovery could
+			// never be observed. The probe is the only way back into the pool.
+			if latency.admitForProbe(route.ProviderID, now, policy.probeInterval) {
+				if logger != nil {
+					logger.Debugf("gateway: probing previously slow provider %s (last measured first-token %.0fms, fastest %.0fms)",
+						route.ProviderID, ms, fastest)
+				}
+				kept = append(kept, route)
+				continue
+			}
 			skipped = append(skipped, route.ProviderID)
 			continue
 		}

@@ -1,5 +1,6 @@
 import { errorMessageFromPayload } from "./apiError";
 import { requestJson } from "./http";
+import { apiUrl } from "./apiPath";
 
 /** Upstream API protocol of a provider. */
 export type ProviderType = "openai" | "openai-responses" | "anthropic" | "gemini" | "gemini-interactions";
@@ -61,6 +62,8 @@ export interface ProviderModelEntry {
    * model under its tooling from this block; empty reads as a chat model.
    */
   capabilities?: ProviderModelCapabilities;
+  /** Explicit pricing-catalog entry; empty resolves by the provider name and the upstream name. */
+  pricing?: { provider?: string; model?: string };
 }
 
 /** One upstream API surface of a provider. */
@@ -84,9 +87,58 @@ export interface ProviderAdapterUI {
 /** Quota (subscription usage) configuration of a provider. */
 export interface ProviderQuotaConfigUI {
   preset?: string;
+  /** Quota endpoint; a preset supplies it unless overridden here. */
   endpoint?: string;
+  /**
+   * JavaScript expression that fetches/computes the usage snapshot instead of
+   * the declarative endpoint+windows mapping. Accepts the CC Switch shape
+   * (`({request, extractor})`) or an async function.
+   */
+  script?: string;
   refreshInterval?: string;
   enforce?: { enabled?: boolean; threshold?: number; fallbackCooldown?: string };
+  /**
+   * Inline mapping fields (windows, extras, divideBy, auth, headers, ...) come
+   * from a YAML-authored mapping. The form preserves them verbatim instead of
+   * dropping them on save; only the endpoint editor touches them.
+   */
+  [key: string]: unknown;
+}
+
+/**
+ * One built-in quota preset offered by the server. `endpoint` may be a
+ * "{base}/path" template: the real URL comes from the provider's own
+ * endpoint, so a self-hosted aggregator needs no duplicated host.
+ */
+export interface QuotaPresetSummary {
+  id: string;
+  name: string;
+  description?: string;
+  /** Grouping key: official | subscription | self-hosted. */
+  category?: string;
+  endpoint?: string;
+  needsBase?: boolean;
+  /** The preset is driven by JavaScript instead of a static mapping. */
+  hasScript?: boolean;
+  windows: number;
+  extras: number;
+}
+
+/** One preset including its script source, for "load preset script". */
+export interface QuotaPresetDetail extends QuotaPresetSummary {
+  script?: string;
+}
+
+/** Result of running a draft script through the test endpoint. */
+export interface QuotaScriptTestResult {
+  snapshot: CredentialQuota;
+  request?: {
+    url: string;
+    method: string;
+    headers?: Record<string, string>;
+    body?: unknown;
+  };
+  error?: string;
 }
 
 /** One usage window of a credential as reported by /api/providers/quotas. */
@@ -98,12 +150,17 @@ export interface QuotaWindowStatus {
   remainingPercent: number;
   status?: string;
   resetsAt?: string;
+  /** Absolute amounts of an amount window (used/limit); zero for percent windows. */
+  used?: number;
+  limit?: number;
 }
 
 export interface QuotaExtra {
   id: string;
   label: string;
   value: unknown;
+  /** Rendered after the value (" USD", "%", ...). */
+  suffix?: string;
 }
 
 export interface CredentialQuota {
@@ -144,6 +201,11 @@ export interface ProviderConfigUI {
   cooldown?: ProviderCooldownPolicy | { policy?: ProviderCooldownPolicy; auth?: string; authProbe?: string; rateLimit?: string; transient?: string };
   /** Prefix prepended to every exposed model name (default: none). */
   modelPrefix?: string;
+  /**
+   * Pricing-catalog provider id used to price this provider's models. Empty
+   * falls back to the provider's own id, lowercased.
+   */
+  pricingProvider?: string;
   /** Provider template this entry was created from (provenance only). */
   template?: string;
   /** Subscription usage mapping shown as quota cards. */
@@ -191,10 +253,19 @@ export interface ProvidersStatusResponse {
     disabled?: boolean;
     modelCount: number;
     keyCount: number;
+    /**
+     * Every configured credential, including keys disabled in configuration.
+     * Route key lists only carry schedulable members, so the quota cards read
+     * this one to show a disabled key's subscription too.
+     */
+    keys?: ProviderKeyStatus[];
   }>;
   routes: ProviderRouteStatus[];
-  /** Built-in quota preset ids (providers.<id>.quota.preset values). */
-  quotaPresets?: string[];
+  stickySessionsEnabled?: boolean;
+  /** Built-in quota presets (providers.<id>.quota.preset values). */
+  quotaPresets?: QuotaPresetSummary[];
+  /** Observed first-token latency per provider (skip-slow routing). */
+  latency?: Record<string, unknown>;
 }
 
 export interface ProvidersProbeRequest {
@@ -269,6 +340,10 @@ export function normalizeProvider(value: unknown): ProviderConfigUI | null {
     cooldown: normalizeCooldown(record.cooldown),
     modelPrefix:
       typeof record.modelPrefix === "string" && record.modelPrefix !== "" ? record.modelPrefix : undefined,
+    pricingProvider:
+      typeof record.pricingProvider === "string" && record.pricingProvider.trim() !== ""
+        ? record.pricingProvider.trim()
+        : undefined,
     template: typeof record.template === "string" && record.template !== "" ? record.template : undefined,
     quota: normalizeQuota(record.quota),
     apiKeys,
@@ -394,9 +469,21 @@ function normalizeModelEntries(value: unknown): ProviderModelEntry[] {
       if (proxy) out.proxy = proxy;
       const capabilities = normalizeModelCapabilities(entry.capabilities);
       if (capabilities) out.capabilities = capabilities;
+      const pricing = normalizePricingRef(entry.pricing);
+      if (pricing) out.pricing = pricing;
       return out;
     })
     .filter((item): item is ProviderModelEntry => item !== null);
+}
+
+/** Normalizes an explicit pricing-catalog ref; undefined when nothing is set. */
+function normalizePricingRef(value: unknown): { provider?: string; model?: string } | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const entry = value as Record<string, unknown>;
+  const provider = typeof entry.provider === "string" && entry.provider.trim() !== "" ? entry.provider.trim() : undefined;
+  const model = typeof entry.model === "string" && entry.model.trim() !== "" ? entry.model.trim() : undefined;
+  if (!provider && !model) return undefined;
+  return { provider, model };
 }
 
 /** Normalizes a capability block; undefined when nothing is declared. */
@@ -457,11 +544,22 @@ function normalizeCooldown(
 function normalizeQuota(value: unknown): ProviderQuotaConfigUI | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   const record = value as Record<string, unknown>;
-  const quota: ProviderQuotaConfigUI = {};
+  // Start from the raw block: fields this editor does not surface (windows,
+  // extras, divideBy, auth, headers, method, timeoutSeconds) belong to an
+  // inline mapping and must survive an edit/save cycle. Rebuilding the object
+  // from scratch silently deleted them.
+  const quota: ProviderQuotaConfigUI = { ...(record as ProviderQuotaConfigUI) };
+
   if (typeof record.preset === "string" && record.preset !== "") quota.preset = record.preset;
+  else delete quota.preset;
   if (typeof record.endpoint === "string" && record.endpoint !== "") quota.endpoint = record.endpoint;
+  else delete quota.endpoint;
+  if (typeof record.script === "string" && record.script.trim() !== "") quota.script = record.script;
+  else delete quota.script;
   if (typeof record.refreshInterval === "string" && record.refreshInterval !== "") {
     quota.refreshInterval = record.refreshInterval;
+  } else {
+    delete quota.refreshInterval;
   }
   if (record.enforce && typeof record.enforce === "object") {
     const enforce = record.enforce as Record<string, unknown>;
@@ -472,6 +570,9 @@ function normalizeQuota(value: unknown): ProviderQuotaConfigUI | undefined {
       out.fallbackCooldown = enforce.fallbackCooldown;
     }
     if (Object.keys(out).length > 0) quota.enforce = out;
+    else delete quota.enforce;
+  } else {
+    delete quota.enforce;
   }
   return Object.keys(quota).length > 0 ? quota : undefined;
 }
@@ -544,6 +645,7 @@ export function providersSectionToConfig(
         ? { cooldown: p.cooldown }
         : {}),
       ...(p.modelPrefix ? { modelPrefix: p.modelPrefix } : {}),
+      ...(p.pricingProvider ? { pricingProvider: p.pricingProvider } : {}),
       ...(p.template ? { template: p.template } : {}),
       ...(p.quota && Object.keys(p.quota).length > 0 ? { quota: p.quota } : {}),
       apiKeys: keys,
@@ -563,16 +665,20 @@ function hasAdapterExtras(adapter: ProviderAdapterUI): boolean {
 }
 
 function serializeModel(model: ProviderModelEntry): unknown {
-  // The scalar shorthand cannot carry a proxy, aliases or capabilities: keep
-  // the object form then.
+  // The scalar shorthand cannot carry a proxy, aliases, capabilities or a
+  // pricing ref: keep the object form then.
   const capabilities = model.capabilities;
-  if (!model.proxy && !model.aliases?.length && !capabilities && model.local === model.remote) return model.local;
+  const pricing = model.pricing;
+  if (!model.proxy && !model.aliases?.length && !capabilities && !pricing && model.local === model.remote) {
+    return model.local;
+  }
   return {
     local: model.local,
     remote: model.remote,
     ...(model.aliases?.length ? { aliases: model.aliases } : {}),
     ...(model.proxy ? { proxy: model.proxy } : {}),
     ...(capabilities ? { capabilities } : {}),
+    ...(pricing ? { pricing } : {}),
   };
 }
 
@@ -605,9 +711,15 @@ function serializeAdapter(adapter: ProviderAdapterUI): Record<string, unknown> {
 /** Fetches the runtime status of all providers and their credentials. */
 export async function fetchProvidersStatus(): Promise<ProvidersStatusResponse> {
   const payload = await requestJson<ProvidersStatusResponse>("/api/providers/status");
+  // Pass the whole payload through: rebuilding it field by field silently
+  // dropped everything the page did not ask for yet, which is how the quota
+  // preset list never reached the editor's dropdown.
   return {
     providers: Array.isArray(payload?.providers) ? payload.providers : [],
     routes: Array.isArray(payload?.routes) ? payload.routes : [],
+    stickySessionsEnabled: payload?.stickySessionsEnabled === true,
+    quotaPresets: Array.isArray(payload?.quotaPresets) ? payload.quotaPresets : [],
+    ...(payload?.latency ? { latency: payload.latency } : {}),
   };
 }
 
@@ -691,6 +803,29 @@ export async function clearProviderKeyCooldown(keyID: string): Promise<void> {
   });
 }
 
+/** Loads one built-in quota preset including its script source. */
+export async function fetchQuotaPreset(id: string): Promise<QuotaPresetDetail> {
+  return requestJson<QuotaPresetDetail>(`/api/providers/quota-presets/${encodeURIComponent(id)}`);
+}
+
+/**
+ * Runs a draft quota script (or a preset's script) against one credential.
+ * Nothing is cached and no enforcement is applied, so this is safe to call
+ * while the operator is still editing.
+ */
+export async function testQuotaScript(req: {
+  providerID: string;
+  keyID?: string;
+  script?: string;
+  preset?: string;
+}): Promise<QuotaScriptTestResult> {
+  return requestJson<QuotaScriptTestResult>("/api/providers/quotas/test", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req),
+  });
+}
+
 /** A full config snapshot as served by GET /api/config. */
 export interface ConfigSnapshot {
   config?: Record<string, unknown>;
@@ -703,7 +838,7 @@ export interface ConfigSnapshot {
 
 /** Loads the full config snapshot (providers section included). */
 export async function fetchConfigSnapshot(): Promise<ConfigSnapshot> {
-  const response = await fetch("/api/config", { credentials: "same-origin" });
+  const response = await fetch(apiUrl("/api/config"), { credentials: "same-origin" });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
     throw new Error(errorMessageFromPayload(payload, `HTTP ${response.status}`));
@@ -720,7 +855,7 @@ export async function saveProvidersSection(
   etag: string,
   providers: Record<string, ProviderConfigUI>,
 ): Promise<ConfigSnapshot> {
-  const response = await fetch("/api/config", {
+  const response = await fetch(apiUrl("/api/config"), {
     method: "PATCH",
     credentials: "same-origin",
     headers: { "Content-Type": "application/json", "If-Match": etag },
@@ -806,7 +941,7 @@ export async function setProviderDisabled(
     // 已经处于启用状态且配置里本就没有该字段：无需请求，也就不会改动 etag。
     return await fetchConfigSnapshot();
   }
-  const response = await fetch("/api/config", {
+  const response = await fetch(apiUrl("/api/config"), {
     method: "PATCH",
     credentials: "same-origin",
     headers: { "Content-Type": "application/json", "If-Match": etag },

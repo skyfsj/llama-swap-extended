@@ -26,6 +26,10 @@ const (
 	// amplify memory or transaction time without bound.
 	maxPricingEntries       = 200_000
 	maxPricingIdentityBytes = 512
+	// maxPricingErrorBytes bounds the failure message kept for the UI. A proxy or
+	// DNS error can embed a whole URL and certificate chain; the panel only needs
+	// enough to tell the operator what to fix.
+	maxPricingErrorBytes = 512
 )
 
 type Syncer struct {
@@ -61,6 +65,44 @@ func (s *Syncer) Sync(ctx context.Context) (SyncResult, error) {
 	if s.Store == nil {
 		return SyncResult{}, fmt.Errorf("pricing store is required")
 	}
+	result, err := s.syncLocked(ctx)
+	if err != nil {
+		// Surface the failure where an operator can see it. The daemon log is
+		// the only other place it lands, and logToStdout "none" discards that,
+		// which left an aging catalog with no visible cause.
+		s.recordError(ctx, err)
+		return result, err
+	}
+	s.recordError(ctx, nil)
+	return result, nil
+}
+
+// recordError persists the outcome of the last attempt so the control plane can
+// show why the catalog is stale. It is best-effort: a store failure must not
+// replace the sync error the caller is already handling.
+func (s *Syncer) recordError(ctx context.Context, cause error) {
+	if s.Store == nil {
+		return
+	}
+	meta, err := s.Store.GetPricingMeta(ctx)
+	if err != nil {
+		return
+	}
+	message := ""
+	if cause != nil {
+		message = cause.Error()
+		if len(message) > maxPricingErrorBytes {
+			message = message[:maxPricingErrorBytes]
+		}
+	}
+	if meta.LastError == message {
+		return
+	}
+	meta.LastError = message
+	_ = s.Store.SetPricingMeta(ctx, meta)
+}
+
+func (s *Syncer) syncLocked(ctx context.Context) (SyncResult, error) {
 	endpoint := strings.TrimSpace(s.URL)
 	if endpoint == "" {
 		endpoint = "https://models.dev/api.json"

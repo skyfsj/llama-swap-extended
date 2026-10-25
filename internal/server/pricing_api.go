@@ -23,6 +23,9 @@ type pricingPricesResponse struct {
 	ETag       string        `json:"etag,omitempty"`
 	SyncedAt   *time.Time    `json:"syncedAt,omitempty"`
 	Source     string        `json:"source,omitempty"`
+	// LastError explains a failed refresh. Without it a background failure is
+	// invisible: the timestamp simply stops moving and nothing says why.
+	LastError string `json:"lastError,omitempty"`
 }
 
 type pricingPriceRequest struct {
@@ -161,12 +164,12 @@ func (s *Server) handleAPIPricingSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	settings := s.currentConfig().EffectivePricing().ModelsDev
-	if !settings.Enabled {
+	if !settings.ModelsDevEnabled() {
 		swaputil.SendResponse(w, r, http.StatusConflict, "pricing synchronization is disabled")
 		return
 	}
-	syncer := s.pricing
-	if syncer == nil || strings.TrimSpace(syncer.URL) != strings.TrimSpace(settings.URL) {
+	syncer, syncerURL := s.currentPricingSyncer()
+	if syncer == nil || strings.TrimSpace(syncerURL) != strings.TrimSpace(settings.URL) {
 		syncer = &pricing.Syncer{Store: s.store, URL: settings.URL}
 	}
 	result, err := syncer.Sync(r.Context())
@@ -198,7 +201,7 @@ func writePricingPricesResponse(w http.ResponseWriter, r *http.Request, page sto
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(pricingPricesResponse{
 		Data: page.Data, Page: page.Page, Limit: page.Limit, Total: page.Total, TotalPages: page.TotalPages,
-		ETag: meta.ETag, SyncedAt: syncedAt, Source: meta.Source,
+		ETag: meta.ETag, SyncedAt: syncedAt, Source: meta.Source, LastError: meta.LastError,
 	})
 }
 

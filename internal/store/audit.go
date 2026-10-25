@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/store/auditstore"
@@ -139,6 +140,108 @@ func (s *Store) OpenBody(ref string) (io.ReadSeeker, int64, time.Time, error) {
 // row — which owns first-token/decode/duration and the speed curve — is still
 // in the operational database, so the fields are read separately and merged
 // with the same COALESCE sentinels the previous single-query join produced.
+// attachActivityPhasesBatch fills the phase telemetry of many audit
+// conversations in one query. It replaces one query per row on the audit list
+// path: the operational database has a single connection, so a 500-row page
+// used to serialize 500 round trips against every concurrent request.
+//
+// The per-row semantics are unchanged: a conversation whose activity row is
+// missing keeps the -1 sentinels, and each row is matched by its own id.
+func (s *Store) attachActivityPhasesBatch(ctx context.Context, conversations []AuditConversation) error {
+	if s == nil || s.db == nil || len(conversations) == 0 {
+		return nil
+	}
+	// Every row starts from the sentinels, including the ones with no activity
+	// id: a row that stays untouched must read exactly like a row whose
+	// activity row is missing.
+	for index := range conversations {
+		conversations[index].FirstTokenMs = -1
+		conversations[index].DecodeMs = -1
+	}
+	ids := make([]int64, 0, len(conversations))
+	seen := make(map[int]struct{}, len(conversations))
+	for _, conversation := range conversations {
+		if conversation.ActivityID < 1 {
+			continue
+		}
+		if _, duplicate := seen[conversation.ActivityID]; duplicate {
+			continue
+		}
+		seen[conversation.ActivityID] = struct{}{}
+		ids = append(ids, int64(conversation.ActivityID))
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+
+	// SQLite's default bound-parameter limit is high, but a huge page would
+	// still build an impractical statement, so the ids are chunked.
+	const chunk = 400
+	for start := 0; start < len(ids); start += chunk {
+		end := min(start+chunk, len(ids))
+		batch := ids[start:end]
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(batch)), ",")
+		args := make([]any, len(batch))
+		for index, id := range batch {
+			args[index] = id
+		}
+		rows, err := s.db.QueryContext(ctx,
+			`SELECT id, first_token_ms, decode_ms, duration_ms, speed_timeline FROM activity WHERE id IN (`+placeholders+`)`,
+			args...)
+		if err != nil {
+			return fmt.Errorf("read activity phases for audit conversations: %w", err)
+		}
+		for rows.Next() {
+			var (
+				id         int64
+				firstToken sql.NullInt64
+				decode     sql.NullInt64
+				duration   sql.NullInt64
+				timeline   sql.NullString
+			)
+			if err := rows.Scan(&id, &firstToken, &decode, &duration, &timeline); err != nil {
+				rows.Close()
+				return fmt.Errorf("read activity phases for audit conversations: %w", err)
+			}
+			for index := range conversations {
+				if int64(conversations[index].ActivityID) != id {
+					continue
+				}
+				applyActivityPhases(&conversations[index], firstToken, decode, duration, timeline)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return fmt.Errorf("read activity phases for audit conversations: %w", err)
+		}
+		rows.Close()
+	}
+	return nil
+}
+
+// applyActivityPhases merges one activity row's phase telemetry into a
+// conversation. It is shared by the single-row and batched readers so both
+// interpret the columns identically.
+func applyActivityPhases(conversation *AuditConversation, firstToken, decode, duration sql.NullInt64, timeline sql.NullString) {
+	if conversation == nil {
+		return
+	}
+	conversation.FirstTokenMs = -1
+	conversation.DecodeMs = -1
+	if firstToken.Valid {
+		conversation.FirstTokenMs = normalizeDecodeMs(int(firstToken.Int64))
+	}
+	if decode.Valid {
+		conversation.DecodeMs = normalizeDecodeMs(int(decode.Int64))
+	}
+	if duration.Valid {
+		conversation.DurationMs = int(duration.Int64)
+	}
+	if timeline.Valid {
+		conversation.SpeedTimeline = timeline.String
+	}
+}
+
 func (s *Store) attachActivityPhases(ctx context.Context, conversation *AuditConversation) error {
 	if conversation == nil {
 		return nil
@@ -159,18 +262,7 @@ func (s *Store) attachActivityPhases(ctx context.Context, conversation *AuditCon
 	if err != nil {
 		return fmt.Errorf("read activity phases for audit conversation: %w", err)
 	}
-	if firstToken.Valid {
-		conversation.FirstTokenMs = normalizeDecodeMs(int(firstToken.Int64))
-	}
-	if decode.Valid {
-		conversation.DecodeMs = normalizeDecodeMs(int(decode.Int64))
-	}
-	if duration.Valid {
-		conversation.DurationMs = int(duration.Int64)
-	}
-	if timeline.Valid {
-		conversation.SpeedTimeline = timeline.String
-	}
+	applyActivityPhases(conversation, firstToken, decode, duration, timeline)
 	return nil
 }
 

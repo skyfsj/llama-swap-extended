@@ -122,7 +122,9 @@ wire A ──decode──▶ canonical ──encode──▶ wire B
 |---|---|
 | Text, system prompts, images (base64 + URL), PDFs | preserved where the target has a representation |
 | Tool definitions, `tool_choice`, parallel tool calls | mapped per dialect; a policy a target lacks is diagnosed |
-| Tool-call ↔ tool-result pairing | preserved; synthetic ids are minted only where the source dialect has none (Gemini, Interactions) |
+| Tool-call ↔ tool-result pairing | preserved; explicit ids are retained, and synthetic ids are minted only when absent |
+| Multiple candidates | non-streaming Chat ↔ Gemini preserves all candidates; cross-dialect streams require one candidate |
+| Empty / multimodal tool results | empty results stay valid; Gemini inline result media is preserved, and targets that cannot carry it report diagnostics |
 | Reasoning / thinking | mapped to `reasoning_content`, Responses reasoning items, Anthropic thinking, Gemini thought parts |
 | Google thought signatures | preserved for Gemini and Interactions targets, diagnosed as lost elsewhere |
 | Structured output | `response_format` ↔ Anthropic `output_config.format` ↔ Gemini `responseMimeType`/`responseSchema` ↔ Interactions `TextResponseFormat` |

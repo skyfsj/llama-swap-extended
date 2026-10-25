@@ -14,6 +14,41 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/gateway"
 )
 
+// keyStatus is one credential's runtime state as served by the status API.
+// Key material is never included.
+type keyStatus struct {
+	ID             string    `json:"id"`
+	Disabled       bool      `json:"disabled"`
+	Unresolved     bool      `json:"unresolvedEnv"`
+	Inflight       int       `json:"inflight"`
+	MaxConcurrent  int       `json:"maxConcurrent"`
+	AuthUntil      time.Time `json:"authCooldownUntil,omitempty"`
+	RateLimitUntil time.Time `json:"rateLimitCooldownUntil,omitempty"`
+	TransientUntil time.Time `json:"transientCooldownUntil,omitempty"`
+	// QuotaUntil is set by quota enforcement when a usage window is full.
+	QuotaUntil  time.Time `json:"quotaCooldownUntil,omitempty"`
+	LastError   string    `json:"lastError,omitempty"`
+	LastErrorAt time.Time `json:"lastErrorAt,omitempty"`
+	LastUsed    time.Time `json:"lastUsed,omitempty"`
+}
+
+func keyStatusFromCredential(status gateway.CooldownStatus) keyStatus {
+	return keyStatus{
+		ID:             status.ID,
+		Disabled:       status.Disabled,
+		Unresolved:     status.Unresolved,
+		Inflight:       status.Inflight,
+		MaxConcurrent:  status.MaxConcurrent,
+		AuthUntil:      status.AuthUntil,
+		RateLimitUntil: status.RateLimitUntil,
+		TransientUntil: status.TransientUntil,
+		QuotaUntil:     status.QuotaUntil,
+		LastError:      status.LastError,
+		LastErrorAt:    status.LastErrorAt,
+		LastUsed:       status.LastUsed,
+	}
+}
+
 // handleAPIProvidersStatus reports the runtime state of every provider route
 // and credential: cooldowns, in-flight counts, last errors. Key values are
 // never included.
@@ -21,21 +56,6 @@ func (s *Server) handleAPIProvidersStatus(w http.ResponseWriter, r *http.Request
 	gw := s.currentGateway()
 	cfg := s.currentConfig()
 
-	type keyStatus struct {
-		ID             string    `json:"id"`
-		Disabled       bool      `json:"disabled"`
-		Unresolved     bool      `json:"unresolvedEnv"`
-		Inflight       int       `json:"inflight"`
-		MaxConcurrent  int       `json:"maxConcurrent"`
-		AuthUntil      time.Time `json:"authCooldownUntil,omitempty"`
-		RateLimitUntil time.Time `json:"rateLimitCooldownUntil,omitempty"`
-		TransientUntil time.Time `json:"transientCooldownUntil,omitempty"`
-		// QuotaUntil is set by quota enforcement when a usage window is full.
-		QuotaUntil  time.Time `json:"quotaCooldownUntil,omitempty"`
-		LastError   string    `json:"lastError,omitempty"`
-		LastErrorAt time.Time `json:"lastErrorAt,omitempty"`
-		LastUsed    time.Time `json:"lastUsed,omitempty"`
-	}
 	type routeStatus struct {
 		ProviderID  string `json:"providerID"`
 		Adapter     string `json:"adapter,omitempty"`
@@ -61,16 +81,17 @@ func (s *Server) handleAPIProvidersStatus(w http.ResponseWriter, r *http.Request
 		Providers     []map[string]any `json:"providers"`
 		Routes        []routeStatus    `json:"routes"`
 		StickyEnabled bool             `json:"stickySessionsEnabled"`
-		// QuotaPresets lists the built-in usage mappings the UI can offer as
-		// providers.<id>.quota.preset values.
-		QuotaPresets []string `json:"quotaPresets"`
+		// QuotaPresets describes the built-in usage mappings the UI offers as
+		// providers.<id>.quota.preset values: the dropdown needs the label,
+		// and the hint under it needs the endpoint and its shape.
+		QuotaPresets []config.QuotaPresetSummary `json:"quotaPresets"`
 		// Latency reports the observed first-token latency per provider. It
 		// backs the skip-slow routing rule, so an operator can see why a
 		// provider is being passed over instead of guessing.
 		Latency map[string]gateway.ProviderLatency `json:"latency,omitempty"`
 	}{
 		Providers: []map[string]any{}, Routes: []routeStatus{},
-		QuotaPresets: config.QuotaPresetIDs(),
+		QuotaPresets: config.QuotaPresetSummaries(),
 	}
 	if gw != nil {
 		out.Latency = gw.Latencies()
@@ -95,6 +116,16 @@ func (s *Server) handleAPIProvidersStatus(w http.ResponseWriter, r *http.Request
 		if len(adapters) > 1 {
 			primaryType, primaryEndpoint = "multi", ""
 		}
+		// Every configured key, including ones disabled in configuration:
+		// route member lists exclude those, but the quota card still shows
+		// their subscription and the operator needs to see the key that is
+		// switched off. An empty list for providers the gateway never built.
+		providerKeys := []keyStatus{}
+		if gw != nil {
+			for _, cred := range gw.ProviderCredentials(id) {
+				providerKeys = append(providerKeys, keyStatusFromCredential(cred.Status()))
+			}
+		}
 		out.Providers = append(out.Providers, map[string]any{
 			"id":             id,
 			"type":           primaryType,
@@ -107,10 +138,11 @@ func (s *Server) handleAPIProvidersStatus(w http.ResponseWriter, r *http.Request
 			"sticky":         p.StickyEnabled(),
 			"bareNamePolicy": p.BareNamePolicy,
 			"cooldownPolicy": p.Cooldown.Policy,
-			"maxRetries":     p.MaxRetries,
+			"maxRetries":     p.MaxRetriesPerCredential(),
 			"disabled":       p.Disabled,
 			"modelCount":     len(p.AllModels()),
 			"keyCount":       len(p.ApiKeys),
+			"keys":           providerKeys,
 		})
 	}
 
@@ -130,21 +162,7 @@ func (s *Server) handleAPIProvidersStatus(w http.ResponseWriter, r *http.Request
 				Keys:          []keyStatus{},
 			}
 			for _, cred := range route.Credentials() {
-				st := cred.Status()
-				rs.Keys = append(rs.Keys, keyStatus{
-					ID:             st.ID,
-					Disabled:       st.Disabled,
-					Unresolved:     st.Unresolved,
-					Inflight:       st.Inflight,
-					MaxConcurrent:  st.MaxConcurrent,
-					AuthUntil:      st.AuthUntil,
-					RateLimitUntil: st.RateLimitUntil,
-					TransientUntil: st.TransientUntil,
-					QuotaUntil:     st.QuotaUntil,
-					LastError:      st.LastError,
-					LastErrorAt:    st.LastErrorAt,
-					LastUsed:       st.LastUsed,
-				})
+				rs.Keys = append(rs.Keys, keyStatusFromCredential(cred.Status()))
 			}
 			out.Routes = append(out.Routes, rs)
 		}

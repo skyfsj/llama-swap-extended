@@ -12,6 +12,7 @@
   import ModelLogsTab from "../components/model/ModelLogsTab.svelte";
   import ModelDetailsTab from "../components/model/ModelDetailsTab.svelte";
   import { translate } from "../lib/i18n";
+  import { toast } from "../lib/toast";
   import { forceRestartModel, restartModel } from "../stores/api";
   import { fetchConfigSnapshot, normalizeProvidersSection, providersServingModel, type ModelProviderSurface } from "../lib/providersApi";
   import { onMount } from "svelte";
@@ -89,6 +90,7 @@
     try {
       await restartModel(resolvedId);
       restartDialogOpen = false;
+      toast.success($translate("models.restartRequested", { model: resolvedId }));
     } catch (error) {
       restartError = error instanceof Error ? error.message : String(error);
     } finally {
@@ -107,6 +109,7 @@
     try {
       await forceRestartModel(resolvedId);
       forceRestartDialogOpen = false;
+      toast.success($translate("models.forceRestartRequested", { model: resolvedId }));
     } catch (error) {
       forceRestartError = error instanceof Error ? error.message : String(error);
     } finally {

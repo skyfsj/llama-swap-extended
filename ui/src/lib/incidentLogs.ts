@@ -1,4 +1,5 @@
 import { errorMessageFromPayload } from "./apiError";
+import { apiUrl } from "./apiPath";
 
 export type IncidentLogKind = "inference-crash" | "request-error";
 
@@ -16,7 +17,7 @@ export interface IncidentLogResponse {
 }
 
 export async function fetchIncidentLogs(): Promise<IncidentLogResponse> {
-  const response = await fetch("/api/logs/incidents", { credentials: "same-origin" });
+  const response = await fetch(apiUrl("/api/logs/incidents"), { credentials: "same-origin" });
   const payload = await response.json().catch(() => ({})) as Record<string, unknown>;
   if (!response.ok) throw new Error(errorMessageFromPayload(payload, `HTTP ${response.status}`));
 
@@ -36,7 +37,7 @@ export async function fetchIncidentLogs(): Promise<IncidentLogResponse> {
 }
 
 export function incidentLogURL(name: string): string {
-  return `/api/logs/incidents/${encodeURIComponent(name)}`;
+  return apiUrl(`/api/logs/incidents/${encodeURIComponent(name)}`);
 }
 
 export async function fetchIncidentLog(name: string): Promise<string> {

@@ -229,14 +229,18 @@ func (s *Server) handleAPIUsageExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	const exportBatch = 500
-	total := 0
 	firstBatch := true
+	// The walk is keyset-based: each batch asks for the rows after the last one
+	// written. OFFSET would make the database read and discard every row already
+	// exported, so a large export would cost the sum of all its offsets.
+	lastID := 0
 	for {
 		// The store caps a single page, so walk the selection in batches and
 		// write each one before fetching the next.
 		batch := query
 		batch.Limit = exportBatch
-		batch.Offset = total
+		batch.Offset = 0
+		batch.AfterID = lastID
 		batch.Sort, batch.Order = "time", "asc"
 		page, err := s.store.UsageRecords(r.Context(), batch)
 		if err != nil {
@@ -249,9 +253,9 @@ func (s *Server) handleAPIUsageExport(w http.ResponseWriter, r *http.Request) {
 		}
 		for _, record := range page.Data {
 			writeUsageCSVRow(w, record)
+			lastID = record.ID
 		}
-		total += len(page.Data)
-		if len(page.Data) < exportBatch || total >= page.Total {
+		if len(page.Data) < exportBatch {
 			break
 		}
 	}

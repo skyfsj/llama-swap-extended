@@ -884,7 +884,7 @@ func redactNode(node *yaml.Node, parent string) {
 			key, value := node.Content[i], node.Content[i+1]
 			lower := strings.ToLower(key.Value)
 			apiKeyField := strings.EqualFold(parent, "apikeys") && (lower == "key" || lower == "value" || lower == "secret")
-			if apiKeyField || strings.Contains(lower, "secret") || strings.Contains(lower, "password") || strings.Contains(lower, "token") || lower == "apikey" || lower == "api_key" {
+			if apiKeyField || IsSensitiveConfigName(lower) {
 				value.Kind, value.Tag, value.Value = yaml.ScalarNode, "!!str", "[REDACTED]"
 				value.Content = nil
 				continue
@@ -987,12 +987,59 @@ func redactEnvNode(node *yaml.Node) {
 // stay visible in the model editor while actual credentials remain redacted.
 func IsSensitiveEnvironmentName(name string) bool {
 	key := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(name), "-", "_"))
-	if key == "key" || key == "apikey" || key == "api_key" || key == "authorization" || key == "password" || key == "secret" || key == "token" || key == "credential" {
+	if key == "key" || key == "apikey" || key == "api_key" || key == "authorization" || key == "password" || key == "secret" || key == "token" || key == "credential" || key == "access_token" || key == "auth_token" || key == "refresh_token" {
 		return true
+	}
+	if tokenCountName(key) {
+		return false
 	}
 	return strings.Contains(key, "secret") || strings.Contains(key, "password") ||
 		strings.Contains(key, "token") || strings.Contains(key, "credential") ||
 		strings.Contains(key, "api_key") || strings.HasSuffix(key, "_key")
+}
+
+// IsSensitiveConfigName reports whether a configuration key holds credential
+// material. It is the name-based rule the YAML and JSON redactors share, so a
+// value cannot be secret on one surface and public on another.
+func IsSensitiveConfigName(name string) bool {
+	lower := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(name), "-", "_"))
+	return IsSensitiveEnvironmentName(lower)
+}
+
+// tokenCountName reports whether a key counts tokens rather than holding a
+// credential. Generation limits and usage counters are operational numbers
+// named after the token they measure — max_tokens, max_output_tokens,
+// budget_tokens, input_tokens — and treating them as secrets corrupts them:
+// a redacted "[REDACTED]" string sent back as max_tokens makes an upstream
+// reject the request outright, and a redacted config field cannot be edited.
+//
+// The rule is deliberately narrow. Only an integer count is a count, and the
+// names below are the shapes that carry one. Anything else that mentions a
+// token stays a credential (access_token, token_secret, ghp_…).
+func tokenCountName(key string) bool {
+	switch key {
+	case "max_tokens", "max_completion_tokens", "max_output_tokens", "max_input_tokens",
+		"maxtokens", "maxoutputtokens", "maxcompletiontokens", "maxinputtokens",
+		"input_tokens", "output_tokens", "total_tokens", "prompt_tokens",
+		"completion_tokens", "cached_tokens", "cache_tokens", "reasoning_tokens",
+		"budget_tokens", "thinking_budget_tokens", "tokens_per_second":
+		return true
+	}
+	// A camel-case name lowercases into a run of letters (maxInputTokens →
+	// maxinputtokens), so the same shape check covers both spellings.
+	if strings.HasPrefix(key, "max") && strings.HasSuffix(key, "tokens") {
+		return true
+	}
+	if strings.HasPrefix(key, "input") && strings.HasSuffix(key, "tokens") {
+		return true
+	}
+	if strings.HasPrefix(key, "output") && strings.HasSuffix(key, "tokens") {
+		return true
+	}
+	if strings.HasSuffix(key, "_token_budget") || strings.HasSuffix(key, "_tokens_budget") {
+		return true
+	}
+	return false
 }
 
 // IsSafeAnonymousEnvironmentValue reports whether a bare environment entry
@@ -1203,7 +1250,7 @@ func restoreRedactedNode(candidate, current *yaml.Node, parent string) error {
 			}
 			lower := strings.ToLower(key.Value)
 			sensitive := strings.EqualFold(parent, "apikeys") && (lower == "key" || lower == "value" || lower == "secret")
-			sensitive = sensitive || strings.Contains(lower, "secret") || strings.Contains(lower, "password") || strings.Contains(lower, "token") || lower == "apikey" || lower == "api_key"
+			sensitive = sensitive || IsSensitiveConfigName(lower)
 			if sensitive && value.Kind == yaml.ScalarNode && value.Value == "[REDACTED]" {
 				candidate.Content[i+1] = cloneYAMLNode(currentValue)
 				continue

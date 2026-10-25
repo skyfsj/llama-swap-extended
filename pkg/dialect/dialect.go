@@ -134,6 +134,7 @@ const (
 	EventToolCallStart  = core.EventToolCallStart
 	EventToolCallDelta  = core.EventToolCallDelta
 	EventToolCallEnd    = core.EventToolCallEnd
+	EventToolExecution  = core.EventToolExecution
 	EventUsage          = core.EventUsage
 	EventFinish         = core.EventFinish
 	EventError          = core.EventError
@@ -161,6 +162,21 @@ func ConvertResponse(source, target Format, body []byte) ([]byte, []Diagnostic, 
 	return codec.ConvertResponse(source, target, body)
 }
 
+func ConvertResponseToStream(source, target Format, body []byte, options StreamOptions) ([]Frame, []Diagnostic, error) {
+	return codec.ConvertResponseToStream(source, target, body, options)
+}
+
+func DecodeStream(format Format, body []byte) (*Response, []Diagnostic, error) {
+	return codec.DecodeStream(format, body)
+}
+
+// ConvertResponseWithRequest converts a response together with the request it
+// answers. A Responses target restores the tool namespaces the request had to
+// flatten and echoes the request's tool policy.
+func ConvertResponseWithRequest(source, target Format, body []byte, request *Request) ([]byte, []Diagnostic, error) {
+	return codec.ConvertResponseWithRequest(source, target, body, request)
+}
+
 // DecodeRequest reads a wire request into the canonical representation.
 func DecodeRequest(format Format, body []byte) (*Request, []Diagnostic, error) {
 	return codec.DecodeRequest(format, body)
@@ -179,6 +195,11 @@ func DecodeResponse(format Format, body []byte) (*Response, []Diagnostic, error)
 // EncodeResponse renders the canonical response in the target dialect.
 func EncodeResponse(response *Response, target Format) ([]byte, []Diagnostic, error) {
 	return codec.EncodeResponse(response, target)
+}
+
+// EncodeResponseWithRequest renders a response with the request it answers.
+func EncodeResponseWithRequest(response *Response, target Format, request *Request) ([]byte, []Diagnostic, error) {
+	return codec.EncodeResponseWithRequest(response, target, request)
 }
 
 // ResponseFailed reports whether a decoded response body represents a failure:

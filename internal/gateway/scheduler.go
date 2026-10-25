@@ -50,16 +50,26 @@ type Credential struct {
 	// window is full. It is set by the quota refresher, not by upstream
 	// errors, and cleared when a window frees up or enforcement is disabled.
 	quotaUntil time.Time
-	// authFailureAt is when the last 401/402 was recorded. A single 401 is
-	// often a transient upstream hiccup, so the first one only benches the
-	// credential briefly; repeated failures escalate to the configured auth
-	// cooldown (see applyFailure).
-	authFailureAt time.Time
+	// authFailures counts consecutive auth failures. Escalation must not
+	// decay while the credential is already benched: a key that is cooling
+	// down for ten minutes is not retried until that window ends, by which
+	// time a wall-clock recency window has long expired and the next 401
+	// would restart the short probe — leaving the credential alternating
+	// between probe and full cooldown forever instead of staying benched.
+	authFailures int
 
 	// LastError/LastUsed surface in the status API.
 	LastError   string
 	LastErrorAt time.Time
 	LastUsed    time.Time
+
+	// lastUpstream is the most recent upstream answer this credential
+	// received (status plus a bounded body). While the credential is cooling
+	// down it is what the client is told, so a pool whose every key is
+	// benched for 401 keeps answering 401 instead of a synthetic 502: the
+	// upstream did refuse the request, and that is the useful answer.
+	lastUpstreamStatus int
+	lastUpstreamBody   string
 
 	inflight int
 
@@ -79,13 +89,68 @@ func (c *Credential) available(now time.Time) bool {
 	if c.Disabled || c.Value == "" {
 		return false
 	}
-	if now.Before(c.authUntil) || now.Before(c.rateLimitUntil) || now.Before(c.transientUntil) || now.Before(c.quotaUntil) {
+	if c.concurrencyFullLocked() {
 		return false
 	}
-	if c.MaxConcurrent > 0 && c.inflight >= c.MaxConcurrent {
-		return false
+	return !c.coolingDownLocked(now)
+}
+
+// concurrencyFullLocked reports whether the credential is at its concurrency
+// cap. The caller must hold c.mu.
+func (c *Credential) concurrencyFullLocked() bool {
+	return c.MaxConcurrent > 0 && c.inflight >= c.MaxConcurrent
+}
+
+// coolingDownLocked reports whether a cooldown window is still active. The
+// caller must hold c.mu. A disabled credential or one with no key material is
+// not "cooling down": it is permanently unusable and no amount of waiting
+// helps.
+func (c *Credential) coolingDownLocked(now time.Time) bool {
+	return now.Before(c.authUntil) || now.Before(c.rateLimitUntil) ||
+		now.Before(c.transientUntil) || now.Before(c.quotaUntil)
+}
+
+// cooldownRemaining reports how long until this credential becomes usable
+// again, ignoring concurrency (which frees on its own as requests finish).
+//
+// It is what lets a pool with no available credential still answer a request:
+// when every key is benched, the one whose bench ends soonest is the best guess
+// available, and trying it beats failing the request outright. A credential
+// that will never recover (disabled, or no key material) reports false so the
+// caller never picks it as a fallback.
+//
+// Auth and quota benches are deliberately excluded. A 401/402 means the key
+// itself is rejected, and a quota park means the account has no allowance left:
+// retrying either one cannot succeed, and hammering the upstream with a key it
+// just refused is how an account gets rate-limited or blocked. Only the purely
+// time-based benches (transient failures, rate limiting) are worth a retry,
+// because those are predictions about the upstream rather than verdicts about
+// the credential.
+func (c *Credential) cooldownRemaining(now time.Time) (time.Duration, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.Disabled || c.Value == "" {
+		return 0, false
 	}
-	return true
+	if c.concurrencyFullLocked() {
+		// Saturated, not benched: it would be usable the moment a slot frees,
+		// so it is a legitimate fallback with no wait.
+		return 0, true
+	}
+	if now.Before(c.authUntil) || now.Before(c.quotaUntil) {
+		// A verdict, not a prediction: never retried by the fallback.
+		return 0, false
+	}
+	var latest time.Time
+	for _, until := range []time.Time{c.rateLimitUntil, c.transientUntil} {
+		if until.After(latest) {
+			latest = until
+		}
+	}
+	if latest.IsZero() || !now.Before(latest) {
+		return 0, true
+	}
+	return latest.Sub(now), true
 }
 
 // acquire increments the in-flight count. The caller must invoke the
@@ -124,7 +189,7 @@ func (c *Credential) cooldown(now time.Time, class CooldownClass, until time.Tim
 		if until.After(c.authUntil) {
 			c.authUntil = until
 		}
-		c.authFailureAt = now
+		c.authFailures++
 	case CooldownRateLimit:
 		if until.After(c.rateLimitUntil) {
 			c.rateLimitUntil = until
@@ -138,15 +203,21 @@ func (c *Credential) cooldown(now time.Time, class CooldownClass, until time.Tim
 	c.LastErrorAt = now
 }
 
-// RecentAuthFailure reports whether an auth failure was recorded within the
-// escalation window, i.e. whether the upstream keeps rejecting the credential.
+// RecentAuthFailure reports whether this credential is already known to be
+// failing auth. It is true once an auth failure has been recorded and stays
+// true until an operator clears the cooldowns, so escalation does not depend
+// on how long the credential was benched for.
 func (c *Credential) RecentAuthFailure(now time.Time) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return !c.authFailureAt.IsZero() && now.Sub(c.authFailureAt) < authEscalationWindow
+	return c.authFailures > 0
 }
 
 // ClearCooldowns removes any active cooldowns (operator action from the UI).
+// The recorded auth failures stay on purpose: clearing the cooldowns lifts the
+// ben, it does not mint a new credential. An operator retrying right after a
+// 401 must not get the short first-failure probe again, otherwise every clear
+// resets the escalation and a dead key keeps being retried every 30 seconds.
 func (c *Credential) ClearCooldowns() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -192,6 +263,24 @@ func (c *Credential) noteError(reason string) {
 	defer c.mu.Unlock()
 	c.LastError = reason
 	c.LastErrorAt = time.Now()
+}
+
+// noteUpstream records the upstream answer this credential received, so a
+// request that arrives while it is cooling down can still report the real
+// status and body instead of a synthetic one.
+func (c *Credential) noteUpstream(status int, snippet string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lastUpstreamStatus = status
+	c.lastUpstreamBody = snippet
+}
+
+// LastUpstream reports the most recent upstream answer recorded for this
+// credential (status 0 when none was).
+func (c *Credential) LastUpstream() (int, string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastUpstreamStatus, c.lastUpstreamBody
 }
 
 // CooldownClass classifies why a credential is cooling down.
@@ -291,6 +380,51 @@ func (s *scheduler) hasCandidate(exclude map[string]struct{}) bool {
 	return false
 }
 
+// pickFallback selects the best credential to try when pick found nothing
+// available: the one whose cooldown ends soonest, among those this request has
+// not tried yet.
+//
+// The pool reaching this state means every key is benched — a burst exhausted
+// the transient cooldowns, or several keys failed at once. Refusing the request
+// outright is the worst answer available: the upstream may well serve it now
+// (the cooldown may be conservative), and if it does not, the attempt returns a
+// real upstream error instead of a synthetic "all keys are cooling down". The
+// cost of being wrong is one failed attempt; the cost of not trying is a
+// request that had a chance.
+//
+// "Soonest remaining" is the right order: a key benched for 5 more seconds is a
+// far better guess than one with four minutes left, and it is what makes the
+// fallback converge back to normal scheduling instead of fighting it.
+func (s *scheduler) pickFallback(now time.Time, exclude map[string]struct{}) (*Credential, time.Duration) {
+	if s == nil {
+		return nil, 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var (
+		best     *Credential
+		bestWait time.Duration
+	)
+	for _, c := range s.members {
+		if _, skipped := exclude[c.ID]; skipped {
+			continue
+		}
+		wait, usable := c.cooldownRemaining(now)
+		if !usable {
+			continue
+		}
+		if best == nil || wait < bestWait {
+			best, bestWait = c, wait
+		}
+	}
+	return best, bestWait
+}
+
+// pick selects a credential: filter to available ones, take the highest
+// priority tier present, then weighted-random within the tier. lastID rotation
+// breaks ties so a shrinking candidate set does not starve members (the
+// rotation remembers the last selected ID, not an index).
 func (s *scheduler) pick(now time.Time, exclude map[string]struct{}) *Credential {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -365,7 +499,16 @@ func weightedPick(tier []*Credential, prev string, randn func(int) int) *Credent
 	return tier[len(tier)-1]
 }
 
-// stickyTable maps session hashes to credential IDs with a sliding TTL.
+// stickyTable maps session hashes to the upstream route that served them with
+// a sliding TTL.
+//
+// The binding is route-level on purpose: a provider's API surfaces keep
+// separate caches upstream (the same conversation sent to an OpenAI adapter
+// and to an Anthropic adapter is cached twice), so sticking to a provider is
+// not enough — the session must keep hitting the same provider *and adapter*
+// that served it. The credential is recorded too: keys of one account share
+// the provider-side cache, but keys of different accounts do not, so a
+// session should not hop between them while its first choice is usable.
 type stickyTable struct {
 	mu      sync.Mutex
 	entries map[string]stickyEntry
@@ -373,6 +516,12 @@ type stickyTable struct {
 }
 
 type stickyEntry struct {
+	// provider and route identify the upstream surface. route is the stable
+	// Route.Key() (provider + adapter + model), provider the owning provider
+	// so a surface that is momentarily unavailable can fall back to a sibling
+	// surface of the same provider before another provider takes the session.
+	provider     string
+	route        string
 	credentialID string
 	expires      time.Time
 }
@@ -384,44 +533,109 @@ func newStickyTable(ttl time.Duration) *stickyTable {
 	return &stickyTable{entries: make(map[string]stickyEntry), ttl: ttl}
 }
 
-// get returns the bound credential ID, sliding the TTL forward on a hit.
-func (t *stickyTable) get(sessionHash string, now time.Time) (string, bool) {
+// get returns the bound route, sliding the TTL forward on a hit.
+func (t *stickyTable) get(sessionHash string, now time.Time) (stickyEntry, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	entry, ok := t.entries[sessionHash]
 	if !ok {
-		return "", false
+		return stickyEntry{}, false
 	}
 	if now.After(entry.expires) {
 		delete(t.entries, sessionHash)
-		return "", false
+		return stickyEntry{}, false
 	}
 	entry.expires = now.Add(t.ttl)
 	t.entries[sessionHash] = entry
-	return entry.credentialID, true
+	return entry, true
 }
 
-// bind records a session->credential binding. An existing, unexpired binding
-// for a different credential is never overwritten (sub2api semantics: the
-// sticky target stays bound and resumes serving when healthy again, unless
-// the caller explicitly clears it after observing it is permanently gone).
-func (t *stickyTable) bind(sessionHash, credentialID string, now time.Time) {
+// bind records a session->route binding.
+//
+// A binding for another route is replaced only when that route is no longer
+// usable (boundUnavailable). Once a session has moved off a provider it builds
+// its prompt cache on the provider that answered, so the original provider
+// becoming healthy again must not pull it back: that would discard the cache
+// it just accumulated. The session stays where it landed until that provider
+// fails too, or until the binding expires.
+//
+// The bound credential may be refreshed within the same route: a key rotation
+// or a cooldown should not cost the session its provider-side cache.
+// sweepExpired drops the bindings whose TTL has passed. get removes an entry
+// only when that exact session comes back, so a session that never returns
+// would otherwise stay in the table for as long as the daemon runs.
+func (t *stickyTable) sweepExpired(now time.Time) int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	swept := 0
+	for hash, entry := range t.entries {
+		if now.After(entry.expires) {
+			delete(t.entries, hash)
+			swept++
+		}
+	}
+	return swept
+}
+
+func (t *stickyTable) bind(sessionHash, provider, route, credentialID string, now time.Time, boundUnavailable bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if existing, ok := t.entries[sessionHash]; ok && now.Before(existing.expires) {
-		if existing.credentialID != credentialID {
+		if existing.route != route && !boundUnavailable {
 			return
 		}
 	}
-	t.entries[sessionHash] = stickyEntry{credentialID: credentialID, expires: now.Add(t.ttl)}
+	t.entries[sessionHash] = stickyEntry{
+		provider:     provider,
+		route:        route,
+		credentialID: credentialID,
+		expires:      now.Add(t.ttl),
+	}
 }
 
-// unbind removes a binding (called when the bound credential is gone from
+// unbind removes a binding (called when the bound route is gone from
 // configuration or permanently failed).
 func (t *stickyTable) unbind(sessionHash string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	delete(t.entries, sessionHash)
+}
+
+// snapshot copies the live bindings. It is how a configuration reload carries
+// session affinity across a gateway rebuild: the credentials, cooldowns and
+// in-flight counts of the new instance are all fresh, but which provider a
+// conversation was talking to is not something the new config should decide.
+func (t *stickyTable) snapshot() map[string]stickyEntry {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make(map[string]stickyEntry, len(t.entries))
+	for hash, entry := range t.entries {
+		out[hash] = entry
+	}
+	return out
+}
+
+// adopt installs bindings captured from a previous instance, keeping only
+// those whose route still exists in the new configuration. A binding whose
+// surface was removed cannot serve anything and would only be dropped later
+// on its first use; the credential is kept even when it is gone, because the
+// route is what carries the provider-side cache and the attempt code already
+// falls back to any usable credential of that route.
+func (t *stickyTable) adopt(entries map[string]stickyEntry, keep func(route string) bool) int {
+	if len(entries) == 0 {
+		return 0
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	adopted := 0
+	for hash, entry := range entries {
+		if !keep(entry.route) {
+			continue
+		}
+		t.entries[hash] = entry
+		adopted++
+	}
+	return adopted
 }
 
 // clearCredential removes every session bound to the given credential ID.
@@ -433,6 +647,182 @@ func (t *stickyTable) clearCredential(credentialID string) {
 			delete(t.entries, hash)
 		}
 	}
+}
+
+// poolCandidate is one provider's bid for a bare model name. A provider with
+// several adapters exposing the same model is a single candidate: its surfaces
+// are one upstream account with one quota, so it should hold one share of the
+// traffic, not one share per adapter.
+type poolCandidate struct {
+	provider string
+	route    *Route
+	priority int
+	weight   int
+}
+
+// poolRotator carries the rotation state of one bare model name across
+// requests. Without it every request would build a fresh scheduler, whose
+// "last pick" is always the empty string, and a zero-weight pool would always
+// send traffic to the same provider (the first in sorted order).
+type poolRotator struct {
+	mu   sync.Mutex
+	last string
+}
+
+// pick selects one provider: highest priority tier first, weighted random
+// within it, rotating past the previous pick when all weights are zero.
+func (r *poolRotator) pick(candidates []poolCandidate, randn func(int) int) (poolCandidate, bool) {
+	if len(candidates) == 0 {
+		return poolCandidate{}, false
+	}
+	top := candidates[0].priority
+	for _, candidate := range candidates[1:] {
+		if candidate.priority > top {
+			top = candidate.priority
+		}
+	}
+	tier := make([]poolCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.priority == top {
+			tier = append(tier, candidate)
+		}
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	chosen := weightedCandidatePick(tier, r.last, randn)
+	r.last = chosen.provider
+	return chosen, true
+}
+
+// rotationState copies each bare model's last provider pick. The cursor is
+// per bare name, so a reload preserves the distribution instead of resetting it.
+func (g *Gateway) rotationState() map[string]string {
+	out := map[string]string{}
+	g.pools.Range(func(key, value any) bool {
+		model, _ := key.(string)
+		rotator, _ := value.(*poolRotator)
+		if rotator == nil {
+			return true
+		}
+		rotator.mu.Lock()
+		last := rotator.last
+		rotator.mu.Unlock()
+		if last == "" {
+			return true
+		}
+		out[model] = last
+		return true
+	})
+	return out
+}
+
+// adoptRotation restores the per-model rotation cursor. Entries for models the
+// new configuration does not serve are dropped: they describe a pool that no
+// longer exists.
+func (g *Gateway) adoptRotation(state map[string]string) {
+	for model, last := range state {
+		// A cursor is created when it is missing: the carried state describes a
+		// pool the new configuration still serves, and dropping it would reset
+		// the rotation the old gateway had established. An existing cursor is
+		// left alone, because the new gateway may already have served a request.
+		rotator := g.rotator(model)
+		rotator.mu.Lock()
+		if rotator.last == "" {
+			rotator.last = last
+		}
+		rotator.mu.Unlock()
+	}
+}
+
+// CarryState moves the per-session bindings and rotation cursors of the
+// previous gateway into this one. A configuration reload rebuilds the Gateway
+// from scratch, and the new instance starts with every credential fresh: that
+// is correct for cooldowns and in-flight counts, but it would also drop which
+// provider each conversation was talking to, so the next request of every
+// live conversation would land on a different upstream and lose its prompt
+// cache. State that describes the old topology is dropped instead of carried.
+//
+// It returns the number of bindings carried. Passing the receiver or nil is a
+// no-op.
+func (g *Gateway) CarryState(previous *Gateway) int {
+	if g == nil || previous == nil || g == previous {
+		return 0
+	}
+	g.mu.RLock()
+	routes := make(map[string]struct{}, len(g.routes))
+	for _, route := range g.routes {
+		routes[route.Key()] = struct{}{}
+	}
+	sticky := g.sticky
+	ttl := g.cooldown.stickyTTL
+	g.mu.RUnlock()
+	if sticky == nil {
+		return 0
+	}
+	if len(routes) > 0 {
+		sticky.ttl = ttl
+	}
+	adopted := sticky.adopt(previous.stickySnapshot(), func(route string) bool {
+		if len(routes) == 0 {
+			return false
+		}
+		_, ok := routes[route]
+		return ok
+	})
+	g.adoptRotation(previous.rotationState())
+	return adopted
+}
+
+// stickySnapshot copies the live session bindings for CarryState.
+func (g *Gateway) stickySnapshot() map[string]stickyEntry {
+	if g == nil {
+		return nil
+	}
+	g.mu.RLock()
+	sticky := g.sticky
+	g.mu.RUnlock()
+	if sticky == nil {
+		return nil
+	}
+	return sticky.snapshot()
+}
+
+// weightedCandidatePick mirrors weightedPick for provider candidates.
+func weightedCandidatePick(tier []poolCandidate, prev string, randn func(int) int) poolCandidate {
+	if len(tier) == 1 {
+		return tier[0]
+	}
+	sum := 0
+	for _, candidate := range tier {
+		sum += candidate.weight
+	}
+	if sum == 0 {
+		start := 0
+		for i, candidate := range tier {
+			if candidate.provider == prev {
+				start = i + 1
+				break
+			}
+		}
+		return tier[start%len(tier)]
+	}
+	factor := 1
+	if sum < 10 {
+		factor = 100
+	}
+	total := 0
+	for _, candidate := range tier {
+		total += candidate.weight * factor
+	}
+	r := randn(total)
+	for _, candidate := range tier {
+		r -= candidate.weight * factor
+		if r < 0 {
+			return candidate
+		}
+	}
+	return tier[len(tier)-1]
 }
 
 // SessionHash derives a sticky session key. Explicit headers win; both

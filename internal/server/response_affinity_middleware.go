@@ -39,6 +39,10 @@ func CreateResponseAffinityMiddleware(cfg config.Config, st *store.Store) chain.
 				next.ServeHTTP(w, r)
 				return
 			}
+			if protocolTargetFormat(r) != "" {
+				next.ServeHTTP(w, r)
+				return
+			}
 			data, err := swaputil.FetchContext(r, cfg)
 			if err != nil {
 				next.ServeHTTP(w, r)
@@ -72,7 +76,7 @@ func CreateResponseAffinityMiddleware(cfg config.Config, st *store.Store) chain.
 			// prefix as a canonical response: a truncated SSE stream could retain an
 			// id and accidentally create a seemingly valid, restart-visible chain.
 			if !recorder.truncated {
-				persistNativeResponseAffinity(r.Context(), st, data.ModelID, modelConfig.Backend.Type, recorder.body.Bytes(), recorder.Header(), recorder.status)
+				persistNativeResponseAffinity(r.Context(), st, data.ModelID, modelConfig.Backend.Type, recorder.body.Bytes(), recorder.Header(), recorder.status, requestBody)
 			}
 		})
 	}
@@ -136,7 +140,7 @@ func (r *replayReadCloser) Close() error {
 	return r.err
 }
 
-func persistNativeResponseAffinity(ctx context.Context, st *store.Store, model, backend string, body []byte, headers http.Header, status int) {
+func persistNativeResponseAffinity(ctx context.Context, st *store.Store, model, backend string, body []byte, headers http.Header, status int, request ...[]byte) {
 	// Responses ids are useful for routing subsequent GET/cancel calls even
 	// when the initial request failed (for example an upstream may return a
 	// response.failed SSE lifecycle with HTTP 200, or an error response with a
@@ -163,10 +167,14 @@ func persistNativeResponseAffinity(ctx context.Context, st *store.Store, model, 
 	state := responseAffinityState(response, status)
 	now := time.Now()
 	owner := identityIDFromContext(ctx)
-	writeCtx, cancel := affinityWriteContext()
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), affinityWriteTimeout)
 	defer cancel()
+	var history []byte
+	if len(request) > 0 {
+		history, _ = responseRequestHistory(writeCtx, request[0], model, st)
+	}
 	_ = st.UpsertResponseAffinity(writeCtx, store.ResponseAffinity{
-		ResponseID: id, Model: model, Backend: backend, Status: state, Response: canonical,
+		ResponseID: id, Model: model, Backend: backend, Status: state, Response: canonical, Request: history,
 		IdentityID: owner,
 		ExpiresAt:  now.Add(30 * 24 * time.Hour), CreatedAt: now, UpdatedAt: now,
 	})

@@ -25,8 +25,11 @@ type (
 	Role            = core.Role
 	StreamError     = core.StreamError
 	Tool            = core.Tool
+	ToolBinding     = core.ToolBinding
 	ToolChoice      = core.ToolChoice
 	ToolChoiceMode  = core.ToolChoiceMode
+	ToolKind        = core.ToolKind
+	ToolState       = core.ToolState
 	Usage           = core.Usage
 	ConvertOptions  = core.ConvertOptions
 	StreamOptions   = core.StreamOptions
@@ -60,6 +63,9 @@ const (
 	ToolChoiceRequired = core.ToolChoiceRequired
 	ToolChoiceTool     = core.ToolChoiceTool
 
+	ToolKindFunction = core.ToolKindFunction
+	ToolKindCustom   = core.ToolKindCustom
+
 	FormatText       = core.FormatText
 	FormatJSONObject = core.FormatJSONObject
 	FormatJSONSchema = core.FormatJSONSchema
@@ -71,6 +77,7 @@ const (
 	EventToolCallStart  = core.EventToolCallStart
 	EventToolCallDelta  = core.EventToolCallDelta
 	EventToolCallEnd    = core.EventToolCallEnd
+	EventToolExecution  = core.EventToolExecution
 	EventUsage          = core.EventUsage
 	EventFinish         = core.EventFinish
 	EventError          = core.EventError
@@ -84,3 +91,13 @@ const (
 	FinishPause         = core.FinishPause
 	FinishOther         = core.FinishOther
 )
+
+// Namespace helpers live on the canonical model; these aliases keep the
+// codec reading without a package qualifier.
+var (
+	newToolState = core.NewToolState
+	// FlattenToolName prefixes a member name with its Responses namespace.
+	FlattenToolName = core.FlattenToolName
+)
+
+const defaultToolNamespace = core.DefaultToolNamespace

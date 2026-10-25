@@ -36,25 +36,13 @@ func streamingSpeedTimeline(body []byte, writes []responseBodyWrite, start time.
 	var samples []sample
 	finalUsage := -1.0
 
-	for offset := 0; offset < len(body); {
-		lineStart := offset
-		newline := bytes.IndexByte(body[offset:], '\n')
-		if newline < 0 {
-			offset = len(body)
-		} else {
-			offset += newline + 1
+	scanSSEBody(body, func(line sseLine) {
+		if !gjson.ValidBytes(line.payload) {
+			return
 		}
-		line := bytes.TrimSpace(body[lineStart:offset])
-		if !bytes.HasPrefix(line, []byte("data:")) {
-			continue
-		}
-		payload := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
-		if !gjson.ValidBytes(payload) {
-			continue
-		}
-		parsed := gjson.ParseBytes(payload)
-		if bytes.Equal(payload, []byte("[DONE]")) {
-			continue
+		parsed := gjson.ParseBytes(line.payload)
+		if bytes.Equal(line.payload, []byte("[DONE]")) {
+			return
 		}
 		if usage := parsed.Get("usage.completion_tokens"); usage.Exists() && usage.Type == gjson.Number {
 			finalUsage = usage.Float()
@@ -77,14 +65,14 @@ func streamingSpeedTimeline(body []byte, writes []responseBodyWrite, start time.
 			}
 		}
 		if runes == 0 {
-			continue
+			return
 		}
-		at := writeTimeAt(writes, offset, len(samples) == 0)
+		at := writeTimeAt(writes, line.offset, len(samples) == 0)
 		if at.IsZero() {
-			continue
+			return
 		}
 		samples = append(samples, sample{at: at, runes: runes})
-	}
+	}, nil)
 	if len(samples) == 0 {
 		return ""
 	}

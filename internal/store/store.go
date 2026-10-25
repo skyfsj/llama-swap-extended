@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -310,7 +311,11 @@ func (s *Store) PurgeActivityBefore(ctx context.Context, before time.Time) (int6
 	if before.IsZero() {
 		return 0, nil
 	}
-	result, err := s.db.ExecContext(ctx, `DELETE FROM activity WHERE ts_created < ?`, before.Unix())
+	// The rollup is pruned by the same cutoff: a bucket that still holds rows
+	// deleted from activity would keep counting them in the statistics, so the
+	// dashboard and the detail table would disagree about the same window.
+	cutoff := before.Unix()
+	result, err := s.db.ExecContext(ctx, `DELETE FROM activity WHERE ts_created < ?`, cutoff)
 	if err != nil {
 		return 0, fmt.Errorf("purge activity rows: %w", err)
 	}
@@ -318,7 +323,21 @@ func (s *Store) PurgeActivityBefore(ctx context.Context, before time.Time) (int6
 	if err != nil {
 		return 0, fmt.Errorf("purge activity rows: %w", err)
 	}
+	if err := s.pruneActivityRollup(ctx, rollupBucketFor(cutoff)); err != nil {
+		return deleted, err
+	}
 	return deleted, nil
+}
+
+// pruneActivityRollup drops the rollup buckets that end at or before cutoff, so a
+// pruned row is no longer counted anywhere. The hour that contains the cutoff is
+// kept: rows inside it may still be present, and dropping the whole bucket would
+// under-report the window that is still there.
+func (s *Store) pruneActivityRollup(ctx context.Context, cutoffBucket int64) error {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM activity_rollup WHERE bucket_ts < ?`, cutoffBucket); err != nil {
+		return fmt.Errorf("prune activity rollup: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) InsertActivity(ctx context.Context, entry ActivityLogEntry) (ActivityLogEntry, error) {
@@ -341,7 +360,15 @@ func (s *Store) InsertActivity(ctx context.Context, entry ActivityLogEntry) (Act
 		return ActivityLogEntry{}, err
 	}
 
-	res, err := s.db.ExecContext(ctx, `
+	// The activity row and its rollup contribution share one transaction: a row
+	// that failed to insert must not leave its contribution behind, and a
+	// contribution that failed to fold must not leave a row the statistics will
+	// never count.
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return ActivityLogEntry{}, fmt.Errorf("begin activity insert: %w", err)
+	}
+	res, err := tx.ExecContext(ctx, `
 		INSERT INTO activity (
 			ts_created, model_id, key_id, session_id, req_path, resp_content_type, resp_status_code,
 			cache_tokens, draft_tokens, draft_acc_tokens, input_tokens, output_tokens,
@@ -384,14 +411,55 @@ func (s *Store) InsertActivity(ctx context.Context, entry ActivityLogEntry) (Act
 		boolInt(entry.ProviderLocal),
 	)
 	if err != nil {
+		_ = tx.Rollback()
 		return ActivityLogEntry{}, fmt.Errorf("insert activity: %w", err)
+	}
+	if err := applyRollup(ctx, tx, []rollupInput{rollupContribution(entry)}); err != nil {
+		_ = tx.Rollback()
+		return ActivityLogEntry{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return ActivityLogEntry{}, fmt.Errorf("commit activity: %w", err)
 	}
 	id, err := res.LastInsertId()
 	if err != nil {
 		return ActivityLogEntry{}, fmt.Errorf("insert activity id: %w", err)
 	}
 	entry.ID = int(id)
+	// Advance the backfill cursor with the row: a store that has already been
+	// backfilled must not treat every row written afterwards as never folded.
+	if err := s.advanceRollupCursor(ctx, id); err != nil {
+		return ActivityLogEntry{}, err
+	}
 	return entry, nil
+}
+
+// advanceRollupCursor records that the row just inserted is folded. It is
+// called outside the insert transaction because a cursor write must never roll
+// back a row that was committed: a stale cursor only costs a redundant fold,
+// while a missing one would make the rollup look incomplete.
+//
+// The cursor this advances is the *write* cursor, and it deliberately does not
+// claim anything about rows that predate the rollup: rollupAvailable verifies
+// that the table actually holds what the cursor claims before trusting it, so a
+// cursor that ran ahead of the folding cannot hide the history. Keeping this
+// unconditional is what lets a store created after the rollup existed report
+// itself as available without ever running a backfill.
+func (s *Store) advanceRollupCursor(ctx context.Context, id int64) error {
+	if id <= 0 || s.rollupCursor(ctx) >= id {
+		return nil
+	}
+	if err := s.SetCacheEntry(ctx, CacheEntry{Key: rollupBackfillKey, Data: []byte(strconv.FormatInt(id, 10))}); err != nil {
+		return fmt.Errorf("advance rollup cursor: %w", err)
+	}
+	return nil
+}
+
+// rollupBackfillComplete reports whether every activity row predating the
+// rollup has been folded (the marker backfillActivityRollup writes).
+func (s *Store) rollupBackfillComplete(ctx context.Context) bool {
+	entry, found, err := s.GetCacheEntry(ctx, rollupCompleteKey)
+	return err == nil && found && string(entry.Data) == "1"
 }
 
 // normalizeDecodeMs keeps unknown/absent decode windows in the -1 sentinel
@@ -498,12 +566,29 @@ func (s *Store) ActivityStats(ctx context.Context, query ActivityStatsQuery) (Ac
 	filter.End = query.End
 	filter.MinID = query.MinID
 	filter.MaxID = query.MaxID
-	where, args := activityWhere(filter)
-	aggregates, err := s.aggregateActivity(ctx, where, args)
+	aggregates, err := s.activityAggregatesFor(ctx, filter)
 	if err != nil {
 		return ActivityStats{}, fmt.Errorf("activity stats: %w", err)
 	}
-	aggregate := aggregates.total
+	aggregate := aggregates.activityAggregates.total
+	// Whether the request count may come from the id column depends only on the
+	// filter, not on which path folded it: an unfiltered selection is the one
+	// whose row count a prune would under-report.
+	unfiltered := activityFilterIsEmpty(filter)
+	// Activity rows are pruned to MetricsMaxInMemory, so counting the rows
+	// left makes the completed-request total stop at the retention limit even
+	// though the ids keep increasing. When nothing narrows the set, the
+	// monotonic AUTOINCREMENT id is the true total. A filtered query keeps
+	// counting rows: the highest id inside a filter is not its row count.
+	if unfiltered {
+		// A rollup fold counts the rows it holds; a table that has been pruned
+		// of old rows would under-report the requests that ever happened, so
+		// the monotonic id is the better answer when nothing narrows the set.
+		var maxID int
+		if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(id), 0) FROM activity`).Scan(&maxID); err == nil {
+			aggregate.Requests = maxID
+		}
+	}
 	stats := ActivityStats{
 		TotalRequests:            aggregate.Requests,
 		TotalInputTokens:         aggregate.InputTokens,
@@ -516,9 +601,9 @@ func (s *Store) ActivityStats(ctx context.Context, query ActivityStatsQuery) (Ac
 	}
 	stats.CacheHitRatio = aggregateCacheHitRatio(stats.TotalInputTokens, stats.TotalCacheTokens, stats.TotalCacheCreationTokens)
 	stats.CacheCreationRatio = aggregateCacheCreationRatio(stats.TotalInputTokens, stats.TotalCacheTokens, stats.TotalCacheCreationTokens)
-	stats.ByModel = modelUsageRows(aggregates.byModel)
+	stats.ByModel = modelUsageRows(aggregates.activityAggregates.byModel)
 
-	promptValues, genValues, err := s.speedValues(ctx, where, args)
+	promptValues, genValues, err := s.rollupHistogram(ctx, filter)
 	if err != nil {
 		return ActivityStats{}, err
 	}
@@ -527,40 +612,26 @@ func (s *Store) ActivityStats(ctx context.Context, query ActivityStatsQuery) (Ac
 	return stats, nil
 }
 
-// speedValues reads both histogram source columns in a single scan. Zero
-// values mean the speed was not reported and are excluded per column. No
-// ORDER BY: calculateHistogramData sorts the values itself.
-func (s *Store) speedValues(ctx context.Context, where string, args []any) (prompt, gen []float64, err error) {
-	ctx = normalizeContext(ctx)
-	if err := s.ensureDB(); err != nil {
-		return nil, nil, err
+// activityAggregatesFor folds a filter's totals, preferring the pre-aggregated
+// rollup and falling back to the activity scan when the rollup cannot answer it
+// (a filter on a dimension the rollup does not key on, or a backfill that has not
+// caught up yet). The fallback is what keeps a fresh or migrating installation
+// correct; the rollup is what keeps a long-running one fast.
+func (s *Store) activityAggregatesFor(ctx context.Context, filter ActivityFilter) (activityAggregatesWithSource, error) {
+	if rollupQuery, ok := rollupFilterFor(filter); ok && s.rollupReady(ctx) {
+		folded, err := s.rollupAggregates(ctx, rollupQuery)
+		if err == nil {
+			return activityAggregatesWithSource{activityAggregates: folded, fromRollup: true}, nil
+		}
+		// A rollup read that fails is not a reason to fail the request: the
+		// scan below is slower but always available.
 	}
-	filter := where
-	if filter == "" {
-		filter = ` WHERE prompt_per_second > 0 OR tokens_per_second > 0`
-	} else {
-		filter += ` AND (prompt_per_second > 0 OR tokens_per_second > 0)`
-	}
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT prompt_per_second, tokens_per_second FROM activity`+filter, args...)
+	where, args := activityWhere(filter)
+	aggregates, err := s.aggregateActivity(ctx, where, args)
 	if err != nil {
-		return nil, nil, fmt.Errorf("activity histogram: %w", err)
+		return activityAggregatesWithSource{}, err
 	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var promptValue, genValue float64
-		if err := rows.Scan(&promptValue, &genValue); err != nil {
-			return nil, nil, fmt.Errorf("activity histogram row: %w", err)
-		}
-		if promptValue > 0 {
-			prompt = append(prompt, promptValue)
-		}
-		if genValue > 0 {
-			gen = append(gen, genValue)
-		}
-	}
-	return prompt, gen, rows.Err()
+	return activityAggregatesWithSource{activityAggregates: aggregates}, nil
 }
 
 func (s *Store) PruneActivity(ctx context.Context, maxRows int) error {
@@ -576,12 +647,141 @@ func (s *Store) PruneActivity(ctx context.Context, maxRows int) error {
 	// One statement keeps the per-insert prune cheap; if ids ever become
 	// sparse this retains fewer than maxRows rows, which is fine for a
 	// bounded recent-activity cap.
+	// The hours that still hold rows are the ones whose buckets must be
+	// recomputed; a bucket whose whole hour was pruned is simply dropped.
+	keptHours, err := s.activityRollupHours(ctx)
+	if err != nil {
+		return err
+	}
 	if _, err := s.db.ExecContext(ctx,
 		`DELETE FROM activity WHERE id <= (SELECT MAX(id) FROM activity) - ?`, maxRows,
 	); err != nil {
 		return fmt.Errorf("prune activity: %w", err)
 	}
+	if err := s.rebuildActivityRollupBuckets(ctx, keptHours); err != nil {
+		return err
+	}
 	return nil
+}
+
+// activityRollupHours lists the hour buckets that currently hold activity rows.
+func (s *Store) activityRollupHours(ctx context.Context) ([]int64, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT DISTINCT (ts_created / ?) * ? FROM activity`, activityRollupBucketSeconds, activityRollupBucketSeconds)
+	if err != nil {
+		return nil, fmt.Errorf("list activity rollup hours: %w", err)
+	}
+	defer rows.Close()
+	hours := []int64{}
+	for rows.Next() {
+		var hour int64
+		if err := rows.Scan(&hour); err != nil {
+			return nil, fmt.Errorf("scan activity rollup hour: %w", err)
+		}
+		hours = append(hours, hour)
+	}
+	return hours, rows.Err()
+}
+
+// rebuildActivityRollupBuckets recomputes the given hour buckets from the rows
+// that are still present, and drops the buckets whose hour is gone.
+//
+// Recomputing rather than adjusting is what makes a prune exact: the bucket counts
+// were incremented per row, and the only way to undo some of those increments
+// without knowing which rows went is to fold the survivors again. The work is
+// bounded by the hours a prune can touch, which on a bounded recent-activity cap
+// is one or two.
+func (s *Store) rebuildActivityRollupBuckets(ctx context.Context, hours []int64) error {
+	if len(hours) == 0 {
+		// Nothing is retained: the rollup has nothing left to say.
+		if _, err := s.db.ExecContext(ctx, `DELETE FROM activity_rollup`); err != nil {
+			return fmt.Errorf("clear activity rollup: %w", err)
+		}
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin rollup rebuild: %w", err)
+	}
+	for _, hour := range hours {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM activity_rollup WHERE bucket_ts = ?`, hour); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("clear rollup bucket %d: %w", hour, err)
+		}
+		inputs, _, err := s.readActivityForRollupTx(ctx, tx, hour)
+		if err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		if err := applyRollup(ctx, tx, inputs); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	// Buckets for hours with no retained rows are dropped in the same
+	// transaction, so a reader never sees a bucket counting pruned rows.
+	placeholders := ""
+	args := make([]any, len(hours))
+	for index, hour := range hours {
+		if index > 0 {
+			placeholders += ","
+		}
+		placeholders += "?"
+		args[index] = hour
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM activity_rollup WHERE bucket_ts NOT IN (`+placeholders+`)`, args...); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("drop empty rollup buckets: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit rollup rebuild: %w", err)
+	}
+	return nil
+}
+
+// readActivityForRollupTx reads the rows of one hour as rollup contributions,
+// using the caller's transaction so the rebuild is atomic.
+func (s *Store) readActivityForRollupTx(ctx context.Context, tx rollupExecer, hour int64) ([]rollupInput, int64, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id, ts_created, model_id, key_id, req_path,
+			input_tokens, output_tokens, cache_tokens, cache_creation_tokens, reasoning_tokens,
+			estimated_cost, cost_estimated, duration_ms, first_token_ms, prompt_per_second, tokens_per_second
+		FROM activity WHERE ts_created >= ? AND ts_created < ? ORDER BY id`, hour, hour+activityRollupBucketSeconds)
+	if err != nil {
+		return nil, 0, fmt.Errorf("read activity for rollup rebuild: %w", err)
+	}
+	defer rows.Close()
+	inputs := []rollupInput{}
+	var last int64
+	for rows.Next() {
+		var (
+			id, ts                   int64
+			model, keyID, reqPath    string
+			input, output, cached    sql.NullInt64
+			creation, reasoning      sql.NullInt64
+			cost                     sql.NullFloat64
+			costEstimated            sql.NullInt64
+			durationMs, firstTokenMs sql.NullInt64
+			promptSpeed, genSpeed    sql.NullFloat64
+		)
+		if err := rows.Scan(&id, &ts, &model, &keyID, &reqPath,
+			&input, &output, &cached, &creation, &reasoning,
+			&cost, &costEstimated, &durationMs, &firstTokenMs, &promptSpeed, &genSpeed); err != nil {
+			return nil, 0, fmt.Errorf("scan activity for rollup rebuild: %w", err)
+		}
+		inputs = append(inputs, rollupInputFromRow(
+			ts, model, keyID, reqPath,
+			input.Int64, output.Int64, cached.Int64, creation.Int64, reasoning.Int64,
+			cost.Float64, costEstimated.Int64 != 0,
+			durationMs.Int64, firstTokenMs.Int64,
+			promptSpeed.Float64, genSpeed.Float64,
+		))
+		last = id
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("iterate activity for rollup rebuild: %w", err)
+	}
+	return inputs, last, nil
 }
 
 const (
@@ -878,4 +1078,15 @@ func scanActivity(scanner activityScanner) (ActivityLogEntry, error) {
 		}
 	}
 	return entry, nil
+}
+
+// activityFilterIsEmpty reports whether a filter narrows the selection at all.
+func activityFilterIsEmpty(filter ActivityFilter) bool {
+	return len(filter.Models) == 0 &&
+		strings.TrimSpace(filter.KeyID) == "" &&
+		strings.TrimSpace(filter.SessionID) == "" &&
+		filter.Start.IsZero() &&
+		filter.End.IsZero() &&
+		filter.MinID <= 0 &&
+		filter.MaxID <= 0
 }

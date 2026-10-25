@@ -374,3 +374,55 @@ func TestServer_ExtensionsGeminiDeferredFold(t *testing.T) {
 		t.Fatalf("the deferred result is not a functionResponse part: %v", userParts)
 	}
 }
+
+// A server-executed call is replayed by the Gemini fold. Gemini 3 rejects a
+// replayed functionCall part whose thought signature was dropped, and the
+// caller never saw that call, so the signature has to travel in the pending
+// record; rebuilding the part from name and arguments lost it.
+func TestServer_ExtensionsGeminiDeferredFoldKeepsServerCallSignature(t *testing.T) {
+	payload := extensionPendingPayload{
+		Calls: []extensionPendingCall{
+			{ExtensionID: "gcal", ID: "call_gemini_1", Name: "lookup", Arguments: `{"q":"x"}`, Kind: pendingCallServer, Signature: "SIG-SERVER"},
+			{ID: "client_tool", Name: "client_tool", Kind: pendingCallClient},
+		},
+		ClientIDs: map[string]string{"client_tool": "call_gemini_2"},
+	}
+	var request map[string]any
+	raw := `{"contents":[
+		{"role":"user","parts":[{"text":"hi"}]},
+		{"role":"model","parts":[{"functionCall":{"name":"lookup","args":{"q":"x"}}},{"functionCall":{"name":"client_tool","args":{}}}]}
+	]}`
+	if err := json.Unmarshal([]byte(raw), &request); err != nil {
+		t.Fatal(err)
+	}
+	turn, err := geminiDeferredTurnIn(request, payload)
+	if err != nil {
+		t.Fatalf("deferred turn: %v", err)
+	}
+	outputs := map[string]map[string]any{"call_gemini_1": {"content": "found:x"}}
+	if err := foldGeminiDeferredTurn(request, payload, turn, outputs); err != nil {
+		t.Fatalf("fold: %v", err)
+	}
+	encoded, _ := json.Marshal(request["contents"])
+	if !strings.Contains(string(encoded), `"thoughtSignature":"SIG-SERVER"`) {
+		t.Fatalf("the replayed server call lost its signature, so Gemini 3 rejects the turn: %s", encoded)
+	}
+}
+
+// The caller-visible echo of a hidden surface must carry the signature too:
+// the part is what the client replays on its next turn.
+func TestServer_ExposeExtensionClientCallsKeepsSignature(t *testing.T) {
+	response := map[string]any{"candidates": []any{map[string]any{
+		"content": map[string]any{"role": "model", "parts": []any{
+			map[string]any{"functionCall": map[string]any{"name": "lookup", "args": map[string]any{"q": "x"}}, "thoughtSignature": "SIG-VISIBLE"},
+		}},
+		"index": 0,
+	}}}
+	clientCalls := []extensionCall{{ID: "call_ls_1", OriginalID: "call_gemini_1", Name: "lookup", Arguments: `{"q":"x"}`}}
+	exposeExtensionClientCalls(response, clientCalls, "gemini.generateContent")
+
+	encoded, _ := json.Marshal(response)
+	if !strings.Contains(string(encoded), `"thoughtSignature":"SIG-VISIBLE"`) {
+		t.Fatalf("the caller-visible call lost its signature: %s", encoded)
+	}
+}

@@ -9,6 +9,7 @@
   import { Textarea } from "$lib/components/ui/textarea/index.js";
   import { translate } from "../../lib/i18n";
   import { errorMessageFromPayload } from "../../lib/apiError";
+  import { toast } from "../../lib/toast";
   import { getModelFiles } from "../../lib/modelFiles";
   import type { ModelFile } from "../../lib/types";
   import { childSchema, modelFieldSchema } from "../../lib/configSchema";
@@ -52,6 +53,7 @@
   } from "../../lib/modelConfig";
   import { adoptLaunchFields, launchPinnedFromArguments, parseLaunchCommand, type ParsedLaunch } from "../../lib/launchParse";
   import LaunchArgsCodeEditor from "./LaunchArgsCodeEditor.svelte";
+import { apiUrl } from "../../lib/apiPath";
 
   interface ConfigSource {
     path: string;
@@ -406,7 +408,7 @@
     if (runtime === "") return;
     runtimeVersionCatalogLoading = true;
     try {
-      const response = await fetch(`/api/runtimes/${encodeURIComponent(runtime)}`);
+      const response = await fetch(apiUrl(`/api/runtimes/${encodeURIComponent(runtime)}`));
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(errorMessageFromPayload(payload, `HTTP ${response.status}`));
       const versions = (payload?.versions ?? {}) as Record<string, unknown>;
@@ -550,7 +552,7 @@
 
   async function loadLmcacheAvailability(): Promise<void> {
     try {
-      const response = await fetch("/api/runtimes/lmcache");
+      const response = await fetch(apiUrl("/api/runtimes/lmcache"));
       const payload = await response.json().catch(() => ({}));
       const status = (payload?.status ?? {}) as Record<string, unknown>;
       lmcacheAvailable = typeof status.current === "string" && status.current !== "";
@@ -584,7 +586,7 @@
     gpusLoading = true;
     gpusError = "";
     try {
-      const response = await fetch("/api/gpus");
+      const response = await fetch(apiUrl("/api/gpus"));
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(errorMessageFromPayload(payload, `HTTP ${response.status}`));
       gpus = (payload?.gpus ?? []) as GPUInfo[];
@@ -820,7 +822,7 @@
   async function validatePatch(patch: unknown[]): Promise<void> {
     saving = true;
     try {
-      const response = await fetch("/api/config/validate", {
+      const response = await fetch(apiUrl("/api/config/validate"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(patch),
@@ -853,7 +855,7 @@
     saving = true;
     error = "";
     try {
-      const response = await fetch("/api/config", {
+      const response = await fetch(apiUrl("/api/config"), {
         method: "PATCH",
         headers: { "Content-Type": "application/json", "If-Match": pendingETag },
         body: JSON.stringify(pendingPatch),
@@ -873,6 +875,7 @@
       diffDialogOpen = false;
       clearPending();
       validation = null;
+      toast.success($translate(editing ? "models.saved" : "models.created", { id: savedID }));
       onSaved(savedID);
     } catch (cause) {
       error = cause instanceof Error ? cause.message : String(cause);

@@ -178,10 +178,10 @@ var seed int64 = 42
 func TestGateway_StickyTableBindGetSlide(t *testing.T) {
 	table := newStickyTable(time.Hour)
 	now := time.Now()
-	table.bind("sess1", "credA", now)
-	id, ok := table.get("sess1", now.Add(30*time.Minute))
-	if !ok || id != "credA" {
-		t.Fatalf("get after 30m: %q %v", id, ok)
+	table.bind("sess1", "prov", "prov\x00Chat\x00m1", "credA", now, false)
+	entry, ok := table.get("sess1", now.Add(30*time.Minute))
+	if !ok || entry.credentialID != "credA" {
+		t.Fatalf("get after 30m: %+v %v", entry, ok)
 	}
 	// Each hit slides the expiry (last hit at 30m -> expires at 90m).
 	if _, ok := table.get("sess1", now.Add(89*time.Minute)); !ok {
@@ -197,28 +197,73 @@ func TestGateway_StickyTableBindGetSlide(t *testing.T) {
 	}
 }
 
-func TestGateway_StickyTableNoOverwrite(t *testing.T) {
+func TestGateway_StickyTableBindsRouteAndCredential(t *testing.T) {
 	table := newStickyTable(time.Hour)
 	now := time.Now()
-	table.bind("s", "a", now)
-	table.bind("s", "b", now.Add(time.Minute)) // different cred: ignored
-	id, _ := table.get("s", now.Add(2*time.Minute))
-	if id != "a" {
-		t.Fatalf("binding must not be overwritten, got %q", id)
+	table.bind("s", "prov", "prov\x00Chat\x00m1", "credA", now, false)
+	entry, ok := table.get("s", now)
+	if !ok {
+		t.Fatal("binding missing")
 	}
-	table.bind("s", "a", now.Add(3*time.Minute)) // same cred: refresh ok
-	id, _ = table.get("s", now.Add(4*time.Minute))
-	if id != "a" {
-		t.Fatalf("same-credential rebind must succeed, got %q", id)
+	if entry.provider != "prov" || entry.route != "prov\x00Chat\x00m1" || entry.credentialID != "credA" {
+		t.Fatalf("binding = %+v", entry)
+	}
+
+	// A different route for the same session must not overwrite the binding:
+	// that would move the conversation to another upstream cache.
+	table.bind("s", "other", "other\x00Chat\x00m1", "credB", now.Add(time.Minute), false)
+	entry, _ = table.get("s", now.Add(2*time.Minute))
+	if entry.route != "prov\x00Chat\x00m1" {
+		t.Fatalf("binding must not move to another route, got %+v", entry)
+	}
+
+	// A key rotation inside the same route refreshes the credential and keeps
+	// the route: the provider-side cache is still the same account.
+	table.bind("s", "prov", "prov\x00Chat\x00m1", "credC", now.Add(3*time.Minute), false)
+	entry, _ = table.get("s", now.Add(4*time.Minute))
+	if entry.route != "prov\x00Chat\x00m1" || entry.credentialID != "credC" {
+		t.Fatalf("same-route rebind must refresh the credential, got %+v", entry)
+	}
+}
+
+// A binding whose route can no longer serve the request is the one case where
+// another route takes over: the session moved off it because it was unusable,
+// and it must not be pulled back when that route recovers — it has since built
+// its prompt cache on the provider that answered.
+func TestGateway_StickyTableReplacesOnlyUnavailableBinding(t *testing.T) {
+	table := newStickyTable(time.Hour)
+	now := time.Now()
+	table.bind("s", "prov", "prov\x00Chat\x00m1", "credA", now, false)
+
+	// The bound route is down: another provider answers and takes the session.
+	table.bind("s", "other", "other\x00Chat\x00m1", "credB", now.Add(time.Minute), true)
+	entry, _ := table.get("s", now.Add(2*time.Minute))
+	if entry.route != "other\x00Chat\x00m1" {
+		t.Fatalf("an unusable binding must be replaced, got %+v", entry)
+	}
+
+	// The original route is healthy again. It must not win the session back:
+	// the cache the session has since built would be discarded.
+	table.bind("s", "prov", "prov\x00Chat\x00m1", "credA", now.Add(3*time.Minute), false)
+	entry, _ = table.get("s", now.Add(4*time.Minute))
+	if entry.route != "other\x00Chat\x00m1" {
+		t.Fatalf("a recovered provider must not take the session back, got %+v", entry)
+	}
+
+	// When the new route also becomes unusable, the session may move again.
+	table.bind("s", "prov", "prov\x00Chat\x00m1", "credA", now.Add(5*time.Minute), true)
+	entry, _ = table.get("s", now.Add(6*time.Minute))
+	if entry.route != "prov\x00Chat\x00m1" {
+		t.Fatalf("a second failure must let the session move again, got %+v", entry)
 	}
 }
 
 func TestGateway_StickyTableClearCredential(t *testing.T) {
 	table := newStickyTable(time.Hour)
 	now := time.Now()
-	table.bind("s1", "a", now)
-	table.bind("s2", "a", now)
-	table.bind("s3", "b", now)
+	table.bind("s1", "p", "p\x00Chat\x00m1", "a", now, false)
+	table.bind("s2", "p", "p\x00Chat\x00m1", "a", now, false)
+	table.bind("s3", "p", "p\x00Chat\x00m1", "b", now, false)
 	table.clearCredential("a")
 	if _, ok := table.get("s1", now); ok {
 		t.Fatal("s1 should be unbound")
@@ -226,7 +271,7 @@ func TestGateway_StickyTableClearCredential(t *testing.T) {
 	if _, ok := table.get("s2", now); ok {
 		t.Fatal("s2 should be unbound")
 	}
-	if id, ok := table.get("s3", now); !ok || id != "b" {
+	if entry, ok := table.get("s3", now); !ok || entry.credentialID != "b" {
 		t.Fatal("s3 must keep its binding")
 	}
 }

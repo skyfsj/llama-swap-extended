@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/gateway"
@@ -100,6 +101,9 @@ func multiSurfaceServer(t *testing.T, cfg config.Config) *Server {
 	s.gateway = gw
 	s.routes()
 	t.Cleanup(gw.Shutdown)
+	t.Cleanup(func() {
+		s.closeMCPRuntime()
+	})
 	return s
 }
 
@@ -158,7 +162,7 @@ func TestServer_MultiSurfacePrefersClientDialect(t *testing.T) {
 	})
 
 	t.Run("responses client", func(t *testing.T) {
-		w := postJSON(t, s, "/v1/responses", `{"model":"claude-haiku-5-5","input":"hi","max_output_tokens":16}`)
+		w := postJSON(t, s, "/v1/responses", `{"model":"claude-haiku-5-5","input":"hi from a responses client","max_output_tokens":16}`)
 		if w.Code != http.StatusOK {
 			t.Fatalf("status = %d body = %s", w.Code, w.Body.String())
 		}
@@ -182,7 +186,7 @@ func TestServer_MultiSurfacePrefersClientDialect(t *testing.T) {
 
 	t.Run("chat client converts to the first surface", func(t *testing.T) {
 		w := postJSON(t, s, "/v1/chat/completions",
-			`{"model":"claude-haiku-5-5","messages":[{"role":"user","content":"hi"}],"max_tokens":16}`)
+			`{"model":"claude-haiku-5-5","messages":[{"role":"user","content":"hi from a chat client"}],"max_tokens":16}`)
 		if w.Code != http.StatusOK {
 			t.Fatalf("status = %d body = %s", w.Code, w.Body.String())
 		}
@@ -619,5 +623,159 @@ func TestServer_MultiSurfaceLongBodyStillConverts(t *testing.T) {
 	}
 	if !strings.Contains(bodies2[0], `"max_tokens"`) {
 		t.Fatalf("converted body is not Anthropic: %s", bodies2[0][:120])
+	}
+}
+
+// A bare model name served by two *different providers* on *different*
+// dialects is one pool. The old surface-group walk only ever tried the
+// client's own dialect first and stopped on success, so the other provider
+// never received traffic from that client. The pool now rotates between
+// providers and converts each attempt to that provider's dialect.
+func TestServer_CrossProviderPoolRotatesAcrossDialects(t *testing.T) {
+	responses := &surfaceRecorder{}
+	responsesUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		responses.record(r)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, responsesSurfaceBody)
+	}))
+	defer responsesUpstream.Close()
+	chat := &surfaceRecorder{}
+	chatUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		chat.record(r)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"chatcmpl_1","object":"chat.completion","created":1,"model":"haiku-chat","choices":[{"index":0,"message":{"role":"assistant","content":"pong"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	}))
+	defer chatUpstream.Close()
+
+	cfg := config.Config{
+		Models: map[string]config.ModelConfig{
+			"local-model": {Cmd: "echo hi", Proxy: "http://127.0.0.1:1"},
+		},
+		Providers: config.ProviderDictionaryConfig{
+			"ocg": {
+				ApiKeys: []config.ProviderKey{{Value: "k-ocg"}},
+				Adapters: []config.ProviderAdapter{{
+					Name: "Responses", Type: config.ProviderTypeOpenAIResponses, Endpoint: responsesUpstream.URL,
+					Models: []config.ProviderModel{{Local: "claude-haiku-5-5", Remote: "haiku-responses"}},
+				}},
+			},
+			"other": {
+				Type:     config.ProviderTypeOpenAI,
+				Endpoint: chatUpstream.URL,
+				ApiKeys:  []config.ProviderKey{{Value: "k-other"}},
+				Models:   []config.ProviderModel{{Local: "claude-haiku-5-5", Remote: "haiku-chat"}},
+			},
+		},
+	}
+	s := multiSurfaceServer(t, cfg)
+
+	// Distinct conversations: affinity must not collapse them onto one
+	// provider, and each conversation must stay on the provider it started on.
+	bound := map[string]string{}
+	servedBy := map[string]int{}
+	for turn := 0; turn < 3; turn++ {
+		for _, conversation := range []string{"conv-a", "conv-b", "conv-c", "conv-d"} {
+			body, err := json.Marshal(map[string]any{
+				"model": "claude-haiku-5-5",
+				"input": conversation,
+			})
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			responsesBefore, chatBefore := responses.callCount(), chat.callCount()
+			w := postJSON(t, s, "/v1/responses", string(body))
+			if w.Code != http.StatusOK {
+				t.Fatalf("%s turn %d: status = %d body = %s", conversation, turn, w.Code, w.Body.String())
+			}
+			if !strings.Contains(w.Body.String(), "pong") {
+				t.Fatalf("%s: assistant text lost: %s", conversation, w.Body.String())
+			}
+			provider := ""
+			switch {
+			case responses.callCount() > responsesBefore:
+				provider = "ocg"
+			case chat.callCount() > chatBefore:
+				provider = "other"
+			default:
+				t.Fatalf("%s: no provider recorded the request", conversation)
+			}
+			if want, ok := bound[conversation]; ok && provider != want {
+				t.Fatalf("%s moved from %s to %s", conversation, want, provider)
+			}
+			bound[conversation] = provider
+			servedBy[provider]++
+		}
+	}
+
+	// The Responses-dialect provider natively serves the client; the Chat
+	// provider must have received converted requests.
+	if responses.callCount() == 0 || chat.callCount() == 0 {
+		t.Fatalf("traffic did not reach both providers: responses=%d chat=%d",
+			responses.callCount(), chat.callCount())
+	}
+	_, _, chatBodies, _, _ := chat.snapshot()
+	for _, body := range chatBodies {
+		if !strings.Contains(body, `"messages"`) || !strings.Contains(body, `"haiku-chat"`) {
+			t.Fatalf("chat provider did not receive a converted request with its own model name: %s", body)
+		}
+	}
+	_, _, responsesBodies, _, _ := responses.snapshot()
+	for _, body := range responsesBodies {
+		if !strings.Contains(body, `"input"`) || !strings.Contains(body, `"haiku-responses"`) {
+			t.Fatalf("responses provider did not receive a native request with its own model name: %s", body)
+		}
+	}
+}
+
+// A cooling-down first candidate must hand the request to the next provider
+// instead of answering 502 for the whole pool.
+func TestServer_PoolSkipsProviderWithoutUsableCredential(t *testing.T) {
+	chat := &surfaceRecorder{}
+	chatUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		chat.record(r)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"chatcmpl_1","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"pong"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	}))
+	defer chatUpstream.Close()
+
+	cfg := config.Config{
+		Models: map[string]config.ModelConfig{
+			"local-model": {Cmd: "echo hi", Proxy: "http://127.0.0.1:1"},
+		},
+		Providers: config.ProviderDictionaryConfig{
+			"dead": {
+				Type:     config.ProviderTypeOpenAI,
+				Endpoint: chatUpstream.URL,
+				ApiKeys:  []config.ProviderKey{{Value: "k-dead"}},
+				Models:   []config.ProviderModel{{Local: "shared", Remote: "shared"}},
+			},
+			"alive": {
+				Type:     config.ProviderTypeOpenAI,
+				Endpoint: chatUpstream.URL,
+				ApiKeys:  []config.ProviderKey{{Value: "k-alive"}},
+				Models:   []config.ProviderModel{{Local: "shared", Remote: "shared"}},
+			},
+		},
+	}
+	s := multiSurfaceServer(t, cfg)
+	// Park every credential of "dead": the pool must still serve from "alive".
+	for _, route := range s.currentGateway().AllRoutes() {
+		if route.ProviderID != "dead" {
+			continue
+		}
+		for _, cred := range route.Credentials() {
+			gateway.CooldownForTest(cred, gateway.CooldownAuth, time.Now().Add(time.Hour), "401")
+		}
+	}
+
+	for i := 0; i < 6; i++ {
+		w := postJSON(t, s, "/v1/chat/completions",
+			`{"model":"shared","messages":[{"role":"user","content":"hi"}],"max_tokens":16}`)
+		if w.Code != http.StatusOK {
+			t.Fatalf("request %d: status = %d body = %s", i, w.Code, w.Body.String())
+		}
+	}
+	if chat.callCount() != 6 {
+		t.Fatalf("upstream calls = %d, want 6 served by the healthy provider", chat.callCount())
 	}
 }

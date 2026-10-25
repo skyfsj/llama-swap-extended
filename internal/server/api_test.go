@@ -37,8 +37,10 @@ func TestServer_HandleListModels(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d", w.Code)
 	}
-	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "http://example.com" {
-		t.Errorf("Access-Control-Allow-Origin = %q", got)
+	// The global CORS middleware sets this on every response now, so the
+	// listing no longer echoes the request Origin back.
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Errorf("Access-Control-Allow-Origin = %q want *", got)
 	}
 
 	var resp struct {
@@ -357,6 +359,28 @@ func TestServer_HandleUpstream(t *testing.T) {
 		if w.Code != http.StatusMovedPermanently {
 			t.Errorf("status = %d, want 301", w.Code)
 		}
+		// A relative Location keeps a reverse proxy's path prefix.
+		if got := w.Header().Get("Location"); got != "./m1/" {
+			t.Errorf("Location = %q, want ./m1/", got)
+		}
+	})
+
+	// A name with a colon parses as a URL scheme in an absolute Location, and
+	// a slash name would resolve against the wrong path segment. The relative
+	// form built from the escaped last segment survives both.
+	t.Run("redirects a colon model name relatively", func(t *testing.T) {
+		colonLocal := newStubRouter([]string{"model1:high"}, "upstream-body")
+		colon := newTestServer(colonLocal, newStubRouter(nil, ""))
+		colon.cfg = config.Config{Models: map[string]config.ModelConfig{"model1:high": {}}}
+
+		w := httptest.NewRecorder()
+		colon.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/upstream/model1:high", nil))
+		if w.Code != http.StatusMovedPermanently {
+			t.Fatalf("status = %d, want 301", w.Code)
+		}
+		if got := w.Header().Get("Location"); got != "./model1:high/" {
+			t.Errorf("Location = %q, want ./model1:high/", got)
+		}
 	})
 
 	t.Run("unknown model 404", func(t *testing.T) {
@@ -399,8 +423,8 @@ func TestServer_HandleComfyUI(t *testing.T) {
 			if w.Code != tt.status {
 				t.Errorf("%s status=%d want %d", tt.method, w.Code, tt.status)
 			}
-			if got := w.Header().Get("Location"); got != "/comfyui/?token=value" {
-				t.Errorf("%s Location=%q want /comfyui/?token=value", tt.method, got)
+			if got := w.Header().Get("Location"); got != "comfyui/?token=value" {
+				t.Errorf("%s Location=%q want comfyui/?token=value", tt.method, got)
 			}
 		}
 	})
@@ -886,7 +910,7 @@ func TestServer_HandleMetrics_Unavailable(t *testing.T) {
 func TestServer_Redirects(t *testing.T) {
 	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
 
-	for path, want := range map[string]string{"/": "/ui", "/upstream": "/ui/#/models"} {
+	for path, want := range map[string]string{"/": "ui/", "/upstream": "ui/#/models"} {
 		w := httptest.NewRecorder()
 		s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
 		if w.Code != http.StatusFound {

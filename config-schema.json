@@ -158,6 +158,99 @@
     }
   },
   "properties": {
+    "protocolRuntime": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mcp": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false
+            },
+            "servers": {
+              "type": "object",
+              "propertyNames": {
+                "pattern": "^[a-zA-Z0-9_-]{1,48}$"
+              },
+              "additionalProperties": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "transport"
+                ],
+                "properties": {
+                  "transport": {
+                    "enum": [
+                      "stdio",
+                      "http",
+                      "sse"
+                    ]
+                  },
+                  "url": {
+                    "type": "string"
+                  },
+                  "command": {
+                    "type": "string"
+                  },
+                  "args": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "env": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "headers": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    }
+                  },
+                  "models": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "tools": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "resources": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "prompts": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "approval": {
+                    "enum": [
+                      "always",
+                      "never",
+                      ""
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "healthCheckTimeout": {
       "type": "integer",
       "minimum": 15,
@@ -175,6 +268,12 @@
       "minimum": 0,
       "default": 10,
       "description": "Graceful timeout in seconds when unloading a model (manual, API, or TTL expiry) before force-killing the model process. 0 uses the default of 10 seconds."
+    },
+    "globalConcurrencyLimit": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 0,
+      "description": "Caps the number of inference requests served at once across all models combined, using a single shared semaphore rather than a per-model limit. 0 means no limit. Requests exceeding the limit receive an HTTP 429 Too Many Requests response immediately rather than being queued."
     },
     "logLevel": {
       "type": "string",
@@ -443,7 +542,7 @@
     "startPort": {
       "type": "integer",
       "default": 5800,
-      "description": "Starting port number for the automatic ${PORT} macro. The ${PORT} macro is incremented for every model that uses it."
+      "description": "Starting port number for the automatic ${PORT} macro. The ${PORT} macro is incremented for every model that uses it. Ports are handed out by model ID order, so adding or removing a model can move the ports of models that sort after it; that move is not treated as a configuration change for them."
     },
     "sendLoadingState": {
       "type": "boolean",
@@ -705,6 +804,11 @@
           "timeouts": {
             "$ref": "#/definitions/timeouts"
           },
+          "disableKeepAlives": {
+            "type": "boolean",
+            "default": false,
+            "description": "Open a new upstream connection for every request instead of reusing idle ones. Works around upstreams that close a connection they advertised as keep-alive, such as llama-server after a streamed response (#1205). When true, timeouts.idleConn has no effect."
+          },
           "compat": {
             "type": "object",
             "properties": {
@@ -748,7 +852,8 @@
                     "text",
                     "audio",
                     "image",
-                    "video"
+                    "video",
+                    "decisions"
                   ]
                 },
                 "description": "List of output modalities generated by the model."
@@ -773,6 +878,18 @@
                 "type": "boolean",
                 "default": false,
                 "description": "Marks the model as a translation model (for example Hy-MT2). Clients use it to group the model under translation tooling."
+              },
+              "voices": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Voice IDs returned by GET /v1/audio/voices for this model without asking the upstream. The endpoint is non-standard and upstream answers are unreliable, so set this when a speech model ships a fixed voice list. Never rendered into /v1/models."
+              },
+              "disableAuto": {
+                "type": "boolean",
+                "default": false,
+                "description": "Disable automatic capability discovery for this model. By default llama-swap asks the upstream server what it supports when the model becomes ready and fills in any capability left unset here."
               }
             },
             "additionalProperties": false,
@@ -1139,10 +1256,15 @@
               },
               "default": [],
               "description": "List of model IDs to load on startup. Model names must match keys in models. When preloading multiple models, define a group to prevent swapping."
+            },
+            "profile": {
+              "type": "string",
+              "default": "",
+              "description": "Profile to activate on startup and after a configuration reload. Must name a key under profiles. An empty value starts with no profile active."
             }
           },
           "additionalProperties": false,
-          "description": "Actions to perform on startup. Only supported action is preload."
+          "description": "Actions to perform on startup."
         }
       },
       "additionalProperties": false,
@@ -1353,7 +1475,7 @@
           "sticky": {
             "type": "boolean",
             "default": true,
-            "description": "Enable session affinity: requests with the same session identifier stick to the same key."
+            "description": "Enable session affinity: requests from one conversation stick to the same provider API surface (provider + adapter + key), because a provider's surfaces keep separate upstream prompt caches. One conversation keeps its cache; different conversations still spread across the pool."
           },
           "exposeUpstreamName": {
             "type": "boolean",
@@ -1373,7 +1495,7 @@
             "type": "integer",
             "minimum": 0,
             "default": 2,
-            "description": "How many times a failed request may switch to another key (or provider sharing the same bare model name) before returning the upstream error. Retries also descend priority tiers."
+            "description": "How many times one key may be retried before it is benched and the request continues on the next key. 0 tries each key once. Only transient failures (5xx, network errors, truncated streams) consume the budget; 401/402/429 bench the key immediately because retrying them cannot help."
           },
           "disabled": {
             "type": "boolean",
@@ -1570,6 +1692,21 @@
                               }
                             },
                             "additionalProperties": false
+                          },
+                          "pricing": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "description": "Pin the pricing-catalog entry used to estimate this model's cost. Empty parts resolve from the provider (its pricingProvider, else its own id lowercased) and the upstream model name.",
+                            "properties": {
+                              "provider": {
+                                "type": "string",
+                                "description": "Provider id in the pricing catalog."
+                              },
+                              "model": {
+                                "type": "string",
+                                "description": "Model name in the pricing catalog."
+                              }
+                            }
                           }
                         },
                         "required": [
@@ -1646,8 +1783,11 @@
               },
               "endpoint": {
                 "type": "string",
-                "format": "uri",
-                "description": "Absolute URL polled for usage data. Required unless a preset supplies it."
+                "description": "Absolute URL polled for usage data, or a \"{base}/path\" template resolved against the provider's own endpoint (self-hosted aggregators such as new-api and sub2api). Required unless a preset supplies it."
+              },
+              "script": {
+                "type": "string",
+                "description": "JavaScript expression that produces the usage snapshot instead of endpoint/windows/extras. Two shapes: CC Switch compatible ({request: {url, method, headers, body}, extractor: (response) => ...}) where {{baseUrl}}/{{apiKey}} are substituted in the request fields, or an async function (ctx) => ({windows, extras}) with a synchronous ctx.fetch. See docs/quota-scripts.md. Do not hardcode credentials: use {{apiKey}} or ctx.apiKey."
               },
               "method": {
                 "type": "string",
@@ -1719,7 +1859,7 @@
                     "percent": {
                       "type": "string",
                       "default": "percent",
-                      "description": "Field (relative to path) holding the percentage."
+                      "description": "Field (relative to path) holding the percentage. With limit set it names the USED amount instead, and the share is computed as used/limit."
                     },
                     "percentMode": {
                       "type": "string",
@@ -1728,7 +1868,11 @@
                         "remaining"
                       ],
                       "default": "used",
-                      "description": "Whether the percentage is the used share (default) or the remaining share."
+                      "description": "Whether the percentage is the used share (default) or the remaining share. Not applicable to amount windows (see limit)."
+                    },
+                    "limit": {
+                      "type": "string",
+                      "description": "Field (relative to path) holding the window's total allowance. Aggregators (new-api, sub2api) publish absolute used/limit counters: with limit set, percent names the used amount and the used share becomes used/limit*100. A zero limit renders as \"unlimited\"."
                     },
                     "status": {
                       "type": "string",
@@ -1737,13 +1881,18 @@
                     "resetsAt": {
                       "type": "string",
                       "description": "Optional field holding the window reset timestamp (RFC3339)."
+                    },
+                    "optional": {
+                      "type": "boolean",
+                      "default": false,
+                      "description": "Mark a window some responses legitimately omit (a relay reports either a subscription window or a wallet balance). An absent optional window is dropped instead of flagged as a broken mapping."
                     }
                   }
                 }
               },
               "extras": {
                 "type": "array",
-                "description": "Additional scalar rows shown next to the windows (credit balance, counters, ...).",
+                "description": "Additional scalar rows shown next to the windows (credit balance, counters, ...). An extra whose path is absent is skipped, so one mapping can cover several response modes.",
                 "items": {
                   "type": "object",
                   "required": [
@@ -1760,9 +1909,31 @@
                     },
                     "path": {
                       "type": "string"
+                    },
+                    "divideBy": {
+                      "type": "number",
+                      "minimum": 0,
+                      "description": "Divides a numeric value before display (0 = keep it). Aggregators count quota in internal units: new-api defaults to 500000 per USD."
+                    },
+                    "suffix": {
+                      "type": "string",
+                      "description": "Appended to the rendered value, e.g. \" USD\"."
+                    },
+                    "format": {
+                      "type": "string",
+                      "enum": [
+                        "unix",
+                        "unixMs"
+                      ],
+                      "description": "Convert a timestamp to RFC3339. A zero timestamp means \"never\" and is omitted."
                     }
                   }
                 }
+              },
+              "divideBy": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Default divisor for every numeric extra and window amount in this mapping (0 = keep raw values). A per-extra divideBy wins."
               },
               "enforce": {
                 "type": "object",
@@ -1874,6 +2045,21 @@
                       "type": "string",
                       "minLength": 1,
                       "description": "Upstream model name sent to the provider. Defaults to local."
+                    },
+                    "pricing": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "description": "Pin the pricing-catalog entry used to estimate this model's cost. Empty parts resolve from the provider (its pricingProvider, else its own id lowercased) and the upstream model name.",
+                      "properties": {
+                        "provider": {
+                          "type": "string",
+                          "description": "Provider id in the pricing catalog."
+                        },
+                        "model": {
+                          "type": "string",
+                          "description": "Model name in the pricing catalog."
+                        }
+                      }
                     }
                   },
                   "required": [
@@ -1921,6 +2107,10 @@
             },
             "additionalProperties": false,
             "description": "Timeout settings for connections to this provider."
+          },
+          "pricingProvider": {
+            "type": "string",
+            "description": "Pricing-catalog provider id for this provider's models. Empty falls back to the provider's own id, lowercased."
           }
         },
         "additionalProperties": false
@@ -1937,7 +2127,7 @@
             "integer"
           ],
           "default": "1h",
-          "description": "Idle expiry for provider session-affinity entries. A hit slides the expiry forward (Go duration, e.g. 30m, 1h)."
+          "description": "Idle expiry for provider session-affinity entries. A hit slides the expiry forward (Go duration, e.g. 30m, 1h). Affinity is scoped to one conversation and one model."
         },
         "failover": {
           "type": "object",
@@ -1992,6 +2182,14 @@
               "minimum": 0,
               "default": 3,
               "description": "How many measurements a provider needs before its latency is trusted (default 3). Fewer samples always fail open, so a cold start or one slow request cannot drop a provider."
+            },
+            "probeInterval": {
+              "type": [
+                "string",
+                "integer"
+              ],
+              "default": "5m",
+              "description": "How long a skipped provider stays out of the pool before it is admitted again for one measurement (default 5m, \"0s\" disables probing). Skipping is self-reinforcing: a provider that is never picked produces no new measurement, so its smoothed latency freezes at the value that excluded it and a recovered provider could never prove it. Without probing one slow period removes a provider for good."
             }
           }
         },
@@ -2033,6 +2231,26 @@
           },
           "additionalProperties": false,
           "description": "Cooldown durations per upstream error class."
+        },
+        "emptyResponse": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Retry a success response that carries no model output. A provider occasionally answers 200 and then produces nothing (a lifecycle-only stream, an empty choices array, a truncated tool call); nothing has reached the client at that point, so the request continues on the next credential or provider instead of delivering an empty success downstream.",
+          "properties": {
+            "retry": {
+              "type": "boolean",
+              "default": true,
+              "description": "Retry a success response that carries no model output (default true)."
+            },
+            "hold": {
+              "type": [
+                "string",
+                "integer"
+              ],
+              "default": "15s",
+              "description": "How long a streaming response may be inspected before its first content (Go duration, e.g. 15s). After the hold the response is committed and streamed unchanged, so a slow provider is not mistaken for a broken one. 0 disables stream inspection; whole-body responses are still checked."
+            }
+          }
         }
       },
       "additionalProperties": false,
@@ -2677,6 +2895,98 @@
               "type": "string",
               "default": "5m",
               "description": "How long a caller is rejected once the limit is reached."
+            }
+          }
+        },
+        "cors": {
+          "type": "object",
+          "description": "Access-Control-* headers for browser clients. Leaving allowedOrigins out selects the permissive legacy policy (any origin); setting it means only the listed origins may read responses. The cross-origin management-write guard on /api/ is independent of this block.",
+          "properties": {
+            "allowedOrigins": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Browser origins allowed to read responses, as scheme://host[:port]. \"*\" allows any origin and cannot be combined with allowCredentials or allowPrivateNetwork. An absent key keeps the permissive default; an empty list is rejected."
+            },
+            "allowCredentials": {
+              "type": "boolean",
+              "default": false,
+              "description": "Send Access-Control-Allow-Credentials: true so the browser attaches cookies and Authorization headers."
+            },
+            "allowPrivateNetwork": {
+              "type": "boolean",
+              "default": false,
+              "description": "Answer Chrome's Private Network Access preflight (Access-Control-Allow-Private-Network). Cannot be combined with a \"*\" origin."
+            },
+            "allowedMethods": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Methods advertised on preflight responses. Empty means GET, POST, PUT, PATCH, DELETE, OPTIONS."
+            },
+            "allowedHeaders": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Header names advertised on preflight responses. Empty echoes the client's sanitized Access-Control-Request-Headers."
+            },
+            "exposedHeaders": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Response headers a browser may read beyond the CORS-safelisted set."
+            },
+            "maxAge": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 86400,
+              "description": "Preflight cache lifetime in seconds."
+            }
+          }
+        }
+      }
+    },
+    "pricing": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Cost estimation for the usage records page. The models.dev catalog is synchronized automatically; explicit per-model pricing refs and operator-edited catalog rows always win over the snapshot.",
+      "properties": {
+        "modelsDev": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Synchronize the models.dev catalog (default true)."
+            },
+            "refreshEvery": {
+              "type": "string",
+              "description": "Catalog refresh interval (default 24h)."
+            },
+            "url": {
+              "type": "string",
+              "description": "Catalog source URL (default https://models.dev/api.json)."
+            },
+            "ambiguity": {
+              "type": "string",
+              "enum": [
+                "strict",
+                "provider-first",
+                "lowest"
+              ],
+              "description": "How a model name priced by several catalog providers is resolved: a lone operator-edited row wins first, then the official vendor's entry, then the serving provider's entry, then the only non-zero one; strict stops before those guesses, lowest falls back to the cheapest remaining entry. Default provider-first."
+            },
+            "vendors": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string",
+                "minLength": 1
+              },
+              "description": "Model-name prefix -> pricing-catalog provider id treated as the model's official vendor (\"gemini\" -> \"google\"). Merged over the built-in table, which covers: gpt/o1/o3/o4->openai, gemini->google, qwen/qvq/qwq->alibaba, glm->zhipuai, deepseek->deepseek, claude->anthropic, kimi->moonshotai, minimax->minimax, grok->xai, mimo->xiaomi, step->stepfun, mistral/ministral/codestral/devstral/magistral/pixtral/voxtral->mistral, doubao->volcengine, command->cohere, sonar->perplexity, muse->meta, phi->azure, nvidia->nvidia."
             }
           }
         }

@@ -777,6 +777,7 @@ func TestStore_ReplacePricingSnapshotIsAtomic(t *testing.T) {
 	}
 	defer s.Close()
 	ctx := context.Background()
+	// An operator row seeded before any sync: the refresh must leave it alone.
 	if err := s.UpsertPrice(ctx, Price{Provider: "provider", Model: "stale", Input: 9}); err != nil {
 		t.Fatal(err)
 	}
@@ -788,15 +789,17 @@ func TestStore_ReplacePricingSnapshotIsAtomic(t *testing.T) {
 		t.Fatal(err)
 	}
 	prices, err := s.FindPrices(ctx, "", "")
-	if err != nil || len(prices) != 2 {
+	if err != nil || len(prices) != 3 {
 		t.Fatalf("prices after replacement=%+v err=%v", prices, err)
 	}
-	stale, err := s.FindPrices(ctx, "", "stale")
-	if err != nil {
-		t.Fatal(err)
+	// The operator row survives the refresh untouched; a failed sync must roll
+	// back to exactly this state, operator rows included.
+	stale, err := s.FindPrices(ctx, "provider", "stale")
+	if err != nil || len(stale) != 1 {
+		t.Fatalf("operator row after replacement=%+v err=%v", stale, err)
 	}
-	if len(stale) != 0 {
-		t.Fatalf("stale price survived replacement: %+v", stale)
+	if stale[0].Input != 9 || stale[0].Source != "operator" {
+		t.Fatalf("operator row changed by the refresh: %+v", stale[0])
 	}
 	meta, err := s.GetPricingMeta(ctx)
 	if err != nil || meta.ETag != `"v2"` || meta.Source != "test" {
@@ -807,7 +810,7 @@ func TestStore_ReplacePricingSnapshotIsAtomic(t *testing.T) {
 		t.Fatal("invalid snapshot unexpectedly committed")
 	}
 	prices, err = s.FindPrices(ctx, "", "")
-	if err != nil || len(prices) != 2 {
+	if err != nil || len(prices) != 3 {
 		t.Fatalf("prices after rolled back snapshot=%+v err=%v", prices, err)
 	}
 	meta, err = s.GetPricingMeta(ctx)

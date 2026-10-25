@@ -6,6 +6,7 @@
   import { translate } from "../../lib/i18n";
   import { errorMessageFromPayload } from "../../lib/apiError";
   import ModelConfigEditor from "../config/ModelConfigEditor.svelte";
+import { apiUrl } from "../../lib/apiPath";
 
   interface ConfigSnapshot {
     config?: Record<string, unknown>;
@@ -33,7 +34,7 @@
     loading = true;
     error = "";
     try {
-      const response = await fetch("/api/config");
+      const response = await fetch(apiUrl("/api/config"));
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(errorMessageFromPayload(payload, `HTTP ${response.status}`));
       if (id === requestID) snapshot = payload as ConfigSnapshot;

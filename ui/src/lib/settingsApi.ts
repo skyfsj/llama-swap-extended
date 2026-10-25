@@ -45,6 +45,7 @@ export interface SettingsSnapshot {
 }
 
 import { errorMessageFromPayload } from "./apiError";
+import { apiUrl } from "./apiPath";
 
 export interface SettingsDiagnostic {
   code?: string;
@@ -124,7 +125,7 @@ export interface SettingsPermission {
 export type ApiError = Error & { status?: number; diagnostics?: SettingsDiagnostic[] };
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, { credentials: "same-origin", ...init });
+  const response = await fetch(apiUrl(url), { credentials: "same-origin", ...init });
   const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
   if (!response.ok) {
     let message = `HTTP ${response.status}`;

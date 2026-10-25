@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -23,6 +24,12 @@ type Store struct {
 	db       *sql.DB
 	segments *SegmentStore
 	root     string
+
+	// repairSegment state: one rescan attempt per segment per cooldown, so a
+	// segment that cannot be reconciled costs one scan per minute on the read
+	// path instead of one per read.
+	repairMu        sync.Mutex
+	repairAttempted map[string]time.Time
 }
 
 // Record is one conversation row as persisted. It mirrors the store package's
@@ -139,6 +146,18 @@ CREATE INDEX IF NOT EXISTS idx_conversations_key_created ON conversations (key_i
 CREATE INDEX IF NOT EXISTS idx_conversations_model_created ON conversations (model_id, ts_created DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_conversations_session_created ON conversations (session_id, ts_created DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_conversations_activity ON conversations (activity_id);
+-- The list view sorts by any of these columns. A composite index that leads with
+-- ts_created cannot serve "ORDER BY cached_tokens DESC, ts_created DESC, id DESC":
+-- SQLite follows only an index's contiguous prefix, so the leading column has to
+-- be the sort column itself. Two columns are enough here, because the third term
+-- (id) is the rowid and comes for free in the table's own order.
+CREATE INDEX IF NOT EXISTS idx_conversations_status_created ON conversations (resp_status_code, ts_created DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_conversations_cached_created ON conversations (cached_tokens, ts_created DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_conversations_cache_creation_created ON conversations (cache_creation_tokens, ts_created DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_conversations_ratio_created ON conversations (cache_hit_ratio, ts_created DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_conversations_input_created ON conversations (input_tokens, ts_created DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_conversations_output_created ON conversations (output_tokens, ts_created DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_conversations_path_created ON conversations (req_path, ts_created DESC, id DESC);
 
 -- bodies are the immutable decomposition of one payload; several conversations
 -- share a body when the bytes repeat (a retry, a replayed batch).
@@ -167,6 +186,12 @@ CREATE TABLE IF NOT EXISTS blocks (
     first_seen INTEGER NOT NULL,
     last_seen INTEGER NOT NULL
 );
+
+-- Compaction counts a segment's blocks and retention drops the unreferenced
+-- ones, so both walks need a leading segment / refcount column: without them
+-- every hourly maintenance pass scans the whole block table per segment.
+CREATE INDEX IF NOT EXISTS idx_blocks_segment ON blocks (segment);
+CREATE INDEX IF NOT EXISTS idx_blocks_refcount ON blocks (refcount);
 
 -- sessions accumulate one conversation's cost across its turns.
 CREATE TABLE IF NOT EXISTS sessions (
@@ -217,7 +242,7 @@ func Open(root string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	store := &Store{db: db, segments: segments, root: root}
+	store := &Store{db: db, segments: segments, root: root, repairAttempted: make(map[string]time.Time)}
 	if err := store.loadBlockIndex(); err != nil {
 		db.Close()
 		segments.close()
@@ -448,10 +473,15 @@ func (s *Store) recordBlock(ref blockRef, isNew bool, at time.Time) error {
 	now := at.Unix()
 	var err error
 	if isNew {
+		// The conflict branch rewrites the position columns: a block whose
+		// in-memory entry was dropped (its bytes reclaimed) but which a later
+		// insert re-writes must not keep pointing at the recycled offset.
 		_, err = s.db.Exec(`
 			INSERT INTO blocks (hash, size, compressed_size, segment, offset, length, refcount, first_seen, last_seen)
 			VALUES (?,?,?,?,?,?,0,?,?)
-			ON CONFLICT(hash) DO UPDATE SET last_seen=excluded.last_seen`,
+			ON CONFLICT(hash) DO UPDATE SET
+				size=excluded.size, compressed_size=excluded.compressed_size, segment=excluded.segment,
+				offset=excluded.offset, length=excluded.length, last_seen=excluded.last_seen`,
 			ref.Hash, ref.Size, ref.Compressed, ref.Segment, ref.Offset, ref.Length, now, now)
 	} else {
 		_, err = s.db.Exec(`UPDATE blocks SET last_seen = ? WHERE hash = ?`, now, ref.Hash)

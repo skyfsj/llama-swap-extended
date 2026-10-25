@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -1303,6 +1304,12 @@ func makeContext(vm *goja.Runtime, manifest Manifest, settings []SettingField, m
 	return vm.ToValue(ctx)
 }
 
+// fetchTransportOnce holds the shared transport for this worker process. A
+// worker serves one hook, and a hook may fetch the same host repeatedly (a
+// search preset, then a page render); building a transport per call threw away
+// every keep-alive connection and paid a fresh TCP and TLS handshake each time.
+var fetchTransportOnce = sync.OnceValue(fetchTransport)
+
 // fetchTransport builds the client transport for ctx.http.fetch. The policy
 // arrives from the daemon through the worker environment; without it the
 // transport follows the process proxy variables, which is what it always did.
@@ -1478,7 +1485,7 @@ func FetchAllowed(hosts []string, raw string, options map[string]any) (FetchResu
 			req.Header.Del("Cookie")
 		}
 		return nil
-	}, Transport: fetchTransport()}
+	}, Transport: fetchTransportOnce()}
 	resp, err := client.Do(request)
 	if err != nil {
 		return FetchResult{}, err

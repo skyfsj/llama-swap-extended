@@ -72,6 +72,10 @@ type ProviderModel struct {
 	// under chat, image, speech or translation tooling; an empty declaration
 	// reads as a plain chat model.
 	Capabilities ModelCapConfig `yaml:"capabilities,omitempty" json:"capabilities,omitempty"`
+	// Pricing pins the pricing-catalog entry used to estimate this model's
+	// cost. Without it the estimate resolves the catalog by the provider name
+	// (see ProviderConfig.PricingProvider) and the upstream model name.
+	Pricing PricingRef `yaml:"pricing" json:"pricing,omitempty"`
 }
 
 // Names returns the names the model entry declares for clients: the local name
@@ -180,9 +184,11 @@ type ProviderConfig struct {
 	// name when a local model shares it: "local-first" (default) keeps local
 	// precedence, "provider-first" lets this provider win.
 	BareNamePolicy string `yaml:"bareNamePolicy" json:"bareNamePolicy,omitempty"`
-	// MaxRetries is how many times a failed request may switch to another
-	// key (or provider sharing the same bare name) before giving up.
-	MaxRetries int `yaml:"maxRetries" json:"maxRetries,omitempty"`
+	// MaxRetries is how many times one credential may be retried before it is
+	// benched and the request continues on the next credential of the chain.
+	// A pointer so an explicit 0 ("try each credential once") is distinct from
+	// an omitted value ("use the default").
+	MaxRetries *int `yaml:"maxRetries" json:"maxRetries,omitempty"`
 
 	Disabled bool `yaml:"disabled" json:"disabled,omitempty"`
 
@@ -190,6 +196,14 @@ type ProviderConfig struct {
 	// clients (routing and /v1/models). Default "" exposes the bare model ID.
 	// The legacy provider/model form keeps working as a routing alias.
 	ModelPrefix string `yaml:"modelPrefix" json:"modelPrefix,omitempty"`
+
+	// PricingProvider is the pricing-catalog provider id used to price this
+	// provider's models when a model entry does not pin its own pricing ref:
+	// the estimate looks up (PricingProvider, the upstream model name). Empty
+	// falls back to the provider's own id, lowercased — a provider named
+	// "DeepSeek" then prices against models.dev's "deepseek" entries without
+	// any per-model configuration.
+	PricingProvider string `yaml:"pricingProvider" json:"pricingProvider,omitempty"`
 
 	// SessionHeaders are request headers set to the session id on upstream
 	// requests: the caller's value when it sent one of the headers listed in
@@ -250,6 +264,18 @@ func (p ProviderConfig) AllModels() []ProviderModel {
 func (p ProviderConfig) StickyEnabled() bool {
 	return p.Sticky == nil || *p.Sticky
 }
+
+// MaxRetriesPerCredential reports how many times one credential may be retried
+// before it is benched.
+func (p ProviderConfig) MaxRetriesPerCredential() int {
+	if p.MaxRetries == nil {
+		return 2
+	}
+	return *p.MaxRetries
+}
+
+// intPointer returns a pointer to a copy of value, for optional scalar fields.
+func intPointer(value int) *int { return &value }
 
 // ResolveProviderKeyProxy returns the effective proxy for a key: key-level
 // overrides provider-level; empty inherits environment proxies.
@@ -335,6 +361,67 @@ type GatewayConfig struct {
 	// SkipSlow drops providers whose first-token latency is known to be much
 	// worse than the alternatives serving the same model.
 	SkipSlow GatewaySkipSlowConfig `yaml:"skipSlow" json:"skipSlow,omitempty"`
+	// EmptyResponse decides whether a success response that carries no model
+	// output is retried on the next credential/provider instead of being
+	// handed to the caller.
+	EmptyResponse GatewayEmptyResponseConfig `yaml:"emptyResponse" json:"emptyResponse,omitempty"`
+}
+
+// GatewayEmptyResponseConfig bounds the "model answered nothing" retry.
+//
+// A provider occasionally answers 200 and then produces no token at all: a
+// lifecycle-only stream, an empty choices array, a truncated tool call. Nothing
+// has reached the client at that point, so the request can continue on another
+// credential (or provider) instead of leaving the caller with an empty success
+// that breaks whatever runs downstream.
+type GatewayEmptyResponseConfig struct {
+	// Retry turns the behaviour on (default true).
+	Retry *bool `yaml:"retry" json:"retry,omitempty"`
+	// Hold bounds how long a streaming response may be inspected before its
+	// first content. Content usually arrives well before this; the bound keeps
+	// a client from waiting on lifecycle frames that never become an answer.
+	// After the hold the response is committed and streamed as before.
+	// Default 15s; 0 disables stream inspection (whole-body responses are
+	// still checked).
+	Hold string `yaml:"hold" json:"hold,omitempty"`
+}
+
+// DefaultEmptyResponseHold is how long a stream may stay content-free before
+// the gateway commits it anyway.
+const DefaultEmptyResponseHold = 15 * time.Second
+
+// RetryEnabled reports whether empty responses are retried (default true).
+func (c GatewayEmptyResponseConfig) RetryEnabled() bool {
+	return c.Retry == nil || *c.Retry
+}
+
+// EffectiveHold applies the default to an unset duration.
+func (c GatewayEmptyResponseConfig) EffectiveHold() time.Duration {
+	if strings.TrimSpace(c.Hold) == "" {
+		return DefaultEmptyResponseHold
+	}
+	// Validate has already rejected unparsable values on the load path;
+	// returning the default here keeps programmatically built configs sane.
+	d, err := time.ParseDuration(c.Hold)
+	if err != nil || d < 0 {
+		return DefaultEmptyResponseHold
+	}
+	return d
+}
+
+// Validate rejects a hold that is not a duration.
+func (c GatewayEmptyResponseConfig) Validate() error {
+	if strings.TrimSpace(c.Hold) == "" {
+		return nil
+	}
+	d, err := time.ParseDuration(c.Hold)
+	if err != nil {
+		return fmt.Errorf("gateway.emptyResponse.hold: %q is not a duration", c.Hold)
+	}
+	if d < 0 {
+		return fmt.Errorf("gateway.emptyResponse.hold must be >= 0")
+	}
+	return nil
 }
 
 // GatewaySkipSlowConfig makes the gateway prefer the provider that answers
@@ -362,12 +449,22 @@ type GatewaySkipSlowConfig struct {
 	// is trusted (default 3). A cold start or one slow request must not be
 	// enough to drop a provider, and the gateway itself resets on reload.
 	MinSamples int `yaml:"minSamples" json:"minSamples,omitempty"`
+	// ProbeInterval bounds how long a skipped provider stays out of the pool
+	// before it is sampled again (default 5m, "0s" disables probing).
+	//
+	// Skipping is self-reinforcing: a provider that is never picked never
+	// produces a new measurement, so its smoothed latency freezes at the value
+	// that got it skipped while the faster siblings keep refreshing theirs. A
+	// provider that recovered would therefore stay excluded forever. Probing
+	// admits it back on a timer so recovery is observable at all.
+	ProbeInterval string `yaml:"probeInterval" json:"probeInterval,omitempty"`
 }
 
 // Skip-slow defaults.
 const (
 	GatewaySkipSlowDefaultFactor     = 3.0
 	GatewaySkipSlowDefaultMinSamples = 3
+	GatewaySkipSlowDefaultProbe      = 5 * time.Minute
 )
 
 // EnabledValue reports whether the behaviour is on. The default is on, and a
@@ -393,6 +490,22 @@ func (c GatewaySkipSlowConfig) EffectiveMinSamples() int {
 	return c.MinSamples
 }
 
+// EffectiveProbeInterval applies the default. A negative value means probing is
+// disabled; an empty or zero value means "use the default".
+func (c GatewaySkipSlowConfig) EffectiveProbeInterval() time.Duration {
+	if strings.TrimSpace(c.ProbeInterval) == "" {
+		return GatewaySkipSlowDefaultProbe
+	}
+	d, err := time.ParseDuration(c.ProbeInterval)
+	if err != nil {
+		return GatewaySkipSlowDefaultProbe
+	}
+	if d <= 0 {
+		return 0
+	}
+	return d
+}
+
 // Validate rejects settings that cannot mean anything, so a typo is reported
 // instead of quietly changing routing.
 func (c GatewaySkipSlowConfig) Validate() error {
@@ -404,6 +517,11 @@ func (c GatewaySkipSlowConfig) Validate() error {
 	}
 	if c.MinSamples < 0 {
 		return fmt.Errorf("gateway.skipSlow.minSamples must be >= 0")
+	}
+	if strings.TrimSpace(c.ProbeInterval) != "" {
+		if _, err := time.ParseDuration(c.ProbeInterval); err != nil {
+			return fmt.Errorf("gateway.skipSlow.probeInterval: %w", err)
+		}
 	}
 	if c.Enabled != nil && *c.Enabled && c.MaxFirstTokenMs == 0 && c.RelativeFactor == 0 {
 		// 显式写了 enabled: true 却两个规则都为 0：等于配了但不生效，属于笔误。
@@ -667,7 +785,7 @@ func (p *ProviderConfig) UnmarshalYAML(unmarshal func(interface{}) error) error 
 	defaults := rawProviderConfig{
 		Sticky:         nil,
 		BareNamePolicy: "local-first",
-		MaxRetries:     2,
+		MaxRetries:     intPointer(2),
 		ApiKeys:        []ProviderKey{},
 		Models:         []ProviderModel{},
 		Timeouts: TimeoutsConfig{
@@ -695,8 +813,8 @@ func (p *ProviderConfig) normalize() error {
 	if p.BareNamePolicy == "" {
 		p.BareNamePolicy = "local-first"
 	}
-	if p.MaxRetries == 0 {
-		p.MaxRetries = 2
+	if p.MaxRetries == nil {
+		p.MaxRetries = intPointer(2)
 	}
 	if p.Timeouts == (TimeoutsConfig{}) {
 		p.Timeouts = TimeoutsConfig{
@@ -751,7 +869,7 @@ func (p *ProviderConfig) normalize() error {
 	if p.BareNamePolicy != "local-first" && p.BareNamePolicy != "provider-first" {
 		return fmt.Errorf("providers: bareNamePolicy must be \"local-first\" or \"provider-first\", got %q", p.BareNamePolicy)
 	}
-	if p.MaxRetries < 0 {
+	if p.MaxRetries == nil || *p.MaxRetries < 0 {
 		return fmt.Errorf("providers: maxRetries must be >= 0")
 	}
 	if p.Weight < 0 || p.Priority < 0 {

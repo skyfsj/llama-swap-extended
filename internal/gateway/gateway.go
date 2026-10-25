@@ -15,9 +15,11 @@ import (
 	"bytes"
 	"compress/flate"
 	"compress/gzip"
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -33,6 +35,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/netproxy"
+	protocolrelaykit "github.com/mostlygeek/llama-swap/internal/protocol/relaykit"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
@@ -47,16 +50,13 @@ const (
 	DefaultTransientCooldown = 30 * time.Second
 	DefaultStickyTTL         = time.Hour
 
-	// DefaultAuthProbeCooldown is how long a first 401 benches a credential.
+	// DefaultAuthProbeCooldown is how long the first 401 benches a credential.
 	// Upstreams occasionally answer 401 transiently (edge hiccups, rotating
 	// gateways), so the credential is retried soon instead of being parked for
-	// the full auth cooldown; a repeated 401 within authEscalationWindow
-	// escalates. Configurable via gateway.cooldown.authProbe ("0s" disables
-	// probing).
+	// the full auth cooldown; any further 401 escalates to the full cooldown
+	// until an operator clears it. Configurable via
+	// gateway.cooldown.authProbe ("0s" disables probing).
 	DefaultAuthProbeCooldown = 30 * time.Second
-	// authEscalationWindow is how close two auth failures must be for the
-	// second one to be treated as "this credential is really broken".
-	authEscalationWindow = 2 * time.Minute
 )
 
 // Route is one schedulable provider model: a scheduler over the credentials
@@ -86,7 +86,8 @@ type Route struct {
 	ProviderFirst bool
 	// Sticky controls session affinity for this route.
 	Sticky bool
-	// MaxRetries is how many credential switches a failing request may make.
+	// MaxRetries is how many times one credential may be retried before it is
+	// benched and the request continues on the next credential of the chain.
 	MaxRetries int
 	// SessionHeaders are request headers set to the session id on every
 	// upstream attempt; an empty session id leaves them untouched.
@@ -113,6 +114,60 @@ type Route struct {
 	pathMap          map[string]string
 	endpoint         *url.URL
 	timeouts         transportTimeouts
+}
+
+// Key identifies the upstream surface a route belongs to: provider, adapter
+// (API surface) and model. Session affinity binds to this key rather than to
+// the provider alone, because a provider's surfaces keep separate upstream
+// caches: the same conversation sent to the Responses adapter and to the Chat
+// adapter is cached twice.
+func (r *Route) Key() string {
+	if r == nil {
+		return ""
+	}
+	return r.ProviderID + "\x00" + r.AdapterName + "\x00" + r.ModelID
+}
+
+// Available reports whether any credential of this route can serve a request
+// right now (not disabled, not cooling down, not at its concurrency cap).
+func (r *Route) Available() bool {
+	if r == nil {
+		return false
+	}
+	return r.sched.hasCandidate(nil)
+}
+
+// poolBid returns the priority and weight this route's provider bids with in a
+// bare-name pool. The provider's highest-priority key speaks for the whole
+// provider: its adapters share one account and one quota, so a provider with
+// several surfaces must not look more important than its keys say. Keys that
+// are cooling down are only considered when nothing is available, which keeps
+// the order stable while the pool reports the real upstream state.
+func (r *Route) poolBid() (priority, weight int) {
+	if r == nil {
+		return 0, 0
+	}
+	now := time.Now()
+	var availableBest, anyBest *Credential
+	for _, cred := range r.Members {
+		if anyBest == nil || cred.Priority > anyBest.Priority {
+			anyBest = cred
+		}
+		if !cred.available(now) {
+			continue
+		}
+		if availableBest == nil || cred.Priority > availableBest.Priority {
+			availableBest = cred
+		}
+	}
+	best := availableBest
+	if best == nil {
+		best = anyBest
+	}
+	if best == nil {
+		return 0, 0
+	}
+	return best.Priority, best.Weight
 }
 
 // egressProxy resolves the proxy a request uses: the route's model/adapter
@@ -161,13 +216,34 @@ type Gateway struct {
 	mu         sync.RWMutex
 	routes     map[string]*Route // FQN provider/model -> route
 	bareRoutes map[string][]*Route
-	sticky     *stickyTable
-	cooldown   cooldownConfig
-	failover   failoverPolicy
-	skipSlow   skipSlowPolicy
-	latency    *latencyTable
-	logger     *logmon.Monitor
-	transports *transportCache
+	// providerCredentials holds every configured credential per provider,
+	// including keys disabled in configuration. Disabled keys never reach a
+	// route's member list (the scheduler must not pick them), but the quota
+	// card and the status API still address them: a disabled key keeps its
+	// subscription, and its balance is exactly what an operator parks a key to
+	// watch.
+	providerCredentials map[string][]*Credential
+	sticky              *stickyTable
+	cooldown            cooldownConfig
+	failover            failoverPolicy
+	skipSlow            skipSlowPolicy
+	emptyResponse       emptyResponsePolicy
+	latency             *latencyTable
+	logger              *logmon.Monitor
+	transports          *transportCache
+
+	// pools carries one rotation cursor per bare model name: a pool's
+	// selection must remember its previous pick across requests, otherwise a
+	// zero-weight pool always starts from the same sorted candidate. The map is
+	// a sync.Map because every request looks its own cursor up, and a global
+	// mutex there serialized planning across all models.
+	pools sync.Map // map[string]*poolRotator
+
+	// shutdown cancels the background loops the Gateway starts. Shutdown
+	// replaces the sticky table, so a sweep that is still running would write
+	// into the discarded one.
+	shutdown   context.Context
+	shutdownFn context.CancelFunc
 }
 
 // failoverPolicy decides which upstream responses are worth another attempt
@@ -228,16 +304,19 @@ type cooldownConfig struct {
 // degrades one key instead of failing the whole config.
 func New(cfg config.Config, logger *logmon.Monitor) (*Gateway, error) {
 	g := &Gateway{
-		routes:     make(map[string]*Route),
-		bareRoutes: make(map[string][]*Route),
-		logger:     logger,
-		transports: newTransportCache(),
+		routes:              make(map[string]*Route),
+		bareRoutes:          make(map[string][]*Route),
+		providerCredentials: make(map[string][]*Credential),
+		logger:              logger,
+		transports:          newTransportCache(),
 	}
 	g.cooldown = resolveCooldowns(cfg.Gateway)
 	g.failover = resolveFailover(cfg.Gateway.Failover)
 	g.skipSlow = resolveSkipSlow(cfg.Gateway.SkipSlow)
+	g.emptyResponse = resolveEmptyResponse(cfg.Gateway.EmptyResponse)
 	g.latency = newLatencyTable()
 	g.sticky = newStickyTable(g.cooldown.stickyTTL)
+	g.shutdown, g.shutdownFn = context.WithCancel(context.Background())
 	if g.skipSlow.enabled && logger != nil {
 		logger.Infof("gateway: skip-slow providers enabled (%s)", g.skipSlow.describe())
 	}
@@ -250,6 +329,15 @@ func New(cfg config.Config, logger *logmon.Monitor) (*Gateway, error) {
 
 	for _, id := range providerIDs {
 		pcfg := cfg.Providers[id]
+
+		// Credentials exist for every configured provider, including one
+		// that is switched off: quota cards read each key's own subscription.
+		// One Credential per key id, shared by every adapter of the provider:
+		// cooldowns, in-flight counts, quota parks and the sticky binding must
+		// describe the key, not the API surface it was reached through.
+		credentialsByID := newProviderCredentials(id, pcfg)
+		g.providerCredentials[id] = sortedCredentials(credentialsByID)
+
 		if pcfg.Disabled {
 			continue
 		}
@@ -260,10 +348,6 @@ func New(cfg config.Config, logger *logmon.Monitor) (*Gateway, error) {
 		}
 
 		providerKeys := pcfg.ApiKeys
-		// One Credential per key id, shared by every adapter of the provider:
-		// cooldowns, in-flight counts, quota parks and the sticky binding must
-		// describe the key, not the API surface it was reached through.
-		credentialsByID := make(map[string]*Credential)
 		providerRoutes := make([]providerRoute, 0, len(pcfg.AllModels()))
 		for _, adapter := range pcfg.EffectiveAdapters() {
 			endpoint, err := url.Parse(adapter.Endpoint)
@@ -285,23 +369,9 @@ func New(cfg config.Config, logger *logmon.Monitor) (*Gateway, error) {
 
 			members := make([]*Credential, 0, len(keys))
 			for _, keyCfg := range keys {
-				value := keyCfg.Value
-				if value == "" && keyCfg.ValueEnv != "" {
-					value = os.Getenv(keyCfg.ValueEnv)
-				}
-				credID := keyID(id, valueOrEnvRef(value, keyCfg.ValueEnv))
-				cred, exists := credentialsByID[credID]
-				if !exists {
-					cred = &Credential{
-						ID:            credID,
-						Value:         value,
-						Priority:      keyCfg.Priority,
-						Weight:        keyCfg.Weight,
-						MaxConcurrent: keyCfg.MaxConcurrent,
-						Proxy:         pcfg.ResolveProviderKeyProxy(keyCfg),
-						Disabled:      keyCfg.Disabled,
-					}
-					credentialsByID[credID] = cred
+				cred := credentialsByID[keyID(id, valueOrEnvRef(resolveKeyValue(keyCfg), keyCfg.ValueEnv))]
+				if cred == nil {
+					continue
 				}
 				if !cred.Disabled {
 					members = append(members, cred)
@@ -327,7 +397,7 @@ func New(cfg config.Config, logger *logmon.Monitor) (*Gateway, error) {
 					Capabilities:     model.Capabilities,
 					ProviderFirst:    pcfg.BareNamePolicy == "provider-first",
 					Sticky:           pcfg.StickyEnabled(),
-					MaxRetries:       pcfg.MaxRetries,
+					MaxRetries:       pcfg.MaxRetriesPerCredential(),
 					SessionHeaders:   pcfg.SessionHeaders,
 					StaticHeaders:    pcfg.Headers,
 					proxy:            routeProxy,
@@ -499,6 +569,81 @@ func valueOrEnvRef(value, envName string) string {
 	return "env:" + envName
 }
 
+// resolveKeyValue reads a key's secret, falling back to its valueEnv variable.
+func resolveKeyValue(key config.ProviderKey) string {
+	if key.Value != "" {
+		return key.Value
+	}
+	if key.ValueEnv == "" {
+		return ""
+	}
+	return os.Getenv(key.ValueEnv)
+}
+
+// CredentialID derives the stable id a provider key gets, exactly like the
+// gateway's own credential construction. Callers outside this package (the
+// quota refresher) need it to address a credential that belongs to a disabled
+// key, which never reaches a route.
+func CredentialID(providerID string, key config.ProviderKey) string {
+	return keyID(providerID, valueOrEnvRef(resolveKeyValue(key), key.ValueEnv))
+}
+
+// newProviderCredentials builds one Credential per distinct key of a provider,
+// covering provider-level keys and adapter-owned key sets. Disabled keys are
+// created too: they stay out of routing but keep reporting their subscription.
+func newProviderCredentials(providerID string, pcfg config.ProviderConfig) map[string]*Credential {
+	credentials := make(map[string]*Credential)
+	add := func(keys []config.ProviderKey) {
+		for _, keyCfg := range keys {
+			credID := CredentialID(providerID, keyCfg)
+			if _, exists := credentials[credID]; exists {
+				continue
+			}
+			credentials[credID] = &Credential{
+				ID:            credID,
+				Value:         resolveKeyValue(keyCfg),
+				Priority:      keyCfg.Priority,
+				Weight:        keyCfg.Weight,
+				MaxConcurrent: keyCfg.MaxConcurrent,
+				Proxy:         pcfg.ResolveProviderKeyProxy(keyCfg),
+				Disabled:      keyCfg.Disabled,
+			}
+		}
+	}
+	add(pcfg.ApiKeys)
+	for _, adapter := range pcfg.EffectiveAdapters() {
+		add(adapter.ApiKeys)
+	}
+	return credentials
+}
+
+// sortedCredentials returns the credentials ordered by id, so the status API
+// and the quota targets are stable across rebuilds.
+func sortedCredentials(credentials map[string]*Credential) []*Credential {
+	out := make([]*Credential, 0, len(credentials))
+	for _, cred := range credentials {
+		out = append(out, cred)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// ProviderCredentials returns every configured credential of a provider,
+// including keys disabled in configuration. The returned slice is a copy; the
+// Credentials themselves are shared with the scheduler.
+func (g *Gateway) ProviderCredentials(providerID string) []*Credential {
+	if g == nil {
+		return nil
+	}
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	stored := g.providerCredentials[providerID]
+	if len(stored) == 0 {
+		return nil
+	}
+	return append([]*Credential(nil), stored...)
+}
+
 // Handles reports whether the gateway serves this model name (FQN or bare).
 func (g *Gateway) Handles(model string) bool {
 	g.mu.RLock()
@@ -540,56 +685,36 @@ func (g *Gateway) FirstRouteOfType(providerType string) *Route {
 	return nil
 }
 
+// RouteFor answers "which route would serve this model" for dispatch
+// decisions: it is deterministic and side-effect free (no rotation), so the
+// forwarding path that follows keeps full control of the pool's cursor.
+//
+// A provider-qualified name resolves to its pinned route even when every
+// credential of that provider is parked: the forwarder then reports the real
+// upstream state. A bare-name pool yields nil only when no candidate at all is
+// usable, which is what makes the dispatcher answer "all keys are cooling
+// down" instead of picking a dead route.
 func (g *Gateway) RouteFor(model string, localHasModel bool) *Route {
 	g.mu.RLock()
-	defer g.mu.RUnlock()
-	if route, ok := g.routes[model]; ok {
-		return route
+	exact, pinned := g.routes[model]
+	g.mu.RUnlock()
+	if pinned {
+		return exact
 	}
-	candidates := preferOwnName(g.bareRoutes[model], model)
-	if len(candidates) == 0 {
+
+	routes := g.PoolRoutes(model, localHasModel, "")
+	if len(routes) == 0 {
 		return nil
 	}
-	eligible := make([]*Route, 0, len(candidates))
-	for _, route := range candidates {
-		if localHasModel && !route.ProviderFirst {
-			continue
+	if len(routes) > 1 {
+		routes = filterSlowRoutes(routes, g.skipSlow, g.latency, g.logger)
+	}
+	for _, route := range routes {
+		if route.Available() {
+			return route
 		}
-		eligible = append(eligible, route)
 	}
-	if len(eligible) == 0 {
-		return nil
-	}
-	if len(eligible) == 1 {
-		// 单候选：需求明确要求不跳过（也是"慢"与"不可用"的界限）。
-		return eligible[0]
-	}
-	// 多候选：先按历史首字延迟筛掉明显更慢的，再按优先级/权重调度。
-	// 在已持读锁的路径上调用，避免二次加锁与写者互等。
-	eligible = g.fastRoutesLocked(eligible)
-	if len(eligible) == 0 {
-		return nil
-	}
-	// Cross-provider pool: schedule by priority tier then weight over each
-	// route's best credential.
-	members := make([]*Credential, 0, len(eligible))
-	byID := make(map[string]*Route, len(eligible))
-	for _, route := range eligible {
-		best := route.BestCredential()
-		if best == nil {
-			continue
-		}
-		byID[best.ID] = route
-		members = append(members, best)
-	}
-	if len(members) == 0 {
-		return nil
-	}
-	chosen := newScheduler(members).pick(time.Now(), nil)
-	if chosen == nil {
-		return nil
-	}
-	return byID[chosen.ID]
+	return nil
 }
 
 // Credentials returns the route's credential set (status API).
@@ -660,13 +785,66 @@ func sortedKeys[V any](m map[string]V) []string {
 	return keys
 }
 
+// stickySweepInterval caps how often expired session bindings are dropped. The
+// sweep is tied to the sticky TTL, because an entry that outlived its TTL is
+// unreachable anyway and waking more often than the TTL would be pointless.
+const stickySweepInterval = time.Minute
+
+// startStickySweep drops expired session bindings in the background. A binding
+// is removed lazily when its session comes back, which never happens for a
+// session that does not return, so without this sweep the table would grow for
+// as long as the daemon runs. Only entries already past their TTL are removed,
+// so live sessions keep their provider.
+func (g *Gateway) startStickySweep() {
+	if g.shutdown == nil {
+		return
+	}
+	interval := g.cooldown.stickyTTL
+	if interval <= 0 || interval > stickySweepInterval {
+		interval = stickySweepInterval
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-g.shutdown.Done():
+				return
+			case <-ticker.C:
+				g.mu.RLock()
+				sticky := g.sticky
+				g.mu.RUnlock()
+				if sticky == nil {
+					return
+				}
+				sticky.sweepExpired(time.Now())
+			}
+		}
+	}()
+}
+
+// stickyTable returns the live sticky table, or nil once the Gateway has been
+// shut down.
+func (g *Gateway) stickyTable() *stickyTable {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.sticky
+}
+
 // Shutdown drops sticky state and releases cached transports' idle
 // connections.
 func (g *Gateway) Shutdown() {
+	if g.shutdownFn != nil {
+		g.shutdownFn()
+	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.sticky = newStickyTable(g.cooldown.stickyTTL)
+	// The rotation cursors are per-model and carry no resource: dropping the
+	// map is enough, and each cursor is recreated on the next request.
+	g.pools = sync.Map{}
 	g.transports.close()
+	g.startStickySweep()
 }
 
 // outcome describes what one forwarding attempt concluded.
@@ -687,10 +865,23 @@ const (
 type Session struct {
 	// Hash is the sticky affinity key. Empty disables affinity for the request.
 	Hash string
+	// Model is the client-facing model the request asked for. Affinity is
+	// tracked per conversation *and* model so a session that talks to several
+	// models keeps one binding per model instead of starving the others.
+	Model string
 	// ID is the session id echoed upstream under each route session header.
 	// The server fills it with the caller's session id when present, otherwise
 	// with a hash derived from the conversation prefix. Empty injects nothing.
 	ID string
+}
+
+// affinityKey is the sticky-table key for this request. Empty when the caller
+// sent nothing that identifies a session.
+func (s Session) affinityKey() string {
+	if s.Hash == "" {
+		return ""
+	}
+	return s.Hash + "\x00" + s.Model
 }
 
 // ServeHTTP forwards a request to the resolved route's provider. The caller
@@ -708,6 +899,11 @@ type AttemptOptions struct {
 	// writing it to the client, so a caller with another upstream surface to
 	// try can retry there.
 	StopOnRequestScoped bool
+	// StopOnUnavailable returns "this route has no usable credential" to the
+	// caller instead of writing a 502, so a caller with more providers in its
+	// pool can continue there. Without it a single cooling provider would
+	// answer for the whole pool.
+	StopOnUnavailable bool
 }
 
 // AttemptOutcome reports how one pass ended.
@@ -744,30 +940,53 @@ func (g *Gateway) serveHTTP(w http.ResponseWriter, req *http.Request, chain []*R
 	primary := chain[0]
 
 	// Session affinity: a bound credential short-circuits rotation on the
-	// first attempt only; if it fails the retry loop re-schedules normally
-	// and rebinds. It applies to the primary route only: another provider has
-	// its own credentials.
+	// first attempt only; if it fails the retry loop re-schedules normally.
+	// The binding is route-level (provider + adapter + model), so it applies
+	// only when this pass targets that same surface: the caller orders the
+	// pool from that binding (PlanRoutes), and a pass for another surface must
+	// not hijack the session back to an upstream cache it is not using.
+	//
+	// boundRoute is remembered separately from bound: whether the bound
+	// surface could serve this request at all decides if a successful answer on
+	// another surface may replace the binding (see the commit case below). A
+	// binding that expired is treated as absent rather than unusable, because
+	// there is then nothing to preserve.
+	// boundRouteKey is the session's binding at the start of this request, when
+	// it applies to the surface this pass targets. It decides whether a
+	// successful answer on another surface may take the session over (see the
+	// commit case): a session whose bound provider failed has to follow the
+	// provider that answered, or it would keep returning to the one that is
+	// down. A credential that is cooling down, parked or at its concurrency cap
+	// is still listed in its route's members, so membership alone must not count
+	// as healthy.
 	var bound *Credential
+	boundRouteKey := ""
+	boundRouteHealthy := true
 	if primary.Sticky && session.Hash != "" {
-		if id, ok := g.sticky.get(session.Hash, time.Now()); ok {
+		if entry, ok := g.sticky.get(session.affinityKey(), time.Now()); ok && entry.route == primary.Key() {
 			for _, c := range primary.Members {
-				if c.ID == id {
-					bound = c
+				if c.ID == entry.credentialID {
+					bound, boundRouteKey = c, entry.route
+					boundRouteHealthy = c.available(time.Now())
 					break
 				}
-			}
-			if bound == nil {
-				// The bound credential left the configuration.
-				g.sticky.unbind(session.Hash)
 			}
 		}
 	}
 
-	// Each distinct credential of the chain is one attempt; maxRetries still
-	// guarantees its own floor for single-provider routes.
+	// maxRetries is a per-credential budget, not a per-request one: one
+	// credential may be tried maxRetries+1 times before it is benched and the
+	// request moves on to the next credential of the chain. Retrying the same
+	// credential is what lets a single-key provider ride out a transient
+	// failure instead of failing on the first 5xx, while a pool still walks
+	// its keys in order.
+	maxRetries := primary.MaxRetries
+	if maxRetries < 0 {
+		maxRetries = 0
+	}
 	attempts := primary.MaxRetries + 1
-	if credits := chainCredentialCount(chain); credits > attempts {
-		attempts = credits
+	if credits := chainCredentialCount(chain); credits*(maxRetries+1) > attempts {
+		attempts = credits * (maxRetries + 1)
 	}
 	if attempts > maxFailoverAttempts {
 		attempts = maxFailoverAttempts
@@ -776,10 +995,22 @@ func (g *Gateway) serveHTTP(w http.ResponseWriter, req *http.Request, chain []*R
 		attempts = 1
 	}
 
+	// tried holds the credentials that are done for this request: they either
+	// used their whole retry budget or failed in a way no retry can fix.
 	tried := map[string]struct{}{}
-	var lastStatus int
-	var lastSnippet string
-	var lastRoute *Route
+	credentialAttempts := make(map[string]int, len(primary.Members))
+	retrySleep := time.Duration(0)
+	var (
+		lastStatus  int
+		lastSnippet string
+		lastRoute   *Route
+		// retryCred/retryRoute carry the credential the next iteration must
+		// retry. A transient failure spends one unit of that credential's
+		// budget instead of benching it, so a single-key provider can recover
+		// from a hiccup within one request.
+		retryCred  *Credential
+		retryRoute *Route
+	)
 
 	// Retryable attempts must re-send the request body. httptest and plain
 	// handlers do not always populate GetBody, so buffer once here and
@@ -794,6 +1025,29 @@ func (g *Gateway) serveHTTP(w http.ResponseWriter, req *http.Request, chain []*R
 	for attempt := 0; attempt < attempts; attempt++ {
 		cred := bound
 		route := primary
+		if retryCred != nil {
+			cred, route = retryCred, retryRoute
+			retryCred, retryRoute = nil, nil
+			// Hammering a struggling upstream immediately is how a retry makes
+			// things worse. Back off between attempts on the same credential,
+			// bounded both per wait and across the whole request so a
+			// misconfigured budget cannot stall the caller.
+			if wait := g.retryBackoff(credentialAttempts[cred.ID], route); wait > 0 {
+				if remaining := maxTotalRetryBackoff - retrySleep; remaining < wait {
+					wait = remaining
+				}
+				if wait > 0 {
+					retrySleep += wait
+					timer := time.NewTimer(wait)
+					select {
+					case <-timer.C:
+					case <-req.Context().Done():
+						timer.Stop()
+						return AttemptOutcome{Committed: true, Status: http.StatusGatewayTimeout}
+					}
+				}
+			}
+		}
 		bound = nil
 		if cred == nil {
 			cred, route = g.pickAcrossChain(chain, tried, time.Now())
@@ -813,32 +1067,84 @@ func (g *Gateway) serveHTTP(w http.ResponseWriter, req *http.Request, chain []*R
 		// unattributed for the whole wait, and a failover would keep pointing
 		// at the attempt that is no longer being tried.
 		swaputil.ReportInferenceAttempt(req.Context(), route.ProviderID, route.AdapterName)
+		// A provider request has no local process to wait for, so the initial
+		// "waiting for process readiness" phase is wrong for it: from here the
+		// request is waiting on the upstream. The next phase is driven by the
+		// actual first content, not by the first byte (lifecycle frames such as
+		// response.created or message_start are not output).
+		swaputil.ReportInferencePhase(req.Context(), "upstream", "waiting for the provider's response")
 
 		res := g.attempt(w, req, route, cred, session, opts)
 		release()
 
 		switch res.outcome {
 		case outcomeCommit:
-			// Success (2xx/3xx or a committed request-scoped error): bind
-			// the session to the credential that served it.
-			if res.status < 400 && primary.Sticky && session.Hash != "" {
-				g.sticky.bind(session.Hash, cred.ID, time.Now())
+			// Success (2xx/3xx or a committed request-scoped error): bind the
+			// session to the surface and credential that served it. The
+			// binding survives a key rotation within the same surface: only a
+			// different provider/adapter costs the session its upstream cache.
+			//
+			// A session that already had a binding is only re-bound when that
+			// binding is no longer usable: it moved off its provider because
+			// that provider could not serve it, and it has since built its
+			// cache on the one that answered. Pulling it back when the original
+			// recovers would throw that cache away, so the new provider keeps
+			// the session until it fails too.
+			if res.status < 400 && route.Sticky && session.Hash != "" {
+				// The session moves when its own provider could not serve this
+				// request — either it was already cooling down when the request
+				// started, or it failed during it (the first attempt is the
+				// bound credential, so a retry that lands elsewhere proves it).
+				boundUnavailable := boundRouteKey != "" && (!boundRouteHealthy || boundRouteKey != route.Key())
+				g.sticky.bind(session.affinityKey(), route.ProviderID, route.Key(), cred.ID, time.Now(), boundUnavailable)
 			}
 			return AttemptOutcome{Committed: true, Status: res.status}
 		case outcomeStop:
 			return AttemptOutcome{Committed: true, Status: res.status}
 		case outcomeRetry:
-			g.applyFailure(cred, res, route, cooldown)
-			tried[cred.ID] = struct{}{}
+			credentialAttempts[cred.ID]++
 			lastStatus = res.status
 			lastSnippet = res.snippet
 			lastRoute = route
+			// Whether the credential is benched now depends on the failure:
+			// a verdict on the credential (401/402/429) or a request-scoped
+			// rejection ends its participation at once, because retrying it
+			// cannot help. A transient failure (5xx, transport, truncated
+			// stream) instead spends one unit of its retry budget; only when
+			// that budget is gone is the credential benched and the request
+			// handed to the next one.
+			spent := credentialAttempts[cred.ID] > maxRetries
+			// The request-wide cap can end the loop while a credential still
+			// has budget left. Leaving it less than fully spent would let the
+			// next request hammer a key that is in fact failing, so a cut-off
+			// credential is benched exactly like an exhausted one.
+			lastIteration := attempt == attempts-1
+			switch {
+			case res.skipCooldown:
+				// A request-scoped rejection says nothing about the credential:
+				// record it and drop it for this request without benching.
+				g.applyFailure(cred, res, route, cooldown)
+				tried[cred.ID] = struct{}{}
+			case !res.retryableOnCredential || spent || lastIteration:
+				g.applyFailure(cred, res, route, cooldown)
+				tried[cred.ID] = struct{}{}
+			default:
+				// Not benched yet: keep the credential schedulable and retry
+				// it. The upstream error is still recorded on it so the status
+				// API shows what happened.
+				g.noteFailureOnly(cred, res)
+				retryCred, retryRoute = cred, route
+			}
 			if g.logger != nil {
+				left := maxRetries - credentialAttempts[cred.ID] + 1
+				if left < 0 {
+					left = 0
+				}
 				// The upstream's own words are the difference between "it said
 				// 400" and "it refused the history because reasoning_content was
 				// missing": an operator debugging a failover needs the second.
-				g.logger.Warnf("gateway: provider %s adapter %q model %s credential %s failed (%s), %d attempt(s) left: %s",
-					route.ProviderID, route.Adapter(), route.ModelID, cred.ID, res.cause, attempts-attempt-1, oneLine(res.snippet, 400))
+				g.logger.Warnf("gateway: provider %s adapter %q model %s credential %s failed (%s), %d retry attempt(s) left for this credential: %s",
+					route.ProviderID, route.Adapter(), route.ModelID, cred.ID, res.cause, left, oneLine(res.snippet, 400))
 			}
 		}
 	}
@@ -847,146 +1153,318 @@ func (g *Gateway) serveHTTP(w http.ResponseWriter, req *http.Request, chain []*R
 		// Every attempt failed. The request still went to (and was refused by)
 		// a real provider, and that is exactly the row an operator needs to
 		// attribute an outage: report the last route tried, not nothing.
-		swaputil.PublishRequestProvider(req.Context(), lastRoute.ProviderID, lastRoute.AdapterName)
+		//
+		// Only the pass that answers the client may do so. The record holder is
+		// first-publisher-wins, and a caller that will try another surface
+		// (StopOnRequestScoped) may still land on a route that produces the
+		// answer: publishing here would pin the row to a route that never
+		// served anything. A fully exhausted pool is covered by the caller,
+		// which attributes the last candidate it tried.
+		if !opts.StopOnRequestScoped {
+			swaputil.PublishRequestProvider(req.Context(), lastRoute.ProviderID, lastRoute.AdapterName)
+		}
 		if opts.StopOnRequestScoped {
 			return AttemptOutcome{Committed: false, Status: lastStatus, Snippet: lastSnippet}
 		}
 		swaputil.SendResponse(w, req, lastStatus, truncate(lastSnippet, 2048))
 		return AttemptOutcome{Committed: true, Status: lastStatus}
 	}
-	swaputil.SendResponse(w, req, http.StatusBadGateway,
-		fmt.Sprintf("gateway: no available credential for provider %s model %s", primary.ProviderID, primary.ModelID))
+	// Nothing was schedulable this pass: every credential of the chain is
+	// cooling down, parked or disabled. The upstream has already answered this
+	// account recently, so report that answer rather than a synthetic 502 — a
+	// client whose keys all return 401 should keep seeing 401, not a shape it
+	// cannot interpret. Fall back to the synthetic error only when the chain
+	// never received an upstream answer at all (every key disabled or with an
+	// unset env var, say).
+	if status, snippet := chainLastUpstream(chain); status != 0 {
+		// Same rule as the exhausted chain above: a pass that hands the request
+		// onward leaves the record open, so the route that eventually answers
+		// owns the row instead of a benched chain that never served it.
+		if route := chain[0]; route != nil && !opts.StopOnUnavailable {
+			swaputil.PublishRequestProvider(req.Context(), route.ProviderID, route.AdapterName)
+		}
+		if opts.StopOnUnavailable {
+			// Another provider may still serve this request; the caller decides
+			// whether to continue instead of answering from here.
+			return AttemptOutcome{Committed: false, Status: status, Snippet: snippet}
+		}
+		swaputil.SendResponse(w, req, status, truncate(snippet, 2048))
+		return AttemptOutcome{Committed: true, Status: status}
+	}
+	snippet := fmt.Sprintf("gateway: no available credential for provider %s model %s", primary.ProviderID, primary.ModelID)
+	if opts.StopOnUnavailable {
+		// Another provider may still serve this request; the caller decides
+		// whether to continue instead of committing to a 502 here.
+		return AttemptOutcome{Committed: false, Status: http.StatusBadGateway, Snippet: snippet}
+	}
+	swaputil.SendResponse(w, req, http.StatusBadGateway, snippet)
 	return AttemptOutcome{Committed: true, Status: http.StatusBadGateway}
 }
 
-// SurfaceRoutes lists every route that can serve a model name, ordered so the
-// surface matching the client's dialect comes first (that one needs no
-// conversion). Providers exposing one model on several API surfaces appear here
-// once per surface, which is what lets the caller fall back to another surface
-// when an upstream rejects the request on the preferred one.
-func (g *Gateway) SurfaceRoutes(model string, localHasModel bool, clientSurface string) []*Route {
-	g.mu.RLock()
-	candidates := append([]*Route(nil), preferOwnName(g.bareRoutes[model], model)...)
-	if exact, ok := g.routes[model]; ok {
-		found := false
-		for _, candidate := range candidates {
-			if candidate == exact {
-				found = true
-				break
-			}
-		}
-		if !found {
-			candidates = append(candidates, exact)
-		}
-	}
-	g.mu.RUnlock()
-
-	eligible := make([]*Route, 0, len(candidates))
-	for _, route := range candidates {
-		if localHasModel && !route.ProviderFirst {
+// chainLastUpstream returns the most recent upstream answer recorded by any
+// credential of the chain, so a pass that could not schedule anything still
+// reports the real reason (status 0 when the chain never heard from upstream).
+func chainLastUpstream(chain []*Route) (int, string) {
+	var (
+		bestStatus int
+		bestBody   string
+		bestAt     time.Time
+	)
+	for _, route := range chain {
+		if route == nil {
 			continue
 		}
-		eligible = append(eligible, route)
-	}
-	if len(eligible) == 0 && localHasModel {
-		// A model claimed by a local process and by providers that are not
-		// provider-first: the pool rule keeps local precedence.
-		return nil
-	}
-	if clientSurface != "" {
-		sort.SliceStable(eligible, func(i, j int) bool {
-			left := eligible[i].Type() == clientSurface
-			right := eligible[j].Type() == clientSurface
-			return left && !right
-		})
-	}
-	return eligible
-}
-
-// SurfaceGroups lists the attempt passes for a model that several adapters
-// expose: one group per upstream API surface, the surface matching the client's
-// dialect first, each group in failover order. The caller converts the request
-// for a group's surface and moves on to the next group when the upstream
-// rejects it there. A model with a single surface yields nil so the caller
-// keeps its normal single-pass path.
-func (g *Gateway) SurfaceGroups(model string, localHasModel bool, clientSurface string) [][]*Route {
-	surfaces := g.SurfaceRoutes(model, localHasModel, clientSurface)
-	if len(surfaces) <= 1 {
-		return nil
-	}
-	groups := make([][]*Route, 0, len(surfaces))
-	seen := make(map[string]bool, len(surfaces))
-	for _, surface := range surfaces {
-		surfaceType := surface.Type()
-		if seen[surfaceType] {
-			continue
-		}
-		seen[surfaceType] = true
-		// FailoverRoutes applies the pool and pinning rules; keeping only the
-		// same-type routes makes one group the same call the gateway would
-		// make on its own, so credential failover still happens inside it.
-		group := make([]*Route, 0, 2)
-		for _, route := range g.FailoverRoutes(model, localHasModel, surface) {
-			if route.Type() == surfaceType {
-				group = append(group, route)
+		for _, cred := range route.Members {
+			status, snippet := cred.LastUpstream()
+			if status == 0 {
+				continue
 			}
-		}
-		if len(group) > 0 {
-			groups = append(groups, group)
+			at := cred.LastErrorAt
+			if at.IsZero() || !at.After(bestAt) {
+				continue
+			}
+			bestAt, bestStatus, bestBody = at, status, snippet
 		}
 	}
-	if len(groups) <= 1 {
-		return nil
-	}
-	return groups
+	return bestStatus, bestBody
 }
 
-// FailoverRoutes returns the routes one request may continue on, primary
-// first. A provider-qualified request (provider/model) stays pinned; a bare
-// model name may continue on every other provider that serves it and is
-// allowed to claim it (the same eligibility rule RouteFor applies).
+// FailoverRoutes returns the routes one request may continue on, with the
+// given route first. A provider-qualified request (provider/model) stays
+// pinned; a bare model name may continue on every other provider and surface
+// that serves it (the same eligibility rule RouteFor applies).
 func (g *Gateway) FailoverRoutes(model string, localHasModel bool, primary *Route) []*Route {
 	if primary == nil {
 		return nil
 	}
-	// A provider-qualified name (legacy provider/model) stays pinned; the
-	// client-facing name may continue on other providers serving it.
 	if !g.failover.crossProvider || !primary.servesName(model) {
 		return []*Route{primary}
 	}
+	chain := g.PlanRoutes(model, localHasModel, "", Session{})
+	for index, route := range chain {
+		if route == primary {
+			return promoteRoute(chain, index)
+		}
+	}
+	if len(chain) == 0 {
+		return []*Route{primary}
+	}
+	return chain
+}
+
+// rotator returns the rotation cursor of one bare model name. The cursor has
+// to live on the Gateway: building a scheduler per request would reset it and
+// always pick the same first candidate.
+func (g *Gateway) rotator(model string) *poolRotator {
+	if rotator, ok := g.pools.Load(model); ok {
+		return rotator.(*poolRotator)
+	}
+	rotator, _ := g.pools.LoadOrStore(model, &poolRotator{})
+	return rotator.(*poolRotator)
+}
+
+// PlanRoutes returns the ordered routes one request may use, across every
+// provider and API surface that serves the name.
+//
+// The order is: the session's bound route first when it is usable (that is
+// what keeps a conversation on the upstream surface whose prompt cache holds
+// its prefix), otherwise one provider chosen by priority/weight rotation,
+// followed by the remaining candidates as failover targets. The rotation is
+// per bare model name so two models do not skew each other's distribution.
+func (g *Gateway) PlanRoutes(model string, localHasModel bool, clientSurface string, session Session) []*Route {
+	if pinned, ok := g.pinnedRoute(model); ok {
+		return pinned
+	}
+	eligible := g.poolCandidates(model, localHasModel)
+	if len(eligible) == 0 {
+		return nil
+	}
+	if len(eligible) > 1 {
+		eligible = filterSlowRoutes(eligible, g.skipSlow, g.latency, g.logger)
+	}
+
+	ordered := orderPoolRoutes(eligible, clientSurface)
+
+	if key := session.affinityKey(); key != "" {
+		if entry, ok := g.sticky.get(key, time.Now()); ok {
+			bound := false
+			for index, route := range ordered {
+				if route.Key() != entry.route {
+					continue
+				}
+				bound = true
+				if route.Available() {
+					return promoteRoute(ordered, index)
+				}
+				break
+			}
+			if !bound {
+				// The bound surface left the configuration (the provider was
+				// removed, or the model moved to another adapter): drop the
+				// binding now instead of waiting for the TTL, so the session
+				// starts a fresh one on whatever serves it today.
+				g.sticky.unbind(key)
+			}
+		}
+	}
+
+	if len(ordered) <= 1 {
+		return ordered
+	}
+
+	// Rotation is between providers, not routes: the adapters of one provider
+	// are one upstream account with one quota.
+	groups := make(map[string][]*Route)
+	order := make([]string, 0, len(ordered))
+	for _, route := range ordered {
+		if _, ok := groups[route.ProviderID]; !ok {
+			order = append(order, route.ProviderID)
+		}
+		groups[route.ProviderID] = append(groups[route.ProviderID], route)
+	}
+	sort.Strings(order)
+
+	bids := make([]poolCandidate, 0, len(order))
+	for _, provider := range order {
+		routes := groups[provider]
+		usable := false
+		for _, route := range routes {
+			if route.Available() {
+				usable = true
+				break
+			}
+		}
+		if !usable {
+			// Every key of this provider is cooling down or parked: it cannot
+			// win this request, but it stays in the chain below so a failure on
+			// the chosen provider can still fall back to it.
+			continue
+		}
+		priority, weight := routes[0].poolBid()
+		bids = append(bids, poolCandidate{
+			provider: provider,
+			route:    routes[0],
+			priority: priority,
+			weight:   weight,
+		})
+	}
+	if len(bids) == 0 {
+		// Nothing is schedulable: hand back the ordered chain so the caller
+		// reports the real upstream state instead of a synthetic error.
+		return ordered
+	}
+
+	chosen, ok := g.rotator(model).pick(bids, rand.Intn)
+	if !ok {
+		return ordered
+	}
+	head := groups[chosen.provider]
+	rest := make([]*Route, 0, len(ordered)-len(head))
+	for _, route := range ordered {
+		if route.ProviderID != chosen.provider {
+			rest = append(rest, route)
+		}
+	}
+	return append(append([]*Route(nil), head...), rest...)
+}
+
+// promoteRoute moves one route to the front of the chain, keeping the order of
+// the others.
+func promoteRoute(routes []*Route, index int) []*Route {
+	if index <= 0 || index >= len(routes) {
+		return routes
+	}
+	out := make([]*Route, 0, len(routes))
+	out = append(out, routes[index])
+	out = append(out, routes[:index]...)
+	out = append(out, routes[index+1:]...)
+	return out
+}
+
+// PoolRoutes lists every route that serves a bare model name, in deterministic
+// order (client dialect first, then priority, provider and adapter). It is
+// side-effect free: unlike PlanRoutes it neither rotates nor filters by
+// cooldowns, so callers that only need the shape of the pool (dialect
+// resolution, status APIs) do not perturb scheduling.
+func (g *Gateway) PoolRoutes(model string, localHasModel bool, clientSurface string) []*Route {
+	if pinned, ok := g.pinnedRoute(model); ok {
+		return pinned
+	}
+	return orderPoolRoutes(g.poolCandidates(model, localHasModel), clientSurface)
+}
+
+// pinnedRoute reports the route of a provider-qualified name, which is pinned
+// to that provider and has no pool. The second result distinguishes "no such
+// name" (a nil slice, no routes) from "not a qualified name" (ok is false, so
+// the caller builds the bare-name pool).
+func (g *Gateway) pinnedRoute(model string) ([]*Route, bool) {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	exact, pinned := g.routes[model]
+	if !pinned {
+		return nil, false
+	}
+	if exact == nil {
+		return nil, true
+	}
+	return []*Route{exact}, true
+}
+
+// poolCandidates lists the deduplicated routes a bare model name may use. Both
+// PoolRoutes and PlanRoutes build the pool this way, so a request that resolves
+// its dialect and then plans its chain sees exactly the same candidate set.
+func (g *Gateway) poolCandidates(model string, localHasModel bool) []*Route {
 	g.mu.RLock()
 	candidates := append([]*Route(nil), preferOwnName(g.bareRoutes[model], model)...)
 	g.mu.RUnlock()
 
-	siblings := make([]*Route, 0, len(candidates))
-	for _, candidate := range candidates {
-		if candidate == primary {
+	eligible := make([]*Route, 0, len(candidates))
+	seen := make(map[*Route]struct{}, len(candidates))
+	for _, route := range candidates {
+		if localHasModel && !route.ProviderFirst {
 			continue
 		}
-		if localHasModel && !candidate.ProviderFirst {
+		if _, duplicate := seen[route]; duplicate {
 			continue
 		}
-		siblings = append(siblings, candidate)
+		seen[route] = struct{}{}
+		eligible = append(eligible, route)
 	}
-	// Deterministic order: best credential priority first, then provider id.
-	sort.SliceStable(siblings, func(i, j int) bool {
-		left, right := siblings[i].BestCredential(), siblings[j].BestCredential()
-		leftPriority, rightPriority := -1, -1
-		if left != nil {
-			leftPriority = left.Priority
+	return eligible
+}
+
+// orderPoolRoutes sorts one pool deterministically: the client's own dialect
+// first (no conversion needed), then higher provider priority, then provider
+// name. Ties keep the configured registration order (adapters in declaration
+// order), which is what makes "the first adapter listed" a meaningful choice
+// for clients whose dialect no adapter speaks.
+func orderPoolRoutes(routes []*Route, clientSurface string) []*Route {
+	ordered := append([]*Route(nil), routes...)
+	// The bid of a route depends on which of its credentials are currently
+	// available, so it is read once per route here instead of inside the
+	// comparator: sorting would otherwise take a credential lock per
+	// comparison, which is O(c log c) lock acquisitions per request. The
+	// snapshot is taken before the sort, so a route's own bid cannot change
+	// halfway through its comparison.
+	bids := make(map[*Route]int, len(ordered))
+	for _, route := range ordered {
+		priority, _ := route.poolBid()
+		bids[route] = priority
+	}
+	sort.SliceStable(ordered, func(i, j int) bool {
+		leftNative := clientSurface != "" && ordered[i].Type() == clientSurface
+		rightNative := clientSurface != "" && ordered[j].Type() == clientSurface
+		if leftNative != rightNative {
+			return leftNative
 		}
-		if right != nil {
-			rightPriority = right.Priority
-		}
+		leftPriority := bids[ordered[i]]
+		rightPriority := bids[ordered[j]]
 		if leftPriority != rightPriority {
 			return leftPriority > rightPriority
 		}
-		if siblings[i].ProviderID != siblings[j].ProviderID {
-			return siblings[i].ProviderID < siblings[j].ProviderID
-		}
-		return siblings[i].AdapterName < siblings[j].AdapterName
+		return ordered[i].ProviderID < ordered[j].ProviderID
 	})
-	return append([]*Route{primary}, siblings...)
+	return ordered
 }
 
 // servesName reports whether the client-facing name belongs to this route
@@ -1064,7 +1542,36 @@ func (g *Gateway) pickAcrossChain(chain []*Route, tried map[string]struct{}, now
 			return cred, route
 		}
 	}
-	return nil, nil
+
+	// Nothing is available: every credential this request has not tried yet is
+	// cooling down. Rather than fail the request while the pool recovers, try
+	// the key whose cooldown ends soonest. A cooldown is a prediction, not a
+	// guarantee — the upstream may serve the request now, and if it does not,
+	// the attempt returns that provider's real error instead of a synthetic
+	// "all keys are cooling down". Only keys this request has not already tried
+	// are eligible, so a failing provider is never retried in the same request.
+	//
+	// This runs last on purpose: normal scheduling always wins when anything is
+	// available, so the fallback cannot perturb the distribution.
+	var (
+		fallback      *Credential
+		fallbackRoute *Route
+		fallbackWait  time.Duration
+	)
+	for _, route := range chain {
+		cred, wait := route.sched.pickFallback(now, tried)
+		if cred == nil {
+			continue
+		}
+		if fallback == nil || wait < fallbackWait {
+			fallback, fallbackRoute, fallbackWait = cred, route, wait
+		}
+	}
+	if fallback != nil && g.logger != nil {
+		g.logger.Warnf("gateway: every credential is cooling down for model %s; trying %s (cooldown ends in %s) instead of failing the request",
+			fallbackRoute.ModelID, fallback.ID, fallbackWait.Round(time.Millisecond))
+	}
+	return fallback, fallbackRoute
 }
 
 // chainCredentialCount counts the distinct credentials of a failover chain.
@@ -1130,6 +1637,11 @@ type attemptResult struct {
 	// itself (a 404 for one model, a malformed parameter, ...). The credential
 	// is still excluded for the rest of this request.
 	skipCooldown bool
+	// retryableOnCredential marks a failure that retrying the same credential
+	// may actually fix (transport errors, truncated streams, 5xx). Auth and
+	// rate-limit failures are verdicts on the credential, so they bench it at
+	// once instead of spending its retry budget.
+	retryableOnCredential bool
 }
 
 // attempt performs one forwarding attempt. It buffers the upstream response
@@ -1155,12 +1667,24 @@ func (g *Gateway) attempt(w http.ResponseWriter, req *http.Request, route *Route
 		}
 		outReq.Body = body
 	}
-	if route.RemoteName != "" && route.RemoteName != route.ModelID {
-		rewritten, rerr := swaputil.ReplaceRequestModel(outReq, route.ModelID, route.RemoteName)
-		if rerr != nil {
-			return attemptResult{outcome: outcomeRetry, cause: "model rewrite failed", snippet: rerr.Error()}
+	// The model name is rewritten per attempt because a failover may target a
+	// provider whose upstream name differs, and a pool may even hold routes
+	// whose local names differ (same bare name reached as another model's
+	// alias). Read the name the request currently carries instead of assuming
+	// the primary route's local name: assuming it silently sends the client's
+	// name upstream whenever the two differ.
+	targetModel := route.RemoteName
+	if targetModel == "" {
+		targetModel = route.ModelID
+	}
+	if targetModel != "" {
+		if current, merr := swaputil.ExtractModel(outReq); merr == nil && current != "" && current != targetModel {
+			rewritten, rerr := swaputil.ReplaceRequestModel(outReq, current, targetModel)
+			if rerr != nil {
+				return attemptResult{outcome: outcomeRetry, cause: "model rewrite failed", snippet: rerr.Error()}
+			}
+			outReq = rewritten
 		}
-		outReq = rewritten
 	}
 
 	outURL := *route.endpoint
@@ -1182,6 +1706,16 @@ func (g *Gateway) attempt(w http.ResponseWriter, req *http.Request, route *Route
 	applyStaticHeaders(outReq.Header, route)
 	setAuthHeaders(outReq, route.ptype, cred.Value)
 	applySessionHeaders(outReq.Header, route, session)
+	outReq = outReq.WithContext(swaputil.WithUpstreamHTTPClient(outReq.Context(), &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}))
+	outReq.Header.Set("Accept-Encoding", "identity")
+	hooks := swaputil.UpstreamHooksFrom(outReq.Context())
+	scope := routeScope(route, targetModel)
+	scope.Credential = cred.ID
+	if hooks.Prepare != nil {
+		if err := hooks.Prepare(outReq.Context(), scope, outReq); err != nil {
+			return attemptResult{outcome: outcomeRetry, status: http.StatusBadRequest, snippet: err.Error(), cause: "request preparation failed", skipCooldown: true}
+		}
+	}
 
 	resp, err := transport.RoundTrip(outReq)
 	if err != nil {
@@ -1189,13 +1723,21 @@ func (g *Gateway) attempt(w http.ResponseWriter, req *http.Request, route *Route
 			// The client is gone: terminal, nothing to retry for.
 			return attemptResult{outcome: outcomeStop, cause: "client disconnected", snippet: err.Error()}
 		}
-		return attemptResult{outcome: outcomeRetry, cause: "transport error", snippet: err.Error()}
+		return attemptResult{outcome: outcomeRetry, cause: "transport error", snippet: err.Error(), retryableOnCredential: true}
 	}
 	defer func() {
 		if resp.Body != nil {
 			resp.Body.Close()
 		}
 	}()
+	if hooks.Complete != nil {
+		capture := &upstreamCapture{}
+		resp.Body = &capturedBody{Reader: io.TeeReader(resp.Body, capture), Closer: resp.Body}
+		input := requestBytes(outReq)
+		defer func() {
+			hooks.Complete(outReq.Context(), scope, input, capture.body.Bytes(), resp.Header.Clone(), resp.StatusCode, capture.truncated)
+		}()
+	}
 
 	// Buffer head + first chunk so failures before the first byte stay
 	// retryable. classify with a single Read: a clean body end reports EOF
@@ -1207,7 +1749,7 @@ func (g *Gateway) attempt(w http.ResponseWriter, req *http.Request, route *Route
 	n, rerr := resp.Body.Read(first)
 	truncated := rerr == io.ErrUnexpectedEOF
 	if rerr != nil && rerr != io.EOF && !truncated {
-		return attemptResult{outcome: outcomeRetry, status: resp.StatusCode, cause: "read error", snippet: rerr.Error()}
+		return attemptResult{outcome: outcomeRetry, status: resp.StatusCode, cause: "read error", snippet: rerr.Error(), retryableOnCredential: true}
 	}
 	// Only a body the upstream declared a length for (or an error body, which
 	// is bounded by definition) is read further here: that is where "the
@@ -1219,7 +1761,7 @@ func (g *Gateway) attempt(w http.ResponseWriter, req *http.Request, route *Route
 		filled, ferr := io.ReadFull(resp.Body, first[n:])
 		n += filled
 		if ferr != nil && ferr != io.EOF && ferr != io.ErrUnexpectedEOF {
-			return attemptResult{outcome: outcomeRetry, status: resp.StatusCode, cause: "read error", snippet: ferr.Error()}
+			return attemptResult{outcome: outcomeRetry, status: resp.StatusCode, cause: "read error", snippet: ferr.Error(), retryableOnCredential: true}
 		}
 		// A declared length that was not delivered means the upstream closed
 		// mid-message. (For an unknown length the reader cannot tell a short
@@ -1230,6 +1772,9 @@ func (g *Gateway) attempt(w http.ResponseWriter, req *http.Request, route *Route
 	}
 	buf = append(buf, first[:n]...)
 	snippet := decodeSnippet(resp, buf)
+	// A response whose whole body is already in hand can be judged as a unit;
+	// a stream (or a body still arriving) is judged as it flows.
+	bodyComplete := rerr == io.EOF || (resp.ContentLength >= 0 && int64(len(buf)) >= resp.ContentLength)
 
 	// Truncated or empty success responses: the upstream aborted before it
 	// produced a usable answer. Both stay retryable because nothing has
@@ -1237,11 +1782,11 @@ func (g *Gateway) attempt(w http.ResponseWriter, req *http.Request, route *Route
 	if resp.StatusCode < 400 && req.Context().Err() == nil {
 		switch {
 		case truncated:
-			return attemptResult{outcome: outcomeRetry, status: resp.StatusCode, cause: "response truncated (EOF before the declared length)", snippet: snippet}
+			return attemptResult{outcome: outcomeRetry, status: resp.StatusCode, cause: "response truncated (EOF before the declared length)", snippet: snippet, retryableOnCredential: true}
 		case n == 0 && isStreamingResponse(resp):
-			return attemptResult{outcome: outcomeRetry, status: resp.StatusCode, cause: "stream ended before first event", snippet: ""}
+			return attemptResult{outcome: outcomeRetry, status: resp.StatusCode, cause: "stream ended before first event", snippet: "", retryableOnCredential: true}
 		case n == 0 && requestCarriesBody(req):
-			return attemptResult{outcome: outcomeRetry, status: resp.StatusCode, cause: "upstream closed before sending a response body", snippet: ""}
+			return attemptResult{outcome: outcomeRetry, status: resp.StatusCode, cause: "upstream closed before sending a response body", snippet: "", retryableOnCredential: true}
 		}
 	}
 
@@ -1262,6 +1807,11 @@ func (g *Gateway) attempt(w http.ResponseWriter, req *http.Request, route *Route
 		case CooldownTransient:
 			res.failureClass = CooldownTransient
 			res.cause = fmt.Sprintf("status %d (transient)", resp.StatusCode)
+			// A 5xx is the one upstream verdict that retrying the same
+			// credential can fix: an overloaded node sheds its load, a gateway
+			// timeout is a passing condition. Auth (401/402) and rate limits
+			// (429) are statements about the credential itself.
+			res.retryableOnCredential = true
 		}
 		return res
 	}
@@ -1296,7 +1846,7 @@ func (g *Gateway) attempt(w http.ResponseWriter, req *http.Request, route *Route
 		// needs it recorded on the failing rows, not only on the 2xx ones.
 		swaputil.PublishRequestProvider(req.Context(), route.ProviderID, route.AdapterName)
 		commitResponse(w, resp, buf)
-		g.forwardBody(w, req, resp.Body, cred)
+		g.forwardBody(w, req, resp.Body, cred) // an error body is not model output
 		return attemptResult{outcome: outcomeCommit, status: resp.StatusCode, snippet: snippet}
 	}
 
@@ -1307,10 +1857,148 @@ func (g *Gateway) attempt(w http.ResponseWriter, req *http.Request, route *Route
 	// or was handed back to a caller that may still try another surface.
 	// Publishing here keeps the recorded provider free of attempts that never
 	// produced an answer.
+	//
+	// A provider sometimes answers 200 and then produces no model output at
+	// all (a lifecycle-only stream, an empty choices array, a truncated tool
+	// call). Nothing has reached the client yet, so that answer is retried on
+	// the next credential or provider instead of being committed: handing the
+	// caller an empty success is worse than one more attempt.
+	if resp.StatusCode < 400 && g.emptyResponse.enabled && probeableResponse(req, resp) {
+		gated, result := g.awaitContent(w, req, resp, route, cred, buf, bodyComplete)
+		if gated {
+			return result
+		}
+		if strings.TrimSpace(result.snippet) == "" {
+			result.snippet = "upstream returned no model output"
+		}
+		return attemptResult{
+			outcome: outcomeRetry,
+			status:  http.StatusBadGateway,
+			snippet: result.snippet,
+			cause:   "success response carried no model output",
+		}
+	}
+
 	swaputil.PublishRequestProvider(req.Context(), route.ProviderID, route.AdapterName)
+	// The stream starts here. Its "decode" phase is published later, when the
+	// first chunk that actually carries model output arrives: the first bytes
+	// of a stream are usually lifecycle frames, and reporting those as decode
+	// makes the phase look earlier than the first token really was.
 	commitResponse(w, resp, buf)
-	g.forwardBody(w, req, resp.Body, cred)
+	g.forwardBodyFor(w, req, resp.Body, cred, route.Type(), buf)
 	return attemptResult{outcome: outcomeCommit, status: resp.StatusCode}
+}
+
+// awaitContent gates a success response on actually carrying model output.
+//
+// It returns gated=true when the response was committed (or the client went
+// away), and gated=false with the observed snippet when the upstream finished
+// without producing any output. A stream is inspected only until its first
+// content or the configured hold: after that it is committed and streamed
+// unchanged, so a slow provider is never treated as a broken one.
+func (g *Gateway) awaitContent(w http.ResponseWriter, req *http.Request, resp *http.Response, route *Route, cred *Credential, buffered []byte, bodyComplete bool) (bool, attemptResult) {
+	probe := newContentProbe(route.Type(), isStreamingResponse(resp))
+	probe.Write(buffered)
+
+	commit := func(head []byte, rest io.Reader) (bool, attemptResult) {
+		swaputil.PublishRequestProvider(req.Context(), route.ProviderID, route.AdapterName)
+		// The buffered head may already hold the first content: the phase is
+		// settled before the stream is handed over so a stream whose first
+		// chunk carried output does not wait for a later flush.
+		if probe.HasContent() {
+			swaputil.ReportInferencePhase(req.Context(), "decode", "model output started")
+		}
+		commitResponse(w, resp, head)
+		g.forwardBodyFor(w, req, rest, cred, route.Type(), nil)
+		return true, attemptResult{outcome: outcomeCommit, status: resp.StatusCode}
+	}
+
+	if bodyComplete {
+		probe.Finish()
+		if !probe.Unknown() && probe.Verdict() == probeEmpty {
+			return false, attemptResult{status: resp.StatusCode, snippet: decodeSnippet(resp, buffered)}
+		}
+		return commit(buffered, resp.Body)
+	}
+
+	hold := g.emptyResponse.hold
+	if hold <= 0 {
+		// Stream inspection disabled: keep the pre-existing behaviour.
+		return commit(buffered, resp.Body)
+	}
+
+	pump := startBodyPump(req.Context(), resp.Body)
+	defer pump.stop()
+	reader := &pumpReader{events: pump.events}
+
+	deadline := time.NewTimer(hold)
+	defer deadline.Stop()
+
+	collected := buffered
+	for {
+		switch probe.Verdict() {
+		case probeContent:
+			return commit(collected, reader)
+		case probeEmpty:
+			return false, attemptResult{status: resp.StatusCode, snippet: ""}
+		}
+		if probe.Unknown() || probe.Forward() {
+			// Not a shape the probe understands, or a correct answer that
+			// carries no model output (a provider-owned background submit
+			// acknowledges with status=queued/in_progress): forward it now.
+			// Holding either would delay a legitimate response by the whole
+			// grace period for no benefit.
+			return commit(collected, reader)
+		}
+		if len(collected) > emptyResponseCommitBufferBytes {
+			// Nothing recognizable in a lot of bytes: the response is not a
+			// shape we can judge, so fail open rather than retry forever.
+			return commit(collected, reader)
+		}
+
+		select {
+		case ev, ok := <-pump.events:
+			if !ok {
+				probe.Finish()
+				if probe.Verdict() == probeEmpty {
+					return false, attemptResult{status: resp.StatusCode, snippet: ""}
+				}
+				return commit(collected, reader)
+			}
+			if ev.err != nil {
+				// The upstream died before producing content: still retryable,
+				// because nothing has been committed.
+				return false, attemptResult{status: resp.StatusCode, snippet: ev.err.Error()}
+			}
+			if len(ev.data) > 0 {
+				collected = append(collected, ev.data...)
+				probe.Write(ev.data)
+			}
+		case <-deadline.C:
+			// The stream is alive but still has no content: commit and keep
+			// streaming. Waiting longer would turn a slow first token into a
+			// failure.
+			return commit(collected, reader)
+		case <-req.Context().Done():
+			return true, attemptResult{outcome: outcomeStop, cause: "client disconnected"}
+		}
+	}
+}
+
+// probeableResponse reports whether a success response may be inspected for
+// model output: a generation endpoint (not embeddings or a media job) whose
+// body we can read without decoding a content coding.
+func probeableResponse(req *http.Request, resp *http.Response) bool {
+	if req == nil || resp == nil {
+		return false
+	}
+	if encoding := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding"))); encoding != "" && encoding != "identity" {
+		// The probe parses JSON; compressed bytes would read as pending and
+		// hold every request for the whole grace period.
+		return false
+	}
+	_, ok := protocolrelaykit.RouteForRequest(req.Method, req.URL.Path)
+	return ok
 }
 
 // decodeSnippet renders buffered upstream bytes for an error message. When the
@@ -1353,7 +2041,20 @@ func decodeSnippet(resp *http.Response, raw []byte) string {
 // failure here cannot be retried (the head is already committed), so it is
 // recorded on the credential instead: a credential that truncates streams
 // should not immediately serve the next request.
+//
+// The reader is wrapped in a probe so the "decode" phase flips on the first
+// chunk that carries model output. Lifecycle frames (response.created,
+// message_start, a role-only delta) arrive first and are not output; reporting
+// them as decode made the live phase lie about when the first token landed.
 func (g *Gateway) forwardBody(w http.ResponseWriter, req *http.Request, body io.Reader, cred *Credential) {
+	g.forwardBodyFor(w, req, body, cred, "", nil)
+}
+
+func (g *Gateway) forwardBodyFor(w http.ResponseWriter, req *http.Request, body io.Reader, cred *Credential, dialect string, seed []byte) {
+	probe := newContentProbe(dialect, true)
+	if len(seed) > 0 {
+		probe.Write(seed)
+	}
 	// Flush after every upstream read. net/http buffers a response writer and
 	// only pushes the buffer out when it fills or the handler returns, so a
 	// copy without flushes delivers a short answer — an SSE stream in
@@ -1363,6 +2064,12 @@ func (g *Gateway) forwardBody(w http.ResponseWriter, req *http.Request, body io.
 	for {
 		n, rerr := body.Read(buf)
 		if n > 0 {
+			if dialect != "" && !probe.HasContent() {
+				probe.Write(buf[:n])
+				if probe.HasContent() {
+					swaputil.ReportInferencePhase(req.Context(), "decode", "model output started")
+				}
+			}
 			if _, werr := w.Write(buf[:n]); werr != nil {
 				if req.Context().Err() != nil {
 					// The client is gone; the upstream didn't fail.
@@ -1404,6 +2111,40 @@ func requestCarriesBody(req *http.Request) bool {
 	return req.ContentLength != 0 || len(req.TransferEncoding) > 0
 }
 
+// noteFailureOnly records a failure that is about to be retried on the same
+// credential, without benching it. The cooldown is what ends a credential's
+// participation in a request; until its retry budget is spent, the transient
+// failure stays observable but must not take the key out of rotation.
+func (g *Gateway) noteFailureOnly(cred *Credential, res attemptResult) {
+	cred.noteUpstream(res.status, res.snippet)
+	cred.noteError(res.cause)
+}
+
+// Retry backoff bounds. The first retry of a credential waits retryBaseDelay;
+// each later one doubles. maxRetryBackoff caps one wait, and
+// maxTotalRetryBackoff caps everything one request may spend sleeping: a
+// misconfigured pool must fail quickly with the upstream's own error, not
+// stall the caller while every key exhausts a long budget.
+const (
+	retryBaseDelay       = 250 * time.Millisecond
+	maxRetryBackoff      = 4 * time.Second
+	maxTotalRetryBackoff = 5 * time.Second
+)
+
+// retryBackoff returns how long to wait before retrying a credential that has
+// already used attempts attempts. The first retry waits retryBaseDelay, each
+// further one doubles up to maxRetryBackoff.
+func (g *Gateway) retryBackoff(attempts int, route *Route) time.Duration {
+	if attempts <= 0 {
+		return 0
+	}
+	wait := retryBaseDelay << (attempts - 1)
+	if wait > maxRetryBackoff {
+		wait = maxRetryBackoff
+	}
+	return wait
+}
+
 // applyFailure records a credential failure: cooldown by class, with
 // Retry-After extending rate-limit cooldowns. Transport errors (status 0)
 // cool down transiently.
@@ -1412,6 +2153,10 @@ func (g *Gateway) applyFailure(cred *Credential, res attemptResult, route *Route
 	if route != nil {
 		cc = route.cooldowns
 	}
+	// The upstream answered, even when this particular failure does not bench
+	// the credential: remember it so requests arriving during the cooldown
+	// report the real status and body.
+	cred.noteUpstream(res.status, res.snippet)
 	if route != nil && route.cooldownDisabled {
 		// The provider opted out of benching: this failure is still visible in
 		// the status API, but the credential keeps serving (and the request may
@@ -1433,9 +2178,14 @@ func (g *Gateway) applyFailure(cred *Credential, res attemptResult, route *Route
 	switch res.failureClass {
 	case CooldownAuth:
 		until := now.Add(cc.auth)
-		// 401 is often transient: probe again soon unless the credential just
-		// failed auth as well. 402 (payment required) is not transient and
-		// keeps the full cooldown immediately.
+		// 401 is often transient: probe again soon unless this credential has
+		// already been rejected by auth. The check is a counter rather than a
+		// wall-clock window on purpose: while a credential is benched for the
+		// full auth cooldown (ten minutes by default) it is not retried, so a
+		// recency window would have expired by the time the next 401 arrives
+		// and would restart the short probe — alternating probe and full
+		// cooldown forever instead of staying benched. 402 (payment required)
+		// is not transient and keeps the full cooldown immediately.
 		if res.status == http.StatusUnauthorized && cc.authProbe > 0 && !cred.RecentAuthFailure(now) {
 			probe := cc.authProbe
 			if probe > cc.auth {
