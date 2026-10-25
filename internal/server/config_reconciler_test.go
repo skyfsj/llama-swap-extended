@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -217,7 +218,14 @@ func TestServer_ReconcileConfigReloadsModelFileSources(t *testing.T) {
 	if response.Code != http.StatusOK {
 		t.Fatalf("model file response status=%d body=%s", response.Code, response.Body.String())
 	}
-	if !strings.Contains(response.Body.String(), `"id":"new-models"`) || !strings.Contains(response.Body.String(), newRoot) {
+	// The API renders paths inside JSON, where backslashes are escaped on
+	// Windows; compare against the marshalled form so the assertion holds on
+	// every host.
+	escapedRoot, err := json.Marshal(newRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(response.Body.String(), `"id":"new-models"`) || !strings.Contains(response.Body.String(), string(escapedRoot)) {
 		t.Fatalf("model file source was not reloaded: %s", response.Body.String())
 	}
 	if strings.Contains(response.Body.String(), `"id":"old-models"`) {

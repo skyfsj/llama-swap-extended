@@ -9,6 +9,14 @@ import (
 	"strings"
 )
 
+// isAbsRoot accepts POSIX absolute paths on every host, mirroring the config
+// package's path validation: a managed-runtime root travels in configs between
+// hosts, and Windows itself resolves a forward-slash path against the current
+// drive, so filepath.IsAbs alone would reject a root the OS would honour.
+func isAbsRoot(path string) bool {
+	return strings.HasPrefix(path, "/") || filepath.IsAbs(path)
+}
+
 // rejectSymlinkPath verifies every existing component of path without
 // following links. Runtime state is written with atomic renames, but a
 // symlinked parent would still redirect those writes outside the configured

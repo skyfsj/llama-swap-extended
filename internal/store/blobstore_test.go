@@ -225,7 +225,11 @@ func TestStore_Blob_GC(t *testing.T) {
 // published (so the metadata stays usable) while streaming that body reports
 // the bytes as missing instead of pretending they are empty.
 func TestStore_Blob_MissingFileDegradesToEmptyBody(t *testing.T) {
-	st, dir := newFileBackedStore(t)
+	dir := t.TempDir()
+	st, err := New(filepath.Join(dir, "db.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := st.InsertAuditConversation(context.Background(), AuditConversation{
 		ID: "fragile", Model: "m", Timestamp: time.Now().Truncate(time.Second),
 		RequestBody: bytes.Repeat([]byte("fragile-media"), 64),
@@ -240,7 +244,13 @@ func TestStore_Blob_MissingFileDegradesToEmptyBody(t *testing.T) {
 		t.Fatal("row did not store its body")
 	}
 	// Lose the segment that carries the body, as a pruned or damaged file
-	// would. The row must stay usable and only the body becomes unavailable.
+	// would. The store is closed first: its append writer holds the segment
+	// open, and Windows cannot unlink a file another process (or the same
+	// one) still has open. Reopening after the loss also proves the row
+	// survives the restart-shaped version of this failure.
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
 	segments, err := os.ReadDir(filepath.Join(dir, "audit", "segments"))
 	if err != nil {
 		t.Fatal(err)
@@ -258,6 +268,15 @@ func TestStore_Blob_MissingFileDegradesToEmptyBody(t *testing.T) {
 	if removed == 0 {
 		t.Fatal("no segment file was written")
 	}
+	st, err = New(filepath.Join(dir, "db.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := st.Close(); err != nil {
+			t.Errorf("store.Close: %v", err)
+		}
+	})
 	full, found, err = st.GetAuditConversation(context.Background(), "fragile")
 	if err != nil || !found {
 		t.Fatalf("GetAuditConversation after loss found=%v err=%v, want usable row", found, err)

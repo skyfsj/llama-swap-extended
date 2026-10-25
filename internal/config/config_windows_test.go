@@ -203,6 +203,14 @@ groups:
 		SendLoadingState:            false,
 		UnloadTimeout:               DEFAULT_UNLOAD_TIMEOUT,
 		RollbackOnModelStartFailure: &trueRollback,
+		// Loading fills the server and limiter defaults so every consumer
+		// reads the same effective values (mirrors config_posix_test.go).
+		Server: HTTPServerConfig{MaxHeaderBytes: DefaultMaxHeaderBytes},
+		Security: SecurityConfig{AuthRateLimit: AuthRateLimitConfig{
+			MaxFailures: DefaultAuthMaxFailures,
+			Window:      DefaultAuthWindow,
+			BlockFor:    DefaultAuthBlockFor,
+		}},
 		Models: map[string]ModelConfig{
 			"model1": {
 				Cmd:                "path/to/cmd --arg1 one",

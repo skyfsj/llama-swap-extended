@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -43,6 +44,10 @@ func (s *stalledSink) Write(p []byte) (int, error) {
 // and the child died on its next write — which reached the operator as a model
 // crash.
 func TestProcessCommand_StalledLogSinkDoesNotStallChild(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// The fixture pipes 200KB of /dev/zero through a POSIX shell.
+		t.Skip("shell-script fixture is unix-only")
+	}
 	if _, err := exec.LookPath("sh"); err != nil {
 		t.Skip("sh unavailable")
 	}

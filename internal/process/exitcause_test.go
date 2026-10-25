@@ -2,16 +2,28 @@ package process
 
 import (
 	"os/exec"
+	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
 )
 
+// exitCodeFixture exits with the given status through the host shell. cmd.exe
+// needs no quoting for a bare number; the unix shell form keeps the historic
+// spelling.
+func exitCodeFixture(code int) *exec.Cmd {
+	if runtime.GOOS == "windows" {
+		return exec.Command("cmd", "/c", "exit", strconv.Itoa(code))
+	}
+	return exec.Command("sh", "-c", "exit "+strconv.Itoa(code))
+}
+
 // TestDescribeExitNamesExitCode pins the operator-facing wording for a process
 // that chose its own exit status. The previous lifecycle error forwarded Go's
 // wrapper untouched, so a reader could not tell a deliberate exit from a kill.
 func TestDescribeExitNamesExitCode(t *testing.T) {
-	cmd := exec.Command("sh", "-c", "exit 120")
+	cmd := exitCodeFixture(120)
 	err := cmd.Run()
 	if err == nil {
 		t.Fatal("expected a non-zero exit")
@@ -26,6 +38,9 @@ func TestDescribeExitNamesExitCode(t *testing.T) {
 // killed by a signal must be reported as such, because "exit status 137" and
 // "killed by signal SIGKILL" describe very different investigations.
 func TestDescribeExitNamesSignal(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows has no signals to name")
+	}
 	cmd := exec.Command("sleep", "30")
 	if err := cmd.Start(); err != nil {
 		t.Skipf("cannot start sleep: %v", err)
@@ -61,6 +76,9 @@ func TestDescribeExitHandlesCleanAndUnknownErrors(t *testing.T) {
 // without the "kernel OOM killer" speculation, which sends the reader after a
 // memory problem that may not exist.
 func TestDescribeExitWithMemorySuppressesOomGuessWhenWeSentTheSignal(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows has no signals to name")
+	}
 	cmd := exec.Command("sleep", "30")
 	if err := cmd.Start(); err != nil {
 		t.Skipf("cannot start sleep: %v", err)

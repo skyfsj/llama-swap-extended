@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -432,6 +433,14 @@ func TestPreset_DateTimeToolSurface(t *testing.T) {
 // time.LoadLocation is wrong, and the disagreement is what this test looks for -
 // across every shipped name, at several instants, including around transitions.
 func TestPreset_DateTimeTableMatchesSystemTzdata(t *testing.T) {
+	// The pinned table is generated on Linux from a pinned tzdata version;
+	// zoneinfo on other hosts comes from different sources (macOS ships its
+	// own builds, Windows uses the registry) and would false-fail on every
+	// DST-column difference. The guard's home is the Linux CI runner, whose
+	// tzdata matches the generator.
+	if runtime.GOOS != "linux" {
+		t.Skip("the table mirrors Linux system tzdata")
+	}
 	preset, ok := PresetByID("datetime-tools")
 	if !ok {
 		t.Fatal("datetime-tools is not in the catalog")

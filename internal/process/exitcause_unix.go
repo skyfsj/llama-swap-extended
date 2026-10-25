@@ -28,25 +28,6 @@ func describeExitState(exitErr *exec.ExitError) string {
 	return exitErr.Error()
 }
 
-// exitCodeHint annotates the exit codes that carry a well-known meaning, so a
-// bare number does not read as an unexplained failure.
-func exitCodeHint(code int) string {
-	switch code {
-	case 1:
-		return " (generic failure)"
-	case 2:
-		return " (usage / argument error)"
-	case 137:
-		return " (128+SIGKILL — killed by the kernel, typically out of memory)"
-	case 139:
-		return " (128+SIGSEGV — segmentation fault)"
-	case 143:
-		return " (128+SIGTERM — terminated)"
-	default:
-		return ""
-	}
-}
-
 // signalName reports the conventional SIG* constant for a signal, falling
 // back to the platform rendering for the long tail this package does not
 // specialise.

@@ -59,3 +59,23 @@ func DescribeExitWithMemory(err error, initiatedByLlamaSwap bool) string {
 	}
 	return description
 }
+
+// exitCodeHint annotates the exit codes that carry a well-known meaning, so a
+// bare number does not read as an unexplained failure. Shared by the per-OS
+// describeExitState implementations.
+func exitCodeHint(code int) string {
+	switch code {
+	case 1:
+		return " (generic failure)"
+	case 2:
+		return " (usage / argument error)"
+	case 137:
+		return " (128+SIGKILL — killed by the kernel, typically out of memory)"
+	case 139:
+		return " (128+SIGSEGV — segmentation fault)"
+	case 143:
+		return " (128+SIGTERM — terminated)"
+	default:
+		return ""
+	}
+}

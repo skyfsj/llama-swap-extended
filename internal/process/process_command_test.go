@@ -453,7 +453,9 @@ func TestProcessCommand_EnsureReadyTimeoutCancelsBlockedHealthCheck(t *testing.T
 		if !strings.Contains(err.Error(), "health check timed out") {
 			t.Fatalf("EnsureReady error = %v, want an explicit health check timeout", err)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(10 * time.Second):
+		// Generous bound: a loaded CI runner can stretch the deadline
+		// plumbing well past the in-process timeout without being stuck.
 		_ = p.Stop(testStopTimeout)
 		t.Fatal("EnsureReady remained blocked after its startup timeout")
 	}

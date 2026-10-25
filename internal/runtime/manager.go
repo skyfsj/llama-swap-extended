@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	stdruntime "runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -467,7 +468,7 @@ func NewManager(root string, providers map[string]Provider) (*Manager, error) {
 	if strings.TrimSpace(root) == "" {
 		return nil, errors.New("runtime root is required")
 	}
-	if !filepath.IsAbs(root) {
+	if !isAbsRoot(root) {
 		return nil, errors.New("runtime root must be absolute")
 	}
 	if err := rejectSymlinkPath(root); err != nil {
@@ -3186,6 +3187,12 @@ func (m *Manager) RemoveVersion(name, version string) error {
 }
 
 func syncDir(path string) error {
+	if stdruntime.GOOS == "windows" {
+		// Directory fsync is a POSIX durability idiom: FlushFileBuffers
+		// rejects directory handles (ERROR_ACCESS_DENIED). The files written
+		// into this directory are fsynced individually by their writers.
+		return nil
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return err

@@ -202,7 +202,10 @@ func TestProcessCommand_LoadingProgressAbortsOnStop(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Stop: %v", err)
 		}
-	case <-time.After(3 * time.Second):
+	case <-time.After(10 * time.Second):
+		// Generous: testStopTimeout already bounds Stop at 2s; a loaded CI
+		// runner (taskkill is slow to spawn) needs margin above that, not a
+		// three-second ceiling that fires while teardown is still legal.
 		t.Fatal("Stop did not return while a progress-extended load was starting")
 	}
 

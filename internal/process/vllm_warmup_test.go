@@ -217,6 +217,12 @@ func TestProcessCommand_VLLMWarmupStopCanRestart(t *testing.T) {
 		t.Fatalf("state=%s, want %s after cancelled warmup", got, StateStopped)
 	}
 
+	// The killed child's listener and executable image are released
+	// asynchronously on Windows; an immediate relaunch can lose the bind race
+	// and exit 1 before any request is made. One scheduling beat keeps the
+	// restart deterministic without masking a real startup failure.
+	time.Sleep(500 * time.Millisecond)
+
 	ctx, cancel := context.WithTimeout(context.Background(), testStartTimeout)
 	defer cancel()
 	if err := p.EnsureReady(ctx, testStartTimeout); err != nil {
