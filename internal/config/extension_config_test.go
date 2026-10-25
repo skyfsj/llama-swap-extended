@@ -460,6 +460,33 @@ func TestModelsDevEnabled_DistinguishesUnsetFromFalse(t *testing.T) {
 	}
 }
 
+// TestCostBackfillOnSync_DefaultsOn pins the backfill switch's three states,
+// same as the syncer switch: absent reads as enabled so existing configs get
+// the repair pass, and an explicit false silences every trigger.
+func TestCostBackfillOnSync_DefaultsOn(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		yaml string
+		want bool
+	}{
+		{"section absent", "models:\n  a:\n    cmd: srv\n    proxy: \"http://127.0.0.1:9000\"\n", true},
+		{"empty block", "pricing:\n  modelsDev: {}\n", true},
+		{"explicitly on", "pricing:\n  modelsDev:\n    costBackfillOnSync: true\n", true},
+		{"explicitly off", "pricing:\n  modelsDev:\n    costBackfillOnSync: false\n", false},
+		{"off alongside a url", "pricing:\n  modelsDev:\n    url: https://mirror.example/api.json\n    costBackfillOnSync: false\n", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := LoadConfigFromReader(strings.NewReader(tc.yaml))
+			if err != nil {
+				t.Fatalf("load: %v", err)
+			}
+			if got := cfg.EffectivePricing().ModelsDev.CostBackfillEnabled(); got != tc.want {
+				t.Fatalf("CostBackfillEnabled()=%v want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestEffectivePricing_KeepsConfiguredValues pins that the effective view does
 // not overwrite what the operator wrote.
 func TestEffectivePricing_KeepsConfiguredValues(t *testing.T) {

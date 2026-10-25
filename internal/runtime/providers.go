@@ -976,7 +976,7 @@ func verifyVLLMEntrypoints(directory string) error {
 		if !info.Mode().IsRegular() {
 			return fmt.Errorf("vLLM entrypoint %s is not a regular file", name)
 		}
-		if info.Mode().Perm()&0o111 == 0 {
+		if !isExecutableFile(entrypoint, info) {
 			return fmt.Errorf("vLLM entrypoint %s is not executable", name)
 		}
 	}
@@ -2142,7 +2142,7 @@ func materializeLlamaCPPEntrypoint(ctx context.Context, directory string) error 
 		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 			return errors.New("llama.cpp entrypoint source is not a regular file")
 		}
-		if info.Mode().Perm()&0o111 == 0 {
+		if !isExecutableFile(candidate, info) {
 			return errors.New("llama.cpp entrypoint source is not executable")
 		}
 		if err := copyRuntimeArtifacts(ctx, directory, []Artifact{{From: source, To: "bin/llama-server"}}, nil); err != nil {
@@ -2244,7 +2244,7 @@ func verifyLlamaCPPEntrypoint(directory string) error {
 	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 		return errors.New("llama.cpp entrypoint is not a regular file")
 	}
-	if info.Mode().Perm()&0o111 == 0 {
+	if !isExecutableFile(entrypoint, info) {
 		return errors.New("llama.cpp entrypoint is not executable")
 	}
 	return nil

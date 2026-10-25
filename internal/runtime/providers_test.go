@@ -1122,6 +1122,12 @@ func TestRuntime_ParseSmokeCommandShellFree(t *testing.T) {
 }
 
 func TestRuntime_ProviderHealthRunsSmokeCommandAndValidatesHealthPath(t *testing.T) {
+	if stdruntime.GOOS == "windows" {
+		// The venv fixture stages unix-style entrypoints (extension-less
+		// files with an exec bit); Windows decides executability by
+		// extension, so the staged tree can never satisfy the check.
+		t.Skip("entrypoint fixtures are unix-style")
+	}
 	root := t.TempDir()
 	directory := filepath.Join(root, "runtime")
 	if err := os.MkdirAll(filepath.Join(directory, ".venv"), 0o750); err != nil {
@@ -1924,6 +1930,9 @@ func TestRuntime_VLLMProviderVerifiesLocalWheelChecksum(t *testing.T) {
 }
 
 func TestRuntime_VLLMProviderVerifyRequiresLaunchEntrypoints(t *testing.T) {
+	if stdruntime.GOOS == "windows" {
+		t.Skip("entrypoint fixtures are unix-style")
+	}
 	root := t.TempDir()
 	directory := filepath.Join(root, "vllm")
 	if err := os.MkdirAll(filepath.Join(directory, ".venv"), 0o750); err != nil {
@@ -1948,6 +1957,9 @@ func TestRuntime_VLLMProviderVerifyRequiresLaunchEntrypoints(t *testing.T) {
 }
 
 func TestRuntime_ProvidersHonorVerifySHA256Metadata(t *testing.T) {
+	if stdruntime.GOOS == "windows" {
+		t.Skip("entrypoint fixtures are unix-style")
+	}
 	root := t.TempDir()
 	directory := filepath.Join(root, "vllm")
 	if err := os.MkdirAll(filepath.Join(directory, ".venv"), 0o750); err != nil {
@@ -1985,6 +1997,9 @@ func TestRuntime_ProvidersHonorVerifySHA256Metadata(t *testing.T) {
 }
 
 func TestRuntime_ProviderVerifyRejectsMalformedManifestReferences(t *testing.T) {
+	if stdruntime.GOOS == "windows" {
+		t.Skip("entrypoint fixtures are unix-style")
+	}
 	root := t.TempDir()
 	directory := filepath.Join(root, "vllm")
 	if err := os.MkdirAll(filepath.Join(directory, ".venv"), 0o750); err != nil {

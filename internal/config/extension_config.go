@@ -951,7 +951,7 @@ func EffectiveLaunchMetadata(model ModelConfig, runtime RuntimeConfig, kind stri
 		return entrypoint, nil
 	}
 	present := make(map[string]bool, len(model.Backend.Arguments))
-	for _, token := range SplitManagedLaunchTokens(model.Backend.Arguments) {
+	for _, token := range SplitManagedLaunchTokens(kind, model.Backend.Arguments) {
 		if name := flagName(token); name != "" {
 			present[name] = true
 		}
@@ -1349,6 +1349,11 @@ type ModelsDevPricingConfig struct {
 	// prefers the official vendor's row over resellers' rows. It starts from
 	// DefaultPricingVendors; entries here override or extend it.
 	Vendors map[string]string `yaml:"vendors" json:"vendors,omitempty"`
+	// CostBackfillOnSync runs a historical cost backfill after each successful
+	// catalog sync: activity rows recorded before their model had a price are
+	// recomputed from the current catalog and persisted. An absent key reads as
+	// enabled, same as the syncer itself.
+	CostBackfillOnSync *bool `yaml:"costBackfillOnSync" json:"costBackfillOnSync,omitempty"`
 }
 
 // DefaultPricingVendors is the built-in prefix -> catalog-provider table used
@@ -1436,6 +1441,13 @@ const (
 // zero-value check that supplied the default no longer matched.
 func (c ModelsDevPricingConfig) ModelsDevEnabled() bool {
 	return c.Enabled == nil || *c.Enabled
+}
+
+// CostBackfillEnabled reports whether a successful catalog sync should also
+// backfill the cost of activity rows recorded before their model had a price.
+// Defaults to on, matching the syncer.
+func (c ModelsDevPricingConfig) CostBackfillEnabled() bool {
+	return c.CostBackfillOnSync == nil || *c.CostBackfillOnSync
 }
 
 // EffectiveAudit returns the selected audit policy with the product defaults

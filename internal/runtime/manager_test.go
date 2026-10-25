@@ -90,6 +90,12 @@ func TestRuntime_ManagerListDoesNotWaitForProviderStage(t *testing.T) {
 }
 
 func TestRuntime_RewriteVLLMEntrypointShebangsAfterStageRename(t *testing.T) {
+	if stdruntime.GOOS == "windows" {
+		// The fixture stages unix-style entrypoints (extension-less files
+		// carrying an exec bit, plus a #! rewrite); Windows decides
+		// executability by extension and has no shebangs.
+		t.Skip("entrypoint fixtures are unix-style")
+	}
 	root := t.TempDir()
 	oldDir := filepath.Join(root, "versions", ".staging-123")
 	newDir := filepath.Join(root, "versions", "0.0.1")
@@ -855,6 +861,12 @@ func TestRuntime_ManagerSeedIfMissingPersistsAndNeverOverwritesCurrent(t *testin
 }
 
 func TestRuntime_ManagerSeedIfMissingNormalizesBundledLlamaBinaryDirectory(t *testing.T) {
+	if stdruntime.GOOS == "windows" {
+		// The bundled-binary fixture is a unix-style llama-server (extension-
+		// less file with an exec bit); Windows decides executability by
+		// extension, so the seed can never accept it there.
+		t.Skip("entrypoint fixtures are unix-style")
+	}
 	root := filepath.Join(t.TempDir(), "runtimes")
 	source := filepath.Join(t.TempDir(), "image-app")
 	if err := os.MkdirAll(source, 0o750); err != nil {

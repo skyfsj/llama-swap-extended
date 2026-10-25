@@ -110,7 +110,7 @@ func foldLaunchIntoArguments(kind string, launch *ModelLaunchConfig, args []stri
 	// structured field and the flag it renders, and appending a second copy
 	// would produce a duplicate the engine reads unpredictably.
 	present := make(map[string]bool, len(args))
-	for _, token := range SplitManagedLaunchTokens(args) {
+	for _, token := range SplitManagedLaunchTokens(kind, args) {
 		if name := flagName(token); name != "" {
 			present[name] = true
 		}

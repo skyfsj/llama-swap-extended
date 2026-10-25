@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -464,6 +465,12 @@ func TestServer_New_GroupConfig(t *testing.T) {
 }
 
 func TestServer_NewAlwaysRegistersBundledLlamaCPP(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// The bundled fixture is a unix-style llama-server (extension-less
+		// file with an exec bit); Windows decides executability by
+		// extension, so the seed can never accept it there.
+		t.Skip("entrypoint fixtures are unix-style")
+	}
 	discard := logmon.NewWriter(io.Discard)
 	source := t.TempDir()
 	if err := os.WriteFile(filepath.Join(source, "llama-server"), []byte("#!/bin/sh\nexit 0\n"), 0o750); err != nil {

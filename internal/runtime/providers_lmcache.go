@@ -599,7 +599,7 @@ func verifyLMCacheEntrypoints(directory string) error {
 		if !info.Mode().IsRegular() {
 			return fmt.Errorf("lmcache entrypoint %s is not a regular file", name)
 		}
-		if info.Mode().Perm()&0o111 == 0 {
+		if !isExecutableFile(entrypoint, info) {
 			return fmt.Errorf("lmcache entrypoint %s is not executable", name)
 		}
 	}

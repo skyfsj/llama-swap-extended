@@ -3,6 +3,7 @@ package server
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +13,11 @@ import (
 )
 
 func TestServer_DiscoverBundledLlamaCPPFromOwnedDirectory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// The bundled fixture is a unix-style llama-server (extension-less
+		// file with an exec bit); Windows decides executability by extension.
+		t.Skip("entrypoint fixtures are unix-style")
+	}
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "llama-server"), []byte("#!/bin/sh\n"), 0o750); err != nil {
 		t.Fatal(err)
@@ -48,6 +54,9 @@ func TestServer_DiscoverBundledLlamaCPPSkipsExplicitRuntime(t *testing.T) {
 }
 
 func TestServer_RegisterDiscoveredBundledLlamaCPPSeedsManager(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("entrypoint fixtures are unix-style")
+	}
 	source := t.TempDir()
 	if err := os.WriteFile(filepath.Join(source, "llama-server"), []byte("#!/bin/sh\nexit 0\n"), 0o750); err != nil {
 		t.Fatal(err)

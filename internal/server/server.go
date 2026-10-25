@@ -112,16 +112,20 @@ type Server struct {
 	// pricingGeneration lets a superseded loop notice it has been replaced
 	// without having to observe the cancellation first.
 	pricingGeneration atomic.Uint64
-	resources         *resourcePlanner.Planner
-	resourcesMu       sync.RWMutex
-	resourceMu        sync.Mutex
-	lmcacheMod        *lmcacheService
-	backendAdapters   map[string]backend.BackendAdapter
-	backendAdapterMu  sync.RWMutex
-	cacheController   *backend.CacheController
-	progressMu        sync.RWMutex
-	backendProgress   map[string]swaputil.BackendProgressEvent
-	progressCancel    context.CancelFunc
+	// costBackfillRunning is the single-flight guard for the historical cost
+	// backfill: the initial sync, the periodic loop and a manual sync can all
+	// succeed close together and each would otherwise start a pass.
+	costBackfillRunning atomic.Bool
+	resources           *resourcePlanner.Planner
+	resourcesMu         sync.RWMutex
+	resourceMu          sync.Mutex
+	lmcacheMod          *lmcacheService
+	backendAdapters     map[string]backend.BackendAdapter
+	backendAdapterMu    sync.RWMutex
+	cacheController     *backend.CacheController
+	progressMu          sync.RWMutex
+	backendProgress     map[string]swaputil.BackendProgressEvent
+	progressCancel      context.CancelFunc
 	// processProgressCancel bridges the local process lifecycle into the
 	// common BackendProgress stream. Keep this subscription separate from the
 	// runtime/download progress listener so either can be stopped independently
@@ -2341,6 +2345,10 @@ func (s *Server) runPricingSync(syncer *pricing.Syncer, stop <-chan struct{}, in
 			ctx, cancel := context.WithTimeout(s.shutdownCtx, pricingSyncTimeout)
 			if _, err := syncer.Sync(ctx); err != nil && s.proxylog != nil {
 				s.proxylog.Warnf("pricing sync failed: %v", err)
+			} else {
+				// A fresh catalog may price rows the record path had to leave
+				// at zero; sweep them in the background.
+				s.startCostBackfill()
 			}
 			cancel()
 		}
@@ -2369,6 +2377,10 @@ func (s *Server) reconfigurePricing(active, desired config.ModelsDevPricingConfi
 		ctx, cancel := context.WithTimeout(s.shutdownCtx, pricingSyncTimeout)
 		if _, err := initial.Sync(ctx); err != nil && s.proxylog != nil {
 			s.proxylog.Warnf("initial pricing sync failed: %v", err)
+		} else {
+			// The first catalog fetch is when most historical rows become
+			// priceable; backfill them without blocking startup.
+			s.startCostBackfill()
 		}
 		cancel()
 	}()

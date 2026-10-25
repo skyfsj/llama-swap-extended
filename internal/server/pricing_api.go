@@ -177,6 +177,10 @@ func (s *Server) handleAPIPricingSync(w http.ResponseWriter, r *http.Request) {
 		swaputil.SendResponse(w, r, http.StatusBadGateway, err.Error())
 		return
 	}
+	// A manual refresh is the operator asking for current prices; sweep the
+	// rows the record path could not price with the old catalog. The pass runs
+	// on the shutdown context, not the request's, so it outlives this response.
+	s.startCostBackfill()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(pricingSyncResponse{Changed: result.Changed, ETag: result.ETag, Count: result.Count, SyncedAt: result.SyncedAt})
 }

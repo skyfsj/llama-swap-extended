@@ -1581,7 +1581,7 @@ func stageBundledRuntimeSource(ctx context.Context, spec Spec, destination strin
 	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 		return Manifest{}, true, errors.New("bundled llama.cpp entrypoint is not a regular file")
 	}
-	if info.Mode().Perm()&0o111 == 0 {
+	if !isExecutableFile(entrypoint, info) {
 		return Manifest{}, true, errors.New("bundled llama.cpp entrypoint is not executable")
 	}
 	if err := rejectSymlinkPath(entrypoint); err != nil {
@@ -1605,7 +1605,7 @@ func stageBundledRuntimeSource(ctx context.Context, spec Spec, destination strin
 		// llama-server was validated above and is required. The remaining
 		// binaries are optional convenience tools; ignore links or non-executable
 		// entries rather than making a usable server asset unseedable.
-		if candidateInfo.Mode()&os.ModeSymlink != 0 || !candidateInfo.Mode().IsRegular() || candidateInfo.Mode().Perm()&0o111 == 0 {
+		if candidateInfo.Mode()&os.ModeSymlink != 0 || !candidateInfo.Mode().IsRegular() || !isExecutableFile(candidate, candidateInfo) {
 			continue
 		}
 		if err := copyBundledRuntimeFile(ctx, candidate, filepath.Join(destination, "bin", name), candidateInfo.Mode().Perm()); err != nil {

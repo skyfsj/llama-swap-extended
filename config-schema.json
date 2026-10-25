@@ -2987,6 +2987,10 @@
                 "minLength": 1
               },
               "description": "Model-name prefix -> pricing-catalog provider id treated as the model's official vendor (\"gemini\" -> \"google\"). Merged over the built-in table, which covers: gpt/o1/o3/o4->openai, gemini->google, qwen/qvq/qwq->alibaba, glm->zhipuai, deepseek->deepseek, claude->anthropic, kimi->moonshotai, minimax->minimax, grok->xai, mimo->xiaomi, step->stepfun, mistral/ministral/codestral/devstral/magistral/pixtral/voxtral->mistral, doubao->volcengine, command->cohere, sonar->perplexity, muse->meta, phi->azure, nvidia->nvidia."
+            },
+            "costBackfillOnSync": {
+              "type": "boolean",
+              "description": "After each successful catalog sync, recompute the cost of activity rows recorded before their model had a price, using the current catalog, and persist it (default true). Already-priced rows are never recomputed."
             }
           }
         }

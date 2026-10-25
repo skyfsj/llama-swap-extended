@@ -9,6 +9,23 @@ import (
 	"strings"
 )
 
+// isExecutableFile reports whether an installed entrypoint can be launched.
+// On Unix this is the execute bit. Windows has no execute bit — os.Stat
+// reports regular files without 0o111 regardless of their real usability —
+// so executability there is decided by extension instead.
+func isExecutableFile(path string, info os.FileInfo) bool {
+	if info.Mode().Perm()&0o111 != 0 {
+		return true
+	}
+	if stdruntime.GOOS == "windows" {
+		switch strings.ToLower(filepath.Ext(path)) {
+		case ".exe", ".com", ".bat", ".cmd", ".py":
+			return true
+		}
+	}
+	return false
+}
+
 // rejectSymlinkPath verifies every existing component of path without
 // following links. Runtime state is written with atomic renames, but a
 // symlinked parent would still redirect those writes outside the configured

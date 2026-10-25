@@ -29,7 +29,11 @@ func ManagedLaunchEntrypoint(kind string) string {
 // without whitespace, including model paths that contain spaces, stay single
 // argv elements; a fully quoted item still has its wrapping quotes stripped
 // so a stored '"0.90"' or '{"json":true}' reaches the engine unquoted.
-func SplitManagedLaunchTokens(args []string) []string {
+//
+// The lexer dialect follows the runtime kind: a vllm command is a POSIX shell
+// command wherever the server runs, so single-quoted JSON flags stop
+// shattering under shlex.Windows; other kinds keep the host dialect.
+func SplitManagedLaunchTokens(kind string, args []string) []string {
 	tokens := make([]string, 0, len(args))
 	for _, argument := range args {
 		trimmed := strings.TrimSpace(argument)
@@ -38,7 +42,7 @@ func SplitManagedLaunchTokens(args []string) []string {
 		}
 		if !strings.ContainsAny(trimmed, " \t") || !strings.HasPrefix(trimmed, "-") {
 			if trimmed[0] == '"' || trimmed[0] == '\'' {
-				if split := shlexSplit(trimmed); len(split) == 1 {
+				if split := shlexSplit(kind, trimmed); len(split) == 1 {
 					tokens = append(tokens, split[0])
 					continue
 				}
@@ -46,13 +50,17 @@ func SplitManagedLaunchTokens(args []string) []string {
 			tokens = append(tokens, trimmed)
 			continue
 		}
-		tokens = append(tokens, shlexSplit(trimmed)...)
+		tokens = append(tokens, shlexSplit(kind, trimmed)...)
 	}
 	return tokens
 }
 
-func shlexSplit(line string) []string {
-	if runtime.GOOS == "windows" {
+func shlexSplit(kind, line string) []string {
+	// A vllm command is a POSIX shell command wherever the server runs (vLLM
+	// does not ship for Windows); other kinds keep the host dialect because
+	// llama-server runs natively on Windows, where operators paste cmd/PowerShell
+	// quoting.
+	if kind != "vllm" && runtime.GOOS == "windows" {
 		return shlex.Windows.Split(line)
 	}
 	return shlex.Posix.Split(line)
@@ -90,7 +98,9 @@ func EnsureVLLMSleepModeArgument(args []string, backendType string, ttl int) []s
 // clobber an operator-written flag, exposed so the reconciliation can tell a
 // TTL edit that rewrites the launch command from one that does not.
 func HasExplicitSleepModeArgument(args []string) bool {
-	for _, token := range SplitManagedLaunchTokens(args) {
+	// --enable-sleep-mode is a vLLM flag, so its tokens are always parsed with
+	// the vllm (POSIX) dialect regardless of the editing host.
+	for _, token := range SplitManagedLaunchTokens("vllm", args) {
 		name := token
 		if equals := strings.IndexByte(token, '='); equals > 0 {
 			name = token[:equals]
@@ -109,7 +119,7 @@ func HasExplicitSleepModeArgument(args []string) bool {
 // remaining engine arguments keep their relative order.
 func RebuildManagedLaunchArguments(args []string, kind, proxy string) ([]string, error) {
 	kind = strings.ToLower(strings.TrimSpace(kind))
-	tokens := SplitManagedLaunchTokens(args)
+	tokens := SplitManagedLaunchTokens(kind, args)
 	rest := launchspec.StripInvocation(kind, tokens)
 
 	var model string
@@ -215,7 +225,7 @@ func BuildManagedLaunchArguments(args []string, entrypoint, kind, proxy string) 
 		// inject into, so the operator owns the whole line — including the
 		// --port that carries the allocated ${PORT}. Only the token split is
 		// normalized (whole-line entries become pairs).
-		rest := SplitManagedLaunchTokens(args)
+		rest := SplitManagedLaunchTokens(kind, args)
 		rebuilt := make([]string, 0, len(head)+len(rest))
 		rebuilt = append(rebuilt, head...)
 		rebuilt = append(rebuilt, rest...)

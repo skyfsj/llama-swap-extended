@@ -550,17 +550,14 @@ func (mp *metricsMonitor) applySessionUsageFrames(entry *ActivityLogEntry, frame
 	return usage.CacheReadInputTokens > 0 || usage.CacheCreationInputTokens > 0
 }
 
-func (mp *metricsMonitor) applyEstimatedCost(entry *ActivityLogEntry, path string) {
-	if entry == nil {
-		return
-	}
-	price, ok := mp.lookupPrice(entry.Model, entry.Provider)
-	if !ok {
-		return
-	}
-	input := int64(entry.Tokens.InputTokens)
-	cached := int64(entry.Tokens.CachedTokens)
-	created := int64(entry.CacheCreationTokens)
+// estimatedCostUSD prices one request from its token counters. Anthropic
+// reports input_tokens as the uncached portion, while OpenAI compatible APIs
+// report the total input and expose cached tokens inside that total. Keep the
+// partition explicit to avoid double charging cache reads/writes in the
+// estimate. The record path and the historical backfill share this function so
+// the two can never drift apart.
+func estimatedCostUSD(price store.Price, reqPath string,
+	input, cached, created, output, reasoning int64) float64 {
 	// A missing cache counter is represented as -1 by the low-level parser so
 	// callers can distinguish "unknown" from a real zero. Cost estimates must
 	// never turn that sentinel into a negative cache charge or an extra input
@@ -571,23 +568,32 @@ func (mp *metricsMonitor) applyEstimatedCost(entry *ActivityLogEntry, path strin
 	if created < 0 {
 		created = 0
 	}
-	// Anthropic reports input_tokens as the uncached portion, while OpenAI
-	// compatible APIs report the total input and expose cached tokens inside
-	// that total. Keep the partition explicit to avoid double charging cache
-	// reads/writes in the estimate.
 	uncached := input
-	if !strings.Contains(path, "/messages") {
+	if !strings.Contains(reqPath, "/messages") {
 		uncached = input - cached - created
 		if uncached < 0 {
 			uncached = 0
 		}
 	}
-	cost := float64(uncached)*price.Input/1e6 +
+	return float64(uncached)*price.Input/1e6 +
 		float64(cached)*price.CacheRead/1e6 +
 		float64(created)*price.CacheWrite/1e6 +
-		float64(entry.Tokens.OutputTokens)*price.Output/1e6 +
-		float64(entry.ReasoningTokens)*price.Reasoning/1e6
-	entry.EstimatedCost = cost
+		float64(output)*price.Output/1e6 +
+		float64(reasoning)*price.Reasoning/1e6
+}
+
+func (mp *metricsMonitor) applyEstimatedCost(entry *ActivityLogEntry, path string) {
+	if entry == nil {
+		return
+	}
+	price, ok := mp.lookupPrice(entry.Model, entry.Provider)
+	if !ok {
+		return
+	}
+	entry.EstimatedCost = estimatedCostUSD(price, path,
+		int64(entry.Tokens.InputTokens), int64(entry.Tokens.CachedTokens),
+		int64(entry.CacheCreationTokens), int64(entry.Tokens.OutputTokens),
+		int64(entry.ReasoningTokens))
 	entry.CostEstimated = true
 }
 
