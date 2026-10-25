@@ -2,7 +2,6 @@ package config
 
 import (
 	"fmt"
-	"path/filepath"
 	"strings"
 )
 
@@ -106,7 +105,7 @@ func (c ExtensionsConfig) Validate() error {
 	if !c.Enabled {
 		return nil
 	}
-	if strings.TrimSpace(c.Directory) == "" || !filepath.IsAbs(c.Directory) {
+	if strings.TrimSpace(c.Directory) == "" || !isAbsConfigPath(c.Directory) {
 		return fmt.Errorf("extensions.directory must be an absolute path when enabled")
 	}
 	return nil

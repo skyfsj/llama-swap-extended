@@ -98,6 +98,11 @@ func (f *lmcacheFakeUV) run(ctx context.Context, name string, args ...string) (s
 // It returns the console script path.
 func writeActiveLMCacheRuntime(t *testing.T, root, version, script string) string {
 	t.Helper()
+	if runtime.GOOS == "windows" {
+		// The fake console script is a POSIX shell script; Windows cannot
+		// exec it (and a real venv would carry lmcache.exe under Scripts).
+		t.Skip("lmcache venv fixture is a unix shell script")
+	}
 	writeRuntimeVersion(t, root, config.LMCacheRuntimeName, runtimeManager.Manifest{
 		Name: config.LMCacheRuntimeName, Version: version, Kind: "lmcache", Source: "pypi",
 		Metadata: map[string]string{"mode": runtimeManager.RuntimeModeNative, "sourceType": "pypi"},
@@ -128,6 +133,11 @@ func writeActiveLMCacheRuntime(t *testing.T, root, version, script string) strin
 // fresh LMCache service onto a bare server.
 func lmcacheServiceFixture(t *testing.T) (*Server, config.Config, *lmcacheFakeUV, string) {
 	t.Helper()
+	if runtime.GOOS == "windows" {
+		// Staged venvs carry POSIX shell scripts (#! + .venv/bin layout);
+		// Windows cannot exec them.
+		t.Skip("lmcache venv fixture is a unix shell script")
+	}
 	root := t.TempDir()
 	for _, name := range []string{"vllm-a", "vllm-b"} {
 		writeActiveVLLMRuntime(t, root, name, "1", "0.19.0")

@@ -74,17 +74,24 @@ func ReservedFlags(kind string) map[string]bool {
 // single quotes people copy out of terminals) can only absorb the rest of
 // its own line,
 // never swallow the following lines the way a whole-input split would.
-func Tokenize(command string) []string {
+//
+// The dialect follows the runtime kind rather than the host OS: a vllm
+// command is a POSIX shell command wherever the server runs (vLLM does not
+// ship for Windows), so single-quoted JSON flags such as
+// '--speculative-config '{"method":…}” must tokenize identically on every
+// editing host. Other kinds keep the host dialect — llama-server runs
+// natively on Windows, where operators paste cmd/PowerShell quoting.
+func Tokenize(kind, command string) []string {
 	joined := strings.ReplaceAll(command, "\\\n", " ")
 	tokens := make([]string, 0, 8)
 	for _, line := range strings.Split(joined, "\n") {
-		tokens = append(tokens, shlexSplit(line)...)
+		tokens = append(tokens, shlexSplit(kind, line)...)
 	}
 	return tokens
 }
 
-func shlexSplit(line string) []string {
-	if runtime.GOOS == "windows" {
+func shlexSplit(kind, line string) []string {
+	if kind != "vllm" && runtime.GOOS == "windows" {
 		return shlex.Windows.Split(line)
 	}
 	return shlex.Posix.Split(line)
@@ -173,7 +180,7 @@ func invocationBase(token string) string {
 // structured spec plus the remaining unmanaged arguments. Unknown flags are
 // never dropped; flags the basic UI owns are moved into their fields.
 func Parse(kind string, command string) (Spec, error) {
-	return ParseTokens(kind, Tokenize(command))
+	return ParseTokens(kind, Tokenize(kind, command))
 }
 
 // ParseTokens parses an already tokenized argv. It is used by the managed

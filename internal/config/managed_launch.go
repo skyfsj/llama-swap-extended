@@ -207,7 +207,7 @@ func BuildManagedLaunchArguments(args []string, entrypoint, kind, proxy string) 
 	if trimmed := strings.TrimSpace(entrypoint); trimmed != "" {
 		// The head is a shell-like command line, so it is tokenized with the
 		// same lexer the operator's argument text uses — never executed.
-		head := launchspec.Tokenize(trimmed)
+		head := launchspec.Tokenize(kind, trimmed)
 		if len(head) == 0 {
 			return nil, nil, errors.New("backend.entrypoint is empty")
 		}

@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -2493,6 +2494,13 @@ func restoreBytesIfExists(path string, data []byte, exists bool) error {
 }
 
 func syncDirectory(path string) error {
+	if runtime.GOOS == "windows" {
+		// Directory fsync is a POSIX durability idiom: FlushFileBuffers
+		// rejects directory handles (ERROR_ACCESS_DENIED), and the rename
+		// that made this directory entry is ordered without it. The file
+		// itself is still fsynced by the caller before the rename.
+		return nil
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return err

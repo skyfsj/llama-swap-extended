@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/mostlygeek/llama-swap/internal/store"
@@ -16,6 +17,12 @@ import (
 // truncated the file, then lost its manifest) must not be accepted on size
 // alone when the provider advertises no checksum.
 func TestModelDownload_SparsePartWithoutChecksumIsNotFinalized(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// fileIsSparse cannot be determined portably on Windows (see
+		// sparse_windows.go), so the hole detection this test exercises does
+		// not exist there: the truncated .part is accepted on size alone.
+		t.Skip("sparse-part detection is unix-only")
+	}
 	root := t.TempDir()
 	st, err := store.New("")
 	if err != nil {

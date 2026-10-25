@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"runtime"
 	"strings"
 
 	"github.com/evanw/esbuild/pkg/api"
@@ -23,8 +24,15 @@ type CheckDiagnostic struct {
 
 // virtualWorkingDir is a stand-in absolute working directory: nothing is read
 // from it and every file is served from the in-memory tree, but esbuild refuses
-// a relative one.
-const virtualWorkingDir = "/virtual-extension"
+// a relative one. It follows the host's path syntax because esbuild validates
+// AbsWorkingDir with the host's rules (a leading slash is not absolute on
+// Windows).
+func virtualWorkingDir() string {
+	if runtime.GOOS == "windows" {
+		return `C:\virtual-extension`
+	}
+	return "/virtual-extension"
+}
 
 // CheckTree checks a draft tree in memory and reports what esbuild finds. Two
 // passes run: every file is parsed on its own, so a syntax error in a module the
@@ -65,7 +73,7 @@ func bundleTree(files map[string]string) (string, error) {
 		return "", fmt.Errorf("bundle: %s is missing", EntryFile)
 	}
 	result := api.Build(api.BuildOptions{
-		EntryPoints: []string{EntryFile}, AbsWorkingDir: virtualWorkingDir, Bundle: true, Write: false,
+		EntryPoints: []string{EntryFile}, AbsWorkingDir: virtualWorkingDir(), Bundle: true, Write: false,
 		Platform: api.PlatformNeutral, Format: api.FormatIIFE, GlobalName: "__llamaSwapExtension",
 		LogLevel: api.LogLevelSilent, LogLimit: 100,
 		Plugins: []api.Plugin{{
@@ -86,7 +94,7 @@ func bundleTree(files map[string]string) (string, error) {
 // relative path that points at nothing.
 func checkBundle(files map[string]string) []CheckDiagnostic {
 	result := api.Build(api.BuildOptions{
-		EntryPoints: []string{EntryFile}, AbsWorkingDir: virtualWorkingDir, Bundle: true, Write: false,
+		EntryPoints: []string{EntryFile}, AbsWorkingDir: virtualWorkingDir(), Bundle: true, Write: false,
 		Platform: api.PlatformNeutral, Format: api.FormatIIFE, GlobalName: "__llamaSwapExtension",
 		LogLevel: api.LogLevelSilent, LogLimit: 100,
 		Plugins: []api.Plugin{{
@@ -195,8 +203,13 @@ func checkFilePath(location string) string {
 	if name == "" {
 		return EntryFile
 	}
-	if index := strings.LastIndex(name, virtualWorkingDir+"/"); index >= 0 {
-		name = name[index+len(virtualWorkingDir)+1:]
+	// esbuild reports paths in the host's separator, so match both.
+	wd := virtualWorkingDir()
+	for _, sep := range []string{"/", `\`} {
+		if index := strings.LastIndex(name, wd+sep); index >= 0 {
+			name = name[index+len(wd)+1:]
+			break
+		}
 	}
 	return strings.TrimPrefix(name, "/")
 }

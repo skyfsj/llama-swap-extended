@@ -256,3 +256,26 @@ func TestLaunchSpec_BuildEnvPinsDeviceOrderWithVisibleDevices(t *testing.T) {
 		t.Fatalf("empty spec env = %v, want none", got)
 	}
 }
+
+// A vllm command is a POSIX shell command wherever the server runs (vLLM does
+// not ship for Windows), so single-quoted JSON flags must tokenize identically
+// on every editing host: the dialect follows the runtime kind, not runtime.GOOS.
+// Windows CI used to run shlex.Windows here, which only recognises double
+// quotes and shattered '{"a":1}' into stray literal-quote tokens.
+func TestLaunchSpec_VllmKindTokenizesSingleQuotedJSONOnEveryHost(t *testing.T) {
+	spec, err := Parse("vllm", strings.Join([]string{
+		"vllm serve /models/demo",
+		`--default-chat-template-kwargs '{"enable_thinking":true,"reasoning_effort":"xhigh"}'`,
+	}, "\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(spec.ExtraArgs, `{"enable_thinking":true,"reasoning_effort":"xhigh"}`) {
+		t.Fatalf("single-quoted JSON was not kept as one token: %v", spec.ExtraArgs)
+	}
+	// The kind-scoped helper is the regression point: assert it directly so a
+	// future host-dialect refactor cannot silently re-break Windows.
+	if tokens := shlexSplit("vllm", `'{"a":1}' trailing`); len(tokens) != 2 || tokens[0] != `{"a":1}` {
+		t.Fatalf("vllm shlexSplit = %#v, want the quoted JSON unquoted as one token", tokens)
+	}
+}

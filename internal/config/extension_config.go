@@ -492,7 +492,7 @@ func (m LMCacheModuleConfig) Validate() error {
 		if l3.Path != p {
 			return errors.New("lmcache.server.l3.path must be normalized (no leading/trailing spaces)")
 		}
-		if !filepath.IsAbs(l3.Path) {
+		if !isAbsConfigPath(l3.Path) {
 			return fmt.Errorf("lmcache.server.l3.path %q must be an absolute path", l3.Path)
 		}
 	} else if strings.TrimSpace(l3.Path) != "" {
@@ -879,7 +879,7 @@ func (c ModelFilesConfig) Validate() error {
 		if (typeName == ModelFileSourceDirectory || typeName == ModelFileSourceFile) && path == "" {
 			return fmt.Errorf("modelFiles.sources.%s.path is required for %s sources", name, typeName)
 		}
-		if path != "" && !filepath.IsAbs(path) {
+		if path != "" && !isAbsConfigPath(path) {
 			return fmt.Errorf("modelFiles.sources.%s.path must be an absolute path", name)
 		}
 	}
@@ -1776,13 +1776,13 @@ func (r RuntimeConfig) Validate(name string) error {
 				}
 				pathValue = decoded
 			}
-			if !filepath.IsAbs(pathValue) || hasParentPathSegment(pathValue) {
+			if !isAbsConfigPath(pathValue) || hasParentPathSegment(pathValue) {
 				return fmt.Errorf("runtime %s: source.url file path must be absolute and cannot contain parent segments", name)
 			}
 		}
 	}
 	if r.Source.Path != "" {
-		if !filepath.IsAbs(r.Source.Path) {
+		if !isAbsConfigPath(r.Source.Path) {
 			return fmt.Errorf("runtime %s: source.path must be an absolute path", name)
 		}
 		if hasParentPathSegment(r.Source.Path) {
@@ -2292,7 +2292,7 @@ func validateRuntimeAllowlistEntry(raw string) error {
 		}
 		return nil
 	}
-	if !filepath.IsAbs(raw) {
+	if !isAbsConfigPath(raw) {
 		return errors.New("path allowlist entries must be absolute")
 	}
 	return nil

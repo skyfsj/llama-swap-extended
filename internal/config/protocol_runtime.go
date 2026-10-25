@@ -3,7 +3,6 @@ package config
 import (
 	"fmt"
 	"net/url"
-	"path/filepath"
 	"regexp"
 	"strings"
 )
@@ -46,7 +45,7 @@ func (c ProtocolRuntimeConfig) Validate() error {
 		}
 		switch s.Transport {
 		case "stdio":
-			if !filepath.IsAbs(s.Command) {
+			if !isAbsConfigPath(s.Command) {
 				return fmt.Errorf("MCP server %s: command must be absolute", id)
 			}
 		case "http", "sse":

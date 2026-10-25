@@ -159,6 +159,9 @@ groups:
 	}
 
 	modelLoadingState := false
+	// Config loading normalizes the rollback policy: an absent key becomes
+	// an explicit true so every consumer reads the historical behaviour.
+	trueRollback := true
 
 	defaultTimeout := TimeoutsConfig{
 		Connect:        30,
@@ -197,8 +200,9 @@ groups:
 		Macros: MacroList{
 			{"svr-path", "path/to/server"},
 		},
-		SendLoadingState: false,
-		UnloadTimeout:    DEFAULT_UNLOAD_TIMEOUT,
+		SendLoadingState:            false,
+		UnloadTimeout:               DEFAULT_UNLOAD_TIMEOUT,
+		RollbackOnModelStartFailure: &trueRollback,
 		Models: map[string]ModelConfig{
 			"model1": {
 				Cmd:                "path/to/cmd --arg1 one",

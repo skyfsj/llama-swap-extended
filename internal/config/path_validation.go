@@ -9,6 +9,21 @@ import (
 	"strings"
 )
 
+// isAbsConfigPath reports whether a configured filesystem path is absolute for
+// validation purposes. It accepts POSIX absolute paths (/var/lib/...) on every
+// host alongside host-native absolute paths, because a config authored for a
+// Linux deployment target is routinely edited and validated on a Windows host
+// (filepath.IsAbs rejects a leading slash there) and vice versa. This is a
+// shape check only — it never touches the filesystem — so a POSIX path is
+// accepted on Windows whether or not it is meaningful there, exactly like a
+// relative path that only resolves at launch time.
+func isAbsConfigPath(path string) bool {
+	if strings.HasPrefix(path, "/") {
+		return true
+	}
+	return filepath.IsAbs(path)
+}
+
 // rejectSymlinkComponents verifies every existing component of path without
 // following links. Store files are opened by the SQLite driver after config
 // validation, so accepting a symlink here would let an otherwise in-bound
