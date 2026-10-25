@@ -246,10 +246,10 @@ func TestStore_CompactionReclaimsUnreferencedBlocks(t *testing.T) {
 	if err := store.Clear(ctx); err != nil {
 		t.Fatal(err)
 	}
-	// Unreferenced blocks younger than blockInsertGrace are kept: an insert in
+	// Unreferenced blocks younger than BlockInsertGrace are kept: an insert in
 	// flight may still be about to reference them. Aging past the grace makes
 	// them reclaimable.
-	time.Sleep(blockInsertGrace + time.Second)
+	time.Sleep(BlockInsertGrace + time.Second)
 	reclaimed, dropped, err := store.CompactSegments(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -327,7 +327,7 @@ func TestStore_CompactionOffsetsSurviveRestart(t *testing.T) {
 	if err := store.Delete(ctx, "1"); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(blockInsertGrace + time.Second)
+	time.Sleep(BlockInsertGrace + time.Second)
 	if _, _, err := store.CompactSegments(ctx); err != nil {
 		t.Fatal(err)
 	}

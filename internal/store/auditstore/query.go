@@ -617,15 +617,17 @@ func (s *Store) segmentBlocksByCreation(name string) ([]blockRef, error) {
 	return ordered, nil
 }
 
-// blockInsertGrace shields blocks whose bookkeeping is still in flight from a
+// BlockInsertGrace shields blocks whose bookkeeping is still in flight from a
 // concurrent compaction. A block's bytes land in the segment before its index
 // row exists, and the row is committed with refcount 0 before the referencing
 // body bumps it to 1 — both windows span only the milliseconds of one Insert,
 // but a compaction pass running in that window would otherwise drop bytes a
 // committed transaction is about to reference. The cost is that freshly
 // deleted blocks wait out the grace before their bytes are reclaimed, which
-// the 10-minute maintenance cadence never notices.
-const blockInsertGrace = 2 * time.Second
+// the 10-minute maintenance cadence never notices. It is exported because the
+// window is observable behaviour: callers (and tests) that want a compaction
+// pass to actually reclaim freshly deleted bytes must age the data past it.
+const BlockInsertGrace = 2 * time.Second
 
 // CompactSegments rewrites the segment files keeping only referenced blocks and
 // removes segments whose day has fully expired. It returns reclaimed bytes and
@@ -641,7 +643,7 @@ func (s *Store) CompactSegments(ctx context.Context) (int64, int, error) {
 	if s == nil || s.db == nil {
 		return 0, 0, errors.New("audit store is unavailable")
 	}
-	graceCutoff := time.Now().Add(-blockInsertGrace).Unix()
+	graceCutoff := time.Now().Add(-BlockInsertGrace).Unix()
 	type blockRow struct {
 		refcount int64
 		lastSeen int64

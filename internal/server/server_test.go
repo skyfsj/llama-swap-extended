@@ -28,6 +28,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/router"
 	runtimeManager "github.com/mostlygeek/llama-swap/internal/runtime"
 	"github.com/mostlygeek/llama-swap/internal/store"
+	"github.com/mostlygeek/llama-swap/internal/store/auditstore"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
@@ -295,7 +296,11 @@ func TestServer_AuditMaintenanceReclaimsOrphanBlobs(t *testing.T) {
 		t.Fatalf("blocks changed inside the GC interval: %d -> %d (rate limit must hold)", baseline.Blocks, unchanged.Blocks)
 	}
 	// Past the interval the unreferenced blocks are dropped and the segment
-	// shrinks; the surviving row still reads its body.
+	// shrinks; the surviving row still reads its body. The store's
+	// keep-predicate shields refcount-0 blocks younger than
+	// auditstore.BlockInsertGrace, so the rows must age past that window
+	// before the next pass can reclaim them.
+	time.Sleep(auditstore.BlockInsertGrace + time.Second)
 	s.auditLastGC = time.Now().Add(-time.Hour)
 	s.gcAuditBlobs(ctx)
 	after, err := st.AuditStats(ctx)

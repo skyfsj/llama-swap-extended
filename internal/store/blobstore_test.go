@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/mostlygeek/llama-swap/internal/store/auditstore"
 )
 
 // readBlob streams a stored body the way the HTTP body endpoint does.
@@ -191,6 +193,11 @@ func TestStore_Blob_GC(t *testing.T) {
 	if err := st.DeleteAuditConversation(context.Background(), "gone"); err != nil {
 		t.Fatal(err)
 	}
+	// The keep-predicate shields refcount-0 blocks younger than
+	// BlockInsertGrace (a fresh delete must not lose bytes a body insert is
+	// about to reference): age the row past that window so the pass below
+	// actually reclaims instead of being a guaranteed no-op.
+	time.Sleep(auditstore.BlockInsertGrace + time.Second)
 	reclaimed, dropped, err := st.MaintainAudit(context.Background(), time.Time{})
 	if err != nil {
 		t.Fatal(err)
