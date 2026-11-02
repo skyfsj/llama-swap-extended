@@ -545,6 +545,9 @@ func (w *extensionStreamWriter) consumeResponses(eventName string, payload map[s
 			if functionName, ok := item["name"].(string); ok && functionName != "" {
 				call.Name = functionName
 			}
+			if namespace, ok := item["namespace"].(string); ok && namespace != "" {
+				call.Namespace = namespace
+			}
 			if arguments, ok := item["arguments"].(string); ok && arguments != "" {
 				call.Arguments = arguments
 			}
@@ -775,7 +778,14 @@ func (w *extensionStreamWriter) ContinueResponse() map[string]any {
 		})
 	}
 	for _, call := range calls {
-		out = append(out, map[string]any{"type": "function_call", "call_id": call.ID, "name": call.Name, "arguments": call.Arguments})
+		item := map[string]any{"type": "function_call", "call_id": call.ID, "name": call.Name, "arguments": call.Arguments}
+		if call.Namespace != "" {
+			// The continuation is replayed as the client's own turn: a call that
+			// belongs to a namespace must stay in it, or the next round hands the
+			// model a call the client can no longer resolve.
+			item["namespace"] = call.Namespace
+		}
+		out = append(out, item)
 	}
 	return map[string]any{"output": out}
 }
@@ -942,6 +952,11 @@ func (w *extensionStreamWriter) emitResponsesVisibleCalls(calls []extensionCall,
 			item = responsesCallItem(call, outputs[call.ID])
 		} else {
 			item = map[string]any{"type": "function_call", "id": call.ID, "call_id": call.ID, "name": call.Name, "arguments": call.Arguments, "status": "completed"}
+			if call.Namespace != "" {
+				// The client dispatches by (namespace, name): a namespaced call
+				// handed back bare is "unsupported call" on Codex.
+				item["namespace"] = call.Namespace
+			}
 		}
 		index := w.outputNextIndex
 		w.outputNextIndex++
@@ -1052,6 +1067,9 @@ func (w *extensionStreamWriter) FinishClientCalls(calls []extensionCall) error {
 	}
 	for _, call := range calls {
 		item := map[string]any{"type": "function_call", "id": call.ID, "call_id": call.ID, "name": call.Name, "arguments": call.Arguments, "status": "completed"}
+		if call.Namespace != "" {
+			item["namespace"] = call.Namespace
+		}
 		index := w.outputNextIndex
 		w.outputNextIndex++
 		if err := w.emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "response_id": w.publicID, "output_index": index, "item": item}); err != nil {

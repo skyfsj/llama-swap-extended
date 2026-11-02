@@ -1340,8 +1340,12 @@ func addedExtensionTools(before, after []string) []string {
 
 type extensionCall struct {
 	ID, OriginalID, Name, Arguments string
-	Owner                           *extensions.Compiled
-	Precomputed                     map[string]any
+	// Namespace is the Responses tool namespace the call was declared in. Codex
+	// dispatches a call by (namespace, name), so rebuilding the item without it
+	// leaves the call unresolvable on the client.
+	Namespace   string
+	Owner       *extensions.Compiled
+	Precomputed map[string]any
 	// RawPart is the wire part a call arrived as, when the surface's parts carry
 	// more than a name and arguments (Gemini thought signatures). A continuation
 	// echoes it back instead of rebuilding the part from name and arguments alone.
@@ -1548,8 +1552,9 @@ func extensionCalls(response map[string]any, endpoint string) []extensionCall {
 		id, _ := item["call_id"].(string)
 		name, _ := item["name"].(string)
 		args, _ := item["arguments"].(string)
+		namespace, _ := item["namespace"].(string)
 		if id != "" && name != "" {
-			result = append(result, extensionCall{ID: id, Name: name, Arguments: args})
+			result = append(result, extensionCall{ID: id, Name: name, Arguments: args, Namespace: namespace})
 		}
 	}
 	return result
