@@ -2197,10 +2197,17 @@ func (e *responsesStreamEncoder) renderTool(slot int) map[string]any {
 	if namespace != "" {
 		item["namespace"] = namespace
 	}
-	if kind == ToolKindCustom {
+	switch kind {
+	case ToolKindCustom:
 		item["type"] = "custom_tool_call"
 		item["input"] = customToolInputFromArguments(arguments)
-	} else {
+	case ToolKindToolSearch:
+		// Codex matches a search answer to this item by call_id and executes
+		// it locally, so the arguments carry the parsed query object.
+		item["type"] = "tool_search_call"
+		item["execution"] = toolSearchExecution("")
+		item["arguments"] = searchArguments(json.RawMessage(arguments), &e.diagnostics)
+	default:
 		item["type"] = "function_call"
 		item["arguments"] = arguments
 	}
@@ -2227,6 +2234,10 @@ func (e *responsesStreamEncoder) announceTool(slot int) ([]Frame, error) {
 	}
 	if kind == ToolKindCustom {
 		item["type"] = "custom_tool_call"
+	} else if kind == ToolKindToolSearch {
+		item["type"] = "tool_search_call"
+		item["execution"] = toolSearchExecution("")
+		item["arguments"] = map[string]any{}
 	} else {
 		item["type"] = "function_call"
 		item["arguments"] = ""
@@ -2240,6 +2251,11 @@ func (e *responsesStreamEncoder) announceTool(slot int) ([]Frame, error) {
 	}
 	frames := []Frame{added}
 	if kind == ToolKindCustom {
+		return frames, nil
+	}
+	if kind == ToolKindToolSearch {
+		// Its arguments are a typed object, not a JSON string to be streamed
+		// into, and codex reads them from output_item.done.
 		return frames, nil
 	}
 	if arguments, _ := e.toolItems[slot]["arguments"].(string); arguments != "" {
@@ -2294,7 +2310,7 @@ func (e *responsesStreamEncoder) closeTool(slot int) ([]Frame, error) {
 			return frames, err
 		}
 		frames = append(frames, done)
-	} else {
+	} else if kind != ToolKindToolSearch {
 		done, err := e.eventFrame("response.function_call_arguments.done", map[string]any{
 			"type": "response.function_call_arguments.done", "sequence_number": e.nextSequence(),
 			"item_id": e.toolItems[slot]["id"], "output_index": e.toolPositions[slot],

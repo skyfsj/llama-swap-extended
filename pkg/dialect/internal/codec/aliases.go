@@ -63,8 +63,9 @@ const (
 	ToolChoiceRequired = core.ToolChoiceRequired
 	ToolChoiceTool     = core.ToolChoiceTool
 
-	ToolKindFunction = core.ToolKindFunction
-	ToolKindCustom   = core.ToolKindCustom
+	ToolKindFunction   = core.ToolKindFunction
+	ToolKindCustom     = core.ToolKindCustom
+	ToolKindToolSearch = core.ToolKindToolSearch
 
 	FormatText       = core.FormatText
 	FormatJSONObject = core.FormatJSONObject
@@ -101,3 +102,5 @@ var (
 )
 
 const defaultToolNamespace = core.DefaultToolNamespace
+
+const toolSearchName = core.ToolSearchName

@@ -1757,6 +1757,19 @@ func encodeResponsesTools(tools []Tool) []any {
 	namespaces := map[string][]any{}
 	for _, tool := range tools {
 		entry := map[string]any{"type": "function", "name": tool.Name}
+		if tool.Kind == ToolKindToolSearch {
+			// Codex declares the search tool without a name field, and its
+			// type tag is what makes the client execute the call itself.
+			entry = map[string]any{
+				"type": "tool_search", "execution": "client",
+				"parameters": rawJSONOrEmpty(tool.Parameters),
+			}
+			if tool.Description != "" {
+				entry["description"] = tool.Description
+			}
+			out = append(out, entry)
+			continue
+		}
 		if tool.Kind == ToolKindCustom {
 			entry["type"] = "custom"
 			entry["name"] = tool.Name

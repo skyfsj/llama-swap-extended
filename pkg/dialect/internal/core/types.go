@@ -80,6 +80,9 @@ type Part struct {
 	// ToolKind distinguishes an ordinary JSON function call from a Responses
 	// custom (freeform) tool call.
 	ToolKind ToolKind
+	// Execution carries the Responses tool_search execution mode ("client").
+	// Only ToolKindToolSearch parts use it.
+	Execution string
 
 	// IsError marks a tool result as a failure report.
 	IsError bool
@@ -117,7 +120,16 @@ const (
 	// ToolKindCustom is a Responses custom (freeform) tool. A function-calling
 	// target receives it as a function with one string "input" argument.
 	ToolKindCustom ToolKind = "custom"
+	// ToolKindToolSearch is the client-executed deferred-tool discovery tool.
+	// A function-calling target receives it as an ordinary function; a
+	// Responses target gets the tool_search item shape back.
+	ToolKindToolSearch ToolKind = "tool_search"
 )
+
+// ToolSearchName is the upstream function name of the deferred-tool search
+// tool. Codex declares it without a name field, so a function-calling target
+// needs a fixed one.
+const ToolSearchName = "tool_search"
 
 // Tool describes a callable function.
 type Tool struct {

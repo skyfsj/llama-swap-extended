@@ -817,6 +817,35 @@ func customToolInputFromArguments(arguments string) string {
 	return string(encoded)
 }
 
+// toolSearchExecution reports the execution mode of a tool_search call. Codex
+// only honours "client", and the upstream tool carries no mode of its own, so
+// a search call always names the client.
+func toolSearchExecution(execution string) string {
+	if execution == "" {
+		return "client"
+	}
+	return execution
+}
+
+// searchArguments renders a search call's arguments as the object codex
+// expects. Chat delivers them as a JSON string, and codex types the field as an
+// object, so an unparseable value becomes an empty query instead of a string
+// inside a typed field — with a diagnostic, because an empty search silently
+// discovers nothing.
+func searchArguments(raw json.RawMessage, diagnostics *[]Diagnostic) any {
+	text := argumentsText(raw)
+	var value any
+	if err := json.Unmarshal([]byte(text), &value); err == nil {
+		if object, ok := value.(map[string]any); ok {
+			return object
+		}
+	}
+	appendDiagnostic(diagnostics, "tool_search_arguments_invalid",
+		"a tool_search call's arguments were not a JSON object; an empty query was sent",
+		"output")
+	return map[string]any{}
+}
+
 func encodeResponsesOutputItems(parts []Part, responseID string, state *ToolState, diagnostics *[]Diagnostic) []any {
 	var items []any
 	var content []any
@@ -874,10 +903,18 @@ func encodeResponsesOutputItems(parts []Part, responseID string, state *ToolStat
 			if namespace != "" {
 				entry["namespace"] = namespace
 			}
-			if kind == ToolKindCustom {
+			switch kind {
+			case ToolKindCustom:
 				entry["type"] = "custom_tool_call"
 				entry["input"] = customToolInputFromArguments(argumentsText(part.Arguments))
-			} else {
+			case ToolKindToolSearch:
+				// Codex dispatches this item type itself, searching the
+				// deferred tool metadata locally. A function_call would be
+				// resolved against a registry that has no such tool.
+				entry["type"] = "tool_search_call"
+				entry["execution"] = toolSearchExecution(part.Execution)
+				entry["arguments"] = searchArguments(part.Arguments, diagnostics)
+			default:
 				entry["type"] = "function_call"
 				entry["arguments"] = argumentsText(part.Arguments)
 			}

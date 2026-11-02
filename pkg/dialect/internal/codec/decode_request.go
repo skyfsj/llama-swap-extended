@@ -1321,6 +1321,34 @@ func decodeResponsesInput(input any, diagnostics *[]Diagnostic, state *ToolState
 			case "item_reference":
 				appendDiagnostic(diagnostics, "item_reference_dropped",
 					"item_reference cannot be resolved without the Responses store", itemPath)
+			case "tool_search_call":
+				// The model asked for deferred tools by description. A
+				// function-calling target replays it as a call to the search
+				// function, so the turn reads the same way to the model.
+				arguments := rawObject(item["arguments"])
+				call := Part{
+					Kind:          PartToolCall,
+					ToolCallID:    stringAt(item, "call_id"),
+					ToolName:      toolSearchName,
+					ToolKind:      ToolKindToolSearch,
+					Execution:     stringAt(item, "execution"),
+					Arguments:     arguments,
+					ArgumentsText: string(mustMarshal(arguments)),
+				}
+				messages = appendAssistantToolCall(messages, call)
+				state.Set(toolSearchName, ToolBinding{Kind: ToolKindToolSearch})
+			case "tool_search_output":
+				// The tools the client discovered are declared here rather than
+				// in the request's tool list, so they must join the callable set
+				// or the model can never use them. The result text also replays
+				// as the answer to the search call.
+				discovered := decodeResponsesTools(arrayAt(item, "tools"), diagnostics, state, seen)
+				additional = append(additional, discovered...)
+				result := toolResultPart(stringAt(item, "call_id"), toolSearchName, []Part{{
+					Kind: PartText, Text: fmt.Sprintf("discovered %d tools", len(discovered)),
+				}}, false)
+				result.ToolKind = ToolKindToolSearch
+				messages = append(messages, Message{Role: RoleTool, Parts: []Part{result}})
 			case "web_search_call", "file_search_call", "computer_call", "computer_call_output",
 				"local_shell_call", "local_shell_call_output", "image_generation_call", "mcp_call", "mcp_list_tools", "mcp_approval_request":
 				appendDiagnostic(diagnostics, "hosted_item_dropped",
@@ -1470,7 +1498,9 @@ func decodeResponsesTools(raw []any, diagnostics *[]Diagnostic, state *ToolState
 		}
 		seen[tool.Name] = struct{}{}
 		tools = append(tools, tool)
-		if tool.Kind == ToolKindCustom {
+		if tool.Kind == ToolKindCustom || tool.Kind == ToolKindToolSearch {
+			// Both need the binding on the way back out: a custom call returns
+			// as custom_tool_call, and a search call returns as tool_search_call.
 			state.Set(tool.Name, ToolBinding{Kind: tool.Kind})
 		}
 	}
@@ -1494,6 +1524,18 @@ func decodeResponsesTools(raw []any, diagnostics *[]Diagnostic, state *ToolState
 				Parameters:  json.RawMessage(customToolInputSchema),
 				Kind:        ToolKindCustom,
 				Format:      rawObject(tool["format"]),
+			}, path)
+		case "tool_search":
+			// Codex declares its deferred-tool discovery tool without a name:
+			// the parameters are an ordinary JSON schema the model fills in,
+			// and the call is executed by the client. A function-calling
+			// target can host that faithfully under a fixed name, so the
+			// capability is not lost just because the type name differs.
+			appendTool(Tool{
+				Name:        toolSearchName,
+				Description: stringAt(tool, "description"),
+				Parameters:  rawObject(tool["parameters"]),
+				Kind:        ToolKindToolSearch,
 			}, path)
 		case "", "function":
 			description := stringAt(tool, "description")
