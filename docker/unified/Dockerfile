@@ -208,6 +208,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 python3 curl ca-certificates \
     libavcodec60 libavformat60 libavutil58 libswresample4 \
     ffmpeg \
+    ipmitool \
     && rm -rf /var/lib/apt/lists/*
 
 # CUDA stub drivers for container compatibility

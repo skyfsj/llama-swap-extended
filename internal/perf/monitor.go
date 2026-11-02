@@ -27,6 +27,9 @@ const (
 
 type gpuStatsFunc func(ctx context.Context, every time.Duration, logger *logmon.Monitor) (chan []GpuStat, error)
 
+// nodeCollectFunc starts the node power collector.
+type nodeCollectFunc func(ctx context.Context, command string, logger *logmon.Monitor) (<-chan NodeStat, error)
+
 // gpuWaitFunc waits d before a collector restart. It returns false if ctx is
 // done first.
 type gpuWaitFunc func(ctx context.Context, d time.Duration) bool
@@ -44,6 +47,11 @@ type Monitor struct {
 	// Tests replace both.
 	gpuStats gpuStatsFunc
 	gpuWait  gpuWaitFunc
+
+	// nodeCollect starts the node power collector; tests replace it. It
+	// returns ErrNoNodePowerTool when no IPMI tool exists, which Start
+	// retries on.
+	nodeCollect nodeCollectFunc
 
 	// energy accumulators integrate power samples into watt-hours since
 	// process start. They survive UpdateConfig restarts so the Prometheus
@@ -93,6 +101,8 @@ func New(c config.PerformanceConfig, power config.PowerConfig, logger *logmon.Mo
 
 		gpuStats: getGpuStats,
 		gpuWait:  waitOrDone,
+
+		nodeCollect: collectNodePower,
 	}, nil
 }
 
@@ -229,14 +239,30 @@ func (m *Monitor) Start() {
 	}
 
 	go func(ctx context.Context) {
-		nodeCh, err := collectNodePower(ctx, ipmi.Command, m.log)
-		if err != nil {
-			if errors.Is(err, ErrNoNodePowerTool) {
-				m.log.Infof("node power monitoring not available: %s", err.Error())
-			} else {
-				m.log.Errorf("failed to initialize node power monitoring: %s", err.Error())
+		// A missing ipmitool is not permanent — a rebuilt image may ship it or
+		// the package may be installed into the running container — so keep
+		// re-probing instead of giving up for the process lifetime. Only the
+		// first absence is logged; recovery announces itself through the
+		// collector's own "available" line.
+		loggedUnavailable := false
+		var nodeCh <-chan NodeStat
+		for nodeCh == nil {
+			ch, err := m.nodeCollect(ctx, ipmi.Command, m.log)
+			if err == nil {
+				nodeCh = ch
+				break
 			}
-			return
+			if !errors.Is(err, ErrNoNodePowerTool) {
+				m.log.Errorf("failed to initialize node power monitoring: %s", err.Error())
+				return
+			}
+			if !loggedUnavailable {
+				loggedUnavailable = true
+				m.log.Infof("node power monitoring not available: %s (retrying every %s)", err.Error(), nodePowerToolRetry)
+			}
+			if !m.gpuWait(ctx, nodePowerToolRetry) {
+				return
+			}
 		}
 
 		for {

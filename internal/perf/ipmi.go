@@ -30,6 +30,13 @@ const nodePowerTimeout = 5 * time.Second
 // before probing again, avoiding a permanent stream of failing exec calls.
 const ipmiProbeBackoffBase = 3
 
+// nodePowerToolRetry is how often the monitor re-probes for an ipmitool
+// binary after startup found none. The tool can appear later (a rebuilt
+// container image that ships it, or the package installed into a running
+// container), so a missing binary must not silence node power monitoring for
+// the lifetime of the process.
+const nodePowerToolRetry = 5 * time.Minute
+
 // dcmiPowerRe matches the "Instantaneous power reading" line of
 // `ipmitool dcmi power` output.
 var dcmiPowerRe = regexp.MustCompile(`Instantaneous power reading:\s+([0-9]+(?:\.[0-9]+)?)\s*Watts`)

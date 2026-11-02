@@ -1,8 +1,10 @@
 package perf
 
 import (
+	"context"
 	"io"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -310,4 +312,39 @@ func TestParseIoregOutput_MissingModel(t *testing.T) {
 	assert.Equal(t, "Apple GPU", stat.Name)
 	assert.Equal(t, 50.0, stat.GpuUtilPct)
 	assert.Equal(t, 1, stat.MemUsedMB)
+}
+
+func TestStart_NodeCollectorRetriesUntilToolAppears(t *testing.T) {
+	m, err := New(config.PerformanceConfig{Every: 100 * time.Millisecond}, config.PowerConfig{}, newTestLogger())
+	require.NoError(t, err)
+
+	var attempts atomic.Int32
+	m.nodeCollect = func(ctx context.Context, command string, log *logmon.Monitor) (<-chan NodeStat, error) {
+		if attempts.Add(1) == 1 {
+			return nil, ErrNoNodePowerTool
+		}
+		ch := make(chan NodeStat, 1)
+		ch <- NodeStat{Timestamp: time.Now(), PowerW: 376, Source: "ipmi-dcmi"}
+		close(ch)
+		return ch, nil
+	}
+	// Skip the real 5-minute retry sleep.
+	m.gpuWait = func(ctx context.Context, d time.Duration) bool { return true }
+
+	m.Start()
+	defer m.Stop()
+
+	deadline := time.After(2 * time.Second)
+	for !m.NodePowerAvailable() {
+		select {
+		case <-deadline:
+			t.Fatal("node sample never arrived after the retry")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	_, _, nodeStats := m.Current()
+	require.Len(t, nodeStats, 1)
+	assert.Equal(t, 376.0, nodeStats[0].PowerW)
+	assert.Equal(t, int32(2), attempts.Load(), "collector should be re-probed exactly once after the miss")
 }
