@@ -91,6 +91,31 @@ export function currentWatts(series: PowerSeriesData | null | undefined): number
   return series.points[series.points.length - 1].avg_watts;
 }
 
+/**
+ * A series whose newest point is older than this no longer counts as "now":
+ * a stopped collector (missing ipmitool, broken GPU tool) would otherwise
+ * freeze the headline current-power reading at its last value for days while
+ * presenting it as the live draw.
+ */
+export const POWER_CURRENT_MAX_AGE_MS = 5 * 60 * 1000;
+
+/**
+ * recentWatts returns the newest reading of a series when that point is fresh
+ * enough to represent the present moment, else -1. The fallback path of the
+ * current-power KPI relies on this so a dead node series is ignored instead
+ * of pinning the reading to a stale wattage.
+ */
+export function recentWatts(
+  series: PowerSeriesData | null | undefined,
+  nowMs: number = Date.now(),
+): number {
+  const watts = currentWatts(series);
+  if (watts < 0 || !series || series.points.length === 0) return -1;
+  const lastTs = Date.parse(series.points[series.points.length - 1].timestamp);
+  if (!Number.isFinite(lastTs) || nowMs - lastTs > POWER_CURRENT_MAX_AGE_MS) return -1;
+  return watts;
+}
+
 /** seriesLabel picks the display name of a power source. */
 export function seriesLabel(series: PowerSeriesData): string {
   if (series.is_node) return series.source_id;

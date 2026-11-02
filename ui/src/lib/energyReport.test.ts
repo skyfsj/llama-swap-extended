@@ -9,6 +9,7 @@ import {
   isPowerWindowKey,
   monthlyEstimate,
   powerChartData,
+  recentWatts,
   seriesLabel,
   tariffLabel,
 } from "./energyReport";
@@ -75,6 +76,28 @@ describe("currentWatts", () => {
     expect(currentWatts(entry)).toBe(150);
     expect(currentWatts(null)).toBe(-1);
     expect(currentWatts(series("a", []))).toBe(-1);
+  });
+});
+
+describe("recentWatts", () => {
+  // Anchor "now" well past the newest sample so the age math is deterministic.
+  const now = Date.parse("2026-10-02T01:30:00Z");
+
+  it("returns the reading when the newest point is fresh", () => {
+    // 2 minutes old — inside the 5-minute window.
+    const entry = series("a", [{ t: "2026-10-02T01:28:00Z", watts: 200 }]);
+    expect(recentWatts(entry, now)).toBe(200);
+  });
+
+  it("reports -1 when the newest point is stale", () => {
+    // 3 days old: a dead collector must not pin the headline reading.
+    const entry = series("a", [{ t: "2026-09-29T11:57:33Z", watts: 358 }]);
+    expect(recentWatts(entry, now)).toBe(-1);
+  });
+
+  it("reports -1 for missing or empty series", () => {
+    expect(recentWatts(null, now)).toBe(-1);
+    expect(recentWatts(series("a", []), now)).toBe(-1);
   });
 });
 

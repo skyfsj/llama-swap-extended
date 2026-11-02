@@ -10,7 +10,6 @@
     POWER_SERIES_COLORS,
     POWER_WINDOW_LABEL_KEYS,
     POWER_WINDOW_OPTIONS,
-    currentWatts,
     formatCost,
     formatGpuSeconds,
     formatKwh,
@@ -19,6 +18,7 @@
     isPowerWindowKey,
     monthlyEstimate,
     powerChartData,
+    recentWatts,
     seriesLabel,
     tariffLabel,
     type PowerWindowKey,
@@ -96,13 +96,16 @@
   });
 
   // The headline "now" reading prefers the node meter (whole machine) and
-  // falls back to the busiest GPU card.
+  // falls back to the busiest GPU card. Both go through recentWatts: a
+  // collector that died days ago must not pin the reading to its last value.
+  let nodeFresh = $derived(recentWatts(nodeSeries) >= 0);
+  let gpuFresh = $derived(gpuSeries.some((entry) => recentWatts(entry) >= 0));
   let currentPower = $derived.by(() => {
-    const node = currentWatts(nodeSeries);
+    const node = recentWatts(nodeSeries);
     if (node >= 0) return node;
     let best = -1;
     for (const entry of gpuSeries) {
-      const watts = currentWatts(entry);
+      const watts = recentWatts(entry);
       if (watts > best) best = watts;
     }
     return best;
@@ -266,9 +269,9 @@
         </div>
         <div class="mt-1 text-lg font-semibold">{formatWatts(currentPower)}</div>
         <div class="text-muted-foreground text-xs">
-          {#if report?.sources.ipmi}
+          {#if nodeFresh}
             {$translate("activity.energy.kpi.currentNode")}
-          {:else if gpuSeries.length > 0}
+          {:else if gpuFresh}
             {$translate("activity.energy.kpi.currentGpu")}
           {:else}
             —
