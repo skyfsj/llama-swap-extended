@@ -294,7 +294,7 @@ func encodeChatMessages(request *Request, diagnostics *[]Diagnostic) []any {
 				messages = append(messages, map[string]any{"role": role, "content": text})
 			}
 		case RoleTool:
-			messages = append(messages, encodeChatToolMessages(message, diagnostics)...)
+			messages = appendChatToolMessages(messages, message, diagnostics)
 		case RoleAssistant:
 			messages = append(messages, encodeChatAssistantMessage(message, diagnostics))
 		default:
@@ -311,6 +311,11 @@ func encodeChatMessages(request *Request, diagnostics *[]Diagnostic) []any {
 					"role": "tool", "tool_call_id": part.ToolCallID,
 					"content": encodeChatToolContent(part.Content, diagnostics),
 				})
+				if media := chatToolMedia(part.Content); len(media) > 0 {
+					if content := encodeChatContent(media, diagnostics, "tool result media"); content != nil {
+						messages = append(messages, map[string]any{"role": "user", "content": content})
+					}
+				}
 			}
 			if len(userParts) > 0 {
 				content := encodeChatContent(userParts, diagnostics, "user")
@@ -320,7 +325,208 @@ func encodeChatMessages(request *Request, diagnostics *[]Diagnostic) []any {
 			}
 		}
 	}
-	return mergeChatAssistantMessages(messages)
+	return fillChatToolCallReasoning(repairChatToolPairing(mergeChatAssistantMessages(attachChatReasoning(messages, diagnostics)), diagnostics), diagnostics)
+}
+
+// fillChatToolCallReasoning gives every replayed tool call an explicit
+// reasoning_content.
+//
+// A thinking-mode upstream such as DeepSeek refuses a transcript that replays
+// an assistant turn with tool_calls and no reasoning_content ("The
+// `reasoning_content` in the thinking mode must be passed back to the API"),
+// and a client that never receives the reasoning — a Responses client gets it
+// as a reasoning item it may not send back — has nothing to put there. The
+// empty string is accepted where a missing field is not, so the turn replays
+// instead of failing the whole request. A turn that does carry reasoning keeps
+// it untouched.
+func fillChatToolCallReasoning(messages []any, diagnostics *[]Diagnostic) []any {
+	filled := 0
+	for _, raw := range messages {
+		message, ok := raw.(map[string]any)
+		if !ok || message["role"] != "assistant" {
+			continue
+		}
+		if len(arrayAt(message, "tool_calls")) == 0 {
+			continue
+		}
+		if _, present := message["reasoning_content"]; present {
+			continue
+		}
+		message["reasoning_content"] = ""
+		filled++
+	}
+	if filled > 0 {
+		appendDiagnostic(diagnostics, "tool_call_reasoning_filled",
+			fmt.Sprintf("%d replayed tool call turn(s) carried no reasoning; an empty reasoning_content was added because a thinking-mode upstream rejects the turn without it", filled),
+			"messages")
+	}
+	return messages
+}
+
+// repairChatToolPairing makes sure every tool message and tool call carries an
+// id, which is the one pairing rule this encoder can enforce without knowing
+// the rest of the conversation.
+//
+// It deliberately does not judge whether a call was declared earlier: callers
+// also encode fragments, such as the single tool message the extension layer
+// appends to the next turn, and those fragments are valid only once stitched
+// into a conversation the encoder never sees. An output whose owning item was
+// dropped is handled where that is knowable, in the decoder.
+func repairChatToolPairing(messages []any, diagnostics *[]Diagnostic) []any {
+	declared := map[string]bool{}
+	// pending holds the calls no result has answered yet, oldest first, so an
+	// id-less result can still be matched to the call it belongs to.
+	var pending []string
+	synthetic := 0
+	nextID := func() string {
+		for {
+			synthetic++
+			id := fmt.Sprintf("call_auto_%d", synthetic)
+			if !declared[id] {
+				return id
+			}
+		}
+	}
+	out := make([]any, 0, len(messages))
+	for _, raw := range messages {
+		message, ok := raw.(map[string]any)
+		if !ok {
+			out = append(out, raw)
+			continue
+		}
+		switch message["role"] {
+		case "assistant":
+			calls := arrayAt(message, "tool_calls")
+			for _, rawCall := range calls {
+				call, ok := rawCall.(map[string]any)
+				if !ok {
+					continue
+				}
+				id := stringAt(call, "id")
+				if id == "" {
+					id = nextID()
+					call["id"] = id
+					appendDiagnostic(diagnostics, "tool_call_id_synthesized",
+						"a tool call had no id, which a tool result could never match, so one was generated",
+						"messages")
+				}
+				declared[id] = true
+				pending = append(pending, id)
+			}
+			out = append(out, message)
+		case "tool":
+			id := stringAt(message, "tool_call_id")
+			if id == "" && len(pending) > 0 {
+				id = pending[0]
+				message["tool_call_id"] = id
+				appendDiagnostic(diagnostics, "tool_call_id_inferred",
+					"a tool result carried no id and was matched to the oldest unanswered call",
+					"messages")
+			}
+			if id == "" {
+				// No id and no call to borrow one from: this cannot stay a
+				// tool message, because a server has nothing to match it by.
+				if content := message["content"]; !messageContentEmpty(content) {
+					out = append(out, map[string]any{"role": "user", "content": content})
+				}
+				appendDiagnostic(diagnostics, "tool_message_unpaired",
+					"a tool result carried no tool_call_id; it was replayed as user content instead",
+					"messages")
+				continue
+			}
+			for index, candidate := range pending {
+				if candidate == id {
+					pending = append(pending[:index], pending[index+1:]...)
+					break
+				}
+			}
+			out = append(out, message)
+		default:
+			out = append(out, message)
+		}
+	}
+	return out
+}
+
+// attachChatReasoning folds an assistant turn that carries only reasoning into
+// the assistant turn it introduces. Responses transcripts record the reasoning
+// item before the message and function calls it explains, which reaches the
+// encoder as its own message; leaving it separate produced a message with
+// content null, no tool_calls and only reasoning_content, which
+// OpenAI-compatible servers such as DeepSeek reject with "Invalid assistant
+// message: content or tool_calls must be set".
+func attachChatReasoning(messages []any, diagnostics *[]Diagnostic) []any {
+	out := make([]any, 0, len(messages))
+	var pending []string
+	dropPending := func() {
+		if len(pending) == 0 {
+			return
+		}
+		pending = nil
+		appendDiagnostic(diagnostics, "reasoning_only_message_dropped",
+			"an assistant turn carried reasoning but no content or tool calls, and no following assistant turn could hold it",
+			"messages")
+	}
+	for _, raw := range messages {
+		message, ok := raw.(map[string]any)
+		if !ok {
+			dropPending()
+			out = append(out, raw)
+			continue
+		}
+		if message["role"] != "assistant" {
+			dropPending()
+			out = append(out, raw)
+			continue
+		}
+		reasoning := stringAt(message, "reasoning_content")
+		if messageContentEmpty(message["content"]) && len(arrayAt(message, "tool_calls")) == 0 {
+			// Nothing but reasoning: hold it for the turn it belongs to. A turn
+			// with neither content, calls nor reasoning is simply dropped —
+			// OpenAI-compatible servers reject it.
+			if reasoning != "" {
+				pending = append(pending, reasoning)
+			} else {
+				appendDiagnostic(diagnostics, "empty_assistant_message_dropped",
+					"an assistant turn carried neither content nor tool calls and was dropped", "messages")
+			}
+			continue
+		}
+		if len(pending) > 0 {
+			pending = append(pending, reasoning)
+			message["reasoning_content"] = strings.Join(compactStrings(pending), "\n")
+			pending = nil
+		}
+		out = append(out, message)
+	}
+	dropPending()
+	return out
+}
+
+// compactStrings drops the empty entries so joining never introduces blank
+// lines that came from a turn without reasoning.
+func compactStrings(values []string) []string {
+	kept := values[:0]
+	for _, value := range values {
+		if value != "" {
+			kept = append(kept, value)
+		}
+	}
+	return kept
+}
+
+// messageContentEmpty reports whether an encoded Chat content field carries no
+// text, treating null, "" and an empty parts array alike.
+func messageContentEmpty(content any) bool {
+	switch value := content.(type) {
+	case nil:
+		return true
+	case string:
+		return value == ""
+	case []any:
+		return len(value) == 0
+	}
+	return false
 }
 
 func mergeChatAssistantMessages(messages []any) []any {
@@ -354,7 +560,13 @@ func mergeChatAssistantMessages(messages []any) []any {
 				}
 				last[key] = singleTextOrParts(parts)
 			} else {
-				last[key] = stringAt(last, key) + stringAt(message, key)
+				// Reasoning blocks from two turns stay two paragraphs, the
+				// same way attachChatReasoning joins a carried-over block.
+				if existing := stringAt(last, key); existing != "" {
+					last[key] = existing + "\n" + stringAt(message, key)
+				} else {
+					last[key] = stringAt(message, key)
+				}
 			}
 		}
 	}
@@ -366,8 +578,6 @@ func encodeChatToolContent(parts []Part, diagnostics *[]Diagnostic) any {
 	for _, part := range parts {
 		if part.Kind == PartText || part.Kind == PartRefusal {
 			content = append(content, part)
-		} else {
-			appendDiagnostic(diagnostics, "tool_result_part_dropped", "Chat tool messages support only text content", "messages.tool.content")
 		}
 	}
 	if result := encodeChatContent(content, diagnostics, "tool content"); result != nil {
@@ -376,8 +586,25 @@ func encodeChatToolContent(parts []Part, diagnostics *[]Diagnostic) any {
 	return ""
 }
 
-func encodeChatToolMessages(message Message, diagnostics *[]Diagnostic) []any {
-	var messages []any
+// chatToolMedia carries the media a Chat tool message cannot hold. Chat keeps a
+// tool message to text, but a Responses tool output may be an image — a
+// screenshot tool returns exactly that — and dropping it left the model with an
+// empty result, so the turn silently lost what the tool produced. The media is
+// replayed in the user turn that follows the result instead.
+func chatToolMedia(parts []Part) []Part {
+	var media []Part
+	for _, part := range parts {
+		switch part.Kind {
+		case PartImage, PartDocument, PartAudio, PartVideo:
+			media = append(media, part)
+		}
+	}
+	return media
+}
+
+// appendChatToolMessages renders one tool turn and appends any media its
+// results carried as the user turn that follows them.
+func appendChatToolMessages(messages []any, message Message, diagnostics *[]Diagnostic) []any {
 	for _, part := range message.Parts {
 		if part.Kind != PartToolResult {
 			appendDiagnostic(diagnostics, "message_part_dropped",
@@ -389,6 +616,11 @@ func encodeChatToolMessages(message Message, diagnostics *[]Diagnostic) []any {
 			"tool_call_id": part.ToolCallID,
 			"content":      encodeChatToolContent(part.Content, diagnostics),
 		})
+		if media := chatToolMedia(part.Content); len(media) > 0 {
+			if content := encodeChatContent(media, diagnostics, "tool result media"); content != nil {
+				messages = append(messages, map[string]any{"role": "user", "content": content})
+			}
+		}
 	}
 	return messages
 }
@@ -430,6 +662,12 @@ func encodeChatAssistantMessage(message Message, diagnostics *[]Diagnostic) map[
 	}
 	if refusal != "" {
 		output["refusal"] = refusal
+		// A refusal is the turn's only visible text; carry it as content too,
+		// because a message with content null and no tool calls is rejected by
+		// OpenAI-compatible servers.
+		if output["content"] == nil {
+			output["content"] = refusal
+		}
 	}
 	if len(toolCalls) > 0 {
 		output["tool_calls"] = toolCalls

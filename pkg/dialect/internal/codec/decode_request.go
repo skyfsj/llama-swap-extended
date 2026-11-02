@@ -1256,6 +1256,10 @@ func decodeResponsesInput(input any, diagnostics *[]Diagnostic, state *ToolState
 	case []any:
 		var messages []Message
 		var additional []Tool
+		// droppedCalls records ids of calls whose owning item could not be
+		// represented. Their outputs would otherwise survive as a tool result
+		// no target can pair, which every server rejects.
+		droppedCalls := map[string]bool{}
 		for index, raw := range value {
 			item, ok := raw.(map[string]any)
 			if !ok {
@@ -1300,8 +1304,23 @@ func decodeResponsesInput(input any, diagnostics *[]Diagnostic, state *ToolState
 					Arguments: encoded, ArgumentsText: string(encoded),
 				})
 			case "function_call_output", "custom_tool_call_output":
+				callID := stringAt(item, "call_id")
+				if droppedCalls[callID] {
+					// The call this answers was dropped, so the result has
+					// nothing to pair with. Replay its text as user content
+					// rather than emit an orphan tool result — for Chat and
+					// Anthropic alike, a result must answer a declared call.
+					content := decodeResponsesToolOutput(item["output"], diagnostics, itemPath+".output")
+					if len(content) > 0 {
+						messages = append(messages, Message{Role: RoleUser, Parts: content})
+					}
+					appendDiagnostic(diagnostics, "tool_output_unpaired",
+						"a tool output answers a call this dialect cannot represent, so it was replayed as user content",
+						itemPath)
+					continue
+				}
 				content := decodeResponsesToolOutput(item["output"], diagnostics, itemPath+".output")
-				result := toolResultPart(stringAt(item, "call_id"), "", content, false)
+				result := toolResultPart(callID, "", content, false)
 				if itemType == "custom_tool_call_output" {
 					result.ToolKind = ToolKindCustom
 				}
@@ -1351,6 +1370,9 @@ func decodeResponsesInput(input any, diagnostics *[]Diagnostic, state *ToolState
 				messages = append(messages, Message{Role: RoleTool, Parts: []Part{result}})
 			case "web_search_call", "file_search_call", "computer_call", "computer_call_output",
 				"local_shell_call", "local_shell_call_output", "image_generation_call", "mcp_call", "mcp_list_tools", "mcp_approval_request":
+				if callID := stringAt(item, "call_id"); callID != "" {
+					droppedCalls[callID] = true
+				}
 				appendDiagnostic(diagnostics, "hosted_item_dropped",
 					fmt.Sprintf("hosted Responses item %q cannot be represented", itemType), itemPath)
 			default:
