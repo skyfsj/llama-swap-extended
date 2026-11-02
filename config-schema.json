@@ -387,9 +387,10 @@
               },
               "default": [
                 "X-Session-ID",
-                "X-Litellm-Session-Id"
+                "X-Litellm-Session-Id",
+                "Session-Id"
               ],
-              "description": "Ordered request headers used to identify sessions in the Activity page."
+              "description": "Ordered request headers used to identify sessions in the Activity page. The first non-empty header wins; when the client sends none, a stable id is derived from the request body (the Responses prompt_cache_key, falling back to the conversation prefix) so a conversation still groups as one session."
             }
           },
           "additionalProperties": false,

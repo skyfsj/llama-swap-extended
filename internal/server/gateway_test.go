@@ -448,7 +448,7 @@ func TestServer_GatewaySessionDownstreamHeaderWins(t *testing.T) {
 	req := httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"prov/remote-chat","messages":[{"role":"user","content":"hello"}]}`))
 	req.Header.Set("X-Session-ID", "session-abc")
-	session := gatewaySession(req, cfg, "remote-chat")
+	session := gatewaySession(req, cfg, swaputil.ReqContextData{}, "remote-chat")
 
 	if session.ID != "session-abc" {
 		t.Fatalf("session id = %q, want the downstream value", session.ID)
@@ -465,7 +465,7 @@ func TestServer_GatewaySessionFallsBackToPrefix(t *testing.T) {
 	sessionFor := func(firstMessage string) gateway.Session {
 		body := `{"model":"prov/remote-chat","messages":[{"role":"user","content":"` + firstMessage + `"}]}`
 		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
-		return gatewaySession(req, cfg, "remote-chat")
+		return gatewaySession(req, cfg, swaputil.ReqContextData{}, "remote-chat")
 	}
 
 	first := sessionFor("how do I configure the gateway")
@@ -491,12 +491,34 @@ func TestServer_GatewaySessionNoSignalInjectsNothing(t *testing.T) {
 	cfg.UI.Activity.SessionID = []string{"X-Session-ID"}
 
 	req := httptest.NewRequest("GET", "/v1/models", nil)
-	session := gatewaySession(req, cfg, "remote-chat")
+	session := gatewaySession(req, cfg, swaputil.ReqContextData{}, "remote-chat")
 	if session.ID != "" {
 		t.Fatalf("session id = %q, want empty when neither header nor body signal exists", session.ID)
 	}
 	if session.Hash != "" {
 		t.Fatal("a request with no conversation signal must have no affinity: hashing the caller alone would pin every request it makes to one provider")
+	}
+}
+
+// TestServer_GatewaySessionUsesMiddlewareDerivedID pins the hand-off: the
+// request-context middleware derives a session id from the body for clients
+// that send no session header, and gatewaySession must reuse that id rather
+// than re-deriving from the 1MB prefix (which would split one Codex thread
+// across two identities).
+func TestServer_GatewaySessionUsesMiddlewareDerivedID(t *testing.T) {
+	cfg := gatewayTestConfig()
+	cfg.UI.Activity.SessionID = []string{"X-Session-ID"}
+
+	req := httptest.NewRequest("POST", "/v1/responses",
+		strings.NewReader(`{"model":"prov/remote-chat","messages":[{"role":"user","content":"a prefix shared by many threads"}]}`))
+	data := swaputil.ReqContextData{Metadata: map[string]string{"session_id": "01a1976b-55b9-7750-8eac-9caaa3a62789"}}
+	session := gatewaySession(req, cfg, data, "remote-chat")
+
+	if session.ID != "01a1976b-55b9-7750-8eac-9caaa3a62789" {
+		t.Fatalf("session id = %q, want the middleware-derived value", session.ID)
+	}
+	if session.Hash == "" {
+		t.Fatal("sticky hash must be derived")
 	}
 }
 

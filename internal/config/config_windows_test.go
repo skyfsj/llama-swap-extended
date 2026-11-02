@@ -271,6 +271,7 @@ groups:
 		UI: UIConfig{Activity: UIActivityConfig{SessionID: []string{
 			"X-Session-ID",
 			"X-Litellm-Session-Id",
+			"Session-Id",
 		}}},
 		Performance: PerformanceConfig{
 			Every: 5 * time.Second,

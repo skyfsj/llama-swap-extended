@@ -2,6 +2,9 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -11,6 +14,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/store"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
+	"github.com/tidwall/gjson"
 )
 
 // apiKeyAuthChallenge deliberately advertises bearer credentials to browsers.
@@ -133,10 +137,66 @@ func CreateRequestContextMiddleware(cfg config.Config) chain.Middleware {
 					break
 				}
 			}
+			if data.Metadata["session_id"] == "" {
+				// No configured session header: self-identify from the body so
+				// a client that sends none still groups its turns into one
+				// session. The Responses prompt_cache_key carries the client's
+				// own conversation id (Codex uses its thread id); it is the
+				// stable per-conversation signal even on multi-MB bodies where
+				// the conversation prefix is shared across threads.
+				if derived := sessionIDFromBody(r); derived != "" {
+					data.Metadata["session_id"] = derived
+				}
+			}
 			*r = *r.WithContext(swaputil.SetContext(r.Context(), data))
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// sessionIDFromBody derives a session id from a client that sends none of the
+// configured session headers. The Responses prompt_cache_key is the first
+// choice: OpenAI-compatible clients put their own stable conversation id in
+// it (Codex Desktop sends the thread id) and it survives multi-MB bodies. The
+// conversation's opening line is the fallback so a Chat client without any
+// cache key still groups its turns; the value is content-derived, not an id,
+// so it is truncated before use.
+func sessionIDFromBody(r *http.Request) string {
+	if r.Body == nil {
+		return ""
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, swaputil.MaxRequestBodySize))
+	// Adopt the read bytes as the replayable body: downstream consumers
+	// (protocol codecs, gateway fingerprinting, audit) need the full stream
+	// after this middleware has consumed it.
+	if err != nil {
+		return ""
+	}
+	swaputil.AdoptRequestBody(r, body)
+	if key := strings.TrimSpace(gjson.GetBytes(body, "prompt_cache_key").String()); key != "" {
+		return key
+	}
+	for _, path := range []string{
+		"input.0.content",
+		"messages.0.content",
+		"contents.0.parts.0.text",
+	} {
+		if text := gjson.GetBytes(body, path).String(); text != "" {
+			return conversationPrefixID(text)
+		}
+	}
+	return ""
+}
+
+// conversationPrefixID maps the opening line of a conversation to a stable,
+// opaque id so the audit column stays short and comparable.
+func conversationPrefixID(text string) string {
+	const max = 1024
+	if len(text) > max {
+		text = text[:max]
+	}
+	sum := sha256.Sum256([]byte(text))
+	return "cp-" + hex.EncodeToString(sum[:12])
 }
 
 // sameOrigin compares an Origin header value against the request's Host,

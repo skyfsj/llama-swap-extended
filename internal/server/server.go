@@ -1297,7 +1297,7 @@ func (s *Server) serveGateway(w http.ResponseWriter, r *http.Request, gw *gatewa
 	// Session affinity hash: explicit configured headers first, falling back
 	// to client identity + a body fingerprint. The raw session id accompanies
 	// the hash so providers can opt into receiving it as a request header.
-	session := gatewaySession(r, cfg, data.ModelID)
+	session := gatewaySession(r, cfg, data, data.ModelID)
 	localHasModel := s.local.Handles(data.ModelID)
 
 	// A request the protocol middleware already converted (a local model
@@ -1626,8 +1626,15 @@ func (s *Server) swapGateway(gw *gateway.Gateway) {
 // (metadata.user_id, prompt_cache_key or the first message/part content) so
 // follow-up turns of one conversation share an id. Requests carrying neither
 // signal inject nothing.
-func gatewaySession(r *http.Request, cfg config.Config, model string) gateway.Session {
-	sessionID := clientSessionID(r, cfg)
+func gatewaySession(r *http.Request, cfg config.Config, data swaputil.ReqContextData, model string) gateway.Session {
+	// The request-context middleware already resolved the session id (configured
+	// header, or the body-derived fallback for clients that send none), so
+	// reusing it keeps the upstream sessionHeaders and the affinity hash on
+	// the same identity the Activity page groups by.
+	sessionID := data.Metadata["session_id"]
+	if sessionID == "" {
+		sessionID = clientSessionID(r, cfg)
+	}
 
 	// Content signals: Anthropic metadata.user_id, OpenAI prompt_cache_key,
 	// then the conversation prefix itself.

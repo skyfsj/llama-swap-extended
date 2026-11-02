@@ -51,6 +51,10 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		UI: UIConfig{Activity: UIActivityConfig{SessionID: []string{
 			"X-Session-ID",
 			"X-Litellm-Session-Id",
+			// Codex Desktop sends the thread id as "Session-Id" (no "X-"
+			// prefix); without it in the list every Codex round is recorded
+			// with an empty session and the Activity page cannot group a thread.
+			"Session-Id",
 		}}},
 	}
 	if err = node.Decode(&config); err != nil {

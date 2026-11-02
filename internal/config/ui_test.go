@@ -14,7 +14,7 @@ func TestConfig_UIActivitySessionID(t *testing.T) {
 	}{
 		{
 			name: "defaults",
-			want: []string{"X-Session-ID", "X-Litellm-Session-Id"},
+			want: []string{"X-Session-ID", "X-Litellm-Session-Id", "Session-Id"},
 		},
 		{
 			name: "normalizes configured headers",

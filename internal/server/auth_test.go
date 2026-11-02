@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -13,6 +14,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/chain"
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/store"
+	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
 func TestServer_SanitizeAccessControlRequestHeaders(t *testing.T) {
@@ -78,6 +80,87 @@ func TestServer_RequestContextMiddleware(t *testing.T) {
 			t.Errorf("status = %d, want 404", w.Code)
 		}
 	})
+}
+
+// TestServer_SessionIDFallbackSelfIdentification covers the gateway-side
+// session recognition: a configured session header wins, and when the client
+// sends none the id is derived from the body (Responses prompt_cache_key,
+// falling back to the conversation prefix) so a conversation still groups
+// into one session.
+func TestServer_SessionIDFallbackSelfIdentification(t *testing.T) {
+	cfg := config.Config{
+		Models: map[string]config.ModelConfig{
+			"llama3": {},
+		},
+		UI: config.UIConfig{Activity: config.UIActivityConfig{SessionID: []string{
+			"X-Session-ID",
+			"Session-Id",
+		}}},
+	}
+
+	var (
+		session  string
+		bodySeen []byte
+	)
+	final := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		data, ok := swaputil.ReadContext(r.Context())
+		if !ok {
+			t.Fatal("request context missing downstream")
+		}
+		session = data.Metadata["session_id"]
+		var err error
+		bodySeen, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("reading body downstream: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	mw := CreateRequestContextMiddleware(cfg)
+
+	run := func(t *testing.T, name string, body string, header ...string) {
+		t.Helper()
+		t.Run(name, func(t *testing.T) {
+			session = ""
+			bodySeen = nil
+			r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+			r.Header.Set("Content-Type", "application/json")
+			for i := 0; i+1 < len(header); i += 2 {
+				r.Header.Set(header[i], header[i+1])
+			}
+			w := httptest.NewRecorder()
+			mw(final).ServeHTTP(w, r)
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200", w.Code)
+			}
+		})
+	}
+
+	const chatBody = `{"model":"llama3","messages":[{"role":"user","content":"write a haiku about swaps"},{"role":"assistant","content":"one"}]}`
+
+	run(t, "header wins over body", `{"model":"llama3","prompt_cache_key":"from-body"}`, "Session-Id", "hdr-1")
+	if session != "hdr-1" {
+		t.Errorf("session_id = %q, want %q", session, "hdr-1")
+	}
+
+	run(t, "prompt cache key derives the session", `{"model":"llama3","prompt_cache_key":"01a1976b-55b9-7750-8eac-9caaa3a62789"}`)
+	if session != "01a1976b-55b9-7750-8eac-9caaa3a62789" {
+		t.Errorf("session_id = %q, want the prompt cache key", session)
+	}
+
+	run(t, "conversation prefix derives the session", chatBody)
+	first := session
+	if first == "" || len(first) != len("cp-")+24 {
+		t.Fatalf("session_id = %q, want a cp- id", session)
+	}
+	// A later turn of the same conversation must land on the same id.
+	run(t, "later turn groups with the first", `{"model":"llama3","messages":[{"role":"user","content":"write a haiku about swaps"},{"role":"assistant","content":"one"},{"role":"user","content":"and a limerick"}]}`)
+	if session != first {
+		t.Errorf("session_id = %q, want %q (same conversation)", session, first)
+	}
+
+	if got := string(bodySeen); got != `{"model":"llama3","messages":[{"role":"user","content":"write a haiku about swaps"},{"role":"assistant","content":"one"},{"role":"user","content":"and a limerick"}]}` {
+		t.Errorf("body downstream = %s, want the full original body", got)
+	}
 }
 
 // TestServer_RequestContextMiddleware_Disabled covers maintenance mode at the
