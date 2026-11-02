@@ -287,19 +287,20 @@ func TestServer_StartCostBackfillRespectsConfig(t *testing.T) {
 		store.TokenMetrics{InputTokens: 1000, OutputTokens: 100}, 0, 0)
 
 	enabled.startCostBackfill()
-	deadline := time.Now().Add(5 * time.Second)
+	// Wait for both observable outcomes: the row priced (the batch commit) and
+	// the guard released (the final empty scan and cursor clear). Checking the
+	// guard the moment the cost appears races the pass's own tail.
+	deadline := time.Now().Add(10 * time.Second)
 	for {
 		cost, estimated := modelCost(t, enabled, "cf-trigger")
-		if estimated && cost > 0 {
-			break
+		if estimated && cost > 0 && enabled.costBackfillIdle() {
+			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("triggered pass never priced the row")
+			t.Fatalf("triggered pass never finished: cost=%v estimated=%v idle=%v",
+				cost, estimated, enabled.costBackfillIdle())
 		}
 		time.Sleep(20 * time.Millisecond)
-	}
-	if !enabled.costBackfillIdle() {
-		t.Fatal("triggered pass never finished")
 	}
 }
 
