@@ -86,6 +86,54 @@ func TestConfig_PowerValidate(t *testing.T) {
 			t.Fatalf("peak/valley split should validate: %v", err)
 		}
 	})
+
+	t.Run("timezone", func(t *testing.T) {
+		cfg := PowerConfig{Timezone: "Asia/Shanghai"}.Effective()
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("valid timezone should validate: %v", err)
+		}
+		if cfg.Location().String() != "Asia/Shanghai" {
+			t.Errorf("Location() = %v, want Asia/Shanghai", cfg.Location())
+		}
+
+		bad := PowerConfig{Timezone: "Mars/Olympus"}.Effective()
+		if err := bad.Validate(); err == nil {
+			t.Errorf("unknown timezone should fail validation")
+		}
+		if bad.Location() != time.Local {
+			t.Errorf("invalid timezone must fall back to local, got %v", bad.Location())
+		}
+
+		empty := PowerConfig{}.Effective()
+		if empty.Location() != time.Local {
+			t.Errorf("empty timezone should mean server local, got %v", empty.Location())
+		}
+	})
+}
+
+func TestConfig_TariffPriceForUsesTimezone(t *testing.T) {
+	cfg := PowerConfig{
+		ElectricityPricePerKwh: 0.5,
+		Timezone:               "Asia/Shanghai",
+		Tariffs: []PowerTariff{
+			{Name: "valley", PricePerKwh: 0.3, Start: "23:00", End: "07:00"},
+		},
+	}.Effective()
+
+	// 16:30 UTC = 00:30 Asia/Shanghai — inside the valley window in Shanghai
+	// wall clock, outside it in UTC wall clock.
+	utc := time.Date(2026, 10, 26, 16, 30, 0, 0, time.UTC)
+	price, name := cfg.TariffPriceFor(utc)
+	if price != 0.3 || name != "valley" {
+		t.Errorf("TariffPriceFor(16:30 UTC) = %v/%q, want 0.3/valley", price, name)
+	}
+
+	// 10:00 UTC = 18:00 Shanghai — no tariff either way.
+	day := time.Date(2026, 10, 26, 10, 0, 0, 0, time.UTC)
+	price, name = cfg.TariffPriceFor(day)
+	if price != 0.5 || name != "" {
+		t.Errorf("TariffPriceFor(10:00 UTC) = %v/%q, want 0.5/base", price, name)
+	}
 }
 
 func TestConfig_ThermalGuardEffective(t *testing.T) {

@@ -640,6 +640,7 @@ func (s *Server) handleAPIPower(w http.ResponseWriter, r *http.Request) {
 		modelID = requestedModel
 	}
 
+	cfg := s.currentConfig()
 	report, err := s.store.PowerReport(r.Context(), store.PowerReportQuery{
 		Start: start,
 		End:   end,
@@ -647,8 +648,11 @@ func (s *Server) handleAPIPower(w http.ResponseWriter, r *http.Request) {
 		// attributed energy. Provider models and names that are not configured
 		// at all still appear in the audit trail, but a row for them here would
 		// report 0 kWh next to a request count that reads like a real entry.
-		Models:  localActivityModels(s.currentConfig()),
+		Models:  localActivityModels(cfg),
 		ModelID: modelID,
+		// The today/month KPI boundaries follow power.timezone so a UTC-hosted
+		// server reports the operator's natural day.
+		Location: cfg.Power.Location(),
 	})
 	if err != nil {
 		s.proxylog.Errorf("power report: %v", err)

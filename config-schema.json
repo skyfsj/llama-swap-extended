@@ -504,6 +504,11 @@
           "default": {},
           "description": "Node-level power via local ipmitool (DCMI preferred, sensor readings as fallback). When unavailable the panel falls back to GPU power only."
         },
+        "timezone": {
+          "type": "string",
+          "default": "",
+          "description": "IANA timezone name (e.g. Asia/Shanghai) for the calendar day boundaries of the today/month energy totals and for tariff wall-clock windows. Empty uses the server's local timezone."
+        },
         "thermalGuard": {
           "type": "object",
           "properties": {

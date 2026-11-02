@@ -15,8 +15,8 @@ type PowerIpmiConfig struct {
 }
 
 // PowerTariff is one time-of-use electricity price window. Start and End are
-// "HH:MM" wall clock times in the server's local timezone; End earlier than
-// Start wraps across midnight (e.g. 22:00-06:00).
+// "HH:MM" wall clock times in power.timezone (server local when unset); End
+// earlier than Start wraps across midnight (e.g. 22:00-06:00).
 type PowerTariff struct {
 	Name        string  `yaml:"name" json:"name"`
 	PricePerKwh float64 `yaml:"pricePerKwh" json:"pricePerKwh"`
@@ -38,6 +38,12 @@ type PowerConfig struct {
 	RetentionDays          int             `yaml:"retentionDays" json:"retentionDays"`
 	FlushInterval          time.Duration   `yaml:"flushInterval" json:"flushInterval"`
 	Ipmi                   PowerIpmiConfig `yaml:"ipmi" json:"ipmi"`
+
+	// Timezone is the IANA zone name for the calendar day boundaries of the
+	// today/month totals and for the tariff wall-clock windows. Empty means
+	// the server's local timezone; a UTC-server operator in another timezone
+	// sets e.g. "Asia/Shanghai" so "today" means their natural day.
+	Timezone string `yaml:"timezone,omitempty" json:"timezone,omitempty"`
 
 	// ThermalGuard stops every model occupying an overheating GPU and puts it
 	// into maintenance mode until the card cools below the recovery point.
@@ -110,10 +116,29 @@ func (p PowerConfig) Effective() PowerConfig {
 	return p
 }
 
+// Location resolves the configured timezone for day boundaries and tariff
+// windows. An empty value (or an invalid name — rejected at validation time)
+// means the server's local timezone.
+func (p PowerConfig) Location() *time.Location {
+	if p.Timezone == "" {
+		return time.Local
+	}
+	loc, err := time.LoadLocation(p.Timezone)
+	if err != nil {
+		return time.Local
+	}
+	return loc
+}
+
 // Validate checks the power config values.
 func (p PowerConfig) Validate() error {
 	if p.ElectricityPricePerKwh < 0 {
 		return fmt.Errorf("electricityPricePerKwh must be >= 0, got %v", p.ElectricityPricePerKwh)
+	}
+	if p.Timezone != "" {
+		if _, err := time.LoadLocation(p.Timezone); err != nil {
+			return fmt.Errorf("timezone: %v", err)
+		}
 	}
 	if p.FlushInterval < 15*time.Second {
 		return fmt.Errorf("flushInterval must be at least 15s, got %v", p.FlushInterval)
@@ -182,12 +207,14 @@ func ParsePowerClock(value string) (int, error) {
 	return hour*60 + minute, nil
 }
 
-// TariffPriceFor returns the price per kWh active at local wall clock time t:
-// the covering tariff window's price, or the base price when no tariff covers
-// it (or when no tariffs are configured at all). The second return value is
-// the matched tariff name, empty for the base price.
+// TariffPriceFor returns the price per kWh active at wall clock time t,
+// evaluated in power.timezone (server local when unset): the covering tariff
+// window's price, or the base price when no tariff covers it (or when no
+// tariffs are configured at all). The second return value is the matched
+// tariff name, empty for the base price.
 func (p PowerConfig) TariffPriceFor(t time.Time) (float64, string) {
-	minutes := t.Hour()*60 + t.Minute()
+	wall := t.In(p.Location())
+	minutes := wall.Hour()*60 + wall.Minute()
 	for _, tariff := range p.Tariffs {
 		start, err := ParsePowerClock(tariff.Start)
 		if err != nil {
