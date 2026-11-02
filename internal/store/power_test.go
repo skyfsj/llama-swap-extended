@@ -316,3 +316,73 @@ func TestStore_PowerReportModelAllowlist(t *testing.T) {
 		t.Fatalf("unfiltered models = %+v, want 3 rows", unfiltered.Models)
 	}
 }
+
+func TestStore_PowerReportBaselineFallbackWhenAlwaysOccupied(t *testing.T) {
+	s, err := New("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	// A model that never stops running occupies its card for the whole window,
+	// so no idle row exists and the idle-median baseline is unavailable. The
+	// fallback must derive the baseline from the flush windows' minimum raw
+	// readings: 40 W here, the loaded-idle floor between bursts.
+	base := time.Now().Add(-time.Hour).Truncate(time.Minute)
+	minute := func(start time.Time, avg, min, max float64) PowerSampleRow {
+		return PowerSampleRow{
+			Start: start, End: start.Add(time.Minute),
+			Source: "gpu", SourceID: "GPU-b", SourceName: "TestGPU",
+			AvgWatts: avg, MinWatts: min, MaxWatts: max,
+			Samples: 12, EnergyWh: avg / 60, PricePerKwh: 0.5,
+		}
+	}
+	if err := s.InsertPowerSamples(ctx, []PowerSampleRow{
+		minute(base, 60, 40, 90),
+		minute(base.Add(time.Minute), 260, 40, 300),
+	}); err != nil {
+		t.Fatalf("insert power samples: %v", err)
+	}
+	if err := s.OpenModelGpuInterval(ctx, ModelGpuIntervalRow{
+		ModelID: "always-on", GpuUUID: "GPU-b", Started: base,
+	}); err != nil {
+		t.Fatalf("open interval: %v", err)
+	}
+
+	report, err := s.PowerReport(ctx, PowerReportQuery{
+		Start: base.Add(-time.Minute), End: base.Add(3 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("power report: %v", err)
+	}
+
+	if got := report.Baselines["GPU-b"]; got != 40 {
+		t.Fatalf("baseline GPU-b = %v, want fallback 40", got)
+	}
+
+	// Net = (60-40)/60 + (260-40)/60 = 4 Wh, all of it billed to the model.
+	var usage *PowerModelUsage
+	for i := range report.Models {
+		if report.Models[i].ModelID == "always-on" {
+			usage = &report.Models[i]
+		}
+	}
+	if usage == nil {
+		t.Fatalf("always-on model missing from report: %+v", report.Models)
+	}
+	if diff := usage.EnergyWh - 4.0; diff > 0.01 || diff < -0.01 {
+		t.Errorf("net energy = %v, want ~4", usage.EnergyWh)
+	}
+	if usage.Cost <= 0 {
+		t.Errorf("cost = %v, want > 0", usage.Cost)
+	}
+	// Gross counts every occupied watt: (60+260)/60 = 5.33 Wh.
+	if diff := usage.GrossEnergyWh - 320.0/60.0; diff > 0.01 || diff < -0.01 {
+		t.Errorf("gross energy = %v, want ~%v", usage.GrossEnergyWh, 320.0/60.0)
+	}
+	// The whole window's draw is attributed, so nothing reads as idle.
+	if report.Totals.InferenceEnergyWh <= 0 {
+		t.Errorf("inference share = %v, want > 0", report.Totals.InferenceEnergyWh)
+	}
+}

@@ -267,8 +267,9 @@ type PowerReport struct {
 	Models        []PowerModelUsage `json:"models"`
 	Totals        PowerTotals       `json:"totals"`
 	// Baselines maps GPU source_id to the idle-baseline watts used for net
-	// attribution. A GPU missing from the map had no idle samples in the
-	// window, so only gross energy is reported for its models.
+	// attribution. A GPU missing from the map had neither idle samples in the
+	// window nor a usable minimum-reading fallback, so only gross energy is
+	// reported for its models.
 	Baselines map[string]float64 `json:"baselines"`
 }
 
@@ -285,6 +286,9 @@ type PowerReportQuery struct {
 	// gets no row. Callers pass the locally served models; nil leaves the
 	// report unfiltered.
 	Models []string
+	// Location is the timezone for the calendar day boundaries of the today
+	// and month totals. Nil means the server's local timezone.
+	Location *time.Location
 	// BucketSeconds forces the time series bucket width. Values <= 0 select
 	// the width from the requested span.
 	BucketSeconds int
@@ -434,6 +438,9 @@ func (s *Store) PowerReport(ctx context.Context, query PowerReportQuery) (PowerR
 	}
 	gpuSamples := []gpuSample{}
 	idleWatts := map[string][]float64{}
+	// Per-card minimum readings from rows that a model occupied. They back
+	// the baseline fallback for cards with no idle samples in the window.
+	occupiedMinWatts := map[string][]float64{}
 
 	tariffEnergy := map[string]float64{}
 	tariffCost := map[string]float64{}
@@ -544,6 +551,9 @@ func (s *Store) PowerReport(ctx context.Context, query PowerReportQuery) (PowerR
 		}
 
 		if totalCoverage > 0 {
+			if minWatts >= 0 {
+				occupiedMinWatts[sourceID] = append(occupiedMinWatts[sourceID], minWatts)
+			}
 			gpuSamples = append(gpuSamples, gpuSample{
 				sourceID:    sourceID,
 				energyWh:    energy,
@@ -565,6 +575,20 @@ func (s *Store) PowerReport(ctx context.Context, query PowerReportQuery) (PowerR
 	// --- Baselines: median idle watts per GPU. ---
 	for sourceID, watts := range idleWatts {
 		if baseline := medianFloat(watts); baseline >= 0 {
+			report.Baselines[sourceID] = baseline
+		}
+	}
+	// A card occupied for the whole window has no idle rows, which would
+	// disable net attribution entirely for a model that never stops running.
+	// Fall back to the median of the flush windows' minimum raw readings: the
+	// within-window floor tracks the loaded-idle draw even when inference
+	// bursts dominate the averages, so idle-with-model-loaded hours stay
+	// mostly unbilled and bursts carry the attribution.
+	for sourceID, watts := range occupiedMinWatts {
+		if _, has := report.Baselines[sourceID]; has {
+			continue
+		}
+		if baseline := medianFloat(watts); baseline > 0 {
 			report.Baselines[sourceID] = baseline
 		}
 	}
@@ -719,10 +743,14 @@ func (s *Store) PowerReport(ctx context.Context, query PowerReportQuery) (PowerR
 		})
 	}
 
-	// --- Calendar totals (today and this month, local time). ---
-	now := time.Now()
-	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
-	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
+	// --- Calendar totals (today and this month, report timezone). ---
+	loc := query.Location
+	if loc == nil {
+		loc = time.Local
+	}
+	now := time.Now().In(loc)
+	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
+	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, loc)
 	todayEnergy, todayCost, _, err := s.powerEnergySince(ctx, todayStart)
 	if err != nil {
 		return PowerReport{}, err
