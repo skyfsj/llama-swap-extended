@@ -38,3 +38,7 @@ work/
 
 # test-run artifacts (request-error snapshots, extension debug logs)
 /internal/server/logs/
+
+# local build caches and binaries built into the repo root
+/.gocache/
+/wol-proxy
