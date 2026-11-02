@@ -945,30 +945,61 @@ func (w *extensionStreamWriter) EmitVisibleCalls(calls []extensionCall, serverID
 // function_call items, server calls become mcp_call items carrying their output.
 // The artifact items are remembered on the request state so the final
 // response.completed frame lists the whole turn, not only its last round.
+//
+// A server call streams the lifecycle the Responses API defines for hosted MCP
+// tools rather than collapsing it into a single completed item: the item is
+// announced in_progress, its arguments arrive through the mcp_call_arguments
+// events, and output_item.done closes it with the output. A client keying its
+// tool row on that lifecycle (ZCode, the OpenAI SDKs) leaves the row open
+// forever on a one-shot added+done pair — the row waits for the argument stage
+// that never comes.
 func (w *extensionStreamWriter) emitResponsesVisibleCalls(calls []extensionCall, serverIDs map[string]bool, outputs map[string]map[string]any) error {
 	for _, call := range calls {
-		var item map[string]any
-		if serverIDs[call.ID] {
-			item = responsesCallItem(call, outputs[call.ID])
-		} else {
-			item = map[string]any{"type": "function_call", "id": call.ID, "call_id": call.ID, "name": call.Name, "arguments": call.Arguments, "status": "completed"}
+		index := w.outputNextIndex
+		w.outputNextIndex++
+		if !serverIDs[call.ID] {
+			item := map[string]any{"type": "function_call", "id": call.ID, "call_id": call.ID, "name": call.Name, "arguments": call.Arguments, "status": "completed"}
 			if call.Namespace != "" {
 				// The client dispatches by (namespace, name): a namespaced call
 				// handed back bare is "unsupported call" on Codex.
 				item["namespace"] = call.Namespace
 			}
+			if err := w.emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "response_id": w.publicID, "output_index": index, "item": item}); err != nil {
+				return err
+			}
+			if err := w.emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "response_id": w.publicID, "output_index": index, "item": item}); err != nil {
+				return err
+			}
+			continue
 		}
-		index := w.outputNextIndex
-		w.outputNextIndex++
-		if err := w.emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "response_id": w.publicID, "output_index": index, "item": item}); err != nil {
+		id := responsesArtifactID(call)
+		// The added frame announces the item only: arguments arrive through the
+		// mcp_call_arguments events, output through output_item.done. Client
+		// schemas (OpenAI SDK, ZCode) accept an empty arguments string here.
+		added := map[string]any{
+			"id": id, "type": artifactResponsesCall, "server_label": artifactServerLabel,
+			"name": call.Name, "arguments": "", "status": "in_progress",
+		}
+		if err := w.emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "response_id": w.publicID, "output_index": index, "item": added}); err != nil {
 			return err
 		}
+		if err := w.emit("response.mcp_call_arguments.delta", map[string]any{
+			"type": "response.mcp_call_arguments.delta", "response_id": w.publicID,
+			"item_id": id, "output_index": index, "delta": call.Arguments,
+		}); err != nil {
+			return err
+		}
+		if err := w.emit("response.mcp_call_arguments.done", map[string]any{
+			"type": "response.mcp_call_arguments.done", "response_id": w.publicID,
+			"item_id": id, "output_index": index, "arguments": call.Arguments,
+		}); err != nil {
+			return err
+		}
+		item := responsesCallItem(call, outputs[call.ID])
 		if err := w.emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "response_id": w.publicID, "output_index": index, "item": item}); err != nil {
 			return err
 		}
-		if serverIDs[call.ID] {
-			w.state.visibleItems = append(w.state.visibleItems, visibleArtifact{SourceCallID: call.ID, Item: item})
-		}
+		w.state.visibleItems = append(w.state.visibleItems, visibleArtifact{SourceCallID: call.ID, Item: item})
 	}
 	return nil
 }

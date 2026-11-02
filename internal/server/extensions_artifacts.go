@@ -252,14 +252,20 @@ func responsesVisibleTurn(response map[string]any, outputs map[string]map[string
 	return visible
 }
 
-// responsesCallItem renders one executed server call as an mcp_call item.
-func responsesCallItem(call extensionCall, output map[string]any) map[string]any {
+// responsesArtifactID is the mcp_call item id of an executed server call: the
+// caller-visible identity every stage of the item's lifecycle shares.
+func responsesArtifactID(call extensionCall) string {
 	id := call.ID
 	if !strings.HasPrefix(id, "mcp_") {
 		id = "mcp_" + strings.TrimPrefix(id, "call_")
 	}
+	return id
+}
+
+// responsesCallItem renders one executed server call as an mcp_call item.
+func responsesCallItem(call extensionCall, output map[string]any) map[string]any {
 	item := map[string]any{
-		"id": id, "type": artifactResponsesCall, "server_label": artifactServerLabel,
+		"id": responsesArtifactID(call), "type": artifactResponsesCall, "server_label": artifactServerLabel,
 		"name": call.Name, "arguments": call.Arguments, "status": "completed",
 	}
 	if output == nil {

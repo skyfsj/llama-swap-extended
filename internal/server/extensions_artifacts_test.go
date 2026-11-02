@@ -304,6 +304,96 @@ func TestServer_ExtensionsResponsesStreamMixedResume(t *testing.T) {
 	}
 }
 
+// A streamed server call follows the lifecycle the Responses API defines for
+// hosted MCP tools — the item is announced in_progress, its arguments arrive
+// through the mcp_call_arguments events, and output_item.done closes it with
+// the output. Clients key their tool row on that lifecycle (ZCode leaves the
+// row at inputStreaming forever on a one-shot added+done pair), so the event
+// order and the item's state at each stage are pinned here.
+func TestServer_ExtensionsResponsesStreamMCPLifecycle(t *testing.T) {
+	local := newStubRouter([]string{"m"}, "")
+	rounds := 0
+	local.serveHTTP = func(w http.ResponseWriter, r *http.Request) {
+		rounds++
+		if rounds == 1 {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "data: {\"id\":\"a\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"s1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"q\\\":\\\"x\\\"}\"}}]}}]}\n\n")
+			_, _ = io.WriteString(w, "data: {\"id\":\"a\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"b","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}`)
+	}
+	s := extensionTestServer(t, local)
+	model := s.cfg.Models["m"]
+	model.Backend = config.BackendConfig{Type: "vllm", Protocol: config.AdapterProtocolNative}
+	s.cfg.Models["m"] = model
+	s.routes()
+	r := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"m","input":"hi","stream":true}`))
+	r.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d %.300s", w.Code, w.Body.String())
+	}
+	type stage struct {
+		event    string
+		status   string
+		contains string
+	}
+	var stages []stage
+	for _, line := range strings.Split(w.Body.String(), "\n") {
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		payload := strings.TrimPrefix(line, "data: ")
+		var frame map[string]any
+		if json.Unmarshal([]byte(payload), &frame) != nil {
+			continue
+		}
+		event, _ := frame["type"].(string)
+		// The completed frame embeds the artifact item too; only the four
+		// lifecycle frames count as stages.
+		switch event {
+		case "response.output_item.added", "response.output_item.done":
+			item, ok := frame["item"].(map[string]any)
+			if !ok || item["type"] != "mcp_call" {
+				continue
+			}
+		case "response.mcp_call_arguments.delta", "response.mcp_call_arguments.done":
+		default:
+			continue
+		}
+		current := stage{event: event}
+		if item, ok := frame["item"].(map[string]any); ok {
+			if status, ok := item["status"].(string); ok {
+				current.status = status
+			}
+			if output, ok := item["output"].(string); ok {
+				current.contains = output
+			}
+		}
+		if _, ok := frame["arguments"].(string); ok {
+			current.contains = "arguments"
+		}
+		stages = append(stages, current)
+	}
+	want := []stage{
+		{event: "response.output_item.added", status: "in_progress"},
+		{event: "response.mcp_call_arguments.delta"},
+		{event: "response.mcp_call_arguments.done", contains: "arguments"},
+		{event: "response.output_item.done", status: "completed", contains: "found:x"},
+	}
+	if len(stages) != len(want) {
+		t.Fatalf("mcp_call lifecycle = %+v, want %+v\nstream: %.2000s", stages, want, w.Body.String())
+	}
+	for i, stage := range want {
+		if stages[i] != stage {
+			t.Fatalf("lifecycle stage %d = %+v, want %+v", i, stages[i], stage)
+		}
+	}
+}
+
 // The Gemini fold rebuilds the replayed model turn and puts the deferred call's
 // own functionResponse next to the caller's, all paired by name.
 func TestServer_ExtensionsGeminiDeferredFold(t *testing.T) {
